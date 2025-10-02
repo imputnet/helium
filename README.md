@@ -1,20 +1,47 @@
-# Helium
-Bullshit-free web browser, based on Chromium. Follows [imput](https://github.com/imputnet)'s ethics and norms.
+<div align="center">
+    <br/>
+    <p>
+        <img src="resources/branding/app_icon/raw.png"
+            title="Helium" alt="Helium logo" width="120" />
+        <h1>Helium</h1>
+    </p>
+    <p width="120">
+        The Chromium-based web browser made for people, with love.
+        <br>
+        Best privacy by default, unbiased ad-blocking, no bloat and no noise.
+    </p>
+    <a href="https://helium.computer/">
+        helium.computer
+    </a>
+    <br/>
+</div>
 
-First and foremost, we're making a good browser for ourselves.
-We don't intend to reinvent the wheel or target everyone, it isn't Helium's goal.
-The main goal is to provide an honest, comfortable, privacy-respecting, and non-invasive experience.
-If you don't like it - you don't like it, that's totally okay, and we don't care.
+## Downloads
+> [!NOTE]
+> Helium is still in beta, so unexpected issues may occur. We are not responsible
+for any damage caused by usage of beta software.
 
-There's a lot more to Helium, but we don't have a complete set of features yet.
-We'll update the documentation when we're closer to a public release!
+Best way to download Helium is to open [helium.computer](https://helium.computer/) on your computer.
+It'll pick the right build for your OS and architecture automatically.
 
-## Platform-specific packaging
-At the moment, only [Helium for macOS](https://github.com/imputnet/helium-macos) is polished and ready for daily use.
+If you wish to download builds "straight from the tap" with all options in one place,
+you can do it on GitHub in the Releases section in each platform's repo:
+- [macOS](https://github.com/imputnet/helium-macos/releases/latest)
+- [Linux](https://github.com/imputnet/helium-linux/releases/latest) (AppImage)
+- [Windows](https://github.com/imputnet/helium-windows/releases/latest) (no auto-updates yet)
 
-We also have packaging for Linux and Windows, but both of them are WIP:
-- [Helium for Linux](https://github.com/imputnet/helium-linux) (AppImage)
-- [Helium for Windows](https://github.com/imputnet/helium-windows) (no auto-updates yet)
+## Platform packaging
+Helium is available on all major desktop platforms, with entirety of source code
+for all of them published here:
+- [Helium for macOS](https://github.com/imputnet/helium-macos)
+- [Helium for Linux](https://github.com/imputnet/helium-linux)
+- [Helium for Windows](https://github.com/imputnet/helium-windows)
+
+## Other Helium repos
+Along with the main repo and platform packaging, these projects are also a part of Helium:
+- [Helium services](https://github.com/imputnet/helium-services)
+- [Helium onboarding](https://github.com/imputnet/helium-onboarding) (the onboarding page seen in Helium at `helium://setup`)
+- [uBlock Origin packaging](https://github.com/imputnet/ublock-origin-crx)
 
 ## Credits
 ### ungoogled-chromium
@@ -41,3 +68,8 @@ repositories is licensed under GPL-3.0. See [LICENSE](LICENSE).
 Any content imported from other projects retains its original license (for
 example, any original unmodified code imported from ungoogled-chromium remains
 licensed under their [BSD 3-Clause license](LICENSE.ungoogled_chromium)).
+
+## More documentation (soon)
+> [!NOTE]
+> We will add more documentation along with design and motivation guidelines in the future.
+All docs will be linked here along with other related content.
