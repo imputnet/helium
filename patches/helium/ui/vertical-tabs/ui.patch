@@ -1,0 +1,1511 @@
+--- a/chrome/browser/ui/tabs/tab_style.cc
++++ b/chrome/browser/ui/tabs/tab_style.cc
+@@ -168,8 +168,10 @@ SkColor TabStyle::GetTabBackgroundColor(
+       return color_provider.GetColor(kSelectedColorIds[hovered][frame_active]);
+     }
+     case TabStyle::TabSelectionState::kInactive: {
+-      constexpr std::array<std::array<ui::ColorId, 2>, 2> kInactiveColorIds = {
++      std::array<std::array<ui::ColorId, 2>, 2> kInactiveColorIds = {
+           {{kColorTabBackgroundInactiveFrameInactive,
++            tabs::AreHeliumVerticalTabsEnabled() ?
++            kColorTabBackgroundInactiveFrameInactive :
+             kColorTabBackgroundInactiveFrameActive},
+            {kColorTabBackgroundInactiveHoverFrameInactive,
+             kColorTabBackgroundInactiveHoverFrameActive}}};
+--- a/chrome/browser/ui/views/frame/browser_frame_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_frame_mac.mm
+@@ -15,6 +15,8 @@
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #import "chrome/browser/ui/cocoa/browser_window_command_handler.h"
+ #import "chrome/browser/ui/cocoa/chrome_command_dispatcher_delegate.h"
+ #import "chrome/browser/ui/cocoa/touchbar/browser_window_touch_bar_controller.h"
+@@ -155,7 +157,7 @@ void BrowserFrameMac::GetWindowFrameTitl
+       browser_view_->frame()->GetFrameView()) {
+     *override_titlebar_height = true;
+     *titlebar_height =
+-        browser_view_->GetTabStripHeight() +
++        (tabs::AreHeliumVerticalTabsEnabled() ? GetLayoutConstant(TAB_STRIP_HEIGHT) : browser_view_->GetTabStripHeight()) +
+         browser_view_->frame()->GetFrameView()->GetTopInset(true);
+     if (!browser_view_->ShouldDrawTabStrip()) {
+       *titlebar_height +=
+--- a/chrome/browser/ui/views/frame/browser_root_view.cc
++++ b/chrome/browser/ui/views/frame/browser_root_view.cc
+@@ -344,7 +344,7 @@ bool BrowserRootView::OnMouseWheel(const
+   // Scroll-event-changes-tab is incompatible with scrolling tabstrip, so
+   // disable it if the latter feature is enabled.
+   if (scroll_event_changes_tab_ &&
+-      !base::FeatureList::IsEnabled(tabs::kScrollableTabStrip)) {
++      !base::FeatureList::IsEnabled(tabs::kScrollableTabStrip) && !tabs::AreHeliumVerticalTabsEnabled()) {
+     // Switch to the left/right tab if the wheel-scroll happens over the
+     // tabstrip, or the empty space beside the tabstrip.
+     views::View* hit_view = GetEventHandlerForPoint(event.location());
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -138,7 +138,7 @@ class BrowserView : public BrowserWindow
+ 
+  public:
+   // The width of the vertical tab strip.
+-  static constexpr int kVerticalTabStripWidth = 240;
++  static constexpr int kVerticalTabStripWidth = 270;
+ 
+   explicit BrowserView(std::unique_ptr<Browser> browser);
+   BrowserView(const BrowserView&) = delete;
+--- a/chrome/browser/ui/views/frame/browser_view_layout.cc
++++ b/chrome/browser/ui/views/frame/browser_view_layout.cc
+@@ -540,10 +540,22 @@ void BrowserViewLayout::LayoutTabStripRe
+   if (web_app_frame_toolbar_) {
+     tab_strip_region_bounds.Inset(gfx::Insets::TLBR(
+         0, 0, 0, web_app_frame_toolbar_->GetPreferredSize().width()));
++  } else if (tabs::AreHeliumVerticalTabsEnabled()) {
++    // if there's anything to the left (e.g. macOS window buttons), offset tab strip.
++    int top_offset = tab_strip_region_bounds.x() != 0 ? tab_strip_region_bounds.height() : 0;
++    tab_strip_region_bounds = gfx::Rect(
++      0, top_offset,
++      BrowserView::kVerticalTabStripWidth, available_bounds.height() - top_offset
++    );
+   }
+ 
+   if (tabs::AreVerticalTabsEnabled() && IsVerticalTabsEnabled()) {
+     SetViewVisibility(tab_strip_region_view_, false);
++  } else if (tabs::AreHeliumVerticalTabsEnabled()) {
++    SetViewVisibility(tab_strip_region_view_, true);
++    available_bounds.set_x(available_bounds.x() +
++                         BrowserView::kVerticalTabStripWidth);
++    tab_strip_region_view_->SetBoundsRect(tab_strip_region_bounds);
+   } else {
+     SetViewVisibility(tab_strip_region_view_, true);
+     tab_strip_region_view_->SetBoundsRect(tab_strip_region_bounds);
+@@ -572,7 +584,7 @@ void BrowserViewLayout::LayoutToolbar(gf
+   bool toolbar_visible = delegate_->IsToolbarVisible();
+   SetViewVisibility(toolbar_, toolbar_visible);
+ 
+-  if (tabs::AreVerticalTabsEnabled() && IsVerticalTabsEnabled()) {
++  if (tabs::AreVerticalTabsEnabled() && IsVerticalTabsEnabled() || tabs::AreHeliumVerticalTabsEnabled()) {
+     // When vertical tabs is enabled, the top element becomes the toolbar.
+     // Because of this, it must now be aware of the location of the caption
+     // buttons. We can reuse the calculation use by the TabStripRegionView to
+@@ -580,11 +592,13 @@ void BrowserViewLayout::LayoutToolbar(gf
+     // caption button location directly.
+     gfx::Rect toolbar_bounds(
+         delegate_->GetBoundsForTabStripRegionInBrowserView());
++
+     toolbar_bounds.set_x(available_bounds.x());
+     toolbar_bounds.set_width(toolbar_bounds.width() -
+                              BrowserView::kVerticalTabStripWidth);
++    int height = toolbar_visible ? toolbar_bounds.height() : 0;
+     toolbar_->SetBounds(toolbar_bounds.x(), toolbar_bounds.y(),
+-                        toolbar_bounds.width(), toolbar_bounds.height());
++                        toolbar_bounds.width(), height);
+   } else {
+     int height = toolbar_visible ? toolbar_->GetPreferredSize().height() : 0;
+     int width = available_bounds.width();
+@@ -727,8 +741,9 @@ BrowserViewLayout::CalculateContentsCont
+   contents_container_bounds.set_height(available_bounds.height() -
+                                        available_bounds.y());
+   int vertical_tab_offset = 0;
+-  if (tabs::AreVerticalTabsEnabled() && IsVerticalTabsEnabled()) {
++  if (tabs::AreVerticalTabsEnabled() && IsVerticalTabsEnabled() || (delegate_->ShouldDrawTabStrip() && tabs::AreHeliumVerticalTabsEnabled())) {
+     vertical_tab_offset = BrowserView::kVerticalTabStripWidth;
++    contents_container_bounds.set_x(vertical_tab_offset);
+     contents_container_bounds.set_width(available_bounds.width() -
+                                         vertical_tab_offset);
+   }
+--- a/chrome/browser/ui/views/frame/tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/tab_strip_region_view.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/views/chrome_layout_provider.h"
+ #include "chrome/browser/ui/views/commerce/product_specifications_button.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -196,6 +197,10 @@ TabStripRegionView::TabStripRegionView(s
+       this, views::kCascadingBackgroundColor,
+       kColorTabBackgroundInactiveFrameInactive);
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    SetBackground(views::CreateSolidBackground(kColorTabBackgroundInactiveFrameInactive));
++  }
++
+   SetLayoutManager(std::make_unique<views::FlexLayout>())
+       ->SetOrientation(views::LayoutOrientation::kHorizontal);
+ 
+@@ -211,6 +216,7 @@ TabStripRegionView::TabStripRegionView(s
+   std::unique_ptr<TabStripActionContainer> tab_strip_action_container;
+   std::unique_ptr<ProductSpecificationsButton> product_specifications_button;
+   if (browser &&
++      !tabs::AreHeliumVerticalTabsEnabled() &&
+       !base::CommandLine::ForCurrentProcess()->HasSwitch("remove-tabsearch-button") &&
+       (browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL)) {
+     if (features::HasTabSearchToolbarButton()) {
+@@ -263,7 +269,7 @@ TabStripRegionView::TabStripRegionView(s
+     }
+   }
+ 
+-  if (base::FeatureList::IsEnabled(tabs::kScrollableTabStrip)) {
++  if (base::FeatureList::IsEnabled(tabs::kScrollableTabStrip) || tabs::AreHeliumVerticalTabsEnabled()) {
+     std::unique_ptr<TabStripScrollContainer> scroll_container =
+         std::make_unique<TabStripScrollContainer>(std::move(tab_strip));
+     tab_strip_scroll_container_ = scroll_container.get();
+@@ -271,7 +277,9 @@ TabStripRegionView::TabStripRegionView(s
+     // Allow the |tab_strip_container_| to grow into the free space available in
+     // the TabStripRegionView.
+     const views::FlexSpecification tab_strip_container_flex_spec =
+-        views::FlexSpecification(views::LayoutOrientation::kHorizontal,
++        views::FlexSpecification(tabs::AreHeliumVerticalTabsEnabled() ?
++                                 views::LayoutOrientation::kVertical :
++                                 views::LayoutOrientation::kHorizontal,
+                                  views::MinimumFlexSizeRule::kScaleToMinimum,
+                                  views::MaximumFlexSizeRule::kPreferred);
+     tab_strip_container_->SetProperty(views::kFlexBehaviorKey,
+@@ -290,7 +298,7 @@ TabStripRegionView::TabStripRegionView(s
+                                       tab_strip_container_flex_spec);
+   }
+ 
+-  if (ShouldShowNewTabButton(browser)) {
++  if (ShouldShowNewTabButton(browser) && !tabs::AreHeliumVerticalTabsEnabled()) {
+     std::unique_ptr<TabStripControlButton> tab_strip_control_button =
+         std::make_unique<TabStripControlButton>(
+             tab_strip_->controller(),
+@@ -313,17 +321,20 @@ TabStripRegionView::TabStripRegionView(s
+           ui::EF_MIDDLE_MOUSE_BUTTON);
+   }
+ 
+-  reserved_grab_handle_space_ =
+-      AddChildView(std::make_unique<FrameGrabHandle>());
+-  reserved_grab_handle_space_->SetProperty(
+-      views::kFlexBehaviorKey,
+-      views::FlexSpecification(views::MinimumFlexSizeRule::kPreferred,
+-                               views::MaximumFlexSizeRule::kUnbounded)
+-          .WithOrder(3));
++  if (!tabs::AreHeliumVerticalTabsEnabled()) {
++    reserved_grab_handle_space_ =
++        AddChildView(std::make_unique<FrameGrabHandle>());
++    reserved_grab_handle_space_->SetProperty(
++        views::kFlexBehaviorKey,
++        views::FlexSpecification(views::MinimumFlexSizeRule::kPreferred,
++                                 views::MaximumFlexSizeRule::kUnbounded)
++            .WithOrder(3));
++  }
+ 
+   SetProperty(views::kElementIdentifierKey, kTabStripRegionElementId);
+ 
+-  if (browser && tab_search_container && !render_tab_search_before_tab_strip_) {
++  if (browser && tab_search_container && !render_tab_search_before_tab_strip_
++      && !tabs::AreHeliumVerticalTabsEnabled()) {
+     if (product_specifications_button) {
+       product_specifications_button_ =
+           AddChildView(std::move(product_specifications_button));
+@@ -337,6 +348,7 @@ TabStripRegionView::TabStripRegionView(s
+     tab_strip_action_container_ =
+         AddChildView(std::move(tab_strip_action_container));
+   }
++
+   UpdateTabStripMargin();
+ }
+ TabStripRegionView::~TabStripRegionView() {
+@@ -396,7 +408,7 @@ bool TabStripRegionView::IsRectInWindowC
+   // true.
+   if (tab_strip_container_->HitTestRect(
+           get_target_rect(tab_strip_container_))) {
+-    if (base::FeatureList::IsEnabled(tabs::kScrollableTabStrip)) {
++    if (base::FeatureList::IsEnabled(tabs::kScrollableTabStrip) || tabs::AreHeliumVerticalTabsEnabled()) {
+       TabStripScrollContainer* scroll_container =
+           views::AsViewClass<TabStripScrollContainer>(tab_strip_container_);
+ 
+@@ -464,7 +476,7 @@ views::View::Views TabStripRegionView::G
+ // manually calculated.
+ void TabStripRegionView::Layout(PassKey) {
+   const bool tab_search_container_before_tab_strip =
+-      tab_search_container_ && render_tab_search_before_tab_strip_;
++      tab_search_container_ && render_tab_search_before_tab_strip_ && !tabs::AreHeliumVerticalTabsEnabled();
+   if (tab_search_container_before_tab_strip) {
+     UpdateTabStripMargin();
+   }
+@@ -654,6 +666,11 @@ void TabStripRegionView::UpdateButtonBor
+ }
+ 
+ void TabStripRegionView::UpdateTabStripMargin() {
++  // Vertical tab strip has constant size defined by BrowserViewLayout.
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    return;
++  }
++
+   // The new tab button overlaps the tabstrip. Render it to a layer and adjust
+   // the tabstrip right margin to reserve space for it.
+   std::optional<int> tab_strip_right_margin;
+--- a/chrome/browser/ui/views/tabs/dragging/dragging_tabs_session.cc
++++ b/chrome/browser/ui/views/tabs/dragging/dragging_tabs_session.cc
+@@ -29,11 +29,20 @@ int CalculateMouseOffset(const DragSessi
+   tabs_to_source.erase(
+       tabs_to_source.begin() + drag_data_.source_view_index_ + 1,
+       tabs_to_source.end());
+-  const int new_x =
+-      TabStrip::GetSizeNeededForViews(tabs_to_source) - source_view->width() +
+-      base::ClampRound(offset_to_width_ratio_ * source_view->width());
+ 
+-  return new_x;
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    const int new_y =
++       TabStrip::GetSizeNeededForViews(tabs_to_source) - source_view->height() +
++       base::ClampRound(offset_to_width_ratio_ * source_view->height());
++
++     return new_y;
++  } else {
++    const int new_x =
++        TabStrip::GetSizeNeededForViews(tabs_to_source) - source_view->width() +
++        base::ClampRound(offset_to_width_ratio_ * source_view->width());
++
++    return new_x;
++  }
+ }
+ 
+ }  // namespace
+@@ -141,11 +150,17 @@ void DraggingTabsSession::MoveAttachedIm
+       drag_data_.attached_views(), drag_data_.num_dragging_tabs());
+ 
+   constexpr int kHorizontalMoveThreshold = 16;  // DIPs.
+-  const int threshold = base::ClampRound(
++  int threshold = 0;
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    threshold = base::ClampRound(static_cast<double>(attached_context_->GetTabAt(to_index)->bounds().height() / 2));
++  } else {
++    threshold = base::ClampRound(
+       static_cast<double>(
+           attached_context_->GetTabAt(to_index)->bounds().width()) /
+       TabStyle::Get()->GetStandardWidth(/*is_split=*/false) *
+       kHorizontalMoveThreshold);
++  }
+ 
+   // Update the model, moving the WebContents from one index to another. Do this
+   // only if we have moved a minimum distance since the last reorder (to prevent
+@@ -153,7 +168,7 @@ void DraggingTabsSession::MoveAttachedIm
+   // we have just attached to a new tabstrip and need to move to the correct
+   // initial position.
+   if (just_attached ||
+-      (abs(point_in_attached_context.x() - last_move_attached_context_loc_) >
++      (abs((tabs::AreHeliumVerticalTabsEnabled() ? point_in_attached_context.y() : point_in_attached_context.x()) - last_move_attached_context_loc_) >
+        threshold) ||
+       (initial_move_ && !AreTabsConsecutive())) {
+     TabStripModel* attached_model = attached_context_->GetTabStripModel();
+@@ -200,7 +215,11 @@ void DraggingTabsSession::MoveAttachedIm
+     // `last_move_attached_context_loc_`.
+     if (index_of_last_item !=
+         attached_model->GetIndexOfWebContents(last_contents)) {
+-      last_move_attached_context_loc_ = point_in_attached_context.x();
++      if (tabs::AreHeliumVerticalTabsEnabled()) {
++        last_move_attached_context_loc_ = point_in_attached_context.y();
++      } else {
++        last_move_attached_context_loc_ = point_in_attached_context.x();
++      }
+     }
+   }
+ 
+@@ -231,6 +250,13 @@ gfx::Rect DraggingTabsSession::GetDragge
+     std::vector<gfx::Rect> all_bounds =
+         attached_context_->CalculateBoundsForDraggedViews(
+             drag_data_.attached_views());
++
++    if (tabs::AreHeliumVerticalTabsEnabled()) {
++      int total_height = all_bounds.back().bottom() - all_bounds.front().y();
++      return gfx::Rect(
++        tab_strip_point.x(), tab_strip_point.y(), drag_data_.source_view_drag_data()->attached_view->width(), total_height);
++    }
++
+     int total_width = all_bounds.back().right() - all_bounds.front().x();
+     return gfx::Rect(
+         tab_strip_point.x(), tab_strip_point.y(), total_width,
+@@ -288,6 +314,72 @@ DraggingTabsSession::CalculateGroupForDr
+     return std::nullopt;
+   }
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    std::optional<tab_groups::TabGroupId> top_group =
++       adjacent_indices.first.has_value()
++           ? attached_model->GetTabGroupForTab(adjacent_indices.first.value())
++           : std::nullopt;
++    std::optional<tab_groups::TabGroupId>  bottom_group =
++       adjacent_indices.second.has_value()
++           ? attached_model->GetTabGroupForTab(adjacent_indices.second.value())
++           : std::nullopt;
++    std::optional<tab_groups::TabGroupId> current_group =
++       attached_model->GetTabGroupForTab(selected_unpinned[0]);
++
++    if (top_group == bottom_group) {
++      return top_group;
++    }
++
++    const Tab* top_most_selected_tab =
++      attached_context_->GetTabAt(selected_unpinned[0]);
++    const int buffer = top_most_selected_tab->height() / 4;
++
++    const int tab_top_inset = TabStyle::Get()->GetStandardHeight() / 2;
++
++    const auto tab_bounds_in_drag_context_coords = [this](int model_index) {
++      const Tab* const tab = attached_context_->GetTabAt(model_index);
++        return ToEnclosingRect(views::View::ConvertRectToTarget(
++          tab->parent(), attached_context_, gfx::RectF(tab->bounds())));
++    };
++
++    int top_edge =
++       adjacent_indices.first.has_value()
++           ? tab_bounds_in_drag_context_coords(adjacent_indices.first.value())
++                    .bottom() -
++                tab_top_inset
++          : tab_top_inset;
++
++    if (top_group.has_value() && top_group == current_group) {
++      top_edge += buffer;
++    }
++    if (bottom_group.has_value() && bottom_group == current_group && top_edge > tab_top_inset) {
++      top_edge -= buffer;
++    }
++
++    const int top_most_selected_y_position =
++      top_most_selected_tab->y() + tab_top_inset;
++
++    if (top_group.has_value() &&
++      !attached_model->IsGroupCollapsed(top_group.value())) {
++      if (tab_bounds_in_drag_context_coords(selected_unpinned.back()).bottom() >=
++         attached_context_->TabDragAreaEndY()) {
++        return std::nullopt;
++      }
++
++      if (top_most_selected_y_position <= top_edge - buffer) {
++        return top_group;
++      }
++    }
++
++    if ((top_most_selected_y_position >= top_edge + buffer) &&
++      bottom_group.has_value() &&
++      !attached_model->IsGroupCollapsed(bottom_group.value())) {
++     return bottom_group;
++   }
++
++   return std::nullopt;
++  }
++
+   std::optional<tab_groups::TabGroupId> left_group =
+       adjacent_indices.first.has_value()
+           ? attached_model->GetTabGroupForTab(adjacent_indices.first.value())
+@@ -380,6 +472,15 @@ gfx::Point DraggingTabsSession::GetAttac
+     gfx::Point point_in_screen) {
+   const gfx::Point tab_loc =
+       views::View::ConvertPointFromScreen(attached_context_, point_in_screen);
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    const int y = tab_loc.y() - mouse_offset_;
++    const int max_y = std::max(
++      0, attached_context_->GetTabDragAreaHeight() -
++              TabStrip::GetSizeNeededForViews(drag_data_.attached_views()));
++    return gfx::Point(0, std::clamp(y, 0, max_y));
++  }
++
+   const int x =
+       attached_context_->GetMirroredXInView(tab_loc.x()) - mouse_offset_;
+ 
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_context.h
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_context.h
+@@ -51,6 +51,7 @@ class TabDragContextBase : public views:
+ 
+   // Returns the width of the region in which dragged tabs are allowed to exist.
+   virtual int GetTabDragAreaWidth() const = 0;
++  virtual int GetTabDragAreaHeight() const = 0;
+ };
+ 
+ // Provides tabstrip functionality specifically for TabDragController, much of
+@@ -100,6 +101,8 @@ class TabDragContext : public TabDragCon
+   // points should detach.
+   virtual int TabDragAreaEndX() const = 0;
+   virtual int TabDragAreaBeginX() const = 0;
++  virtual int TabDragAreaEndY() const = 0;
++  virtual int TabDragAreaBeginY() const = 0;
+ 
+   // Returns the index where the dragged WebContents should be inserted into
+   // this tabstrip given the DraggedTabView's bounds `dragged_bounds` in
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -172,6 +172,16 @@ void OffsetX(int x_offset, std::vector<g
+   }
+ }
+ 
++void OffsetY(int y_offset, std::vector<gfx::Rect>* rects) {
++  if (y_offset == 0) {
++    return;
++  }
++
++  for (auto& rect : *rects) {
++    rect.set_y(rect.y() + y_offset);
++  }
++}
++
+ bool IsWindowDragUsingSystemDragDropAllowed() {
+   return base::FeatureList::IsEnabled(
+       features::kAllowWindowDragUsingSystemDragDrop);
+@@ -471,7 +481,7 @@ TabDragController::Liveness TabDragContr
+                      END_DRAG_CANCEL),
+       ref->source_context_->GetWidget()->GetNativeWindow());
+ 
+-  if (source_view->width() > 0) {
++  if (!tabs::AreHeliumVerticalTabsEnabled() && source_view->width() > 0) {
+     ref->offset_to_width_ratio_ =
+         static_cast<float>(
+             source_view->GetMirroredXInView(source_view_offset)) /
+@@ -1245,6 +1255,13 @@ bool TabDragController::DoesTabStripCont
+   // Make sure the specified screen point is actually within the bounds of the
+   // specified context...
+   gfx::Rect tabstrip_bounds = GetTabstripScreenBounds(context);
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    const int y_in_strip = point_in_screen.y() - tabstrip_bounds.y();
++    return (y_in_strip >= context->TabDragAreaBeginY()) &&
++          (y_in_strip < context->TabDragAreaEndY()) &&
++          DoesRectContainVerticalPointExpanded(
++              tabstrip_bounds, kVerticalDetachMagnetism, point_in_screen.y());
++  }
+   const int x_in_strip = point_in_screen.x() - tabstrip_bounds.x();
+   return (x_in_strip >= context->TabDragAreaBeginX()) &&
+          (x_in_strip < context->TabDragAreaEndX()) &&
+@@ -1520,8 +1537,9 @@ TabDragController::DetachIntoNewBrowserA
+   }
+ 
+   const int previous_tab_area_width = attached_context_->GetTabDragAreaWidth();
++  const int previous_tab_area_height = attached_context_->GetTabDragAreaHeight();
+   const gfx::Size new_size = CalculateDraggedWindowSize(attached_context_);
+-  const int first_tab_leading_x =
++  const int first_tab_leading_x_or_y =
+       GetTabOffsetForDetachedWindow(point_in_screen);
+   const std::vector<gfx::Rect> drag_bounds =
+       attached_context_->CalculateBoundsForDraggedViews(
+@@ -1577,7 +1595,9 @@ TabDragController::DetachIntoNewBrowserA
+     // attached to is hidden and thus can't start the drag session.
+     return StartSystemDnDSessionIfNecessary(source_context_, point_in_screen);
+   }
+-  AdjustTabBoundsForDrag(previous_tab_area_width, first_tab_leading_x,
++  AdjustTabBoundsForDrag(tabs::AreHeliumVerticalTabsEnabled() ?
++                         previous_tab_area_height :
++                         previous_tab_area_width, first_tab_leading_x_or_y,
+                          drag_bounds);
+ 
+   const gfx::Vector2d drag_offset = CalculateWindowDragOffset();
+@@ -2356,6 +2376,13 @@ int TabDragController::GetTabOffsetForDe
+   DCHECK(attached_context_);
+   const gfx::Point attached_point =
+       views::View::ConvertPointFromScreen(attached_context_, point_in_screen);
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    if (attached_point.y() < attached_context_->TabDragAreaBeginY()) return 0;
++    if (attached_point.y() >= attached_context_->TabDragAreaEndY()) return 0;
++    return drag_data_.tab_drag_data_[0].attached_view->bounds().y();
++  }
++
+   if (attached_point.x() < attached_context_->TabDragAreaBeginX()) {
+     // Detaching to the left; tabs should be at the beginning of the window.
+     return 0;
+@@ -2376,6 +2403,30 @@ void TabDragController::AdjustTabBoundsF
+   CHECK(!ShouldDragWindowUsingSystemDnD());
+ 
+   attached_context_->ForceLayout();
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    int previous_tab_area_height = previous_tab_area_width; // uhhh
++    int first_tab_leading_y = first_tab_leading_x; // uhhh 2
++    const int current_tab_area_height = attached_context_->GetTabDragAreaHeight();
++    if (current_tab_area_height < previous_tab_area_height) {
++      const float leading_ratio = first_tab_leading_y / static_cast<float>(previous_tab_area_height);
++
++      if (drag_bounds.back().bottom() < current_tab_area_height) {
++        const int maximum_tab_y =
++          current_tab_area_height -
++          (drag_bounds.back().bottom() - drag_bounds.front().y());
++        const int leading_tab_y =
++           std::min(static_cast<int>(leading_ratio * current_tab_area_height),
++                   maximum_tab_y);
++        OffsetY(leading_tab_y, &drag_bounds);
++      }
++    } else {
++      OffsetY(first_tab_leading_y, &drag_bounds);
++    }
++    attached_context_->SetBoundsForDrag(drag_data_.attached_views(), drag_bounds);
++    return;
++  }
++
+   const int current_tab_area_width = attached_context_->GetTabDragAreaWidth();
+ 
+   // If the new tabstrip region is smaller than the old, resize and reposition
+--- a/chrome/browser/ui/views/tabs/tab_container.h
++++ b/chrome/browser/ui/views/tabs/tab_container.h
+@@ -55,6 +55,8 @@ class TabContainer : public views::View,
+   // the width of the tabstrip.
+   virtual void SetAvailableWidthCallback(
+       base::RepeatingCallback<int()> available_width_callback) = 0;
++  virtual void SetAvailableHeightCallback(
++      base::RepeatingCallback<int()> available_height_callback) = 0;
+ 
+   // Handle model changes.
+   virtual std::vector<Tab*> AddTabs(
+@@ -164,6 +166,7 @@ class TabContainer : public views::View,
+ 
+   // Returns the total width available for the TabContainer's use.
+   virtual int GetAvailableWidthForTabContainer() const = 0;
++  virtual int GetAvailableHeightForTabContainer() const = 0;
+ 
+   // See `in_tab_close_` for details on tab closing mode. `source` is the input
+   // method used to enter tab closing mode, which determines how it is exited
+--- a/chrome/browser/ui/views/tabs/tab_container_impl.cc
++++ b/chrome/browser/ui/views/tabs/tab_container_impl.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+@@ -142,6 +143,10 @@ void TabContainerImpl::SetAvailableWidth
+     base::RepeatingCallback<int()> available_width_callback) {
+   available_width_callback_ = available_width_callback;
+ }
++void TabContainerImpl::SetAvailableHeightCallback(
++    base::RepeatingCallback<int()> available_height_callback) {
++  available_height_callback_ = available_height_callback;
++}
+ 
+ std::vector<Tab*> TabContainerImpl::AddTabs(
+     std::vector<TabInsertionParams> tabs_params) {
+@@ -258,7 +263,7 @@ void TabContainerImpl::SetActiveTab(std:
+     CompleteAnimationAndLayout();
+   }
+ 
+-  if (base::FeatureList::IsEnabled(tabs::kScrollableTabStrip) &&
++  if ((base::FeatureList::IsEnabled(tabs::kScrollableTabStrip) || tabs::AreHeliumVerticalTabsEnabled()) &&
+       new_active_index.has_value()) {
+     ScrollTabToVisible(new_active_index.value());
+   }
+@@ -329,14 +334,33 @@ void TabContainerImpl::ScrollTabToVisibl
+ 
+   // If the tab strip won't be scrollable after the current tabstrip animations
+   // complete, scroll animation wouldn't be meaningful.
+-  if (tabs_view_model_.ideal_bounds(GetTabCount() - 1).right() <=
+-      GetAvailableWidthForTabContainer()) {
+-    return;
++  if (!tabs::AreHeliumVerticalTabsEnabled()) {
++    if (tabs_view_model_.ideal_bounds(GetTabCount() - 1).right() <=
++        GetAvailableWidthForTabContainer()) {
++      return;
++    }
+   }
+ 
+   gfx::Rect active_tab_ideal_bounds =
+       tabs_view_model_.ideal_bounds(model_index);
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    bool scroll_to_bottom = active_tab_ideal_bounds.y() < visible_content_rect->y();
++
++    if (scroll_to_bottom) {
++      int start_left_edge(visible_content_rect->y());
++      int target_left_edge(active_tab_ideal_bounds.y());
++
++      AnimateScrollToShowYCoordinate(start_left_edge, target_left_edge);
++    } else {
++      int start_right_edge(visible_content_rect->bottom());
++      int target_right_edge(active_tab_ideal_bounds.bottom());
++      AnimateScrollToShowYCoordinate(start_right_edge, target_right_edge);
++    }
++
++    return;
++  }
++
+   if ((active_tab_ideal_bounds.x() >= visible_content_rect->x()) &&
+       (active_tab_ideal_bounds.right() <= visible_content_rect->right())) {
+     return;
+@@ -367,6 +391,15 @@ void TabContainerImpl::ScrollTabContaine
+     return;
+   }
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    int start_edge =
++      (offset > 0) ? visible_content_rect->bottom() : visible_content_rect->y();
++
++    AnimateScrollToShowYCoordinate(start_edge, start_edge + offset);
++
++    return;
++  }
++
+   // If tabcontainer is scrolled towards trailing tab, the start edge should
+   // have the x coordinate of the right bound. If it is scrolled towards the
+   // leading tab it should have the x coordinate of the left bound.
+@@ -454,6 +487,11 @@ void TabContainerImpl::ToggleTabGroup(
+             ? CloseTabSource::kFromMouse
+             : CloseTabSource::kFromTouch;
+ 
++    if (tabs::AreHeliumVerticalTabsEnabled()) {
++      EnterTabClosingMode(std::nullopt, source);
++      return;
++    }
++
+     EnterTabClosingMode(
+         tabs_view_model_.ideal_bounds(GetTabCount() - 1).right() -
+             current_group_width + collapsed_group_width,
+@@ -723,6 +761,12 @@ int TabContainerImpl::GetAvailableWidthF
+              : parent()->GetAvailableSize(this).width().value();
+ }
+ 
++int TabContainerImpl::GetAvailableHeightForTabContainer() const {
++  return available_height_callback_
++             ? available_height_callback_.Run()
++             : parent()->GetAvailableSize(this).height().value();
++}
++
+ void TabContainerImpl::EnterTabClosingMode(std::optional<int> override_width,
+                                            CloseTabSource source) {
+   // Tab closing mode only makes sense if the tab was closed as a direct result
+@@ -794,7 +838,7 @@ void TabContainerImpl::SetTabSlotVisibil
+     const bool is_collapsed =
+         (current_group.has_value() &&
+          controller_->IsGroupCollapsed(current_group.value()) &&
+-         tab->bounds().width() <= tab->tab_style()->GetTabOverlap());
++         (tabs::AreHeliumVerticalTabsEnabled() ? true : tab->bounds().width() <= tab->tab_style()->GetTabOverlap()));
+     const bool should_be_visible = is_collapsed ? false : last_tab_visible;
+ 
+     // If we change the visibility of a tab in a group, we must recalculate that
+@@ -885,6 +929,10 @@ void TabContainerImpl::PaintChildren(con
+ }
+ 
+ gfx::Size TabContainerImpl::GetMinimumSize() const {
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    return gfx::Size(BrowserView::kVerticalTabStripWidth, GetLayoutConstant(TAB_STRIP_HEIGHT));
++  }
++
+   // During animations, our minimum width tightly hugs the current bounds of our
+   // children.
+   std::optional<int> minimum_width = GetMidAnimationTrailingX();
+@@ -902,6 +950,25 @@ gfx::Size TabContainerImpl::GetMinimumSi
+ 
+ gfx::Size TabContainerImpl::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    int max_y = 0;
++    int tabs_height = 0;
++
++    // The visual order of the tabs can be out of sync with the logical order,
++    // so we have to check all of them to find the visually trailing-most one.
++    for (views::View* child : children()) {
++      max_y = std::max(max_y, child->bounds().bottom());
++      tabs_height += child->height();
++    }
++
++    /*if (tabs_height < GetAvailableHeightForTabContainer()) {
++      max_y = GetAvailableHeightForTabContainer();
++    }*/
++
++    return gfx::Size(available_size.width().value_or(BrowserView::kVerticalTabStripWidth),
++                     max_y);
++  }
++
+   // During animations, our preferred width tightly hugs the current bounds of
+   // our children.
+   std::optional<int> preferred_width = GetMidAnimationTrailingX();
+@@ -1216,6 +1283,22 @@ void TabContainerImpl::AnimateScrollToSh
+   tab_scrolling_animation_->Start();
+ }
+ 
++void TabContainerImpl::AnimateScrollToShowYCoordinate(const int start_edge,
++                                                      const int target_edge) {
++  if (tab_scrolling_animation_) {
++    tab_scrolling_animation_->Stop();
++  }
++
++
++  gfx::Rect start_rect(0, start_edge, 0, 0);
++  gfx::Rect target_rect(0, target_edge, 0, 0);
++
++  tab_scrolling_animation_ = std::make_unique<TabScrollingAnimation>(
++      scroll_contents_view_, bounds_animator_.container(), start_rect,
++      target_rect);
++  tab_scrolling_animation_->Start();
++}
++
+ void TabContainerImpl::AnimateTabSlotViewTo(TabSlotView* tab_slot_view,
+                                             const gfx::Rect& target_bounds) {
+   // If we don't own the tab, let our controller handle it.
+@@ -1288,14 +1371,22 @@ void TabContainerImpl::StartInsertTabAni
+   // Adjust the starting bounds of the new tab.
+   const int tab_overlap = TabStyle::Get()->GetTabOverlap();
+   if (model_index > 0) {
+-    // If we have a tab to our left, start at its right edge.
+-    bounds.set_x(GetTabAtModelIndex(model_index - 1)->bounds().right() -
+-                 tab_overlap);
++    if (tabs::AreHeliumVerticalTabsEnabled()) {
++      bounds.set_y(GetTabAtModelIndex(model_index - 1)->bounds().y() + TabStyle::Get()->GetStandardHeight());
++    } else {
++      // If we have a tab to our left, start at its right edge.
++      bounds.set_x(GetTabAtModelIndex(model_index - 1)->bounds().right() -
++                   tab_overlap);
++    }
+   } else {
+     CHECK_LT(model_index + 1, GetTabCount())
+         << "First tab inserted into the tabstrip should not animate.";
+-    // Otherwise, if we have a tab to our right, start at its left edge.
+-    bounds.set_x(GetTabAtModelIndex(model_index + 1)->bounds().x());
++    if (tabs::AreHeliumVerticalTabsEnabled()) {
++      bounds.set_y(GetTabAtModelIndex(model_index + 1)->bounds().bottom() + TabStyle::Get()->GetStandardHeight());
++    } else {
++      // Otherwise, if we have a tab to our right, start at its left edge.
++      bounds.set_x(GetTabAtModelIndex(model_index + 1)->bounds().x());
++    }
+   }
+ 
+   // Start at the width of the overlap in order to animate at the same speed
+@@ -1315,7 +1406,8 @@ void TabContainerImpl::StartRemoveTabAni
+   UpdateIdealBounds();
+   if (in_tab_close_ && GetTabCount() > 0 &&
+       override_available_width_for_tabs_ >
+-          tabs_view_model_.ideal_bounds(GetTabCount() - 1).right()) {
++      (tabs::AreHeliumVerticalTabsEnabled() ? true : override_available_width_for_tabs_ >
++          tabs_view_model_.ideal_bounds(GetTabCount() - 1).right())) {
+     // Tab closing mode is no longer constraining tab widths - they're at full
+     // size. Exit tab closing mode so that it doesn't artificially inflate our
+     // bounds.
+@@ -1366,11 +1458,15 @@ gfx::Rect TabContainerImpl::GetTargetBou
+   // Compute the target bounds for animating this tab closed.  The tab's left
+   // edge should stay joined to the right edge of the previous tab, if any.
+   gfx::Rect target_bounds = tab->bounds();
+-  target_bounds.set_x(
+-      (former_model_index > 0)
+-          ? (tabs_view_model_.ideal_bounds(former_model_index - 1).right() -
+-             tab_overlap)
+-          : 0);
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    target_bounds.set_x(0);
++  } else {
++    target_bounds.set_x(
++       (former_model_index > 0)
++           ? (tabs_view_model_.ideal_bounds(former_model_index - 1).right() -
++              tab_overlap)
++           : 0);
++  }
+ 
+   // The tab should animate to the width of the overlap in order to close at the
+   // same speed the surrounding tabs are moving, since at this width the
+@@ -1650,7 +1746,7 @@ bool TabContainerImpl::ShouldTabBeVisibl
+   // N.B. This is separate from the tab being potentially scrolled offscreen -
+   // this solely determines whether the tab should be clipped for the
+   // pre-scrolling overflow behavior.
+-  if (base::FeatureList::IsEnabled(tabs::kScrollableTabStrip)) {
++  if (base::FeatureList::IsEnabled(tabs::kScrollableTabStrip) || tabs::AreHeliumVerticalTabsEnabled()) {
+     return true;
+   }
+ 
+@@ -1819,4 +1915,5 @@ bool TabContainerImpl::IsValidModelIndex
+ 
+ BEGIN_METADATA(TabContainerImpl)
+ ADD_READONLY_PROPERTY_METADATA(int, AvailableWidthForTabContainer)
++ADD_READONLY_PROPERTY_METADATA(int, AvailableHeightForTabContainer)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/tab_container_impl.h
++++ b/chrome/browser/ui/views/tabs/tab_container_impl.h
+@@ -52,6 +52,8 @@ class TabContainerImpl : public TabConta
+   // TabContainer:
+   void SetAvailableWidthCallback(
+       base::RepeatingCallback<int()> available_width_callback) override;
++  void SetAvailableHeightCallback(
++      base::RepeatingCallback<int()> available_height_callback) override;
+ 
+   std::vector<Tab*> AddTabs(
+       std::vector<TabInsertionParams> tabs_params) override;
+@@ -118,6 +120,7 @@ class TabContainerImpl : public TabConta
+   void CompleteAnimationAndLayout() override;
+ 
+   int GetAvailableWidthForTabContainer() const override;
++  int GetAvailableHeightForTabContainer() const override;
+ 
+   void EnterTabClosingMode(std::optional<int> override_width,
+                            CloseTabSource source) override;
+@@ -225,6 +228,8 @@ class TabContainerImpl : public TabConta
+   // bounds of the tabstrip.
+   void AnimateScrollToShowXCoordinate(const int start_edge,
+                                       const int target_edge);
++  void AnimateScrollToShowYCoordinate(const int start_edge,
++                                      const int target_edge);
+   // Animates `tab_slot_view` to `target_bounds`
+   void AnimateTabSlotViewTo(TabSlotView* tab_slot_view,
+                             const gfx::Rect& target_bounds);
+@@ -396,6 +401,7 @@ class TabContainerImpl : public TabConta
+   bool in_tab_close_ = false;
+ 
+   base::RepeatingCallback<int()> available_width_callback_;
++  base::RepeatingCallback<int()> available_height_callback_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_TAB_CONTAINER_IMPL_H_
+--- a/chrome/browser/ui/views/tabs/tab_group_editor_bubble_view.cc
++++ b/chrome/browser/ui/views/tabs/tab_group_editor_bubble_view.cc
+@@ -285,7 +285,9 @@ TabGroupEditorBubbleView::TabGroupEditor
+     std::optional<gfx::Rect> anchor_rect,
+     bool stop_context_menu_propagation)
+     : BubbleDialogDelegateView(anchor_view,
+-                               views::BubbleBorder::Arrow::TOP_LEFT,
++                               tabs::AreHeliumVerticalTabsEnabled() ?
++                               views::BubbleBorder::Arrow::TOP_LEFT :
++                               views::BubbleBorder::Arrow::LEFT_TOP,
+                                views::BubbleBorder::DIALOG_SHADOW,
+                                true),
+       title_field_controller_(this),
+--- a/chrome/browser/ui/views/tabs/tab_group_underline.cc
++++ b/chrome/browser/ui/views/tabs/tab_group_underline.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/views/tabs/tab.h"
+ #include "chrome/browser/ui/views/tabs/tab_group_header.h"
+ #include "chrome/browser/ui/views/tabs/tab_group_style.h"
+@@ -51,6 +52,10 @@ void TabGroupUnderline::UpdateBounds(con
+   const gfx::Rect tab_group_underline_bounds =
+       CalculateTabGroupUnderlineBounds(this, leading_view, trailing_view);
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    SetVisible(true);
++  } else {
++
+   // The width may be zero if the group underline and header are initialized at
+   // the same time, as with tab restore. In this case, don't show the underline.
+   if (tab_group_underline_bounds.width() == 0) {
+@@ -60,6 +65,8 @@ void TabGroupUnderline::UpdateBounds(con
+ 
+   SetVisible(
+       !style_->TabGroupUnderlineShouldBeHidden(leading_view, trailing_view));
++  }
++
+   SetBoundsRect(tab_group_underline_bounds);
+ }
+ 
+@@ -67,6 +74,15 @@ gfx::Rect TabGroupUnderline::CalculateTa
+     const views::View* const underline_view,
+     const views::View* const leading_view,
+     const views::View* const trailing_view) const {
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    int y = leading_view->y() + leading_view->height();
++    return gfx::Rect(
++      TabGroupUnderline::GetStrokeInset(), y - kStrokeThickness,
++      kStrokeThickness, (trailing_view->y() + trailing_view->height()) - y - kStrokeThickness
++    );
++  }
++
+   gfx::RectF leading_bounds = views::View::ConvertRectToTarget(
+       leading_view->parent(), underline_view->parent(),
+       gfx::RectF(leading_view->bounds()));
+@@ -114,6 +130,10 @@ gfx::Insets TabGroupUnderline::GetInsets
+ }
+ 
+ void TabGroupUnderline::MaybeSetVisible(const bool visible) {
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    SetVisible(true);
++    return;
++  }
+   SetVisible(visible && !style_->TabGroupUnderlineShouldBeHidden());
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/tab_group_views.cc
++++ b/chrome/browser/ui/views/tabs/tab_group_views.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/views/frame/browser_non_client_frame_view.h"
+ #include "chrome/browser/ui/views/tabs/tab_group_header.h"
+ #include "chrome/browser/ui/views/tabs/tab_group_highlight.h"
+@@ -39,19 +40,25 @@ TabGroupViews::TabGroupViews(views::View
+   header_ = container_view->AddChildView(std::move(header));
+   underline_ = container_view->AddChildView(
+       std::make_unique<TabGroupUnderline>(this, group_, *style));
+-  drag_underline_ = drag_container_view->AddChildView(
+-      std::make_unique<TabGroupUnderline>(this, group_, *style));
+-  highlight_ = drag_container_view->AddChildView(
+-      std::make_unique<TabGroupHighlight>(this, group_, *style));
+-  highlight_->SetVisible(false);
++
++  if (!tabs::AreHeliumVerticalTabsEnabled()) {
++    drag_underline_ = drag_container_view->AddChildView(
++        std::make_unique<TabGroupUnderline>(this, group_, *style));
++    highlight_ = drag_container_view->AddChildView(
++        std::make_unique<TabGroupHighlight>(this, group_, *style));
++    highlight_->SetVisible(false);
++  }
+ }
+ 
+ TabGroupViews::~TabGroupViews() {
+   header_->parent()->RemoveChildViewT(std::exchange(header_, nullptr));
+   underline_->parent()->RemoveChildViewT(std::exchange(underline_, nullptr));
++
++  if (!tabs::AreHeliumVerticalTabsEnabled()) {
+   drag_underline_->parent()->RemoveChildViewT(
+       std::exchange(drag_underline_, nullptr));
+   highlight_->parent()->RemoveChildViewT(std::exchange(highlight_, nullptr));
++  }
+ }
+ 
+ void TabGroupViews::UpdateBounds() {
+@@ -64,6 +71,8 @@ void TabGroupViews::UpdateBounds() {
+       GetLeadingTrailingGroupViews();
+   underline_->UpdateBounds(leading_group_view, trailing_group_view);
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) return;
++
+   auto [leading_dragged_group_view, trailing_dragged_group_view] =
+       GetLeadingTrailingDraggedGroupViews();
+   drag_underline_->UpdateBounds(leading_dragged_group_view,
+@@ -110,7 +119,7 @@ void TabGroupViews::OnGroupVisualsChange
+ 
+   header_->VisualsChanged();
+   underline_->SchedulePaint();
+-  drag_underline_->SchedulePaint();
++  if (!tabs::AreHeliumVerticalTabsEnabled()) drag_underline_->SchedulePaint();
+ }
+ 
+ gfx::Rect TabGroupViews::GetBounds() const {
+@@ -138,6 +147,7 @@ SkColor TabGroupViews::GetGroupColor() c
+ }
+ 
+ bool TabGroupViews::InTearDown() const {
++  if (tabs::AreHeliumVerticalTabsEnabled()) return !header_ || !header_->GetWidget();
+   return !header_ || !header_->GetWidget() || !drag_underline_->GetWidget();
+ }
+ 
+@@ -145,10 +155,14 @@ std::tuple<const views::View*, const vie
+ TabGroupViews::GetLeadingTrailingGroupViews() const {
+   std::vector<raw_ptr<views::View, VectorExperimental>> children =
+       underline_->parent()->children();
+-  std::vector<raw_ptr<views::View, VectorExperimental>> dragged_children =
++
++  if (!tabs::AreHeliumVerticalTabsEnabled()) {
++    std::vector<raw_ptr<views::View, VectorExperimental>> dragged_children =
+       drag_underline_->parent()->children();
+-  children.insert(children.end(), dragged_children.begin(),
++    children.insert(children.end(), dragged_children.begin(),
+                   dragged_children.end());
++  }
++
+   return GetLeadingTrailingGroupViews(children);
+ }
+ 
+@@ -178,6 +192,22 @@ TabGroupViews::GetLeadingTrailingGroupVi
+     gfx::Rect child_widget_bounds =
+         child->ConvertRectToWidget(child->GetLocalBounds());
+ 
++    if (tabs::AreHeliumVerticalTabsEnabled()) {
++      if (!leading_child ||
++          child_widget_bounds.y() < leading_child_widget_bounds.y()) {
++        leading_child = child;
++        leading_child_widget_bounds = child_widget_bounds;
++      }
++
++      if (!trailing_child ||
++          child_widget_bounds.bottom() > trailing_child_widget_bounds.bottom()) {
++        trailing_child = child;
++        trailing_child_widget_bounds = child_widget_bounds;
++      }
++
++      continue;
++    }
++
+     if (!leading_child ||
+         child_widget_bounds.x() < leading_child_widget_bounds.x()) {
+       leading_child = child;
+--- a/chrome/browser/ui/views/tabs/tab_hover_card_bubble_view.cc
++++ b/chrome/browser/ui/views/tabs/tab_hover_card_bubble_view.cc
+@@ -25,6 +25,7 @@
+ #include "chrome/browser/ui/tabs/saved_tab_groups/collaboration_messaging_tab_data.h"
+ #include "chrome/browser/ui/tabs/tab_renderer_data.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/chrome_typography.h"
+@@ -363,6 +364,8 @@ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(Ta
+ TabHoverCardBubbleView::TabHoverCardBubbleView(Tab* tab,
+                                                const InitParams& params)
+     : BubbleDialogDelegateView(tab,
++                               tabs::AreHeliumVerticalTabsEnabled() ?
++                               views::BubbleBorder::LEFT_TOP :
+                                views::BubbleBorder::TOP_LEFT,
+                                views::BubbleBorder::STANDARD_SHADOW),
+       tab_style_(TabStyle::Get()),
+--- a/chrome/browser/ui/views/tabs/tab_strip.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip.cc
+@@ -179,6 +179,15 @@ class TabStrip::TabDragContextImpl : pub
+ 
+   gfx::Size CalculatePreferredSize(
+       const views::SizeBounds& available_size) const override {
++
++    int max_child_y = 0;
++    for (views::View* child : children()) {
++      if (!views::IsViewClass<TabSlotView>(child)) {
++        continue;
++      }
++      max_child_y = std::max(max_child_y, child->bounds().bottom());
++    }
++
+     int max_child_x = 0;
+     for (views::View* child : children()) {
+       if (!views::IsViewClass<TabSlotView>(child)) {
+@@ -187,7 +196,7 @@ class TabStrip::TabDragContextImpl : pub
+       max_child_x = std::max(max_child_x, child->bounds().right());
+     }
+ 
+-    return gfx::Size(max_child_x, GetLayoutConstant(TAB_HEIGHT));
++    return gfx::Size(max_child_x, max_child_y);
+   }
+ 
+   bool OnMouseDragged(const ui::MouseEvent& event) override {
+@@ -508,14 +517,28 @@ class TabStrip::TabDragContextImpl : pub
+         tab_strip_->width());
+   }
+ 
++  int GetTabDragAreaHeight() const override {
++    return std::max(
++        tab_strip_->tab_container_->GetAvailableHeightForTabContainer(),
++        tab_strip_->height());
++  }
++
+   int TabDragAreaBeginX() const override {
+     return tab_strip_->GetMirroredXWithWidthInView(0, GetTabDragAreaWidth());
+   }
+ 
++  int TabDragAreaBeginY() const override {
++    return tab_strip_->y();
++  }
++
+   int TabDragAreaEndX() const override {
+     return TabDragAreaBeginX() + GetTabDragAreaWidth();
+   }
+ 
++  int TabDragAreaEndY() const override {
++    return TabDragAreaBeginY() + GetTabDragAreaHeight();
++  }
++
+   int GetInsertionIndexForDraggedBounds(const gfx::Rect& dragged_bounds,
+                                         std::vector<TabSlotView*> dragged_views,
+                                         int num_dragged_tabs) const override {
+@@ -559,8 +582,15 @@ class TabStrip::TabDragContextImpl : pub
+     std::vector<gfx::Rect> bounds;
+     const int overlap = TabStyle::Get()->GetTabOverlap();
+     int x = 0;
++    int y = 0;
+     for (const TabSlotView* view : views) {
+       const int width = view->width();
++      if (tabs::AreHeliumVerticalTabsEnabled()) {
++        const int height = view->height();
++        bounds.emplace_back(0, y, width, height);
++        y += height - overlap;
++        continue;
++      }
+       bounds.emplace_back(x, height() - view->height(), width, view->height());
+       x += width - overlap;
+     }
+@@ -619,9 +649,12 @@ class TabStrip::TabDragContextImpl : pub
+       dragged_view->set_dragging(true);
+       if (TabGroupHeader* header =
+               views::AsViewClass<TabGroupHeader>(dragged_view)) {
+-        tab_strip_->tab_container_->GetGroupViews(header->group().value())
+-            ->highlight()
+-            ->SetVisible(true);
++        if (!tabs::AreHeliumVerticalTabsEnabled()) {
++          // highlight is null when vertical tabs are enabled.
++          tab_strip_->tab_container_->GetGroupViews(header->group().value())
++              ->highlight()
++              ->SetVisible(true);
++        }
+         // Make sure the bounds of the group views are up to date right now
+         // instead of waiting for subsequent drag events - if we are dragging a
+         // window by a group header, we won't get any more events. See
+@@ -659,10 +692,12 @@ class TabStrip::TabDragContextImpl : pub
+       const TabGroupHeader* const header =
+           views::AsViewClass<TabGroupHeader>(slot_view);
+       if (header) {
+-        // Disable the group highlight now that the drag is ended.
+-        tab_strip_->tab_container_->GetGroupViews(header->group().value())
+-            ->highlight()
+-            ->SetVisible(false);
++        if (!tabs::AreHeliumVerticalTabsEnabled()) {
++          // Disable the group highlight now that the drag is ended.
++          tab_strip_->tab_container_->GetGroupViews(header->group().value())
++              ->highlight()
++              ->SetVisible(false);
++        }
+         ideal_bounds =
+             tab_strip_->tab_container_->GetIdealBounds(header->group().value());
+       } else {
+@@ -902,6 +937,21 @@ class TabStrip::TabDragContextImpl : pub
+         continue;
+       }
+ 
++      int distance;
++
++      if (tabs::AreHeliumVerticalTabsEnabled()) {
++        const int top_ideal_y = CalculateIdealY(
++          candidate_index, first_dragged_tab_index, dragged_bounds);
++        const int top_distance = std::abs(dragged_bounds.y() - top_ideal_y);
++        const int bottom_ideal_y =
++          top_ideal_y +
++            (can_insert_into_groups
++              ? CalculateIdealYAdjustmentIfAddedToGroup(candidate_index)
++              : 0);
++        const int bottom_distance = std::abs(dragged_bounds.y() - bottom_ideal_y);
++        distance = std::min(top_distance, bottom_distance);
++      } else {
++
+       // If there's a group header here, and we're dragging a group, we might
+       // end up on either side of that header. Check both cases to find the
+       // best option.
+@@ -919,7 +969,10 @@ class TabStrip::TabDragContextImpl : pub
+                : 0);
+       const int right_distance = std::abs(dragged_bounds.x() - right_ideal_x);
+ 
+-      const int distance = std::min(left_distance, right_distance);
++      distance = std::min(left_distance, right_distance);
++
++      }
++
+       if (distance < min_distance) {
+         min_distance = distance;
+         min_distance_index = candidate_index;
+@@ -1017,6 +1070,24 @@ class TabStrip::TabDragContextImpl : pub
+     return ideal_x - tab_overlap;
+   }
+ 
++  int CalculateIdealY(int candidate_index,
++                      int first_dragged_tab_index,
++                      gfx::Rect dragged_bounds) const {
++    if (candidate_index == 0) {
++      return 0;
++    }
++
++    int ideal_y = 0;
++
++    if (candidate_index > first_dragged_tab_index) {
++       ideal_y = tab_strip_->tab_container_->GetIdealBounds(candidate_index - 1).y();
++    } else {
++       ideal_y = tab_strip_->tab_container_->GetIdealBounds(candidate_index).bottom();
++     }
++
++    return ideal_y;
++  }
++
+   // There might be a group starting at `candidate_index`. If there is,
+   // this determines how the ideal x would change if the dragged tabs were
+   // added to that group, thereby moving them to that header's right.
+@@ -1044,6 +1115,26 @@ class TabStrip::TabDragContextImpl : pub
+     return header_width;
+   }
+ 
++  int CalculateIdealYAdjustmentIfAddedToGroup(int candidate_index) const {
++    if (!tab_strip_->IsValidModelIndex(candidate_index)) {
++      return 0;
++    }
++    std::optional<tab_groups::TabGroupId> left_group =
++        tab_strip_->IsValidModelIndex(candidate_index - 1)
++            ? GetTabAt(candidate_index - 1)->group()
++            : std::nullopt;
++    std::optional<tab_groups::TabGroupId> right_group =
++        GetTabAt(candidate_index)->group();
++    if (!right_group.has_value() || left_group == right_group ||
++        tab_strip_->IsGroupCollapsed(right_group.value())) {
++      return 0;
++    }
++
++    const int header_height = GetTabGroupHeader(*right_group)->bounds().height();
++
++    return header_height;
++  }
++
+   const raw_ptr<TabStrip, DanglingUntriaged> tab_strip_;
+ 
+   // Responsible for animating tabs during drag sessions.
+@@ -1113,8 +1204,20 @@ void TabStrip::SetAvailableWidthCallback
+   tab_container_->SetAvailableWidthCallback(available_width_callback);
+ }
+ 
++void TabStrip::SetAvailableHeightCallback(
++    base::RepeatingCallback<int()> available_height_callback) {
++  tab_container_->SetAvailableHeightCallback(available_height_callback);
++}
++
+ // static
+ int TabStrip::GetSizeNeededForViews(const std::vector<TabSlotView*>& views) {
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    int height = 0;
++    for (const TabSlotView* view : views) {
++      height += view->height();
++    }
++    return height;
++  }
+   int width = 0;
+   for (const TabSlotView* view : views) {
+     width += view->width();
+@@ -2151,7 +2254,7 @@ gfx::Size TabStrip::GetMinimumSize() con
+   // `tab_container_` and `drag_context_` overlap (both share TabStrip's
+   // origin), so we need to be able to cover the union of their bounds.
+   gfx::Size min_size = tab_container_->GetMinimumSize();
+-  min_size.SetToMax(drag_context_->GetMinimumSize());
++  if (!tabs::AreHeliumVerticalTabsEnabled()) min_size.SetToMax(drag_context_->GetMinimumSize());
+ 
+   return min_size;
+ }
+@@ -2167,6 +2270,13 @@ gfx::Size TabStrip::CalculatePreferredSi
+ }
+ 
+ void TabStrip::Layout(PassKey) {
++  if(tabs::AreHeliumVerticalTabsEnabled()) {
++    const int required_height = GetPreferredSize().height();
++    const int available_height =
++        tab_container_->GetAvailableHeightForTabContainer();
++
++    SetBounds(0, 0, GetPreferredSize().width(), std::max(available_height, required_height));
++  } else
+   if (base::FeatureList::IsEnabled(tabs::kScrollableTabStrip)) {
+     // With tab scrolling, the TabStrip is the contents view of a ScrollView and
+     // as such is expected to set its own bounds during layout.
+--- a/chrome/browser/ui/views/tabs/tab_strip.h
++++ b/chrome/browser/ui/views/tabs/tab_strip.h
+@@ -87,6 +87,8 @@ class TabStrip : public views::View,
+ 
+   void SetAvailableWidthCallback(
+       base::RepeatingCallback<int()> available_width_callback);
++  void SetAvailableHeightCallback(
++      base::RepeatingCallback<int()> available_height_callback);
+ 
+   void NewTabButtonPressed(const ui::Event& event);
+ 
+--- a/chrome/browser/ui/views/tabs/tab_strip_layout.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_layout.cc
+@@ -10,6 +10,9 @@
+ #include <optional>
+ #include <set>
+ 
++#include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/tabs/tab_group_underline.h" // for kStrokeThickness
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_layout_types.h"
+ #include "components/tabs/public/split_tab_id.h"
+@@ -146,6 +149,24 @@ std::pair<std::vector<gfx::Rect>, Layout
+             LayoutDomain::kInactiveWidthEqualsActiveWidth};
+   }
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    int next_y = 0;
++    std::vector<gfx::Rect> bounds;
++
++    for (const TabWidthConstraints& tab : tabs) {
++      if (tab.get_state().IsClosed()) {
++        bounds.emplace_back(0, next_y, BrowserView::kVerticalTabStripWidth, 0);
++      } else {
++        int left_padding = tab.IsPartOfGroup() ? TabGroupUnderline::kStrokeThickness * 7 : 0;
++        bounds.emplace_back(left_padding, next_y, BrowserView::kVerticalTabStripWidth - left_padding,
++                            TabStyle::Get()->GetStandardHeight());
++        next_y += TabStyle::Get()->GetStandardHeight();
++      }
++    }
++
++    return {bounds, LayoutDomain::kInactiveWidthEqualsActiveWidth};
++  }
++
+   TabSizer tab_sizer = CalculateSpaceFractionAvailable(tabs, width);
+ 
+   int next_x = 0;
+--- a/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
+@@ -278,7 +278,14 @@ TabStripLayoutHelper::CalculateIdealBoun
+         TabLayoutState(open, pinned, active, slots_[i].view->split());
+     TabSizeInfo size_info = slots_[i].view->GetTabSizeInfo();
+ 
+-    tab_widths.emplace_back(state, size_info);
++    bool is_part_of_group = false;
++
++    if (slots_[i].type == TabSlotView::ViewType::kTab) {
++      Tab* tab = static_cast<Tab*>(slots_[i].view);
++      is_part_of_group = tab->GetGroupColor().has_value();
++    }
++
++    tab_widths.emplace_back(state, size_info, is_part_of_group);
+   }
+ 
+   return CalculateTabBounds(tab_widths, available_width);
+--- a/chrome/browser/ui/views/tabs/tab_strip_scroll_container.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_scroll_container.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_controller.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_scrolling_overflow_indicator_strategy.h"
+@@ -105,15 +106,25 @@ TabStripScrollContainer::TabStripScrollC
+   tab_strip->SetAvailableWidthCallback(
+       base::BindRepeating(&TabStripScrollContainer::GetTabStripAvailableWidth,
+                           base::Unretained(this)));
++  tab_strip->SetAvailableHeightCallback(
++      base::BindRepeating(&TabStripScrollContainer::GetTabStripAvailableHeight,
++                          base::Unretained(this)));
+ 
+   std::unique_ptr<views::ScrollView> scroll_view =
+       std::make_unique<views::ScrollView>(
+           views::ScrollView::ScrollWithLayers::kEnabled);
+   scroll_view_ = scroll_view.get();
+   scroll_view->SetBackgroundColor(std::nullopt);
+-  scroll_view->SetHorizontalScrollBarMode(
+-      views::ScrollView::ScrollBarMode::kHiddenButEnabled);
+-  scroll_view->SetTreatAllScrollEventsAsHorizontal(true);
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    scroll_view->SetVerticalScrollBarMode(
++      views::ScrollView::ScrollBarMode::kEnabled);
++  } else {
++    scroll_view->SetHorizontalScrollBarMode(
++        views::ScrollView::ScrollBarMode::kHiddenButEnabled);
++    scroll_view->SetTreatAllScrollEventsAsHorizontal(true);
++  }
++
+   scroll_view->SetContents(std::move(tab_strip));
+ 
+   overflow_indicator_strategy_ =
+@@ -134,7 +145,7 @@ TabStripScrollContainer::TabStripScrollC
+       base::BindRepeating(&TabStripScrollContainer::OnContentsScrolledCallback,
+                           base::Unretained(this)));
+ 
+-  if (!base::FeatureList::IsEnabled(features::kTabScrollingButtonPosition)) {
++  if (!base::FeatureList::IsEnabled(features::kTabScrollingButtonPosition) || tabs::AreHeliumVerticalTabsEnabled()) {
+     leading_scroll_button_ = nullptr;
+     trailing_scroll_button_ = nullptr;
+     overflow_view_ = AddChildView(
+@@ -235,6 +246,10 @@ int TabStripScrollContainer::GetTabStrip
+   return overflow_view_->GetAvailableSize(scroll_view_).width().value();
+ }
+ 
++int TabStripScrollContainer::GetTabStripAvailableHeight() const {
++  return overflow_view_->GetAvailableSize(scroll_view_).height().value();
++}
++
+ void TabStripScrollContainer::ScrollTowardsLeadingTab() {
+   gfx::Rect visible_content = scroll_view_->GetVisibleRect();
+   tab_strip()->ScrollTowardsLeadingTabs(visible_content.width());
+--- a/chrome/browser/ui/views/tabs/tab_strip_scroll_container.h
++++ b/chrome/browser/ui/views/tabs/tab_strip_scroll_container.h
+@@ -53,6 +53,7 @@ class TabStripScrollContainer : public v
+ 
+  private:
+   int GetTabStripAvailableWidth() const;
++  int GetTabStripAvailableHeight() const;
+ 
+   // Scrolls the tabstrip towards the first tab in the tabstrip.
+   void ScrollTowardsLeadingTab();
+--- a/chrome/browser/ui/views/tabs/tab_style_views.cc
++++ b/chrome/browser/ui/views/tabs/tab_style_views.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/tabs/tab_types.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/views/frame/browser_non_client_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/top_container_background.h"
+@@ -286,12 +287,22 @@ SkPath TabStyleViewsImpl::GetPath(TabSty
+     }
+ 
+     if (tab()->split().has_value()) {
+-      if (IsLeftSplitTab(tab())) {
+-        top_right_corner_radius = 0;
+-        bottom_right_corner_radius = 0;
+-      } else if (IsRightSplitTab(tab())) {
+-        top_left_corner_radius = 0;
+-        bottom_left_corner_radius = 0;
++      if (tabs::AreHeliumVerticalTabsEnabled()) {
++        if (IsLeftSplitTab(tab())) {
++          bottom_left_corner_radius = 0;
++          bottom_right_corner_radius = 0;
++        } else if (IsRightSplitTab(tab())) {
++          top_left_corner_radius = 0;
++          top_right_corner_radius = 0;
++        }
++      } else {
++        if (IsLeftSplitTab(tab())) {
++          top_right_corner_radius = 0;
++          bottom_right_corner_radius = 0;
++        } else if (IsRightSplitTab(tab())) {
++          top_left_corner_radius = 0;
++          bottom_left_corner_radius = 0;
++        }
+       }
+     }
+ 
+@@ -1028,6 +1039,8 @@ void TabStyleViewsImpl::PaintBackgroundS
+ }
+ 
+ void TabStyleViewsImpl::PaintSeparators(gfx::Canvas* canvas) const {
++  if (tabs::AreHeliumVerticalTabsEnabled()) return;
++
+   const auto separator_opacities = GetSeparatorOpacities(false);
+   if (!separator_opacities.left && !separator_opacities.right) {
+     return;
+--- a/chrome/browser/ui/views/tabs/tab_width_constraints.cc
++++ b/chrome/browser/ui/views/tabs/tab_width_constraints.cc
+@@ -10,8 +10,9 @@
+ #include "ui/gfx/animation/tween.h"
+ 
+ TabWidthConstraints::TabWidthConstraints(const TabLayoutState& state,
+-                                         const TabSizeInfo& size_info)
+-    : state_(state), size_info_(size_info) {}
++                                         const TabSizeInfo& size_info,
++                                         const bool part_of_group)
++    : state_(state), size_info_(size_info), part_of_group_(part_of_group) {}
+ 
+ float TabWidthConstraints::GetMinimumWidth() const {
+   const float min_width = state_.active() == TabActive::kActive
+@@ -38,3 +39,7 @@ float TabWidthConstraints::TransformForP
+     return width;
+   }
+ }
++
++bool TabWidthConstraints::IsPartOfGroup() const {
++  return part_of_group_;
++}
+--- a/chrome/browser/ui/views/tabs/tab_width_constraints.h
++++ b/chrome/browser/ui/views/tabs/tab_width_constraints.h
+@@ -12,7 +12,8 @@
+ class TabWidthConstraints {
+  public:
+   TabWidthConstraints(const TabLayoutState& state,
+-                      const TabSizeInfo& size_info);
++                      const TabSizeInfo& size_info,
++                      const bool part_of_group);
+ 
+   // The smallest width this tab should ever have.
+   float GetMinimumWidth() const;
+@@ -26,6 +27,8 @@ class TabWidthConstraints {
+   // The width this tab would like to have, if space is available.
+   float GetPreferredWidth() const;
+ 
++  bool IsPartOfGroup() const;
++
+   const TabLayoutState get_state() const { return state_; }
+ 
+  private:
+@@ -34,6 +37,7 @@ class TabWidthConstraints {
+ 
+   TabLayoutState state_;
+   TabSizeInfo size_info_;
++  bool part_of_group_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_TAB_WIDTH_CONSTRAINTS_H_
