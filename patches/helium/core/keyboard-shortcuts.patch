@@ -1,0 +1,251 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -92,9 +92,11 @@
+ #define IDC_WEB_APP_MENU_APP_INFO       34063
+ #define IDC_WEB_APP_UPGRADE_DIALOG      34064
+ 
++// Helium commands
++#define IDC_COPY_OR_INSPECT_SHORTCUT    34080
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ // Move window to other user commands
+-#define IDC_VISIT_DESKTOP_OF_LRU_USER_2 34080
+ #define IDC_VISIT_DESKTOP_OF_LRU_USER_3 34081
+ #define IDC_VISIT_DESKTOP_OF_LRU_USER_4 34082
+ #define IDC_VISIT_DESKTOP_OF_LRU_USER_5 34083
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -1509,6 +1509,11 @@ inline constexpr char kPageColorsBlockLi
+ inline constexpr char kPrefersDefaultScrollbarStyles[] =
+     "settings.a11y.prefers_default_scrollbar_styles";
+ 
++// Boolean that indicates whether the user has enabled the keyboard shortcut
++// for copying the current page URL to the clipboard.
++inline constexpr char kCopyPageUrlShortcut[] =
++    "helium.settings.a11y.copy_page_url_shortcut";
++
+ #if BUILDFLAG(IS_MAC)
+ // Boolean that indicates whether the application should show the info bar
+ // asking the user to set up automatic updates when Keystone promotion is
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -142,6 +142,8 @@ void RegisterBrowserUserPrefs(user_prefs
+   registry->RegisterListPref(prefs::kWebRtcLocalIpsAllowedUrls);
+   registry->RegisterBooleanPref(prefs::kWebRtcTextLogCollectionAllowed, false);
+ 
++  registry->RegisterBooleanPref(prefs::kCopyPageUrlShortcut, true);
++
+   // We need to register the type of these preferences in order to query
+   // them even though they're only typically controlled via policy.
+   registry->RegisterBooleanPref(policy::policy_prefs::kHideWebStoreIcon, false);
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -387,7 +387,10 @@ bool BrowserCommandController::IsReserve
+          command_id == IDC_NEW_INCOGNITO_WINDOW || command_id == IDC_NEW_TAB ||
+          command_id == IDC_NEW_WINDOW || command_id == IDC_RESTORE_TAB ||
+          command_id == IDC_SELECT_NEXT_TAB ||
+-         command_id == IDC_SELECT_PREVIOUS_TAB || command_id == IDC_EXIT;
++         command_id == IDC_SELECT_PREVIOUS_TAB || command_id == IDC_EXIT ||
++         command_id == IDC_COPY_OR_INSPECT_SHORTCUT || command_id == IDC_DEV_TOOLS ||
++         command_id == IDC_DEV_TOOLS_INSPECT || command_id == IDC_DEV_TOOLS_TOGGLE ||
++         command_id == IDC_DEV_TOOLS_CONSOLE || command_id == IDC_TAB_SEARCH;
+ }
+ 
+ void BrowserCommandController::TabStateChanged() {
+@@ -1143,6 +1146,14 @@ bool BrowserCommandController::ExecuteCo
+     case IDC_DUPLICATE_TARGET_TAB:
+       DuplicateKeyboardFocusedTab(browser_);
+       break;
++    case IDC_COPY_OR_INSPECT_SHORTCUT: {
++      PrefService* prefs = profile()->GetPrefs();
++      bool copy = prefs->GetBoolean(prefs::kCopyPageUrlShortcut);
++
++      return ExecuteCommandWithDisposition(
++          copy ? IDC_COPY_URL : IDC_DEV_TOOLS_INSPECT,
++          disposition, time_stamp);
++    }
+     // Hosted App commands
+     case IDC_COPY_URL:
+       CopyURL(browser_, browser_->tab_strip_model()->GetActiveWebContents());
+@@ -1888,6 +1899,12 @@ void BrowserCommandController::UpdateCom
+ 
+   bool dev_tools_enabled = DevToolsWindow::AllowDevToolsFor(
+       profile(), browser_->tab_strip_model()->GetActiveWebContents());
++
++  PrefService* prefs = profile()->GetPrefs();
++  bool copy = prefs->GetBoolean(prefs::kCopyPageUrlShortcut);
++  command_updater_.UpdateCommandEnabled(IDC_COPY_OR_INSPECT_SHORTCUT,
++                                        copy || dev_tools_enabled);
++
+   command_updater_.UpdateCommandEnabled(IDC_DEV_TOOLS, dev_tools_enabled);
+   command_updater_.UpdateCommandEnabled(IDC_DEV_TOOLS_CONSOLE,
+                                         dev_tools_enabled);
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -268,8 +268,10 @@ const AcceleratorMapping kDevToolsAccele
+     {ui::VKEY_I, ui::EF_SHIFT_DOWN | ui::EF_CONTROL_DOWN, IDC_DEV_TOOLS},
+     {ui::VKEY_J, ui::EF_SHIFT_DOWN | ui::EF_CONTROL_DOWN,
+      IDC_DEV_TOOLS_CONSOLE},
+-    {ui::VKEY_C, ui::EF_SHIFT_DOWN | ui::EF_CONTROL_DOWN,
++    {ui::VKEY_E, ui::EF_SHIFT_DOWN | ui::EF_CONTROL_DOWN,
+      IDC_DEV_TOOLS_INSPECT},
++    {ui::VKEY_C, ui::EF_SHIFT_DOWN | ui::EF_CONTROL_DOWN,
++     IDC_COPY_OR_INSPECT_SHORTCUT},
+     {ui::VKEY_U, ui::EF_CONTROL_DOWN, IDC_VIEW_SOURCE},
+ #endif  // !BUILDFLAG(IS_MAC)
+ };
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -145,7 +145,9 @@ const std::vector<KeyboardShortcutData>&
+ 
+       {true,  true,  false, false, kVK_ANSI_M,            IDC_SHOW_AVATAR_MENU},
+       {true,  false, false, true,  kVK_ANSI_L,            IDC_SHOW_DOWNLOADS},
+-      {true,  true,  false, false, kVK_ANSI_C,            IDC_DEV_TOOLS_INSPECT},
++      {true,  true,  false, false, kVK_ANSI_I,            IDC_DEV_TOOLS},
++      {true,  true,  false, false, kVK_ANSI_E,            IDC_DEV_TOOLS_INSPECT},
++      {true,  true,  false, false, kVK_ANSI_C,            IDC_COPY_OR_INSPECT_SHORTCUT},
+       {true,  false, false, true,  kVK_ANSI_C,            IDC_DEV_TOOLS_INSPECT},
+       {true,  false, false, true,  kVK_DownArrow,         IDC_FOCUS_NEXT_PANE},
+       {true,  false, false, true,  kVK_UpArrow,           IDC_FOCUS_PREVIOUS_PANE},
+--- a/chrome/browser/ui/cocoa/accelerators_cocoa.mm
++++ b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+@@ -37,7 +37,8 @@ const struct AcceleratorMapping {
+     {IDC_CUT, ui::EF_COMMAND_DOWN, ui::VKEY_X},
+     {IDC_DEV_TOOLS, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_I},
+     {IDC_DEV_TOOLS_CONSOLE, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_J},
+-    {IDC_DEV_TOOLS_INSPECT, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_C},
++    {IDC_DEV_TOOLS_INSPECT, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_E},
++    {IDC_COPY_OR_INSPECT_SHORTCUT, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_C},
+     {IDC_FIND, ui::EF_COMMAND_DOWN, ui::VKEY_F},
+     {IDC_NEW_INCOGNITO_WINDOW, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
+      ui::VKEY_N},
+@@ -73,9 +74,6 @@ const struct AcceleratorMapping {
+     // We used to define IDC_CLOSE_WINDOW here. Instead, see
+     // AcceleratorForCloseWindow().
+     {IDC_CLOSE_TAB, ui::EF_COMMAND_DOWN, ui::VKEY_W},
+-
+-    {IDC_EMAIL_PAGE_LOCATION, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
+-     ui::VKEY_I},
+ #if BUILDFLAG(ENABLE_PRINTING)
+     {IDC_BASIC_PRINT, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_P},
+ #endif  // ENABLE_PRINTING
+--- a/chrome/app/chrome_dll.rc
++++ b/chrome/app/chrome_dll.rc
+@@ -49,7 +49,8 @@ BEGIN
+     "W",            IDC_CLOSE_WINDOW,           VIRTKEY, CONTROL, SHIFT
+     "I",            IDC_DEV_TOOLS,              VIRTKEY, CONTROL, SHIFT
+     "J",            IDC_DEV_TOOLS_CONSOLE,      VIRTKEY, CONTROL, SHIFT
+-    "C",            IDC_DEV_TOOLS_INSPECT,      VIRTKEY, CONTROL, SHIFT
++    "E",            IDC_DEV_TOOLS_INSPECT,      VIRTKEY, CONTROL, SHIFT
++    "C",            IDC_COPY_OR_INSPECT_SHORTCUT,                       VIRTKEY, CONTROL, SHIFT
+     VK_F12,         IDC_DEV_TOOLS_TOGGLE,       VIRTKEY
+     "F",            IDC_FIND,                   VIRTKEY, CONTROL
+     "G",            IDC_FIND_NEXT,              VIRTKEY, CONTROL
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -579,6 +579,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+ 
+   (*s_allowlist)[::prefs::kCaretBrowsingEnabled] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kCopyPageUrlShortcut] =
++      settings_api::PrefType::kBoolean;
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   // Accounts / Users / People.
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -193,6 +193,16 @@
+       Shows a confirmation when you copy links, images, or videos
+     </message>
+   </if>
++  <if expr="is_macosx">
++    <message name="IDS_SETTINGS_ACCESSIBILITY_COPY_PAGE_URL_SHORTCUT" desc="Toggle in settings that allows you to enable the keyboard shortcut that copies the current page URL to the clipboard. It's enabled by default.">
++      Enable quick page link copying with ⌘+Shift+C
++    </message>
++  </if>
++  <if expr="not is_macosx">
++    <message name="IDS_SETTINGS_ACCESSIBILITY_COPY_PAGE_URL_SHORTCUT" desc="Toggle in settings that allows you to enable the keyboard shortcut that copies the current page URL to the clipboard. It's enabled by default.">
++      Enable quick page link copying with Ctrl+Shift+C
++    </message>
++  </if>
+ 
+   <!-- Appearance Page -->
+   <message name="IDS_SETTINGS_APPEARANCE" desc="Name of the settings page which displays appearance preferences.">
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -276,6 +276,7 @@ void AddA11yStrings(content::WebUIDataSo
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC)
+       {"axTreeFixingTitle", IDS_SETTINGS_AX_TREE_FIXING_TITLE},
+       {"axTreeFixingSubtitle", IDS_SETTINGS_AX_TREE_FIXING_SUBTITLE},
++      {"copyPageUrlShortcut", IDS_SETTINGS_ACCESSIBILITY_COPY_PAGE_URL_SHORTCUT},
+   };
+   html_source->AddLocalizedStrings(kLocalizedStrings);
+ 
+--- a/chrome/browser/resources/settings/a11y_page/a11y_page.html
++++ b/chrome/browser/resources/settings/a11y_page/a11y_page.html
+@@ -99,5 +99,9 @@
+             sub-label="$i18n{toastAlertLevelDescription}">
+         </settings-toggle-button>
+ </if>
++        <settings-toggle-button id="CopyPageUrlShortcut" class="hr"
++            pref="{{prefs.helium.settings.a11y.copy_page_url_shortcut}}"
++            label="$i18n{copyPageUrlShortcut}">
++        </settings-toggle-button>
+       </div>
+     </settings-section>
+--- a/third_party/devtools-frontend/src/front_end/panels/elements/elements-meta.ts
++++ b/third_party/devtools-frontend/src/front_end/panels/elements/elements-meta.ts
+@@ -446,11 +446,11 @@ UI.ActionRegistration.registerActionExte
+   iconClass: UI.ActionRegistration.IconClass.LARGEICON_NODE_SEARCH,
+   bindings: [
+     {
+-      shortcut: 'Ctrl+Shift+C',
++      shortcut: 'Ctrl+Shift+E',
+       platform: UI.ActionRegistration.Platforms.WINDOWS_LINUX,
+     },
+     {
+-      shortcut: 'Meta+Shift+C',
++      shortcut: 'Meta+Shift+E',
+       platform: UI.ActionRegistration.Platforms.MAC,
+     },
+   ],
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -189,6 +189,8 @@ NSMenuItem* BuildEditMenu(NSApplication*
+               Item(IDS_COPY_MAC)
+                   .tag(IDC_CONTENT_CONTEXT_COPY)
+                   .action(@selector(copy:)),
++              Item(IDS_COPY_URL)
++                  .command_id(IDC_COPY_URL),
+               Item(IDS_PASTE_MAC)
+                   .tag(IDC_CONTENT_CONTEXT_PASTE)
+                   .action(@selector(paste:)),
+--- a/chrome/browser/ui/cocoa/share_menu_controller.mm
++++ b/chrome/browser/ui/cocoa/share_menu_controller.mm
+@@ -99,12 +99,6 @@ bool CanShare() {
+   // to fetch sharing services that can handle the NSURL type.
+   NSArray* services = [NSSharingService
+       sharingServicesForItems:@[ [NSURL URLWithString:@"https://google.com"] ]];
+-  NSMenuItem* email = [[NSMenuItem alloc]
+-      initWithTitle:l10n_util::GetNSString(IDS_EMAIL_LINK_MAC)
+-             action:@selector(emailLink:)
+-      keyEquivalent:[self keyEquivalentForMail]];
+-  email.target = self;
+-  [menu addItem:email];
+   for (NSSharingService* service in services) {
+     // Email share service causes mysterious crashes, so share directly.
+     // See https://crbug.com/356643975
+@@ -298,13 +292,4 @@ bool CanShare() {
+   return item;
+ }
+ 
+-- (NSString*)keyEquivalentForMail {
+-  ui::Accelerator accelerator;
+-  bool found = GetDefaultMacAcceleratorForCommandId(IDC_EMAIL_PAGE_LOCATION,
+-                                                    &accelerator);
+-  DCHECK(found);
+-  return GetKeyEquivalentAndModifierMaskFromAccelerator(accelerator)
+-      .keyEquivalent;
+-}
+-
+ @end

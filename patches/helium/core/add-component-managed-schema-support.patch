@@ -1,0 +1,144 @@
+--- a/chrome/browser/extensions/api/storage/managed_value_store_cache.cc
++++ b/chrome/browser/extensions/api/storage/managed_value_store_cache.cc
+@@ -94,9 +94,11 @@ class ManagedValueStoreCache::ExtensionT
+ 
+   // Loads the schemas of the |extensions| and passes a ComponentMap to
+   // Register().
++  void LoadSchemasOnUIThread(ExtensionSet extensions);
+   static void LoadSchemasOnFileTaskRunner(ExtensionSet extensions,
+                                           base::WeakPtr<ExtensionTracker> self);
+-  void Register(const policy::ComponentMap* components);
++  void Register(const policy::ComponentMap* components,
++                ExtensionSet extensions);
+ 
+   raw_ptr<Profile> profile_;
+   policy::PolicyDomain policy_domain_;
+@@ -175,6 +177,22 @@ bool ManagedValueStoreCache::ExtensionTr
+   return extension->manifest()->FindPath(manifest_keys::kStorageManagedSchema);
+ }
+ 
++void ManagedValueStoreCache::ExtensionTracker::LoadSchemasOnUIThread(ExtensionSet extensions) {
++  auto components = std::make_unique<policy::ComponentMap>();
++
++  for (const auto& extension : extensions) {
++    if (!Manifest::IsComponentLocation(extension->location())) {
++      continue;
++    }
++
++    (*components)[extension->id()] =
++        StorageSchemaManifestHandler::GetComponentSchema(extension.get())
++            .value_or(policy::Schema());
++  }
++
++  schema_registry_->RegisterComponents(policy_domain_, *components);
++}
++
+ // static
+ void ManagedValueStoreCache::ExtensionTracker::LoadSchemasOnFileTaskRunner(
+     ExtensionSet extensions,
+@@ -199,14 +217,21 @@ void ManagedValueStoreCache::ExtensionTr
+ 
+   content::GetUIThreadTaskRunner({})->PostTask(
+       FROM_HERE, base::BindOnce(&ExtensionTracker::Register, self,
+-                                base::Owned(components.release())));
++                                base::Owned(components.release()),
++                                std::move(extensions)));
+ }
+ 
+ void ManagedValueStoreCache::ExtensionTracker::Register(
+-    const policy::ComponentMap* components) {
++    const policy::ComponentMap* components,
++    ExtensionSet extensions) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   schema_registry_->RegisterComponents(policy_domain_, *components);
+ 
++  // Our uBlock Origin component has a policy schema, but is
++  // not anywhere on the actual filesystem - so we need to pull
++  // it out on the UI thread from resources.
++  LoadSchemasOnUIThread(std::move(extensions));
++
+   // The first SetExtensionsDomainsReady() call is performed after the
+   // ExtensionSystem is ready, even if there are no managed extensions. It will
+   // trigger a loading of the initial policy for any managed extensions, and
+--- a/chrome/common/extensions/api/storage/storage_schema_manifest_handler.cc
++++ b/chrome/common/extensions/api/storage/storage_schema_manifest_handler.cc
+@@ -15,6 +15,8 @@
+ #include "base/types/expected.h"
+ #include "base/types/expected_macros.h"
+ #include "components/policy/core/common/schema.h"
++#include "extensions/browser/extensions_browser_client.h"
++#include "extensions/browser/component_extension_resource_manager.h"
+ #include "extensions/common/extension.h"
+ #include "extensions/common/install_warning.h"
+ #include "extensions/common/manifest.h"
+@@ -23,6 +25,7 @@
+ #include "extensions/common/permissions/api_permission.h"
+ #include "extensions/common/permissions/api_permission_set.h"
+ #include "extensions/common/permissions/permissions_info.h"
++#include "ui/base/resource/resource_bundle.h"
+ 
+ using extensions::manifest_keys::kStorageManagedSchema;
+ 
+@@ -34,6 +37,33 @@ StorageSchemaManifestHandler::~StorageSc
+ 
+ // static
+ base::expected<policy::Schema, std::string>
++StorageSchemaManifestHandler::GetComponentSchema(const Extension* extension) {
++  auto* manager =
++      extensions::ExtensionsBrowserClient::Get()->GetComponentExtensionResourceManager();
++  const ui::ResourceBundle& rb = ui::ResourceBundle::GetSharedInstance();
++
++  int resource_id;
++  std::string path;
++  if (const std::string* temp =
++          extension->manifest()->FindStringPath(kStorageManagedSchema)) {
++    path = *temp;
++  } else {
++      return base::unexpected(base::StringPrintf(
++        "%s does not have a schema path", extension->id()));
++  }
++
++  if (!manager->IsComponentExtensionResource(
++        extension->path(), base::FilePath::FromUTF8Unsafe(path), &resource_id)) {
++    return base::unexpected(base::StringPrintf(
++        "%s/%s is not a component extension resource",
++        base::UTF16ToUTF8(extension->path().LossyDisplayName()), path));
++  }
++
++  return policy::Schema::Parse(rb.LoadDataResourceString(resource_id));
++}
++
++// static
++base::expected<policy::Schema, std::string>
+ StorageSchemaManifestHandler::GetSchema(const Extension* extension) {
+   std::string path;
+   if (const std::string* temp =
+--- a/chrome/common/extensions/api/storage/storage_schema_manifest_handler.h
++++ b/chrome/common/extensions/api/storage/storage_schema_manifest_handler.h
+@@ -29,6 +29,8 @@ class StorageSchemaManifestHandler : pub
+   // If the schema is invalid then the Schema returned is invalid too, and
+   // the failure reason is stored in |error|.
+   // This function does file I/O and must be called on a thread that allows I/O.
++  static base::expected<policy::Schema, std::string> GetComponentSchema(
++      const Extension* extension);
+   static base::expected<policy::Schema, std::string> GetSchema(
+       const Extension* extension);
+ 
+--- a/chrome/common/extensions/BUILD.gn
++++ b/chrome/common/extensions/BUILD.gn
+@@ -83,6 +83,7 @@ source_set("extensions") {
+     "//components/url_formatter",
+     "//components/version_info",
+     "//extensions:extensions_resources",
++    "//extensions/browser",
+     "//extensions/common",
+     "//extensions/common:common_constants",
+     "//extensions/common:core_api_provider",
+@@ -90,6 +91,7 @@ source_set("extensions") {
+     "//extensions/strings",
+     "//ui/gfx/geometry",
+     "//ui/message_center/public/cpp",
++    "//ui/base",
+     "//url",
+   ]
+ 
