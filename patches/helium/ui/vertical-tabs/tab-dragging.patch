@@ -1,0 +1,373 @@
+--- a/chrome/browser/ui/views/tabs/dragging/dragging_tabs_session.cc
++++ b/chrome/browser/ui/views/tabs/dragging/dragging_tabs_session.cc
+@@ -29,11 +29,20 @@ int CalculateMouseOffset(const DragSessi
+   tabs_to_source.erase(
+       tabs_to_source.begin() + drag_data_.source_view_index_ + 1,
+       tabs_to_source.end());
+-  const int new_x =
+-      TabStrip::GetSizeNeededForViews(tabs_to_source) - source_view->width() +
+-      base::ClampRound(offset_to_width_ratio_ * source_view->width());
+ 
+-  return new_x;
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    const int new_y =
++       TabStrip::GetSizeNeededForViews(tabs_to_source) - source_view->height() +
++       base::ClampRound(offset_to_width_ratio_ * source_view->height());
++
++     return new_y;
++  } else {
++    const int new_x =
++        TabStrip::GetSizeNeededForViews(tabs_to_source) - source_view->width() +
++        base::ClampRound(offset_to_width_ratio_ * source_view->width());
++
++    return new_x;
++  }
+ }
+ 
+ }  // namespace
+@@ -103,6 +112,11 @@ gfx::Rect DraggingTabsSession::GetEnclos
+   const gfx::Point right_point_of_last_tab = last_tab->bounds().bottom_right();
+   const gfx::Point left_point_of_first_tab = first_tab->bounds().origin();
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    return gfx::Rect(0, left_point_of_first_tab.y(),
++                     attached_context_->width(),
++                     right_point_of_last_tab.y() - left_point_of_first_tab.y());
++  }
+   return gfx::Rect(left_point_of_first_tab.x(), 0,
+                    right_point_of_last_tab.x() - left_point_of_first_tab.x(),
+                    0);
+@@ -141,20 +155,27 @@ void DraggingTabsSession::MoveAttachedIm
+       drag_data_.attached_views(), drag_data_.num_dragging_tabs());
+ 
+   constexpr int kHorizontalMoveThreshold = 16;  // DIPs.
+-  const int threshold = base::ClampRound(
++  int threshold = 0;
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    threshold = base::ClampRound(static_cast<double>(
++      attached_context_->GetTabAt(to_index)->bounds().height() / 2));
++  } else {
++    threshold = base::ClampRound(
+       static_cast<double>(
+           attached_context_->GetTabAt(to_index)->bounds().width()) /
+       TabStyle::Get()->GetStandardWidth(/*is_split=*/false) *
+       kHorizontalMoveThreshold);
++  }
+ 
+   // Update the model, moving the WebContents from one index to another. Do this
+   // only if we have moved a minimum distance since the last reorder (to prevent
+   // jitter), or if this the first move and the tabs are not consecutive, or if
+   // we have just attached to a new tabstrip and need to move to the correct
+   // initial position.
+-  if (just_attached ||
+-      (abs(point_in_attached_context.x() - last_move_attached_context_loc_) >
+-       threshold) ||
++  if (just_attached || (abs((tabs::AreHeliumVerticalTabsEnabled() ?
++      point_in_attached_context.y() : point_in_attached_context.x()) -
++      last_move_attached_context_loc_) > threshold) ||
+       (initial_move_ && !AreTabsConsecutive())) {
+     TabStripModel* attached_model = attached_context_->GetTabStripModel();
+ 
+@@ -200,7 +221,11 @@ void DraggingTabsSession::MoveAttachedIm
+     // `last_move_attached_context_loc_`.
+     if (index_of_last_item !=
+         attached_model->GetIndexOfWebContents(last_contents)) {
+-      last_move_attached_context_loc_ = point_in_attached_context.x();
++      if (tabs::AreHeliumVerticalTabsEnabled()) {
++        last_move_attached_context_loc_ = point_in_attached_context.y();
++      } else {
++        last_move_attached_context_loc_ = point_in_attached_context.x();
++      }
+     }
+   }
+ 
+@@ -231,6 +256,15 @@ gfx::Rect DraggingTabsSession::GetDragge
+     std::vector<gfx::Rect> all_bounds =
+         attached_context_->CalculateBoundsForDraggedViews(
+             drag_data_.attached_views());
++
++    if (tabs::AreHeliumVerticalTabsEnabled()) {
++      int total_height = all_bounds.back().bottom() - all_bounds.front().y();
++      return gfx::Rect(
++        0, tab_strip_point.y(),
++        drag_data_.source_view_drag_data()->attached_view->width(),
++        total_height);
++    }
++
+     int total_width = all_bounds.back().right() - all_bounds.front().x();
+     return gfx::Rect(
+         tab_strip_point.x(), tab_strip_point.y(), total_width,
+@@ -288,6 +322,72 @@ DraggingTabsSession::CalculateGroupForDr
+     return std::nullopt;
+   }
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    std::optional<tab_groups::TabGroupId> top_group =
++       adjacent_indices.first.has_value()
++           ? attached_model->GetTabGroupForTab(adjacent_indices.first.value())
++           : std::nullopt;
++    std::optional<tab_groups::TabGroupId>  bottom_group =
++       adjacent_indices.second.has_value()
++           ? attached_model->GetTabGroupForTab(adjacent_indices.second.value())
++           : std::nullopt;
++    std::optional<tab_groups::TabGroupId> current_group =
++       attached_model->GetTabGroupForTab(selected_unpinned[0]);
++
++    if (top_group == bottom_group) {
++      return top_group;
++    }
++
++    const Tab* top_most_selected_tab =
++      attached_context_->GetTabAt(selected_unpinned[0]);
++    const int buffer = top_most_selected_tab->height() / 4;
++
++    const int tab_top_inset = TabStyle::Get()->GetStandardHeight() / 2;
++
++    const auto tab_bounds_in_drag_context_coords = [this](int model_index) {
++      const Tab* const tab = attached_context_->GetTabAt(model_index);
++        return ToEnclosingRect(views::View::ConvertRectToTarget(
++          tab->parent(), attached_context_, gfx::RectF(tab->bounds())));
++    };
++
++    int top_edge =
++       adjacent_indices.first.has_value()
++           ? tab_bounds_in_drag_context_coords(adjacent_indices.first.value())
++                    .bottom() -
++                tab_top_inset
++          : tab_top_inset;
++
++    if (top_group.has_value() && top_group == current_group) {
++      top_edge += buffer;
++    }
++    if (bottom_group.has_value() && bottom_group == current_group && top_edge > tab_top_inset) {
++      top_edge -= buffer;
++    }
++
++    const int top_most_selected_y_position =
++      top_most_selected_tab->y() + tab_top_inset;
++
++    if (top_group.has_value() &&
++      !attached_model->IsGroupCollapsed(top_group.value())) {
++      if (tab_bounds_in_drag_context_coords(selected_unpinned.back()).bottom() >=
++         attached_context_->TabDragAreaEndY()) {
++        return std::nullopt;
++      }
++
++      if (top_most_selected_y_position <= top_edge - buffer) {
++        return top_group;
++      }
++    }
++
++    if ((top_most_selected_y_position >= top_edge + buffer) &&
++      bottom_group.has_value() &&
++      !attached_model->IsGroupCollapsed(bottom_group.value())) {
++     return bottom_group;
++   }
++
++   return std::nullopt;
++  }
++
+   std::optional<tab_groups::TabGroupId> left_group =
+       adjacent_indices.first.has_value()
+           ? attached_model->GetTabGroupForTab(adjacent_indices.first.value())
+@@ -380,6 +480,15 @@ gfx::Point DraggingTabsSession::GetAttac
+     gfx::Point point_in_screen) {
+   const gfx::Point tab_loc =
+       views::View::ConvertPointFromScreen(attached_context_, point_in_screen);
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    const int y = tab_loc.y() - mouse_offset_;
++    const int max_y = std::max(
++      0, attached_context_->GetTabDragAreaHeight() -
++              TabStrip::GetSizeNeededForViews(drag_data_.attached_views()));
++    return gfx::Point(0, std::clamp(y, 0, max_y));
++  }
++
+   const int x =
+       attached_context_->GetMirroredXInView(tab_loc.x()) - mouse_offset_;
+ 
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_context.h
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_context.h
+@@ -51,6 +51,7 @@ class TabDragContextBase : public views:
+ 
+   // Returns the width of the region in which dragged tabs are allowed to exist.
+   virtual int GetTabDragAreaWidth() const = 0;
++  virtual int GetTabDragAreaHeight() const = 0;
+ };
+ 
+ // Provides tabstrip functionality specifically for TabDragController, much of
+@@ -100,6 +101,8 @@ class TabDragContext : public TabDragCon
+   // points should detach.
+   virtual int TabDragAreaEndX() const = 0;
+   virtual int TabDragAreaBeginX() const = 0;
++  virtual int TabDragAreaEndY() const = 0;
++  virtual int TabDragAreaBeginY() const = 0;
+ 
+   // Returns the index where the dragged WebContents should be inserted into
+   // this tabstrip given the DraggedTabView's bounds `dragged_bounds` in
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -161,6 +161,16 @@ bool DoesRectContainVerticalPointExpande
+   return y >= lower_threshold && y <= upper_threshold;
+ }
+ 
++// Returns true if `bounds` contains the x-coordinate `x`. The x-coordinate
++// of `bounds` is adjusted by `horizontal_adjustment`.
++bool DoesRectContainHorizontalPointExpanded(const gfx::Rect& bounds,
++                                            int horizontal_adjustment,
++                                            int x) {
++  int right_threshold = bounds.right() + horizontal_adjustment;
++  int left_threshold = bounds.x() - horizontal_adjustment;
++  return x >= left_threshold && x <= right_threshold;
++}
++
+ // Adds `x_offset` to all the rectangles in `rects`.
+ void OffsetX(int x_offset, std::vector<gfx::Rect>* rects) {
+   if (x_offset == 0) {
+@@ -172,6 +182,16 @@ void OffsetX(int x_offset, std::vector<g
+   }
+ }
+ 
++void OffsetY(int y_offset, std::vector<gfx::Rect>* rects) {
++  if (y_offset == 0) {
++    return;
++  }
++
++  for (auto& rect : *rects) {
++    rect.set_y(rect.y() + y_offset);
++  }
++}
++
+ bool IsWindowDragUsingSystemDragDropAllowed() {
+   return base::FeatureList::IsEnabled(
+       features::kAllowWindowDragUsingSystemDragDrop);
+@@ -395,7 +415,9 @@ TabDragController::Liveness TabDragContr
+   ref->can_release_capture_ = false;
+ #endif
+   ref->start_point_in_screen_ =
+-      gfx::Point(source_view_offset, mouse_offset.y());
++      tabs::AreHeliumVerticalTabsEnabled()
++          ? gfx::Point(mouse_offset.x(), source_view_offset)
++          : gfx::Point(source_view_offset, mouse_offset.y());
+   views::View::ConvertPointToScreen(source_view,
+                                     &(ref->start_point_in_screen_));
+   ref->event_source_ = event_source;
+@@ -471,11 +493,14 @@ TabDragController::Liveness TabDragContr
+                      END_DRAG_CANCEL),
+       ref->source_context_->GetWidget()->GetNativeWindow());
+ 
+-  if (source_view->width() > 0) {
++  if (!tabs::AreHeliumVerticalTabsEnabled() && source_view->width() > 0) {
+     ref->offset_to_width_ratio_ =
+         static_cast<float>(
+             source_view->GetMirroredXInView(source_view_offset)) /
+         source_view->width();
++  } else if (tabs::AreHeliumVerticalTabsEnabled() && source_view->height() > 0) {
++    ref->offset_to_width_ratio_ =
++        static_cast<float>(source_view_offset) / source_view->height();
+   }
+   ref->initial_selection_model_ = std::move(initial_selection_model);
+ 
+@@ -1245,6 +1270,15 @@ bool TabDragController::DoesTabStripCont
+   // Make sure the specified screen point is actually within the bounds of the
+   // specified context...
+   gfx::Rect tabstrip_bounds = GetTabstripScreenBounds(context);
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    const int y_in_strip = point_in_screen.y() - tabstrip_bounds.y();
++    return (y_in_strip >= context->TabDragAreaBeginY()) &&
++          (y_in_strip < context->TabDragAreaEndY()) &&
++          DoesRectContainVerticalPointExpanded(
++              tabstrip_bounds, kVerticalDetachMagnetism, point_in_screen.y()) &&
++          DoesRectContainHorizontalPointExpanded(
++              tabstrip_bounds, kVerticalDetachMagnetism, point_in_screen.x());
++  }
+   const int x_in_strip = point_in_screen.x() - tabstrip_bounds.x();
+   return (x_in_strip >= context->TabDragAreaBeginX()) &&
+          (x_in_strip < context->TabDragAreaEndX()) &&
+@@ -1520,8 +1554,9 @@ TabDragController::DetachIntoNewBrowserA
+   }
+ 
+   const int previous_tab_area_width = attached_context_->GetTabDragAreaWidth();
++  const int previous_tab_area_height = attached_context_->GetTabDragAreaHeight();
+   const gfx::Size new_size = CalculateDraggedWindowSize(attached_context_);
+-  const int first_tab_leading_x =
++  const int first_tab_leading_x_or_y =
+       GetTabOffsetForDetachedWindow(point_in_screen);
+   const std::vector<gfx::Rect> drag_bounds =
+       attached_context_->CalculateBoundsForDraggedViews(
+@@ -1577,7 +1612,9 @@ TabDragController::DetachIntoNewBrowserA
+     // attached to is hidden and thus can't start the drag session.
+     return StartSystemDnDSessionIfNecessary(source_context_, point_in_screen);
+   }
+-  AdjustTabBoundsForDrag(previous_tab_area_width, first_tab_leading_x,
++  AdjustTabBoundsForDrag(tabs::AreHeliumVerticalTabsEnabled() ?
++                         previous_tab_area_height :
++                         previous_tab_area_width, first_tab_leading_x_or_y,
+                          drag_bounds);
+ 
+   const gfx::Vector2d drag_offset = CalculateWindowDragOffset();
+@@ -2356,6 +2393,13 @@ int TabDragController::GetTabOffsetForDe
+   DCHECK(attached_context_);
+   const gfx::Point attached_point =
+       views::View::ConvertPointFromScreen(attached_context_, point_in_screen);
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    if (attached_point.y() < attached_context_->TabDragAreaBeginY()) return 0;
++    if (attached_point.y() >= attached_context_->TabDragAreaEndY()) return 0;
++    return drag_data_.tab_drag_data_[0].attached_view->bounds().y();
++  }
++
+   if (attached_point.x() < attached_context_->TabDragAreaBeginX()) {
+     // Detaching to the left; tabs should be at the beginning of the window.
+     return 0;
+@@ -2376,6 +2420,30 @@ void TabDragController::AdjustTabBoundsF
+   CHECK(!ShouldDragWindowUsingSystemDnD());
+ 
+   attached_context_->ForceLayout();
++
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    int previous_tab_area_height = previous_tab_area_width;
++    int first_tab_leading_y = first_tab_leading_x;
++    const int current_tab_area_height = attached_context_->GetTabDragAreaHeight();
++    if (current_tab_area_height < previous_tab_area_height) {
++      const float leading_ratio = first_tab_leading_y / static_cast<float>(previous_tab_area_height);
++
++      if (drag_bounds.back().bottom() < current_tab_area_height) {
++        const int maximum_tab_y =
++          current_tab_area_height -
++          (drag_bounds.back().bottom() - drag_bounds.front().y());
++        const int leading_tab_y =
++           std::min(static_cast<int>(leading_ratio * current_tab_area_height),
++                   maximum_tab_y);
++        OffsetY(leading_tab_y, &drag_bounds);
++      }
++    } else {
++      OffsetY(first_tab_leading_y, &drag_bounds);
++    }
++    attached_context_->SetBoundsForDrag(drag_data_.attached_views(), drag_bounds);
++    return;
++  }
++
+   const int current_tab_area_width = attached_context_->GetTabDragAreaWidth();
+ 
+   // If the new tabstrip region is smaller than the old, resize and reposition
+--- a/chrome/browser/ui/views/tabs/tab_container.h
++++ b/chrome/browser/ui/views/tabs/tab_container.h
+@@ -55,6 +55,8 @@ class TabContainer : public views::View,
+   // the width of the tabstrip.
+   virtual void SetAvailableWidthCallback(
+       base::RepeatingCallback<int()> available_width_callback) = 0;
++  virtual void SetAvailableHeightCallback(
++      base::RepeatingCallback<int()> available_height_callback) = 0;
+ 
+   // Handle model changes.
+   virtual std::vector<Tab*> AddTabs(
+@@ -164,6 +166,7 @@ class TabContainer : public views::View,
+ 
+   // Returns the total width available for the TabContainer's use.
+   virtual int GetAvailableWidthForTabContainer() const = 0;
++  virtual int GetAvailableHeightForTabContainer() const = 0;
+ 
+   // See `in_tab_close_` for details on tab closing mode. `source` is the input
+   // method used to enter tab closing mode, which determines how it is exited
