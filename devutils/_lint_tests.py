@@ -16,6 +16,10 @@ def _read_text(path):
         return filter(str, f.read().splitlines())
 
 
+def _read_patch(path):
+    return unidiff.PatchSet('\n'.join(_read_text(path)))
+
+
 def _init(root):
     global patches_dir
     global series
@@ -59,8 +63,7 @@ def c_all_new_files_have_license_header():
         if 'helium' not in patch:
             continue
 
-        patch_set = unidiff.PatchSet('\n'.join(_read_text(patch)))
-        added_files = filter(lambda f: f.is_added_file, patch_set)
+        added_files = filter(lambda f: f.is_added_file, _read_patch(patch))
 
         for file in added_files:
             if any(p in file.path.lower() for p in LICENSE_HEADER_IGNORES):
@@ -75,8 +78,8 @@ def c_all_new_headers_have_correct_guard():
         if 'helium' not in patch:
             continue
 
-        patch_set = unidiff.PatchSet('\n'.join(_read_text(patch)))
-        added_files = filter(lambda f: f.is_added_file and f.path.endswith('.h'), patch_set)
+        added_files = filter(lambda f: f.is_added_file and f.path.endswith('.h'),
+                             _read_patch(patch))
 
         for file in added_files:
             expected_macro_name = file.path.upper() \
@@ -119,8 +122,7 @@ def d_no_whitespace_only_changes():
         if 'helium' not in patch:
             continue
 
-        patch_set = unidiff.PatchSet('\n'.join(_read_text(patch)))
-        for file in patch_set:
+        for file in _read_patch(patch):
             for hunk in file:
                 seen_nonws = False
                 for line in hunk:
