@@ -1,0 +1,260 @@
+Based on Brave's MRU tab cycling implementation, adapted for Helium.
+
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2025, The Brave Authors
+Copyright (c) 2025, The Helium Authors
+
+Alternatively, the contents of this file may be used under the terms
+of the GNU General Public License Version 3, as described below:
+
+Copyright (C) 2025 The Helium Authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -54,6 +54,7 @@
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_finder.h"
+ #include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/commerce/ui_utils.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
+ #include "chrome/browser/ui/tabs/features.h"
+@@ -3658,6 +3659,44 @@ TabStripSelectionChange TabStripModel::S
+   return selection;
+ }
+ 
++void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
++                                 TabStripUserGestureDetails detail) {
++  if (mru_cycle_list_.empty()) {
++    Browser* browser = chrome::FindBrowserWithTab(GetWebContentsAt(0));
++    if (!browser) {
++      return;
++    }
++
++    for (int i = 0; i < count(); ++i) {
++      mru_cycle_list_.push_back(i);
++    }
++
++    std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
++              [this](int a, int b) {
++                return GetWebContentsAt(a)->GetLastActiveTimeTicks() >
++                       GetWebContentsAt(b)->GetLastActiveTimeTicks();
++              });
++
++    if (BrowserView* browser_view = browser->window()->AsBrowserView()) {
++      browser_view->StartTabCycling();
++    }
++  }
++
++  if (direction == TabRelativeDirection::kNext) {
++    std::rotate(mru_cycle_list_.begin(), mru_cycle_list_.begin() + 1,
++                mru_cycle_list_.end());
++  } else {
++    std::rotate(mru_cycle_list_.rbegin(), mru_cycle_list_.rbegin() + 1,
++                mru_cycle_list_.rend());
++  }
++
++  ActivateTabAt(mru_cycle_list_[0], detail);
++}
++
++void TabStripModel::StopMRUCycling() {
++  mru_cycle_list_.clear();
++}
++
+ void TabStripModel::SelectRelativeTab(TabRelativeDirection direction,
+                                       TabStripUserGestureDetails detail) {
+   // This may happen during automated testing or if a user somehow buffers
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -604,6 +604,10 @@ class TabStripModel {
+       TabStripUserGestureDetails detail = TabStripUserGestureDetails(
+           TabStripUserGestureDetails::GestureType::kOther));
+ 
++  // Stops cycling through tabs in MRU order when Ctrl is released.
++  // Used in BrowserView::StopTabCycling().
++  void StopMRUCycling();
++
+   // Moves the active in the specified direction. Respects group boundaries.
+   void MoveTabNext();
+   void MoveTabPrevious();
+@@ -1132,6 +1136,11 @@ class TabStripModel {
+     kPrevious,
+   };
+ 
++  // Selects either the most recently used tab
++  // or the least recently used tab.
++  void SelectMRUTab(TabRelativeDirection direction,
++                    TabStripUserGestureDetails detail);
++
+   // Selects either the next tab (kNext), or the previous tab (kPrevious).
+   void SelectRelativeTab(TabRelativeDirection direction,
+                          TabStripUserGestureDetails detail);
+@@ -1388,6 +1397,9 @@ class TabStripModel {
+   // Tracks whether a modal UI is showing.
+   bool showing_modal_ui_ = false;
+ 
++  // List of tabs for MRU cycling
++  std::vector<int> mru_cycle_list_;
++
+   base::WeakPtrFactory<TabStripModel> weak_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -285,7 +285,10 @@
+ #include "ui/compositor/paint_recorder.h"
+ #include "ui/content_accelerators/accelerator_util.h"
+ #include "ui/display/screen.h"
++#include "ui/events/event.h"
++#include "ui/events/event_handler.h"
+ #include "ui/events/event_utils.h"
++#include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/gfx/animation/animation_runner.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/color_utils.h"
+@@ -303,6 +306,7 @@
+ #include "ui/views/controls/button/menu_button.h"
+ #include "ui/views/controls/textfield/textfield.h"
+ #include "ui/views/controls/webview/webview.h"
++#include "ui/views/event_monitor.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/layout/fill_layout.h"
+ #include "ui/views/view.h"
+@@ -726,6 +730,83 @@ bool ConvertedHitTest(views::View* src,
+ 
+ }  // namespace
+ 
++// Handles events during MRU tab cycling to start/stop tab cycling.
++class TabCyclingEventHandler : public ui::EventObserver,
++                               public views::WidgetObserver {
++ public:
++  explicit TabCyclingEventHandler(BrowserView* browser_view)
++      : browser_view_(browser_view) {
++    Start();
++  }
++
++  ~TabCyclingEventHandler() override { Stop(); }
++
++  TabCyclingEventHandler(const TabCyclingEventHandler&) = delete;
++  TabCyclingEventHandler& operator=(const TabCyclingEventHandler&) = delete;
++
++ private:
++  // ui::EventObserver overrides:
++  void OnEvent(const ui::Event& event) override {
++    if (event.type() == ui::EventType::kKeyReleased &&
++        event.AsKeyEvent()->key_code() == ui::VKEY_CONTROL) {
++      // Ctrl key was released, stop the tab cycling.
++      Stop();
++      return;
++    }
++
++    if (event.type() == ui::EventType::kMousePressed) {
++      Stop();
++    }
++  }
++
++  // views::WidgetObserver overrides:
++  void OnWidgetActivationChanged(views::Widget* widget, bool active) override {
++    // We should stop cycling if other application gets active state.
++    if (!active) {
++      Stop();
++    }
++  }
++
++  // Handle browser widget closing while tab cycling is in-progress.
++  void OnWidgetClosing(views::Widget* widget) override { Stop(); }
++
++  void Start() {
++    // Add the event handler.
++    auto* widget = browser_view_->GetWidget();
++    if (widget->GetNativeWindow()) {
++      monitor_ = views::EventMonitor::CreateWindowMonitor(
++          this, widget->GetNativeWindow(),
++          {ui::EventType::kMousePressed, ui::EventType::kKeyReleased});
++    }
++    widget->AddObserver(this);
++  }
++
++  void Stop() {
++    if (!monitor_) {
++      // Already stopped.
++      return;
++    }
++
++    // Remove event handler.
++    auto* widget = browser_view_->GetWidget();
++    monitor_.reset();
++    widget->RemoveObserver(this);
++    browser_view_->StopTabCycling();
++  }
++
++  raw_ptr<BrowserView> browser_view_;
++  std::unique_ptr<views::EventMonitor> monitor_;
++};
++
++void BrowserView::StartTabCycling() {
++  tab_cycling_event_handler_ = std::make_unique<TabCyclingEventHandler>(this);
++}
++
++void BrowserView::StopTabCycling() {
++  tab_cycling_event_handler_.reset();
++  browser()->tab_strip_model()->StopMRUCycling();
++}
++
+ class BrowserView::AccessibilityModeObserver : public ui::AXModeObserver {
+  public:
+   explicit AccessibilityModeObserver(BrowserView* browser_view)
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -80,6 +80,7 @@ class LocationBarView;
+ class MultiContentsView;
+ class ScrimView;
+ class SidePanel;
++class TabCyclingEventHandler;
+ class TabDragDelegate;
+ class TabSearchBubbleHost;
+ class TabStrip;
+@@ -566,6 +567,10 @@ class BrowserView : public BrowserWindow
+   void ShowChromeLabs() override;
+   views::WebView* GetContentsWebView() override;
+   BrowserView* AsBrowserView() override;
++
++  void StartTabCycling();
++  void StopTabCycling();
++
+   SharingDialog* ShowSharingDialog(content::WebContents* contents,
+                                    SharingDialogData data) override;
+   void ShowUpdateChromeDialog() override;
+@@ -889,6 +894,7 @@ class BrowserView : public BrowserWindow
+   friend class BrowserViewLayoutDelegateImplNew;
+   friend class BrowserViewLayoutDelegateImplOld;
+   friend class BrowserViewLayoutDelegateImplBrowsertest;
++  friend class TabCyclingEventHandler;
+   friend class TopControlsSlideControllerTest;
+   FRIEND_TEST_ALL_PREFIXES(BrowserViewTest, BrowserView);
+   FRIEND_TEST_ALL_PREFIXES(BrowserViewTest, AccessibleWindowTitle);
+@@ -1395,6 +1401,8 @@ class BrowserView : public BrowserWindow
+ 
+   base::CallbackListSubscription vertical_tab_subscription_;
+ 
++  std::unique_ptr<TabCyclingEventHandler> tab_cycling_event_handler_;
++
+   mutable base::WeakPtrFactory<BrowserView> weak_ptr_factory_{this};
+ };
+ 
