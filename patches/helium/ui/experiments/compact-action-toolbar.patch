@@ -1,0 +1,331 @@
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -30,6 +30,9 @@ namespace helium {
+   constexpr const char kCanvasNoiseCommandLine[] = "fingerprinting-canvas-noise";
+   constexpr const char kAudioContextJitterCommandLine[] = "fingerprinting-audio-context-jitter";
+   constexpr const char kMiddleClickAutoscrollCommandLine[] = "middle-click-autoscroll";
++  constexpr const char kHeliumCatUiCommandLine[] = "helium-cat-ui";
++  constexpr const char kHeliumCatFixedAddressBarCommandLine[] =
++      "helium-cat-fixed-address-bar";
+ 
+ }  // namespace helium
+ 
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -28,4 +28,12 @@
+      "Middle Click Autoscroll",
+      "Enables autoscroll on middle click. Helium flag, Chromium feature.",
+      kOsDesktop, FEATURE_VALUE_TYPE(blink::features::kHeliumMiddleClickAutoscroll)},
++    {helium::kHeliumCatUiCommandLine,
++     "[CAT] Helium Compact Action Toolbar UI",
++     "Enables the new experimental UI that merges the tab strip and toolbar into one UI component to save vertical screen estate. Early and buggy, stuff will break and/or look weird. Helium flag.",
++     kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumCatUi)},
++    {helium::kHeliumCatFixedAddressBarCommandLine,
++     "[CAT] Fixed address bar width",
++     "Prevents the address bar from shrinking in the CAT layout. Will push toolbar actions outside of bounds on small window sizes, beware. Works only when the main CAT flag is enabled. Early and buggy, stuff will break and/or look weird. Helium flag.",
++     kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumCatFixedAddressBar)},
+ #endif  /* CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_ */
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -17,6 +17,22 @@
+ 
+ namespace features {
+ 
++// Helium Compact Action Toolbar UI
++BASE_FEATURE(kHeliumCatUi,
++             base::FEATURE_DISABLED_BY_DEFAULT);
++
++BASE_FEATURE(kHeliumCatFixedAddressBar,
++             base::FEATURE_DISABLED_BY_DEFAULT);
++
++bool IsHeliumCatEnabled() {
++  return base::FeatureList::IsEnabled(kHeliumCatUi);
++}
++
++bool IsHeliumCatFixedAddressBar() {
++  return IsHeliumCatEnabled() && base::FeatureList::IsEnabled(
++      kHeliumCatFixedAddressBar);
++}
++
+ // Enables the tab dragging fallback when full window dragging is not supported
+ // by the platform (e.g. Wayland). See https://crbug.com/896640
+ BASE_FEATURE(kAllowWindowDragUsingSystemDragDrop,
+--- a/chrome/browser/ui/ui_features.h
++++ b/chrome/browser/ui/ui_features.h
+@@ -20,6 +20,11 @@ namespace features {
+ // All features in alphabetical order. The features should be documented
+ // alongside the definition of their values in the .cc file.
+ 
++BASE_DECLARE_FEATURE(kHeliumCatUi);
++BASE_DECLARE_FEATURE(kHeliumCatFixedAddressBar);
++bool IsHeliumCatEnabled();
++bool IsHeliumCatFixedAddressBar();
++
+ // TODO(crbug.com/40598679): Remove this when the tab dragging
+ // interactive_ui_tests pass on Wayland.
+ BASE_DECLARE_FEATURE(kAllowWindowDragUsingSystemDragDrop);
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -873,8 +873,12 @@ BrowserView::BrowserView(Browser* browse
+ 
+   top_container_ = AddChildView(std::make_unique<TopContainerView>(this));
+ 
+-  tab_strip_region_view_ =
+-      top_container_->AddChildView(std::make_unique<TabStripRegionView>(this));
++  // When the CAT feature is enabled, tab strip is in the toolbar.
++  // We shouldn't create a duplicate tab strip.
++  if (!features::IsHeliumCatEnabled() || !GetIsNormalType()) {
++    tab_strip_region_view_ =
++        top_container_->AddChildView(std::make_unique<TabStripRegionView>(this));
++  }
+ 
+   if (tabs::IsVerticalTabsFeatureEnabled()) {
+     auto vertical_tab_strip_container =
+@@ -1236,7 +1240,8 @@ bool BrowserView::ShouldDrawTabStrip() c
+   // since callers may otherwise try to access it. Note that we can't just check
+   // this alone, as the tabstrip is created unconditionally even for windows
+   // that won't display it.
+-  return tab_strip_region_view_->tab_strip() != nullptr;
++  return tab_strip_region_view_ != nullptr &&
++         tab_strip_region_view_->tab_strip() != nullptr;
+ }
+ 
+ bool BrowserView::GetIncognito() const {
+@@ -5178,6 +5183,12 @@ void BrowserView::AddedToWidget() {
+ 
+   toolbar_->Init();
+ 
++  // When the CAT feature is enabled, the tab strip is owned by the toolbar.
++  if (features::IsHeliumCatEnabled() && GetIsNormalType()) {
++    tab_strip_region_view_ =
++        static_cast<TabStripRegionView*>(toolbar_->GetTabStripRegionView());
++  }
++
+   if (!base::CommandLine::ForCurrentProcess()->HasSwitch("remove-tabsearch-button"))
+   if (GetIsNormalType()) {
+     if (features::HasTabSearchToolbarButton()) {
+--- a/chrome/browser/ui/views/frame/browser_view_layout.cc
++++ b/chrome/browser/ui/views/frame/browser_view_layout.cc
+@@ -535,11 +535,19 @@ void BrowserViewLayout::LayoutVerticalTa
+ 
+ void BrowserViewLayout::LayoutTabStripRegion(gfx::Rect& available_bounds) {
+   TRACE_EVENT0("ui", "BrowserViewLayout::LayoutTabStripRegion");
++
++  // If the CAT feature is enabled, then the tab strip is in the toolbar.
++  // We shouldn't layout it here.
++  if (features::IsHeliumCatEnabled()) {
++    return;
++  }
++
+   if (!delegate_->ShouldDrawTabStrip()) {
+     SetViewVisibility(tab_strip_region_view_, false);
+     tab_strip_region_view_->SetBounds(0, 0, 0, 0);
+     return;
+   }
++
+   // This retrieves the bounds for the tab strip based on whether or not we show
+   // anything to the left of it, like the incognito avatar.
+   gfx::Rect tab_strip_region_bounds(
+@@ -587,6 +595,15 @@ void BrowserViewLayout::LayoutToolbar(gf
+     toolbar_bounds.set_width(toolbar_bounds.width() -
+                              BrowserView::kVerticalTabStripWidth);
+     toolbar_->SetBoundsRect(toolbar_bounds);
++  } else if (features::IsHeliumCatEnabled() && delegate_->ShouldDrawTabStrip()) {
++    // If CAT is enabled and the tab strip should be drawn, then we're most
++    // likely layered under window controls, so we accommodate space for
++    // them like a tab strip would.
++    gfx::Rect tab_strip_region_bounds(
++        delegate_->GetBoundsForToolbarInVerticalTabBrowserView());
++    int height = toolbar_visible ? toolbar_->GetPreferredSize().height() : 0;
++    toolbar_->SetBounds(tab_strip_region_bounds.x(), available_bounds.y(),
++                        tab_strip_region_bounds.width(), height);
+   } else {
+     int height = toolbar_visible ? toolbar_->GetPreferredSize().height() : 0;
+     int width = available_bounds.width();
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -57,6 +57,7 @@
+ #include "chrome/browser/ui/views/extensions/extensions_toolbar_coordinator.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/top_container_background.h"
+ #include "chrome/browser/ui/views/global_media_controls/media_toolbar_button_contextual_menu.h"
+ #include "chrome/browser/ui/views/global_media_controls/media_toolbar_button_view.h"
+@@ -144,6 +145,8 @@ DEFINE_UI_CLASS_PROPERTY_KEY(bool, kActi
+ 
+ namespace {
+ 
++constexpr int kPreferredCompactWidth = 350;
++
+ // Gets the display mode for a given browser.
+ ToolbarView::DisplayMode GetDisplayMode(Browser* browser) {
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -534,6 +537,26 @@ void ToolbarView::Init() {
+ 
+   reload_->SetVisible(show_reload_button_.GetValue());
+ 
++  // Tab strip should be in the toolbar only when the CAT feature is enabled.
++  if (features::IsHeliumCatEnabled()) {
++    auto tab_strip_region_view =
++        std::make_unique<TabStripRegionView>(browser_view_);
++    tab_strip_region_view_ = tab_strip_region_view.get();
++
++    // Add the tab strip region view to the container view right after
++    // the location bar if it's present.
++    auto location_bar_index = location_bar_ ?
++        container_view_->GetIndexOf(location_bar_) :
++        std::nullopt;
++
++    if (location_bar_index) {
++      container_view_->AddChildViewAt(std::move(tab_strip_region_view),
++                                      *location_bar_index + 1);
++    } else {
++      container_view_->AddChildView(std::move(tab_strip_region_view));
++    }
++  }
++
+   show_avatar_button_.Init(
+       prefs::kShowAvatarButton, prefs,
+       base::BindRepeating(&ToolbarView::OnShowAvatarButtonChanged,
+@@ -564,12 +587,24 @@ void ToolbarView::Init() {
+ 
+   InitLayout();
+ 
++  auto flex_preferred = views::FlexSpecification(
++                          views::MinimumFlexSizeRule::kPreferred,
++                          views::MaximumFlexSizeRule::kPreferred);
++
+   for (auto* button : std::array<views::Button*, 5>{back_, forward_, reload_,
+                                                     home_, avatar_}) {
+     if (button) {
+       button->set_tag(GetViewCommandMap().at(button->GetID()));
++      button->SetProperty(views::kFlexBehaviorKey, flex_preferred);
+     }
+   }
++
++  // Pinned actions (including downloads) should not shrink in CAT layout.
++  if (features::IsHeliumCatEnabled()) {
++    pinned_toolbar_actions_container_->SetProperty(
++        views::kFlexBehaviorKey, flex_preferred);
++  }
++
+   if (browser_view_->GetSupportsTabStrip()) {
+     browser()->GetTabStripModel()->AddObserver(this);
+   }
+@@ -700,6 +735,24 @@ bool ToolbarView::IsRectInWindowCaption(
+     return gfx::ToEnclosingRect(rect_in_target_coords_f);
+   };
+ 
++  // Check the tab strip region first if CAT is enabled.
++  if (features::IsHeliumCatEnabled() && tab_strip_region_view_) {
++    const gfx::Rect tab_strip_rect = get_target_rect(tab_strip_region_view_);
++    if (tab_strip_region_view_->GetLocalBounds().Intersects(tab_strip_rect)) {
++      // Check if the rect is actually on the tab strip region view.
++      if (tab_strip_region_view_->HitTestRect(tab_strip_rect)) {
++        auto* tab_strip_region =
++            static_cast<TabStripRegionView*>(tab_strip_region_view_);
++
++        if (tab_strip_region->IsPositionInWindowCaption(tab_strip_rect.origin())) {
++          return true;
++        }
++
++        return false;
++      }
++    }
++  }
++
+   // Check each child view in container_view_ to see if the rect intersects with
+   // any clickable elements. If it does, check if the click is actually on that
+   // element. False if on a clickable element, true if not on a clickable element.
+@@ -981,8 +1034,12 @@ void ToolbarView::InitLayout() {
+   constexpr int kToolbarActionsFlexOrder = kOrderOffset + 2;
+   constexpr int kExtensionsFlexOrder = kOrderOffset + 3;
+ 
++  auto min_location_bar_flex = features::IsHeliumCatFixedAddressBar() ?
++                                  views::MinimumFlexSizeRule::kPreferred :
++                                  views::MinimumFlexSizeRule::kScaleToMinimum;
++
+   const views::FlexSpecification location_bar_flex_rule =
+-      views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
++      views::FlexSpecification(min_location_bar_flex,
+                                views::MaximumFlexSizeRule::kUnbounded)
+           .WithOrder(kLocationBarFlexOrder);
+ 
+@@ -998,6 +1055,12 @@ void ToolbarView::InitLayout() {
+   location_bar_->SetProperty(views::kMarginsKey,
+                              gfx::Insets::VH(0, location_bar_margin));
+ 
++  if (features::IsHeliumCatEnabled()) {
++    location_bar_->SetPreferredSize(gfx::Size(kPreferredCompactWidth, 0));
++    location_bar_->SetProperty(views::kMarginsKey,
++                               gfx::Insets::TLBR(0, location_bar_margin, 0, 0));
++  }
++
+   if (extensions_container_) {
+     const views::FlexSpecification extensions_flex_rule =
+         views::FlexSpecification(
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -146,6 +146,9 @@ class ToolbarView : public views::Access
+   // Shows a bookmark bubble and anchors it appropriately.
+   void ShowBookmarkBubble(const GURL& url, bool already_bookmarked);
+ 
++  // Returns the tab strip region view if CAT feature is enabled, nullptr otherwise.
++  views::View* GetTabStripRegionView() const { return tab_strip_region_view_.get(); }
++
+   // Accessors.
+   Browser* browser() const { return browser_; }
+   views::Button* GetChromeLabsButton() const;
+@@ -322,6 +325,7 @@ class ToolbarView : public views::Access
+   raw_ptr<BrowserAppMenuButton> app_menu_button_ = nullptr;
+   raw_ptr<views::View> new_tab_button_ = nullptr;
+   raw_ptr<PinnedActionToolbarButton> tab_search_button_ = nullptr;
++  raw_ptr<views::View> tab_strip_region_view_ = nullptr;
+ 
+   const raw_ptr<Browser> browser_;
+   const raw_ptr<BrowserView> browser_view_;
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -187,6 +187,11 @@ gfx::Insets GetLayoutInsets(LayoutInset
+     case TOOLBAR_INTERIOR_MARGIN: {
+       const int vert = GetLayoutConstant(TOP_BAR_VERTICAL_PADDING);
+       const int horiz = vert * 2;
++
++      if (features::IsHeliumCatEnabled()) {
++        return gfx::Insets::VH(vert, horiz + vert);
++      }
++
+       return touch_ui ? gfx::Insets() :
+           gfx::Insets::TLBR(0, horiz, vert, horiz);
+     }
+--- a/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
+@@ -616,7 +616,7 @@ int OmniboxViewViews::GetUnelidedTextWid
+ }
+ 
+ gfx::Size OmniboxViewViews::GetMinimumSize() const {
+-  constexpr int kMinCharacters = 20;
++  constexpr int kMinCharacters = 32;
+   return gfx::Size(
+       GetFontList().GetExpectedTextWidth(kMinCharacters) + GetInsets().width(),
+       GetPreferredSize().height());
+--- a/chrome/browser/ui/views/location_bar/location_icon_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_icon_view.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/omnibox/omnibox_edit_model.h"
+ #include "chrome/browser/ui/page_info/page_info_dialog.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/location_bar/icon_label_bubble_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_util.h"
+@@ -193,7 +194,7 @@ bool LocationIconView::GetShowText() con
+       url.SchemeIs(extensions::kExtensionScheme) ||
+       url.SchemeIs(url::kFileScheme) ||
+       url.SchemeIs(dom_distiller::kDomDistillerScheme)) {
+-    return true;
++    return !features::IsHeliumCatEnabled();
+   }
+ 
+   return !location_bar_model->GetSecureDisplayText().empty();

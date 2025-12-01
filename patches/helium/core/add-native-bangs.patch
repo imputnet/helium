@@ -724,7 +724,7 @@
  COMPONENT_EXPORT(HELIUM) GURL GetDummyURL();
 --- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
 +++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
-@@ -1973,6 +1973,9 @@ void AddPrivacyStrings(content::WebUIDat
+@@ -1975,6 +1975,9 @@ void AddPrivacyStrings(content::WebUIDat
        {"heliumServicesToggle", IDS_SETTINGS_HELIUM_SERVICES_TOGGLE},
        {"heliumServicesToggleDescription",
          IDS_SETTINGS_HELIUM_SERVICES_TOGGLE_DESCRIPTION},
@@ -736,7 +736,7 @@
        {"heliumExtProxyToggleDescription",
 --- a/chrome/app/settings_strings.grdp
 +++ b/chrome/app/settings_strings.grdp
-@@ -1945,6 +1945,12 @@
+@@ -1951,6 +1951,12 @@
    <message name="IDS_SETTINGS_HELIUM_SERVICES_EXT_PROXY_TOGGLE_DESCRIPTION" desc="Description of the toggle for enabling/disabling of downloading and proxying extensions">
      When enabled, Helium will proxy extension downloads and updates to protect your privacy. When disabled, downloading and updating extensions will not work.
    </message>
@@ -796,9 +796,68 @@
  }  // namespace prefs
  
  #endif  // COMPONENTS_HELIUM_SERVICES_PREF_NAMES_H_
+--- a/third_party/metrics_proto/omnibox_event.proto
++++ b/third_party/metrics_proto/omnibox_event.proto
+@@ -771,6 +771,8 @@ message OmniboxEventProto {
+                             // or tabbing to it.
+     TOOLBELT = 9;           // Select and activate a search shortcuts action
+                             // from the omnibox toolbelt.
++    RETURN_BANG = 10;       // Accept a bang at the end of the query by pressing
++                            // the Return/Enter key.
+   }
+ 
+   optional KeywordModeEntryMethod keyword_mode_entry_method = 20;
+--- a/chrome/browser/ui/omnibox/omnibox_edit_model.h
++++ b/chrome/browser/ui/omnibox/omnibox_edit_model.h
+@@ -268,6 +268,9 @@ class OmniboxEditModel {
+     return !is_keyword_hint_ && !keyword_.empty();
+   }
+ 
++  // Accepts the bang at the end of the user query.
++  void MaybeAcceptTrailingBang();
++
+   // Accepts the current keyword hint as a keyword. It always returns true for
+   // caller convenience. |entry_method| indicates how the user entered
+   // keyword mode.
+@@ -647,6 +650,10 @@ class OmniboxEditModel {
+   // triggering is enabled, false otherwise.
+   bool AllowKeywordSpaceTriggering() const;
+ 
++  // Checks whether the user text contains a bang at the end of it
++  // that can be accepted by pressing the Return key.
++  bool HasTrailingBangKeyword() const;
++
+   // Accepts current keyword if the user just typed a space at the end of
+   // |new_text|.  This handles both of the following cases:
+   //   (assume "foo" is a keyword, | is the input caret, [] is selected text)
 --- a/chrome/browser/ui/omnibox/omnibox_edit_model.cc
 +++ b/chrome/browser/ui/omnibox/omnibox_edit_model.cc
-@@ -840,6 +840,17 @@ bool OmniboxEditModel::AcceptKeyword(
+@@ -832,6 +832,24 @@ void OmniboxEditModel::OpenSelectionForT
+   OpenSelection(popup_selection_, timestamp, disposition, via_keyboard);
+ }
+ 
++void OmniboxEditModel::MaybeAcceptTrailingBang() {
++  if (!HasTrailingBangKeyword()) {
++    return;
++  }
++
++  AcceptKeyword(OmniboxEventProto::RETURN_BANG);
++
++  const AutocompleteResult& result = autocomplete_controller()->result();
++  for (size_t i = 0; i < result.size(); i++) {
++    const AutocompleteMatch& match = result.match_at(i);
++
++    if (input_.text() == match.fill_into_edit) {
++      SetPopupSelection(OmniboxPopupSelection(i));
++      return;
++    }
++  }
++}
++
+ bool OmniboxEditModel::AcceptKeyword(
+     OmniboxEventProto::KeywordModeEntryMethod entry_method) {
+   TRACE_EVENT0("omnibox", "OmniboxEditModel::AcceptKeyword");
+@@ -840,6 +858,17 @@ bool OmniboxEditModel::AcceptKeyword(
  
    controller_->StopAutocomplete(/*clear_result=*/false);
  
@@ -816,7 +875,7 @@
    is_keyword_hint_ = false;
    keyword_mode_entry_method_ = entry_method;
    if (original_user_text_with_keyword_.empty()) {
-@@ -882,9 +893,6 @@ bool OmniboxEditModel::AcceptKeyword(
+@@ -882,9 +911,6 @@ bool OmniboxEditModel::AcceptKeyword(
    }
  
    base::RecordAction(base::UserMetricsAction("AcceptedKeywordHint"));
@@ -826,7 +885,7 @@
    EmitEnteredKeywordModeHistogram(entry_method, turl, !user_text_.empty());
    return true;
  }
-@@ -1543,7 +1551,13 @@ void OmniboxEditModel::InternalSetUserTe
+@@ -1543,7 +1569,13 @@ void OmniboxEditModel::InternalSetUserTe
  
  std::u16string OmniboxEditModel::MaybeStripKeyword(
      const std::u16string& text) const {
@@ -841,7 +900,28 @@
               ? AutocompleteInput::SplitReplacementStringFromInput(text, false)
               : text;
  }
-@@ -2756,10 +2770,12 @@ bool OmniboxEditModel::MaybeAcceptKeywor
+@@ -2750,16 +2782,33 @@ bool OmniboxEditModel::AllowKeywordSpace
+   return GetPrefService()->GetBoolean(omnibox::kKeywordSpaceTriggeringEnabled);
+ }
+ 
++bool OmniboxEditModel::HasTrailingBangKeyword() const {
++  if (!is_keyword_hint_ || input_.InKeywordMode()
++      || !keyword_.starts_with('!')
++      || !AutocompleteMatch::IsSearchType(current_match_.type)
++      || !GetText().ends_with(keyword_)) {
++    return false;
++  }
++
++  const TemplateURL* turl =
++    controller_->client()->GetTemplateURLService()->GetTemplateURLForKeyword(
++        keyword_);
++
++  return turl && turl->bang_id() > 0;
++}
++
+ bool OmniboxEditModel::MaybeAcceptKeywordBySpace(
+     const std::u16string& new_text) {
+   if (!AllowKeywordSpaceTriggering()) {
      return false;
    }
  
@@ -856,3 +936,13 @@
           AcceptKeyword(OmniboxEventProto::SPACE_AT_END);
  }
  
+--- a/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
+@@ -1925,6 +1925,7 @@ bool OmniboxViewViews::HandleKeyEvent(vi
+                                     metric_value);
+       if (model()->PopupIsOpen() && !control) {
+         // Normal case of pressing <return> when the popup is open.
++        model()->MaybeAcceptTrailingBang();
+         model()->OpenSelection(model()->GetPopupSelection(), event.time_stamp(),
+                                disposition,
+                                /*via_keyboard=*/true);
