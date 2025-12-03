@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Copyright 2025 The Helium Authors
-# You can use, redistribute, and/or modify this source code under
-# the terms of the GPL-3.0 license that can be found in the LICENSE file.
-
 # Copyright (c) 2019 The ungoogled-chromium Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE.ungoogled_chromium file.
@@ -67,19 +63,19 @@ def _dir_empty(path):
     return False
 
 
-def _rename_files_with_dirs(root_dir, sorted_file_iter):
+def _rename_files_with_dirs(root_dir, source_dir, sorted_file_iter):
     '''
-    Moves a list of sorted files back to the upstream repo, removing empty directories along the way
+    Moves a list of sorted files back to their original location,
+    removing empty directories along the way
     '''
     past_parent = None
-    upstream_path = Path(os.path.dirname(os.path.realpath(__file__))) / '../patches'
     for partial_path in sorted_file_iter:
         complete_path = Path(root_dir, partial_path)
-        complete_upstream_path = Path(upstream_path, partial_path)
+        complete_source_path = Path(source_dir, partial_path)
         try:
-            complete_path.rename(complete_upstream_path)
+            complete_path.rename(complete_source_path)
         except FileNotFoundError:
-            get_logger().warning('Could not remove prepended patch: %s', complete_path)
+            get_logger().warning('Could not move prepended patch: %s', complete_path)
         if past_parent != complete_path.parent:
             while past_parent and _dir_empty(past_parent):
                 past_parent.rmdir()
@@ -91,7 +87,7 @@ def _rename_files_with_dirs(root_dir, sorted_file_iter):
         complete_path = complete_path.parent
 
 
-def unmerge_platform_patches(platform_patches_dir):
+def unmerge_platform_patches(platform_patches_dir, prepend_patches_dir):
     '''
     Undo merge_platform_patches(), adding any new patches from series.merged as necessary
 
@@ -105,8 +101,8 @@ def unmerge_platform_patches(platform_patches_dir):
         filter(len,
                (platform_patches_dir / _SERIES_PREPEND).read_text(encoding=ENCODING).splitlines()))
 
-    # Move prepended files to original location, preserving changes, and clean up
-    _rename_files_with_dirs(platform_patches_dir, sorted(prepend_series))
+    # Move prepended files back to original location, preserving changes
+    _rename_files_with_dirs(platform_patches_dir, prepend_patches_dir, sorted(prepend_series))
 
     # Determine positions of blank spaces in series.orig
     if not (platform_patches_dir / _SERIES_ORIG).exists():
@@ -175,10 +171,11 @@ def main():
     repo_dir = Path(__file__).resolve().parent.parent
 
     success = False
+    prepend_patches_dir = repo_dir / 'patches'
     if args.command == 'merge':
-        success = merge_platform_patches(args.platform_patches, repo_dir / 'patches')
+        success = merge_platform_patches(args.platform_patches, prepend_patches_dir)
     elif args.command == 'unmerge':
-        success = unmerge_platform_patches(args.platform_patches)
+        success = unmerge_platform_patches(args.platform_patches, prepend_patches_dir)
     else:
         raise NotImplementedError(args.command)
 
