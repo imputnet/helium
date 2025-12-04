@@ -1,0 +1,474 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -4358,6 +4358,8 @@ static_library("ui") {
+       "views/tabs/tab.h",
+       "views/tabs/tab_close_button.cc",
+       "views/tabs/tab_close_button.h",
++      "views/tabs/tab_unpin_button.cc",
++      "views/tabs/tab_unpin_button.h",
+       "views/tabs/tab_container.cc",
+       "views/tabs/tab_container.h",
+       "views/tabs/tab_container_controller.h",
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
+@@ -35,6 +35,7 @@
+ #include "chrome/browser/ui/tabs/alert/tab_alert.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/collaboration_messaging_tab_data.h"
++#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
+@@ -47,6 +48,7 @@
+ #include "chrome/browser/ui/views/tabs/browser_tab_strip_controller.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/tab_close_button.h"
++#include "chrome/browser/ui/views/tabs/tab_unpin_button.h"
+ #include "chrome/browser/ui/views/tabs/tab_hover_card_bubble_view.h"
+ #include "chrome/browser/ui/views/tabs/tab_icon.h"
+ #include "chrome/browser/ui/views/tabs/tab_slot_controller.h"
+@@ -282,6 +284,14 @@ Tab::Tab(TabSlotController* controller)
+                           base::Unretained(controller_))));
+   close_button_->SetHasInkDropActionOnClick(true);
+ 
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    unpin_button_ = AddChildView(std::make_unique<TabUnpinButton>(
++        base::BindRepeating(&Tab::UnpinButtonPressed, base::Unretained(this)),
++        base::BindRepeating(&TabSlotController::OnMouseEventInTab,
++                          base::Unretained(controller_))));
++    unpin_button_->SetHasInkDropActionOnClick(true);
++  }
++
+ #if BUILDFLAG(IS_CHROMEOS)
+   showing_close_button_ = !controller_->IsLockedForOnTask();
+   close_button_->SetVisible(showing_close_button_);
+@@ -396,7 +406,28 @@ void Tab::Layout(PassKey) {
+   const int after_title_padding = GetLayoutConstant(TAB_AFTER_TITLE_PADDING);
+ 
+   int close_x = contents_rect.right();
+-  if (showing_close_button_) {
++  if (showing_unpin_button_) {
++    const int unpin_button_visible_size =
++        GetLayoutConstant(TAB_CLOSE_BUTTON_SIZE);
++    const gfx::Size unpin_button_actual_size =
++        unpin_button_->GetPreferredSize();
++
++    const int top =
++        contents_rect.y() +
++        Center(contents_rect.height(), unpin_button_actual_size.height());
++
++    const int visible_left =
++        std::max(close_x - unpin_button_visible_size,
++                 Center(width(), unpin_button_visible_size));
++
++    const int non_visible_left_padding =
++        (unpin_button_actual_size.width() - unpin_button_visible_size) / 2;
++
++    unpin_button_->SetBoundsRect(
++        {gfx::Point(visible_left - non_visible_left_padding, top),
++         unpin_button_actual_size});
++    close_x = visible_left - after_title_padding;
++  } else if (!showing_unpin_button_ && showing_close_button_) {
+     // The visible size is the button's hover shape size. The actual size
+     // includes the border insets for the button.
+     const int close_button_visible_size =
+@@ -426,11 +457,14 @@ void Tab::Layout(PassKey) {
+          close_button_actual_size});
+     close_x = visible_left - after_title_padding;
+   }
+-  close_button_->SetVisible(showing_close_button_);
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    unpin_button_->SetVisible(showing_unpin_button_);
++  }
++  close_button_->SetVisible(!showing_unpin_button_ && showing_close_button_);
+ 
+   if (showing_alert_indicator_) {
+     int right = contents_rect.right();
+-    if (showing_close_button_) {
++    if (showing_unpin_button_ || showing_close_button_) {
+       right = close_x;
+       if (extra_alert_indicator_padding_) {
+         right -= ui::TouchUiController::Get()->touch_ui()
+@@ -471,7 +505,7 @@ void Tab::Layout(PassKey) {
+     int title_right = contents_rect.right();
+     if (showing_alert_indicator_) {
+       title_right = alert_indicator_button_->x() - after_title_padding;
+-    } else if (showing_close_button_) {
++    } else if (showing_unpin_button_ || showing_close_button_) {
+       // Allow the title to overlay the close button's empty border padding.
+       title_right = close_x - after_title_padding;
+     }
+@@ -1004,8 +1038,9 @@ void Tab::SetData(TabRendererData data)
+   }
+   if (old.pinned != data_.pinned) {
+     showing_alert_indicator_ = false;
++    showing_unpin_button_ = tabs::AreHeliumVerticalTabsEnabled() && data_.pinned;
+   }
+-  if (!data_.pinned && old.pinned) {
++  if (!data_.pinned && old.pinned && !tabs::AreHeliumVerticalTabsEnabled()) {
+     is_animating_from_pinned_ = true;
+     // We must set this to true early, because we don't want to set
+     // `is_animating_from_pinned_` to false if we lay out before the animation
+@@ -1236,6 +1271,10 @@ void Tab::UpdateIconVisibility() {
+ }
+ 
+ bool Tab::ShouldRenderAsNormalTab() const {
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    return true;
++  }
++
+   return !data().pinned || (width() >= (GetTabSizeInfo().pinned_tab_width +
+                                         kPinnedTabExtraWidthToRenderAsNormal));
+ }
+@@ -1268,6 +1307,9 @@ void Tab::UpdateForegroundColors() {
+   TabStyle::TabColors colors = tab_style_views()->CalculateTargetColors();
+   title_->SetEnabledColor(colors.foreground_color);
+   close_button_->SetColors(colors);
++  if (tabs::AreHeliumVerticalTabsEnabled()) {
++    unpin_button_->SetColors(colors);
++  }
+   alert_indicator_button_->OnParentTabButtonColorChanged();
+   // There may be no focus ring when the tab is closing.
+   if (auto* focus_ring = views::FocusRing::Get(this); focus_ring) {
+@@ -1301,5 +1343,9 @@ void Tab::CloseButtonPressed(const ui::E
+                                          : CloseTabSource::kFromTouch);
+ }
+ 
++void Tab::UnpinButtonPressed(const ui::Event& event) {
++  controller_->ToggleTabPin(this);
++}
++
+ BEGIN_METADATA(Tab)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/tab.h
++++ b/chrome/browser/ui/views/tabs/tab.h
+@@ -31,6 +31,7 @@
+ 
+ class AlertIndicatorButton;
+ class TabCloseButton;
++class TabUnpinButton;
+ class TabSlotController;
+ class TabIcon;
+ struct TabSizeInfo;
+@@ -268,6 +269,8 @@ class Tab : public gfx::AnimationDelegat
+ 
+   void CloseButtonPressed(const ui::Event& event);
+ 
++  void UnpinButtonPressed(const ui::Event& event);
++
+   // The controller, never nullptr.
+   const raw_ptr<TabSlotController> controller_;
+ 
+@@ -285,6 +288,7 @@ class Tab : public gfx::AnimationDelegat
+   raw_ptr<TabIcon> icon_ = nullptr;
+   raw_ptr<AlertIndicatorButton> alert_indicator_button_ = nullptr;
+   raw_ptr<TabCloseButton> close_button_ = nullptr;
++  raw_ptr<TabUnpinButton> unpin_button_ = nullptr;
+ 
+   raw_ptr<views::Label> title_;
+   // The title's bounds are animated when switching between showing and hiding
+@@ -310,6 +314,10 @@ class Tab : public gfx::AnimationDelegat
+   // detect when it changes and layout appropriately.
+   bool showing_close_button_ = false;
+ 
++  // Whether we are showing the close button. It is cached so that we can
++  // detect when it changes and layout appropriately.
++  bool showing_unpin_button_ = false;
++
+   // Whether the tab is currently animating from a pinned to an unpinned state.
+   bool is_animating_from_pinned_ = false;
+ 
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/tab_unpin_button.cc
+@@ -0,0 +1,220 @@
++// Copyright 2025 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/tab_unpin_button.h"
++
++#include <map>
++#include <memory>
++#include <vector>
++
++#include "base/hash/hash.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/views/tabs/tab.h"
++#include "chrome/browser/ui/views/tabs/tab_slot_controller.h"
++#include "components/strings/grit/components_strings.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/pointer/touch_ui_controller.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/skia_conversions.h"
++#include "ui/gfx/image/image_skia_operations.h"
++#include "ui/gfx/paint_vector_icon.h"
++#include "ui/gfx/vector_icon_types.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/animation/ink_drop.h"
++#include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/layout/layout_provider.h"
++#include "ui/views/rect_based_targeting_utils.h"
++#include "ui/views/view_class_properties.h"
++
++#if defined(USE_AURA)
++#include "ui/aura/env.h"
++#endif
++
++namespace {
++constexpr int kIconSize = 16;
++constexpr gfx::Size kButtonSize = {28, 28};
++const gfx::Insets kInkDropInsets = gfx::Insets::VH(1, 0);
++constexpr int kCornerRadius = 4;
++}  // namespace
++
++TabUnpinButton::TabUnpinButton(PressedCallback pressed_callback,
++                               MouseEventCallback mouse_event_callback)
++    : views::LabelButton(std::move(pressed_callback)),
++      mouse_event_callback_(std::move(mouse_event_callback)) {
++  SetEventTargeter(std::make_unique<views::ViewTargeter>(this));
++  GetViewAccessibility().SetName(l10n_util::GetStringUTF16(IDS_ACCNAME_CLOSE));
++  SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++
++  views::InkDrop::Get(this)->SetMode(views::InkDropHost::InkDropMode::ON);
++  views::InkDrop::Get(this)->SetHighlightOpacity(0.16f);
++  views::InkDrop::Get(this)->SetVisibleOpacity(0.14f);
++
++  SetImageCentered(true);
++
++  // Disable animation so that the hover indicator shows up immediately to help
++  // avoid mis-clicks.
++  SetAnimationDuration(base::TimeDelta());
++  views::InkDrop::Get(this)->GetInkDrop()->SetHoverHighlightFadeDuration(
++      base::TimeDelta());
++
++  image_container_view()->DestroyLayer();
++
++  // The ink drop highlight path is the same as the focus ring highlight path,
++  // but needs to be explicitly mirrored for RTL.
++  // TODO(http://crbug.com/1056490): Make ink drops in RTL work the same way as
++  // focus rings.
++
++  auto ink_drop_highlight_path =
++      std::make_unique<views::RoundRectHighlightPathGenerator>(kInkDropInsets, kCornerRadius);
++  ink_drop_highlight_path->set_use_contents_bounds(true);
++  ink_drop_highlight_path->set_use_mirrored_rect(true);
++  views::HighlightPathGenerator::Install(this,
++                                         std::move(ink_drop_highlight_path));
++
++  SetInstallFocusRingOnFocus(true);
++  // TODO(http://crbug.com/1056490): Once this bug is solved and explicit
++  // mirroring for ink drops is not needed, we can combine these two.
++  auto ring_highlight_path =
++      std::make_unique<views::RoundRectHighlightPathGenerator>(kInkDropInsets, kCornerRadius);
++  ring_highlight_path->set_use_contents_bounds(true);
++  views::FocusRing::Get(this)->SetPathGenerator(std::move(ring_highlight_path));
++
++  UpdateIcon();
++}
++
++TabUnpinButton::~TabUnpinButton() = default;
++
++TabStyle::TabColors TabUnpinButton::GetColors() const {
++  return colors_;
++}
++
++void TabUnpinButton::SetColors(TabStyle::TabColors colors) {
++  if (colors == colors_) {
++    return;
++  }
++  colors_ = std::move(colors);
++  views::InkDrop::Get(this)->SetBaseColor(
++      color_utils::GetColorWithMaxContrast(colors_.background_color));
++  views::FocusRing::Get(this)->SetColorId(
++      colors_.close_button_focus_ring_color);
++
++  UpdateIcon();
++
++  OnPropertyChanged(&colors_, views::kPropertyEffectsPaint);
++}
++
++views::View* TabUnpinButton::GetTooltipHandlerForPoint(
++    const gfx::Point& point) {
++  // Tab close button has no children, so tooltip handler should be the same
++  // as the event handler. In addition, a hit test has to be performed for the
++  // point (as GetTooltipHandlerForPoint() is responsible for it).
++  if (!HitTestPoint(point)) {
++    return nullptr;
++  }
++  return GetEventHandlerForPoint(point);
++}
++
++bool TabUnpinButton::OnMousePressed(const ui::MouseEvent& event) {
++  mouse_event_callback_.Run(this, event);
++
++  bool handled = LabelButton::OnMousePressed(event);
++  // Explicitly mark midle-mouse clicks as non-handled to ensure the tab
++  // sees them.
++  return !event.IsMiddleMouseButton() && handled;
++}
++
++void TabUnpinButton::OnMouseReleased(const ui::MouseEvent& event) {
++  mouse_event_callback_.Run(this, event);
++  Button::OnMouseReleased(event);
++}
++
++void TabUnpinButton::OnMouseMoved(const ui::MouseEvent& event) {
++  mouse_event_callback_.Run(this, event);
++  Button::OnMouseMoved(event);
++}
++
++void TabUnpinButton::OnGestureEvent(ui::GestureEvent* event) {
++  // Consume all gesture events here so that the parent (Tab) does not
++  // start consuming gestures.
++  LabelButton::OnGestureEvent(event);
++  event->SetHandled();
++}
++
++void TabUnpinButton::AddLayerToRegion(ui::Layer* new_layer,
++                                      views::LayerRegion region) {
++  image_container_view()->SetPaintToLayer();
++  image_container_view()->layer()->SetFillsBoundsOpaquely(false);
++  ink_drop_container()->SetVisible(true);
++  ink_drop_container()->AddLayerToRegion(new_layer, region);
++}
++
++void TabUnpinButton::RemoveLayerFromRegions(ui::Layer* old_layer) {
++  ink_drop_container()->RemoveLayerFromRegions(old_layer);
++  ink_drop_container()->SetVisible(false);
++  image_container_view()->DestroyLayer();
++}
++
++gfx::Size TabUnpinButton::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  return kButtonSize;
++}
++
++views::View* TabUnpinButton::TargetForRect(views::View* root,
++                                           const gfx::Rect& rect) {
++  CHECK_EQ(root, this);
++
++  if (!views::UsePointBasedTargeting(rect)) {
++    return ViewTargeterDelegate::TargetForRect(root, rect);
++  }
++
++  // Ignore the padding set on the button.
++  gfx::Rect contents_bounds = GetMirroredRect(GetContentsBounds());
++
++#if defined(USE_AURA)
++  // Include the padding in hit-test for touch events.
++  // TODO(pkasting): It seems like touch events would generate rects rather
++  // than points and thus use the TargetForRect() call above.  If this is
++  // reached, it may be from someone calling GetEventHandlerForPoint() while a
++  // touch happens to be occurring.  In such a case, maybe we don't want this
++  // code to run?  It's possible this block should be removed, or maybe this
++  // whole function deleted.  Note that in these cases, we should probably
++  // also remove the padding on the close button bounds (see Tab::Layout()), as
++  // it will be pointless.
++  if (aura::Env::GetInstance()->is_touch_down()) {
++    contents_bounds = GetLocalBounds();
++  }
++#endif
++
++  return contents_bounds.Intersects(rect) ? this : parent();
++}
++
++bool TabUnpinButton::GetHitTestMask(SkPath* mask) const {
++  // We need to define this so hit-testing won't include the border region.
++  mask->addRect(gfx::RectToSkRect(GetMirroredRect(GetContentsBounds())));
++  return true;
++}
++void TabUnpinButton::UpdateIcon() {
++  const auto& icon = kKeepIcon;
++
++  SetImageModel(views::Button::STATE_NORMAL,
++                ui::ImageModel::FromVectorIcon(icon, colors_.foreground_color,
++                                               kIconSize));
++  SetImageModel(views::Button::STATE_HOVERED,
++                ui::ImageModel::FromVectorIcon(icon, colors_.foreground_color,
++                                               kIconSize));
++  SetImageModel(views::Button::STATE_PRESSED,
++                ui::ImageModel::FromVectorIcon(icon, colors_.foreground_color,
++                                               kIconSize));
++}
++
++BEGIN_METADATA(TabUnpinButton)
++ADD_PROPERTY_METADATA(TabStyle::TabColors, Colors)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/tab_unpin_button.h
+@@ -0,0 +1,68 @@
++// Copyright 2025 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_TAB_UNPIN_BUTTON_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_TAB_UNPIN_BUTTON_H_
++
++#include "base/functional/callback_forward.h"
++#include "chrome/browser/ui/views/tabs/tab_style_views.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/controls/button/label_button.h"
++#include "ui/views/masked_targeter_delegate.h"
++
++// This is a Button subclass that shows the tab unpin button.
++class TabUnpinButton : public views::LabelButton,
++                       public views::MaskedTargeterDelegate {
++  METADATA_HEADER(TabUnpinButton, views::LabelButton)
++
++ public:
++  using MouseEventCallback =
++      base::RepeatingCallback<void(views::View*, const ui::MouseEvent&)>;
++
++  // The mouse_event callback will be called for every mouse event to allow
++  // middle clicks to be handled by the parent.
++  //
++  // See note on SetTabColor.
++  TabUnpinButton(PressedCallback pressed_callback,
++                 MouseEventCallback mouse_event_callback);
++  TabUnpinButton(const TabUnpinButton&) = delete;
++  TabUnpinButton& operator=(const TabUnpinButton&) = delete;
++  ~TabUnpinButton() override;
++
++  TabStyle::TabColors GetColors() const;
++  // This function must be called before the tab is painted so it knows what
++  // colors to use. It must also be called when the background color of the tab
++  // changes (this class does not track tab activation state), and when the
++  // theme changes.
++  void SetColors(TabStyle::TabColors colors);
++
++  // views::LabelButton:
++  View* GetTooltipHandlerForPoint(const gfx::Point& point) override;
++  bool OnMousePressed(const ui::MouseEvent& event) override;
++  void OnMouseReleased(const ui::MouseEvent& event) override;
++  void OnMouseMoved(const ui::MouseEvent& event) override;
++  void OnGestureEvent(ui::GestureEvent* event) override;
++  void AddLayerToRegion(ui::Layer* new_layer,
++                        views::LayerRegion region) override;
++  void RemoveLayerFromRegions(ui::Layer* old_layer) override;
++
++ protected:
++  // Set/reset the image models for the icon with new colors.
++  void UpdateIcon();
++
++  // views::LabelButton:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++
++ private:
++  // views::MaskedTargeterDelegate:
++  views::View* TargetForRect(views::View* root, const gfx::Rect& rect) override;
++  bool GetHitTestMask(SkPath* mask) const override;
++
++  MouseEventCallback mouse_event_callback_;
++
++  TabStyle::TabColors colors_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_TAB_UNPIN_BUTTON_H_

@@ -1,0 +1,165 @@
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -21,6 +21,7 @@
+ 
+ int GetLayoutConstant(LayoutConstant constant) {
+   const bool touch_ui = ui::TouchUiController::Get()->touch_ui();
++  const bool vertical_tabs = tabs::AreHeliumVerticalTabsEnabled();
+   switch (constant) {
+     case TOP_BAR_VERTICAL_PADDING:
+       return 3;
+@@ -94,13 +95,21 @@ int GetLayoutConstant(LayoutConstant con
+       return touch_ui ? 12 : 16;
+     case TAB_CLOSE_BUTTON_SIZE:
+       return touch_ui ? 24 : 16;
+-    case TAB_HEIGHT:
+-      return 31;
+-    case TAB_STRIP_HEIGHT:
+-      return GetLayoutConstant(TAB_HEIGHT) +
+-             GetLayoutConstant(TAB_STRIP_PADDING);
++    case TAB_HEIGHT: {
++      const int base_height = 28;
++      return !vertical_tabs ?
++            base_height + GetLayoutConstant(TOP_BAR_VERTICAL_PADDING) :
++            base_height;
++    }
++    case TAB_STRIP_HEIGHT: {
++      int padding = GetLayoutConstant(TOP_BAR_VERTICAL_PADDING);
++      if (vertical_tabs) {
++        padding = padding * 2;
++      }
++      return GetLayoutConstant(TAB_HEIGHT) + padding;
++    }
+     case TAB_STRIP_PADDING:
+-      return GetLayoutConstant(TOP_BAR_VERTICAL_PADDING);
++      return vertical_tabs ? 0 : GetLayoutConstant(TOP_BAR_VERTICAL_PADDING);
+     case TAB_SEPARATOR_HEIGHT:
+       return touch_ui ? 24 : 20;
+     case TAB_PRE_TITLE_PADDING:
+@@ -186,6 +195,11 @@ gfx::Insets GetLayoutInsets(LayoutInset
+     case TOOLBAR_INTERIOR_MARGIN: {
+       const int vert = GetLayoutConstant(TOP_BAR_VERTICAL_PADDING);
+       const int horiz = vert * 2;
++
++      if (tabs::AreHeliumVerticalTabsEnabled()) {
++        return gfx::Insets::VH(vert, horiz + vert);
++      }
++
+       return touch_ui ? gfx::Insets() :
+           gfx::Insets::TLBR(0, horiz, vert, horiz);
+     }
+--- a/chrome/browser/ui/views/frame/browser_root_view.cc
++++ b/chrome/browser/ui/views/frame/browser_root_view.cc
+@@ -344,7 +344,7 @@ bool BrowserRootView::OnMouseWheel(const
+   // Scroll-event-changes-tab is incompatible with scrolling tabstrip, so
+   // disable it if the latter feature is enabled.
+   if (scroll_event_changes_tab_ &&
+-      !base::FeatureList::IsEnabled(tabs::kScrollableTabStrip)) {
++      !base::FeatureList::IsEnabled(tabs::kScrollableTabStrip) && !tabs::AreHeliumVerticalTabsEnabled()) {
+     // Switch to the left/right tab if the wheel-scroll happens over the
+     // tabstrip, or the empty space beside the tabstrip.
+     views::View* hit_view = GetEventHandlerForPoint(event.location());
+--- a/chrome/browser/ui/views/frame/browser_view_layout.cc
++++ b/chrome/browser/ui/views/frame/browser_view_layout.cc
+@@ -548,10 +548,22 @@ void BrowserViewLayout::LayoutTabStripRe
+   if (web_app_frame_toolbar_) {
+     tab_strip_region_bounds.Inset(gfx::Insets::TLBR(
+         0, 0, 0, web_app_frame_toolbar_->GetPreferredSize().width()));
++  } else if (tabs::AreHeliumVerticalTabsEnabled()) {
++    int top_offset = tab_strip_region_bounds.height();
++    tab_strip_region_bounds = gfx::Rect(0, top_offset,
++        BrowserView::kVerticalTabStripWidth,
++        available_bounds.height() - top_offset);
+   }
+ 
+   if (tabs::IsVerticalTabsFeatureEnabled() && ShouldDisplayVerticalTabs()) {
+     SetViewVisibility(tab_strip_region_view_, false);
++  } else if (tabs::AreHeliumVerticalTabsEnabled()) {
++    SetViewVisibility(tab_strip_region_view_, true);
++    available_bounds.set_x(available_bounds.x() +
++                         BrowserView::kVerticalTabStripWidth);
++    tab_strip_region_view_->SetBoundsRect(tab_strip_region_bounds);
++    top_container_->ReorderChildView(tab_strip_region_view_,
++                                     top_container_->children().size());
+   } else {
+     SetViewVisibility(tab_strip_region_view_, true);
+     tab_strip_region_view_->SetBoundsRect(tab_strip_region_bounds);
+@@ -580,13 +592,13 @@ void BrowserViewLayout::LayoutToolbar(gf
+   bool toolbar_visible = delegate_->IsToolbarVisible();
+   SetViewVisibility(toolbar_, toolbar_visible);
+ 
+-  if (tabs::IsVerticalTabsFeatureEnabled() && ShouldDisplayVerticalTabs()) {
+-    gfx::Rect toolbar_bounds(
++  if ((tabs::IsVerticalTabsFeatureEnabled() && ShouldDisplayVerticalTabs())
++      || tabs::AreHeliumVerticalTabsEnabled()) {
++    gfx::Rect tab_strip_region_bounds(
+         delegate_->GetBoundsForToolbarInVerticalTabBrowserView());
+-    toolbar_bounds.set_x(available_bounds.x());
+-    toolbar_bounds.set_width(toolbar_bounds.width() -
+-                             BrowserView::kVerticalTabStripWidth);
+-    toolbar_->SetBoundsRect(toolbar_bounds);
++    int height = toolbar_visible ? tab_strip_region_bounds.height() : 0;
++    toolbar_->SetBounds(tab_strip_region_bounds.x(), available_bounds.y(),
++                        tab_strip_region_bounds.width(), height);
+   } else {
+     int height = toolbar_visible ? toolbar_->GetPreferredSize().height() : 0;
+     int width = available_bounds.width();
+@@ -727,7 +739,7 @@ BrowserViewLayout::CalculateContentsCont
+     const gfx::Rect& available_bounds) const {
+   gfx::Rect contents_container_bounds = available_bounds;
+   int vertical_tab_offset = 0;
+-  if (tabs::IsVerticalTabsFeatureEnabled() && ShouldDisplayVerticalTabs()) {
++  if (delegate_->ShouldDrawTabStrip() && ((tabs::IsVerticalTabsFeatureEnabled() && ShouldDisplayVerticalTabs()) || tabs::AreHeliumVerticalTabsEnabled())) {
+     vertical_tab_offset = BrowserView::kVerticalTabStripWidth;
+     contents_container_bounds.set_width(available_bounds.width() -
+                                         vertical_tab_offset);
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -138,7 +138,7 @@ class BrowserView : public BrowserWindow
+ 
+  public:
+   // The width of the vertical tab strip.
+-  static constexpr int kVerticalTabStripWidth = 240;
++  static constexpr int kVerticalTabStripWidth = 210;
+ 
+   explicit BrowserView(Browser* browser);
+   BrowserView(const BrowserView&) = delete;
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -4868,6 +4868,15 @@ int BrowserView::NonClientHitTest(const
+     }
+   }
+ 
++  // In vertical tabs mode, check if the point is within the toolbar and
++  // allow the toolbar to handle the event instead of the system frame.
++  if (tabs::AreHeliumVerticalTabsEnabled() && toolbar_) {
++    gfx::Point test_point(point);
++    if (ConvertedHitTest(parent(), toolbar_, &test_point)) {
++      return HTCLIENT;
++    }
++  }
++
+   // Let the frame handle any events that fall within the bounds of the window
+   // controls overlay.
+   if (IsWindowControlsOverlayEnabled() && GetActiveWebContents()) {
+--- a/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
+@@ -19,7 +19,9 @@
+ #import "chrome/browser/ui/cocoa/browser_window_command_handler.h"
+ #import "chrome/browser/ui/cocoa/chrome_command_dispatcher_delegate.h"
+ #import "chrome/browser/ui/cocoa/touchbar/browser_window_touch_bar_controller.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
++#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/browser_widget.h"
+@@ -156,7 +158,7 @@ void BrowserNativeWidgetMac::GetWindowFr
+       browser_view_->browser_widget()->GetFrameView()) {
+     *override_titlebar_height = true;
+     *titlebar_height =
+-        browser_view_->GetTabStripHeight() +
++        (tabs::AreHeliumVerticalTabsEnabled() ? GetLayoutConstant(TAB_STRIP_HEIGHT) : browser_view_->GetTabStripHeight()) +
+         browser_view_->browser_widget()->GetFrameView()->GetTopInset(true);
+     if (!browser_view_->ShouldDrawTabStrip()) {
+       *titlebar_height +=
