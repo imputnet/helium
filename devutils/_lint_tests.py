@@ -101,11 +101,11 @@ def c_all_new_headers_have_correct_guard():
             for _line in file[0]:
                 line = str(_line)
 
-                if '#ifndef' in line:
+                if expected["ifndef"] in line:
                     assert found["define"] is None
                     assert found["ifndef"] is None
                     found["ifndef"] = line
-                elif '#define' in line:
+                elif expected["define"] in line:
                     assert found["ifndef"] is not None
                     assert found["define"] is None
                     found["define"] = line
