@@ -1,0 +1,305 @@
+//
+// Helium re-implementation note:
+//
+// All files in this patch are originally from Chromium, but were removed
+// upstream at some point in time. The Chromium Authors still hold the
+// copyright for them.
+//
+// [crrev.com/1538814]
+// canvas_noise_token_data.cc & canvas_noise_token_data.h were restored
+// as-is with an exception for a feature CHECK().
+//
+// [crrev.com/1538396]
+// canvas_interventions_helper.cc & canvas_interventions_helper.h were
+// heavily stripped down to fit our needs better.
+//
+// These files may break the build and may not function without the rest
+// of related patches. The goal of the patch separation is to draw a
+// clear line between Chromium and Helium copyright and licensing.
+//
+
+//
+// Chromium License:
+//
+// Copyright 2015 The Chromium Authors
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//    * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+//    * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+//    * Neither the name of Google LLC nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+
+--- /dev/null
++++ b/content/browser/fingerprinting_protection/canvas_noise_token_data.cc
+@@ -0,0 +1,82 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/fingerprinting_protection/canvas_noise_token_data.h"
++
++#include <cstdint>
++#include <memory>
++#include <string_view>
++
++#include "base/containers/span.h"
++#include "base/hash/hash.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/supports_user_data.h"
++#include "base/types/pass_key.h"
++#include "base/unguessable_token.h"
++#include "content/public/browser/browser_context.h"
++#include "crypto/hash.h"
++#include "net/base/network_anonymization_key.h"
++#include "net/base/schemeful_site.h"
++#include "third_party/blink/public/common/features.h"
++#include "url/origin.h"
++#include "url/scheme_host_port.h"
++
++namespace content {
++
++namespace {
++const void* const kBrowserContextCanvasNoiseTokenKey =
++    &kBrowserContextCanvasNoiseTokenKey;
++
++// FNV constants
++// https://datatracker.ietf.org/doc/html/draft-eastlake-fnv#name-fnv-constants
++constexpr uint64_t kFnvPrime = 0x00000100000001b3;
++constexpr uint64_t kFnvOffset = 0xcbf29ce484222325;
++
++blink::NoiseToken DeriveInitialNoiseHash(blink::NoiseToken token,
++                                         std::string_view domain) {
++  uint64_t token_hash = kFnvOffset;
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  hasher.Update(base::U64ToLittleEndian(token.Value()));
++  hasher.Update(base::as_byte_span(domain));
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  token_hash ^= base::U64FromLittleEndian(base::span(digest).first<8>());
++  token_hash *= kFnvPrime;
++  return blink::NoiseToken(token_hash);
++}
++}  // namespace
++
++// static
++blink::NoiseToken CanvasNoiseTokenData::GetBrowserToken(
++    BrowserContext* context) {
++  CanvasNoiseTokenData* data = static_cast<CanvasNoiseTokenData*>(
++      context->GetUserData(&kBrowserContextCanvasNoiseTokenKey));
++  if (data != nullptr) {
++    return data->session_token_;
++  }
++  return CanvasNoiseTokenData::SetNewToken(context);
++}
++
++// static
++blink::NoiseToken CanvasNoiseTokenData::GetToken(BrowserContext* context,
++                                                 const url::Origin& origin) {
++  if (!origin.opaque()) {
++    return DeriveInitialNoiseHash(GetBrowserToken(context), origin.Serialize());
++  }
++  return DeriveInitialNoiseHash(GetBrowserToken(context),
++                                base::UnguessableToken::Create().ToString());
++}
++
++// static
++blink::NoiseToken CanvasNoiseTokenData::SetNewToken(BrowserContext* context) {
++  auto new_data = std::make_unique<CanvasNoiseTokenData>();
++  blink::NoiseToken token = new_data->session_token_;
++  context->SetUserData(&kBrowserContextCanvasNoiseTokenKey,
++                       std::move(new_data));
++  return token;
++}
++
++}  // namespace content
+--- /dev/null
++++ b/content/browser/fingerprinting_protection/canvas_noise_token_data.h
+@@ -0,0 +1,43 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_FINGERPRINTING_PROTECTION_CANVAS_NOISE_TOKEN_DATA_H_
++#define CONTENT_BROWSER_FINGERPRINTING_PROTECTION_CANVAS_NOISE_TOKEN_DATA_H_
++
++#include <cstdint>
++
++#include "base/rand_util.h"
++#include "content/public/browser/browser_context.h"
++#include "third_party/blink/public/common/fingerprinting_protection/noise_token.h"
++#include "url/origin.h"
++
++namespace content {
++
++// A user data class that generates and stores BrowserContext-associated noise
++// tokens used for canvas noising.
++class CONTENT_EXPORT CanvasNoiseTokenData
++    : public base::SupportsUserData::Data {
++ public:
++  CanvasNoiseTokenData() = default;
++
++  // Gets the 64 bit BrowserContext-associated noise token computed with the
++  // main frame's |origin|. If the origin is opaque, a random value will be
++  // used.
++  static blink::NoiseToken GetToken(BrowserContext* context,
++                                    const url::Origin& origin);
++
++  // Regenerates the noise token, returning the updated token value.
++  static blink::NoiseToken SetNewToken(BrowserContext* context);
++
++ private:
++  // Helper to generate the 64 bit BrowserContext-associated token, which will
++  // be different per BrowserContext.
++  static blink::NoiseToken GetBrowserToken(BrowserContext* context);
++
++  blink::NoiseToken session_token_{base::RandUint64()};
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_FINGERPRINTING_PROTECTION_CANVAS_NOISE_TOKEN_DATA_H_
+--- /dev/null
++++ b/third_party/blink/renderer/core/canvas_interventions/canvas_interventions_helper.cc
+@@ -0,0 +1,89 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/core/canvas_interventions/canvas_interventions_helper.h"
++
++#include "base/containers/span.h"
++#include "base/memory/scoped_refptr.h"
++#include "third_party/blink/renderer/core/canvas_interventions/noise_hash.h"
++#include "third_party/blink/renderer/core/canvas_interventions/noise_helper.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_high_entropy_op_type.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
++#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
++#include "ui/gfx/skia_span_util.h"
++
++namespace blink {
++
++namespace {
++
++// Returns true when all criteria to apply noising are met.
++bool ShouldApplyNoise(HighEntropyCanvasOpType canvas_operations,
++                      ExecutionContext* execution_context) {
++  // Check if there was a triggering operation
++  if (canvas_operations == HighEntropyCanvasOpType::kNone) {
++    return false;
++  }
++
++  // Check if execution context exists and has a noise token
++  if (!execution_context || !execution_context->CanvasNoiseToken().has_value()) {
++    return false;
++  }
++
++  return true;
++}
++
++}  // namespace
++
++// static
++bool CanvasInterventionsHelper::MaybeNoiseSnapshot(
++    ExecutionContext* execution_context,
++    scoped_refptr<StaticBitmapImage>& snapshot) {
++  CHECK(snapshot);
++
++  HighEntropyCanvasOpType high_entropy_canvas_op_types =
++      snapshot->HighEntropyCanvasOpTypes();
++  if (!ShouldApplyNoise(high_entropy_canvas_op_types, execution_context)) {
++    return false;
++  }
++
++  // Use kUnpremul_SkAlphaType as alpha type as we are changing the pixel values
++  // of all channels, including the alpha channel.
++  auto info = SkImageInfo::Make(
++      snapshot->GetSize().width(), snapshot->GetSize().height(),
++      viz::ToClosestSkColorType(snapshot->GetSharedImageFormat()),
++      kUnpremul_SkAlphaType, snapshot->GetColorSpace().ToSkColorSpace());
++  SkBitmap bm;
++  if (!bm.tryAllocPixels(info)) {
++    return false;
++  }
++
++  // Copy the original pixels from snapshot to the modifiable SkPixmap. SkBitmap
++  // should already allocate the correct amount of pixels, so this shouldn't
++  // fail because of memory allocation.
++  auto pixmap_to_noise = bm.pixmap();
++  PaintImage paint_image = snapshot->PaintImageForCurrentFrame();
++  if (!paint_image.readPixels(bm.info(), pixmap_to_noise.writable_addr(),
++                              bm.rowBytes(), 0, 0)) {
++    return false;
++  }
++
++  base::span<uint8_t> modify_pixels =
++      gfx::SkPixmapToWritableSpan(pixmap_to_noise);
++
++  // Guaranteed to have a value, as per |ShouldApplyNoise|.
++  auto token_hash = NoiseHash(execution_context->CanvasNoiseToken().value());
++  NoisePixels(token_hash, modify_pixels, pixmap_to_noise.width(),
++              pixmap_to_noise.height());
++
++  auto noised_image = bm.asImage();
++  snapshot = blink::UnacceleratedStaticBitmapImage::Create(
++      std::move(noised_image), snapshot->Orientation());
++
++  return true;
++}
++
++}  // namespace blink
+--- /dev/null
++++ b/third_party/blink/renderer/core/canvas_interventions/canvas_interventions_helper.h
+@@ -0,0 +1,27 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_CANVAS_INTERVENTIONS_CANVAS_INTERVENTIONS_HELPER_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_CANVAS_INTERVENTIONS_CANVAS_INTERVENTIONS_HELPER_H_
++
++#include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
++
++namespace blink {
++
++class CORE_EXPORT CanvasInterventionsHelper {
++ public:
++  // If allowed, performs noising on a copy of the snapshot StaticBitmapImage
++  // and modifies it in place. Returns true if noise was applied.
++  static bool MaybeNoiseSnapshot(ExecutionContext* execution_context,
++                                 scoped_refptr<StaticBitmapImage>& snapshot);
++
++ private:
++  CanvasInterventionsHelper() = delete;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_CANVAS_INTERVENTIONS_CANVAS_INTERVENTIONS_HELPER_H_

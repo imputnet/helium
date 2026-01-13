@@ -1,0 +1,628 @@
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -27,6 +27,7 @@ namespace helium {
+   };
+ 
+   constexpr const char kDisableEchCommandLine[] = "disable-ech";
++  constexpr const char kCanvasNoiseCommandLine[] = "fingerprinting-canvas-noise";
+ 
+ }  // namespace helium
+ 
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -16,4 +16,8 @@
+      "Disables TLS Encrypted Client Hello. Not recommended unless you live in an area with heavy Internet"
+      " censorship and ECH prevents websites from loading. Helium flag.",
+      kOsAll, SINGLE_VALUE_TYPE(helium::kDisableEchCommandLine)},
++    {helium::kCanvasNoiseCommandLine,
++     "Canvas fingerprinting protection",
++     "Add noise to canvas when its contents are read by a script. Bound to a browser profile session and origin. Helium flag.",
++     kOsAll, FEATURE_VALUE_TYPE(blink::features::kCanvasNoise)},
+ #endif  /* CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_ */
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -1120,6 +1120,8 @@ source_set("browser") {
+     "find_in_page_client.h",
+     "find_request_manager.cc",
+     "find_request_manager.h",
++    "fingerprinting_protection/canvas_noise_token_data.cc",
++    "fingerprinting_protection/canvas_noise_token_data.h",
+     "first_party_sets/database/first_party_sets_database.cc",
+     "first_party_sets/database/first_party_sets_database.h",
+     "first_party_sets/first_party_set_parser.cc",
+--- a/content/browser/browsing_data/browsing_data_remover_impl.cc
++++ b/content/browser/browsing_data/browsing_data_remover_impl.cc
+@@ -31,6 +31,7 @@
+ #include "content/browser/browsing_data/browsing_data_filter_builder_impl.h"
+ #include "content/browser/btm/btm_service_impl.h"
+ #include "content/browser/btm/btm_utils.h"
++#include "content/browser/fingerprinting_protection/canvas_noise_token_data.h"
+ #include "content/browser/preloading/prefetch/prefetch_features.h"
+ #include "content/browser/preloading/prefetch/prefetch_service.h"
+ #include "content/browser/preloading/prefetch/prefetch_status.h"
+@@ -55,6 +56,7 @@
+ #include "services/network/public/mojom/clear_data_filter.mojom.h"
+ #include "services/network/public/mojom/network_context.mojom.h"
+ #include "storage/browser/quota/special_storage_policy.h"
++#include "third_party/blink/public/common/features.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track.h"
+ #include "url/gurl.h"
+ #include "url/origin.h"
+@@ -746,6 +748,19 @@ void BrowsingDataRemoverImpl::RemoveImpl
+     }
+   }
+ 
++  //////////////////////////////////////////////////////////////////////////////
++  // Regenerate CanvasNoiseToken:
++  // Regenerate the token for canvas noising. Because these noise tokens
++  // are linked to the profile, it can be used to identify users. As such,
++  // regeneration of the randomized token must occur to prevent creating a
++  // stable identifier.
++  if (remove_mask & DATA_TYPE_COOKIES &&
++      base::FeatureList::IsEnabled(blink::features::kCanvasNoise) &&
++      filter_builder->MatchesMostOriginsAndDomains()) {
++    content::CanvasNoiseTokenData::SetNewToken(browser_context_);
++  }
++
++  //////////////////////////////////////////////////////////////////////////////
+   // Embedder data.
+   if (embedder_delegate_) {
+     embedder_delegate_->RemoveEmbedderData(
+--- a/content/public/browser/content_browser_client.cc
++++ b/content/public/browser/content_browser_client.cc
+@@ -2008,6 +2008,12 @@ ContentBrowserClient::GetClipboardTypesI
+   return std::nullopt;
+ }
+ 
++bool ContentBrowserClient::ShouldEnableCanvasNoise(
++    BrowserContext* browser_context,
++    const GURL& origin) {
++  return base::FeatureList::IsEnabled(blink::features::kCanvasNoise);
++}
++
+ bool ContentBrowserClient::UsePrefetchPrerenderIntegration() {
+   return false;
+ }
+--- a/content/public/browser/content_browser_client.h
++++ b/content/public/browser/content_browser_client.h
+@@ -3341,6 +3341,11 @@ class CONTENT_EXPORT ContentBrowserClien
+   GetClipboardTypesIfPolicyApplied(
+       const ui::ClipboardSequenceNumberToken& seqno);
+ 
++  // Returns true if CanvasNoise should be enabled for `origin`'s navigation.
++  // Enabled by default, can be disabled via blink::features::kCanvasNoise.
++  virtual bool ShouldEnableCanvasNoise(BrowserContext* browser_context,
++                                       const GURL& origin);
++
+   // Returns true if PrefetchPrerenderIntegration should be allowed, this
+   // allows a prerender fall back to prefetch if available.
+   virtual bool UsePrefetchPrerenderIntegration();
+--- a/third_party/blink/common/features.cc
++++ b/third_party/blink/common/features.cc
+@@ -377,6 +377,10 @@ BASE_FEATURE(kCanvas2DHibernationRelease
+ BASE_FEATURE(kCanvas2DHibernationNoSmallCanvas,
+              base::FeatureState::FEATURE_DISABLED_BY_DEFAULT);
+ 
++// Canvas noise for fingerprinting protection.
++BASE_FEATURE(kCanvasNoise,
++             base::FeatureState::FEATURE_ENABLED_BY_DEFAULT);
++
+ // Whether to capture the source location of JavaScript execution, which is one
+ // of the renderer eviction reasons for Back/Forward Cache.
+ BASE_FEATURE(kCaptureJSExecutionLocation, base::FEATURE_ENABLED_BY_DEFAULT);
+--- a/third_party/blink/public/common/features.h
++++ b/third_party/blink/public/common/features.h
+@@ -238,6 +238,8 @@ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE
+     kCanvas2DHibernationReleaseTransferMemory);
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kCanvas2DHibernationNoSmallCanvas);
+ 
++BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kCanvasNoise);
++
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kCaptureJSExecutionLocation);
+ 
+ // If enabled, the HTMLDocumentParser will only check its budget after parsing a
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -55,6 +55,7 @@
+ #include "content/browser/devtools/network_service_devtools_observer.h"
+ #include "content/browser/download/download_manager_impl.h"
+ #include "content/browser/fenced_frame/fenced_frame_url_mapping.h"
++#include "content/browser/fingerprinting_protection/canvas_noise_token_data.h"
+ #include "content/browser/interest_group/ad_auction_headers_util.h"
+ #include "content/browser/loader/browser_initiated_resource_request.h"
+ #include "content/browser/loader/cached_navigation_url_loader.h"
+@@ -8803,6 +8804,23 @@ void NavigationRequest::ReadyToCommitNav
+     }
+   }
+ 
++  // Populate the canvas noise token if this is a main frame navigation. Canvas
++  // noise tokens should be generated based on the resolved origin, which is
++  // available at |ReadyToCommit| time. Eventually, prior to commit, this value
++  // will be used to sync blink::Pages with this token value, and subsequent
++  // subframe navigations will inherit this token to populate their
++  // blink::Pages.
++  if (IsInMainFrame()) {
++    BrowserContext* browser_context =
++        frame_tree_node()->navigator().controller().GetBrowserContext();
++    canvas_noise_token_ =
++        GetContentClient()->browser()->ShouldEnableCanvasNoise(
++            browser_context, origin_to_commit->GetURL())
++            ? std::optional(CanvasNoiseTokenData::GetToken(
++                  browser_context, origin_to_commit.value()))
++            : std::nullopt;
++  }
++
+   if (ready_to_commit_callback_for_testing_)
+     std::move(ready_to_commit_callback_for_testing_).Run();
+ }
+--- a/content/browser/renderer_host/navigation_request.h
++++ b/content/browser/renderer_host/navigation_request.h
+@@ -1474,6 +1474,17 @@ class CONTENT_EXPORT NavigationRequest
+ 
+   bool is_ad_tagged() const { return is_ad_tagged_; }
+ 
++  // Returns the canvas noise token used for canvas noising on the renderer.
++  // Only one token should be generated per page and should use the main frame's
++  // origin to generate such. Main frames should use this accessor to populate
++  // the content::Page and subsequent blink::Pages. Subframes should not use
++  // this accessor, but instead should use `PageImpl::canvas_noise_token()` to
++  // get the canvas noise token.
++  std::optional<blink::NoiseToken> canvas_noise_token() {
++    CHECK(IsInMainFrame());
++    return canvas_noise_token_;
++  }
++
+   // Called when the browser process is about to process beforeunload handlers
+   // for this navigation, including sending an IPC to the renderer process to
+   // run beforeunload handlers when necessary.
+@@ -3382,6 +3393,10 @@ class CONTENT_EXPORT NavigationRequest
+   blink::mojom::ConfidenceLevel confidence_level_ =
+       blink::mojom::ConfidenceLevel::kHigh;
+ 
++  // The token value for canvas noising. This should only be set on main frame
++  // navigations that subsequently set the token value on the page.
++  std::optional<blink::NoiseToken> canvas_noise_token_ = std::nullopt;
++
+   // A container for embedder-specific data that needs to be available during
+   // the renderer process selection phase of a navigation.
+   ProcessSelectionUserData process_selection_user_data_;
+--- a/content/browser/renderer_host/page_impl.h
++++ b/content/browser/renderer_host/page_impl.h
+@@ -84,6 +84,14 @@ class CONTENT_EXPORT PageImpl : public P
+   // Setter for the `window.setResizable(bool)` API's value defining whether the
+   // window can be resized or not. `std::nullopt` means the value is not set.
+   void SetResizable(std::optional<bool> resizable);
++
++  std::optional<blink::NoiseToken> canvas_noise_token() const {
++    return canvas_noise_token_;
++  }
++  void set_canvas_noise_token(std::optional<blink::NoiseToken> token) {
++    canvas_noise_token_ = token;
++  }
++
+   base::WeakPtr<PageImpl> GetWeakPtrImpl();
+ 
+   virtual void UpdateManifestUrl(const GURL& manifest_url);
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -12375,6 +12375,22 @@ void RenderFrameHostImpl::CommitNavigati
+     }
+   }
+ 
++  if (is_main_frame()) {
++    // Ensures the blink::Page is set with the correct canvas noise token for
++    // main frames by syncing the value with the frame's associated
++    // blink::WebView prior to commit. This must be done at CommitNavigation
++    // time as the origin will not be available when the blink::Page is created
++    // earlier.
++    std::optional<blink::NoiseToken> canvas_noise_token =
++        navigation_request->canvas_noise_token();
++    frame_tree()->root()->render_manager()->ExecutePageBroadcastMethod(
++        [canvas_noise_token](RenderViewHostImpl* rvh) {
++          if (auto& broadcast = rvh->GetAssociatedPageBroadcast()) {
++            broadcast->UpdateCanvasNoiseToken(canvas_noise_token);
++          }
++        });
++  }
++
+   bool is_srcdoc = common_params->url.IsAboutSrcdoc();
+   if (is_srcdoc) {
+     // TODO(wjmaclean): initialize this in NavigationRequest's constructor
+@@ -15889,6 +15905,15 @@ bool RenderFrameHostImpl::DidCommitNavig
+     document_associated_data_->owned_page()->set_last_main_document_source_id(
+         ukm::ConvertToSourceId(navigation_request->GetNavigationId(),
+                                ukm::SourceIdType::NAVIGATION_ID));
++
++    // Set this on content::Page so that all subframes can inherit the same
++    // canvas noise token. Note that the content::Page may have been swapped
++    // above (earlier in DidCommitNavigationInternal()) in cases like
++    // prerendering.  At this point in the navigation, the content::Page should
++    // be set and can be inherited for subframe navigations.
++    // TODO(crbug.com/434006731): Assign this state earlier once RenderDocument
++    // ships and content::Page doesn't need to swap.
++    GetPage().set_canvas_noise_token(navigation_request->canvas_noise_token());
+   }
+ 
+ #if BUILDFLAG(IS_ANDROID)
+--- a/content/browser/renderer_host/render_view_host_impl.cc
++++ b/content/browser/renderer_host/render_view_host_impl.cc
+@@ -462,6 +462,17 @@ bool RenderViewHostImpl::CreateRenderVie
+   DCHECK_EQ(&frame_tree_node->frame_tree(), frame_tree_);
+   params->navigation_metrics_token = navigation_metrics_token;
+ 
++  // When a new RenderViewHost creates a RenderView for a subframe, inherit the
++  // current content::Page's token. This is not done for main frames (i.e., when
++  // main_rfh is defined instead of main_rfph), because the new content::Page
++  // hasn't committed to be the current page yet. Additionally, the token
++  // usually has not been computed yet (only until the origin is known when
++  // navigation at ready to commit time).
++  params->canvas_noise_token = main_rfph ? frame_tree_node->current_frame_host()
++                                               ->GetPage()
++                                               .canvas_noise_token()
++                                         : std::nullopt;
++
+   if (frame_tree_->is_prerendering() ||
+       frame_tree_->page_delegate()->IsPageInPreviewMode()) {
+     auto prerender_param = blink::mojom::PrerenderParam::New();
+--- a/content/common/frame.mojom
++++ b/content/common/frame.mojom
+@@ -32,6 +32,7 @@ import "third_party/blink/public/mojom/c
+ import "third_party/blink/public/mojom/devtools/console_message.mojom";
+ import "third_party/blink/public/mojom/fenced_frame/fenced_frame.mojom";
+ import "third_party/blink/public/mojom/fenced_frame/fenced_frame_config.mojom";
++import "third_party/blink/public/mojom/fingerprinting_protection/noise_token.mojom";
+ import "third_party/blink/public/mojom/frame/frame_owner_properties.mojom";
+ import "third_party/blink/public/mojom/frame/frame_policy.mojom";
+ import "third_party/blink/public/mojom/frame/frame_replication_state.mojom";
+@@ -176,6 +177,10 @@ struct CreateViewParams {
+   // A snapshot of the history information when this view was created.
+   int32 history_index = -1;
+   int32 history_length = 0;
++
++  // The 64 bit hash value for canvas noising from the current page. A nullopt
++  // indicates canvas noising should be disabled for this page.
++  blink.mojom.NoiseToken? canvas_noise_token;
+ };
+ 
+ // A union to distinguish between parameters specific to local main frame
+--- a/third_party/blink/public/mojom/page/page.mojom
++++ b/third_party/blink/public/mojom/page/page.mojom
+@@ -8,6 +8,7 @@ import "mojo/public/mojom/base/time.mojo
+ import "mojo/public/mojom/base/unguessable_token.mojom";
+ import "services/network/public/mojom/attribution.mojom";
+ import "skia/public/mojom/skcolor.mojom";
++import "third_party/blink/public/mojom/fingerprinting_protection/noise_token.mojom";
+ import "third_party/blink/public/mojom/frame/frame_replication_state.mojom";
+ import "third_party/blink/public/mojom/frame/remote_frame.mojom";
+ import "third_party/blink/public/mojom/frame/view_transition_state.mojom";
+@@ -177,6 +178,11 @@ interface PageBroadcast {
+   // of theme changes.
+   UpdateColorProviders(ColorProviderColorMaps color_provider_colors);
+ 
++  // Update the page's canvas noise token. This allows the browser to compute
++  // the noise token at ReadyToCommit time and update blink::WebViews that
++  // were made at request time.
++  UpdateCanvasNoiseToken(blink.mojom.NoiseToken? canvas_noise_token);
++
+   // Indicates that the page's main frame should collect draggable regions set
+   // using the app-region CSS property.
+   SetSupportsDraggableRegions(bool supports_draggable_regions);
+--- a/third_party/blink/public/web/web_view.h
++++ b/third_party/blink/public/web/web_view.h
+@@ -135,6 +135,10 @@ class BLINK_EXPORT WebView {
+   // |history_index| and |history_length| are information about the frame tree's
+   // history list at the point when this view was created. These values are
+   // updated again at navigation commit time.
++  // |canvas_noise_token| is the seed token used for canvas noising on canvas
++  // elements in each frame, which should be constant per page. If the
++  // canvas_noise_token value is nullopt, this indicates the page should not
++  // enable canvas noising.
+   static WebView* Create(
+       WebViewClient*,
+       bool is_hidden,
+@@ -152,7 +156,8 @@ class BLINK_EXPORT WebView {
+       const base::UnguessableToken& browsing_context_group_token,
+       const ColorProviderColorMaps* color_provider_colors,
+       int32_t history_index,
+-      int32_t history_length);
++      int32_t history_length,
++      const std::optional<NoiseToken>& canvas_noise_token);
+ 
+   // Destroys the WebView synchronously.
+   virtual void Close() = 0;
+@@ -465,6 +470,10 @@ class BLINK_EXPORT WebView {
+   virtual void SetPageAttributionSupport(
+       network::mojom::AttributionSupport support) = 0;
+ 
++  // Returns the canvas noise token assigned in the WebView's blink::Page, used
++  // for testing.
++  virtual std::optional<NoiseToken> CanvasNoiseTokenForTesting() = 0;
++
+  protected:
+   ~WebView() = default;
+ };
+--- a/third_party/blink/renderer/core/exported/web_view_impl.cc
++++ b/third_party/blink/renderer/core/exported/web_view_impl.cc
+@@ -502,7 +502,8 @@ WebView* WebView::Create(
+     const base::UnguessableToken& browsing_context_group_token,
+     const ColorProviderColorMaps* color_provider_colors,
+     int32_t history_index,
+-    int32_t history_length) {
++    int32_t history_length,
++    const std::optional<NoiseToken>& canvas_noise_token) {
+   return WebViewImpl::Create(
+       client,
+       is_hidden ? mojom::blink::PageVisibilityState::kHidden
+@@ -511,7 +512,8 @@ WebView* WebView::Create(
+       widgets_never_composited, To<WebViewImpl>(opener), std::move(page_handle),
+       agent_group_scheduler, session_storage_namespace_id,
+       std::move(page_base_background_color), browsing_context_group_token,
+-      color_provider_colors, history_index, history_length);
++      color_provider_colors, history_index, history_length,
++      canvas_noise_token);
+ }
+ 
+ WebViewImpl* WebViewImpl::Create(
+@@ -530,14 +532,15 @@ WebViewImpl* WebViewImpl::Create(
+     const base::UnguessableToken& browsing_context_group_token,
+     const ColorProviderColorMaps* color_provider_colors,
+     int32_t history_index,
+-    int32_t history_length) {
++    int32_t history_length,
++    const std::optional<NoiseToken>& canvas_noise_token) {
+   return new WebViewImpl(
+       client, visibility, std::move(prerender_param), fenced_frame_mode,
+       compositing_enabled, widgets_never_composited, opener,
+       std::move(page_handle), agent_group_scheduler,
+       session_storage_namespace_id, std::move(page_base_background_color),
+       browsing_context_group_token, color_provider_colors, history_index,
+-      history_length);
++      history_length, canvas_noise_token);
+ }
+ 
+ size_t WebView::GetWebViewCount() {
+@@ -603,7 +606,8 @@ WebViewImpl::WebViewImpl(
+     const base::UnguessableToken& browsing_context_group_token,
+     const ColorProviderColorMaps* color_provider_colors,
+     int32_t history_index,
+-    int32_t history_length)
++    int32_t history_length,
++    const std::optional<NoiseToken>& canvas_noise_token)
+     : widgets_never_composited_(widgets_never_composited),
+       web_view_client_(client),
+       chrome_client_(MakeGarbageCollected<ChromeClientImpl>(this)),
+@@ -636,7 +640,8 @@ WebViewImpl::WebViewImpl(
+   page_ = Page::CreateOrdinary(
+       *chrome_client_, opener ? opener->GetPage() : nullptr,
+       agent_group_scheduler.GetAgentGroupScheduler(),
+-      browsing_context_group_token, color_provider_colors);
++      browsing_context_group_token, color_provider_colors,
++      canvas_noise_token);
+   CoreInitializer::GetInstance().ProvideModulesToPage(
+       *page_, session_storage_namespace_id_);
+ 
+@@ -3406,6 +3411,15 @@ void WebViewImpl::UpdateColorProviders(
+   }
+ }
+ 
++void WebViewImpl::UpdateCanvasNoiseToken(
++    std::optional<NoiseToken> canvas_noise_token) {
++  page_->SetCanvasNoiseToken(canvas_noise_token);
++}
++
++std::optional<NoiseToken> WebViewImpl::CanvasNoiseTokenForTesting() {
++  return page_->CanvasNoiseToken();
++}
++
+ void WebViewImpl::SetBaseBackgroundColorOverrideTransparent(
+     bool override_to_transparent) {
+   DCHECK(does_composite_);
+--- a/third_party/blink/renderer/core/exported/web_view_impl.h
++++ b/third_party/blink/renderer/core/exported/web_view_impl.h
+@@ -131,7 +131,8 @@ class CORE_EXPORT WebViewImpl final : pu
+       const base::UnguessableToken& browsing_context_group_token,
+       const ColorProviderColorMaps* color_provider_colors,
+       int32_t history_index,
+-      int32_t history_length);
++      int32_t history_length,
++      const std::optional<NoiseToken>& canvas_noise_token);
+ 
+   // All calls to Create() should be balanced with a call to Close(). This
+   // synchronously destroys the WebViewImpl.
+@@ -320,6 +321,9 @@ class CORE_EXPORT WebViewImpl final : pu
+   void UpdateColorProviders(
+       const ColorProviderColorMaps& color_provider_colors) override;
+   void SetSupportsDraggableRegions(bool supports_draggable_regions) override;
++  void UpdateCanvasNoiseToken(
++      std::optional<NoiseToken> canvas_noise_token) override;
++  std::optional<NoiseToken> CanvasNoiseTokenForTesting() override;
+ 
+   void DispatchPersistedPageshow(base::TimeTicks navigation_start);
+   void DispatchPagehide(mojom::blink::PagehideDispatch pagehide_dispatch);
+@@ -725,7 +729,8 @@ class CORE_EXPORT WebViewImpl final : pu
+       const base::UnguessableToken& browsing_context_group_token,
+       const ColorProviderColorMaps* color_provider_colors,
+       int32_t history_index,
+-      int32_t history_length);
++      int32_t history_length,
++      const std::optional<NoiseToken>& canvas_noise_token);
+   ~WebViewImpl() override;
+ 
+   void ConfigureAutoResizeMode();
+--- a/third_party/blink/renderer/core/page/page.cc
++++ b/third_party/blink/renderer/core/page/page.cc
+@@ -217,12 +217,14 @@ Page* Page::CreateOrdinary(
+     Page* opener,
+     AgentGroupScheduler& agent_group_scheduler,
+     const base::UnguessableToken& browsing_context_group_token,
+-    const ColorProviderColorMaps* color_provider_colors) {
++    const ColorProviderColorMaps* color_provider_colors,
++    const std::optional<NoiseToken>& canvas_noise_token) {
+   Page* page = MakeGarbageCollected<Page>(
+       base::PassKey<Page>(), chrome_client, agent_group_scheduler,
+       browsing_context_group_token, color_provider_colors,
+       /*is_ordinary=*/true);
+   page->opener_ = opener;
++  page->canvas_noise_token_ = canvas_noise_token;
+ 
+   OrdinaryPages().insert(page);
+ 
+--- a/third_party/blink/renderer/core/page/page.h
++++ b/third_party/blink/renderer/core/page/page.h
+@@ -136,7 +136,8 @@ class CORE_EXPORT Page final : public Ga
+       Page* opener,
+       AgentGroupScheduler& agent_group_scheduler,
+       const base::UnguessableToken& browsing_context_group_token,
+-      const ColorProviderColorMaps* color_provider_colors);
++      const ColorProviderColorMaps* color_provider_colors,
++      const std::optional<NoiseToken>& canvas_noise_token);
+ 
+   Page(base::PassKey<Page>,
+        ChromeClient& chrome_client,
+@@ -193,6 +194,14 @@ class CORE_EXPORT Page final : public Ga
+     color_provider_colors_ = color_provider_colors;
+   }
+ 
++  void SetCanvasNoiseToken(const std::optional<NoiseToken>& canvas_noise_token) {
++    canvas_noise_token_ = canvas_noise_token;
++  }
++
++  std::optional<NoiseToken> CanvasNoiseToken() const {
++    return canvas_noise_token_;
++  }
++
+   void InitialStyleChanged();
+   void UpdateAcceleratedCompositingSettings();
+ 
+@@ -719,6 +728,9 @@ class CORE_EXPORT Page final : public Ga
+   // who may depend on the main Page for colors.
+   ColorProviderColorMaps color_provider_colors_;
+ 
++  // Canvas noise token for fingerprinting protection.
++  std::optional<NoiseToken> canvas_noise_token_;
++
+   // This provider is used when forced color emulation is enabled via DevTools,
+   // overriding the light, dark or forced colors color providers.
+   std::unique_ptr<ui::ColorProvider> emulated_forced_colors_provider_;
+--- a/content/renderer/agent_scheduling_group.cc
++++ b/content/renderer/agent_scheduling_group.cc
+@@ -250,7 +250,8 @@ blink::WebView* AgentSchedulingGroup::Cr
+       std::move(params->blink_page_broadcast), agent_group_scheduler(),
+       params->session_storage_namespace_id, params->base_background_color,
+       params->browsing_context_group_token, &params->color_provider_colors,
+-      params->history_index, params->history_length);
++      params->history_index, params->history_length,
++      params->canvas_noise_token);
+ 
+   web_view->SetRendererPreferences(params->renderer_preferences);
+   web_view->SetWebPreferences(params->web_preferences);
+--- a/components/printing/renderer/print_render_frame_helper.cc
++++ b/components/printing/renderer/print_render_frame_helper.cc
+@@ -683,7 +683,8 @@ class HeaderAndFooterContext {
+         /*browsing_context_group_token=*/base::UnguessableToken::Create(),
+         /*color_provider_colors=*/nullptr,
+         /*history_index=*/-1,
+-        /*history_length=*/0);
++        /*history_length=*/0,
++        /*canvas_noise_token=*/std::nullopt);
+     view->GetSettings()->SetJavaScriptEnabled(true);
+     return view;
+   }
+@@ -976,7 +977,8 @@ void PrepareFrameAndViewForPrint::CopySe
+       /*browsing_context_group_token=*/base::UnguessableToken::Create(),
+       /*color_provider_colors=*/nullptr,
+       /*history_index=*/-1,
+-      /*history_length=*/0);
++      /*history_length=*/0,
++      /*canvas_noise_token=*/std::nullopt);
+   blink::WebView::ApplyWebPreferences(prefs, web_view);
+   blink::WebLocalFrame* main_frame = blink::WebLocalFrame::CreateMainFrame(
+       web_view, this, nullptr, mojo::NullRemote(), blink::LocalFrameToken(),
+--- a/components/plugins/renderer/webview_plugin.cc
++++ b/components/plugins/renderer/webview_plugin.cc
+@@ -280,7 +280,8 @@ WebViewPlugin::WebViewHelper::WebViewHel
+       /*browsing_context_group_token=*/base::UnguessableToken(),
+       /*color_provider_colors=*/nullptr,
+       /*history_index=*/-1,
+-      /*history_length=*/0);
++      /*history_length=*/0,
++      /*canvas_noise_token=*/std::nullopt);
+   // ApplyWebPreferences before making a WebLocalFrame so that the frame sees a
+   // consistent view of our preferences.
+   blink::WebView::ApplyWebPreferences(parent_web_preferences, web_view_);
+--- a/third_party/blink/renderer/core/canvas_interventions/build.gni
++++ b/third_party/blink/renderer/core/canvas_interventions/build.gni
+@@ -3,6 +3,8 @@
+ # found in the LICENSE file.
+ 
+ blink_core_sources_canvas_interventions = [
++  "canvas_interventions_helper.cc",
++  "canvas_interventions_helper.h",
+   "noise_hash.cc",
+   "noise_hash.h",
+   "noise_helper.cc",
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -74,6 +74,7 @@
+ #include "third_party/blink/renderer/core/geometry/dom_matrix.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
++#include "third_party/blink/renderer/core/canvas_interventions/canvas_interventions_helper.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_draw_listener.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_font_cache.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+@@ -1305,6 +1306,8 @@ String HTMLCanvasElement::ToDataURLInter
+ 
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
+   if (image_bitmap) {
++    CanvasInterventionsHelper::MaybeNoiseSnapshot(GetExecutionContext(),
++                                                   image_bitmap);
+     std::unique_ptr<ImageDataBuffer> data_buffer =
+         ImageDataBuffer::Create(image_bitmap);
+     if (!data_buffer)
+@@ -1416,6 +1419,8 @@ void HTMLCanvasElement::toBlob(V8BlobCal
+   CanvasAsyncBlobCreator* async_creator = nullptr;
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(kBackBuffer);
+   if (image_bitmap) {
++    CanvasInterventionsHelper::MaybeNoiseSnapshot(GetExecutionContext(),
++                                                   image_bitmap);
+     auto* options = ImageEncodeOptions::Create();
+     options->setType(ImageEncoderUtils::MimeTypeName(encoding_mime_type));
+     async_creator = MakeGarbageCollected<CanvasAsyncBlobCreator>(
+--- a/third_party/blink/renderer/core/loader/document_loader.cc
++++ b/third_party/blink/renderer/core/loader/document_loader.cc
+@@ -2853,7 +2853,8 @@ void DocumentLoader::CommitNavigation()
+       ->GetRuntimeFeatureStateOverrideContext()
+       ->ApplyOverrideValuesFromParams(modified_runtime_features_);
+ 
+-  frame_->DomWindow()->SetCanvasNoiseToken(std::nullopt);
++  frame_->DomWindow()->SetCanvasNoiseToken(
++      frame_->GetPage()->CanvasNoiseToken());
+ 
+   // Previous same-document navigation tasks are not relevant once a
+   // cross-document navigation has happened.
+--- a/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
++++ b/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+@@ -22,6 +22,7 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
++#include "third_party/blink/renderer/core/canvas_interventions/canvas_interventions_helper.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context_factory.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_resource_tracker.h"
+@@ -343,11 +344,13 @@ ScriptPromise<Blob> OffscreenCanvas::con
+   base::TimeTicks start_time = base::TimeTicks::Now();
+   scoped_refptr<StaticBitmapImage> image_bitmap = context_->GetImage();
+   if (image_bitmap) {
++    auto* execution_context = ExecutionContext::From(script_state);
++    CanvasInterventionsHelper::MaybeNoiseSnapshot(execution_context,
++                                                   image_bitmap);
+     auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<Blob>>(
+         script_state, exception_state.GetContext());
+     CanvasAsyncBlobCreator::ToBlobFunctionType function_type =
+         CanvasAsyncBlobCreator::kOffscreenCanvasConvertToBlobPromise;
+-    auto* execution_context = ExecutionContext::From(script_state);
+     auto* async_creator = MakeGarbageCollected<CanvasAsyncBlobCreator>(
+         image_bitmap, options, function_type, start_time, execution_context,
+         resolver);
