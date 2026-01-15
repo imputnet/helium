@@ -1,0 +1,423 @@
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -30,6 +30,7 @@ namespace helium {
+ 
+   constexpr const char kHeliumNoiseCommandLine[] = "helium-noise";
+   constexpr const char kHeliumNoiseCanvasCommandLine[] = "helium-noise-canvas";
++  constexpr const char kHeliumNoiseAudioCommandLine[] = "helium-noise-audio";
+ 
+ }  // namespace helium
+ 
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -24,4 +24,8 @@
+      "[Helium Noise] Canvas pixel noising",
+      "Adds insignificant noise to canvas pixels during readback to deceive canvas-based fingerprinting. Helium flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseCanvas)},
++    {helium::kHeliumNoiseAudioCommandLine,
++     "[Helium Noise] Jitter audio context data",
++     "Adds insignificant jitter to audio data to deceive AudioContext-based fingerprinting. Helium flag.",
++     kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseAudio)},
+ #endif  /* CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_ */
+--- a/third_party/blink/common/features.cc
++++ b/third_party/blink/common/features.cc
+@@ -47,6 +47,10 @@ BASE_FEATURE(kHeliumNoise,
+ BASE_FEATURE(kHeliumNoiseCanvas,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++// Audio Context jitter for fingerprinting protection.
++BASE_FEATURE(kHeliumNoiseAudio,
++             base::FEATURE_ENABLED_BY_DEFAULT);
++
+ // Controls whether to include information about the page's open popup in
+ // AIPageContent.
+ BASE_FEATURE(kAIPageContentIncludePopupWindows,
+--- a/third_party/blink/public/common/features.h
++++ b/third_party/blink/public/common/features.h
+@@ -43,6 +43,7 @@ BLINK_COMMON_EXPORT extern const base::F
+ 
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoise);
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoiseCanvas);
++BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoiseAudio);
+ 
+ // Controls whether to include information about the page's open popup in
+ // AIPageContent.
+--- a/third_party/blink/renderer/modules/webaudio/audio_buffer.cc
++++ b/third_party/blink/renderer/modules/webaudio/audio_buffer.cc
+@@ -32,6 +32,7 @@
+ 
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
++#include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_audio_buffer_options.h"
+ #include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
+ #include "third_party/blink/renderer/platform/audio/audio_bus.h"
+@@ -200,6 +201,20 @@ AudioBuffer::AudioBuffer(AudioBus* bus)
+   }
+ }
+ 
++void AudioBuffer::JitterAudioData(ExecutionContext* context) {
++  if (!base::FeatureList::IsEnabled(blink::features::kHeliumNoiseAudio)) {
++    return;
++  }
++
++  for (unsigned i = 0; i < channels_.size(); ++i) {
++    if (NotShared<DOMFloat32Array> channel = getChannelData(i)) {
++      for (float& sample : channel->AsSpan()) {
++        sample = BaseAudioContext::JitterAudioData(sample, context);
++      }
++    }
++  }
++}
++
+ NotShared<DOMFloat32Array> AudioBuffer::getChannelData(
+     unsigned channel_index,
+     ExceptionState& exception_state) {
+--- a/third_party/blink/renderer/modules/webaudio/audio_buffer.h
++++ b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
+@@ -41,6 +41,7 @@ namespace blink {
+ 
+ class AudioBus;
+ class AudioBufferOptions;
++class ExecutionContext;
+ class ExceptionState;
+ class SharedAudioBuffer;
+ 
+@@ -115,6 +116,8 @@ class MODULES_EXPORT AudioBuffer final :
+ 
+   std::unique_ptr<SharedAudioBuffer> CreateSharedAudioBuffer();
+ 
++  void JitterAudioData(ExecutionContext* context);
++
+  private:
+   static DOMFloat32Array* CreateFloat32ArrayOrNull(
+       uint32_t length,
+--- a/third_party/blink/renderer/modules/webaudio/audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/audio_context.cc
+@@ -921,7 +921,12 @@ double AudioContext::baseLatency() const
+   DCHECK_CALLED_ON_VALID_SEQUENCE(main_thread_sequence_checker_);
+   DCHECK(destination());
+ 
+-  return base_latency_;
++  if (!base::FeatureList::IsEnabled(blink::features::kHeliumNoiseAudio)) {
++    return base_latency_;
++  }
++
++  // Round to two decimal places
++  return std::round(base_latency_ * 100.0) / 100.0;
+ }
+ 
+ double AudioContext::outputLatency() const {
+--- a/third_party/blink/renderer/modules/webaudio/base_audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/base_audio_context.cc
+@@ -26,10 +26,13 @@
+ #include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
+ 
+ #include <algorithm>
++#include <bit>
+ 
+ #include "base/metrics/histogram_functions.h"
+ #include "build/build_config.h"
+ #include "media/base/audio_bus.h"
++#include "third_party/blink/public/common/features.h"
++#include "third_party/blink/public/common/helium_noise/noise_token.h"
+ #include "third_party/blink/public/mojom/devtools/console_message.mojom-blink.h"
+ #include "third_party/blink/public/mojom/frame/lifecycle.mojom-shared.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -37,7 +40,9 @@
+ #include "third_party/blink/renderer/bindings/core/v8/dictionary.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_periodic_wave_constraints.h"
++#include "third_party/blink/renderer/core/helium_noise/helium_noise_hash.h"
+ #include "third_party/blink/renderer/core/dom/dom_exception.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/html/media/html_media_element.h"
+@@ -777,6 +782,35 @@ LocalDOMWindow* BaseAudioContext::GetWin
+   return To<LocalDOMWindow>(GetExecutionContext());
+ }
+ 
++float BaseAudioContext::JitterAudioData(float data, ExecutionContext* context) {
++  if (!base::FeatureList::IsEnabled(blink::features::kHeliumNoiseAudio)) {
++    return data;
++  }
++
++  if (!context || !context->GetHeliumNoiseTokens().contains(
++      HeliumNoiseFeature::kAudio)) {
++    return data;
++  }
++
++  HeliumNoiseHash noise_hash(
++      context->GetHeliumNoiseTokens().at(HeliumNoiseFeature::kAudio));
++
++  // Update the hash with audio data for extra entropy. This makes it
++  // harder to identify or remove the noise, similar to how we do
++  // it in canvas.
++  uint64_t data_bits = std::bit_cast<uint64_t>(static_cast<double>(data));
++  noise_hash.Update(data_bits);
++
++  // Generate jitter within [-0.0001, 0.0001] (aka ±0.01%)
++  // Note: GetValueBelow(2) returns an int value, either 0 or 1.
++  constexpr float scale = 0.0001f / 10000.0f;
++  int noise_value = noise_hash.GetValueBelow(10000 + 1);
++  int noise_sign = noise_hash.GetValueBelow(2) ? 1 : -1;
++  float jitter = noise_value * noise_sign * scale;
++
++  return data * (1.0f + jitter);
++}
++
+ void BaseAudioContext::NotifySourceNodeStartedProcessing(AudioNode* node) {
+   DCHECK(IsMainThread());
+   DeferredTaskHandler::GraphAutoLocker locker(this);
+--- a/third_party/blink/renderer/modules/webaudio/base_audio_context.h
++++ b/third_party/blink/renderer/modules/webaudio/base_audio_context.h
+@@ -327,6 +327,8 @@ class MODULES_EXPORT BaseAudioContext
+   // if the execution context does not exist.
+   bool CheckExecutionContextAndThrowIfNecessary(ExceptionState&);
+ 
++  static float JitterAudioData(float data, ExecutionContext* context);
++
+  protected:
+   enum class ContextType { kRealtimeContext, kOfflineContext };
+ 
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+@@ -396,6 +396,8 @@ void OfflineAudioContext::FireCompletion
+       return;
+     }
+ 
++    rendered_buffer->JitterAudioData(GetExecutionContext());
++
+     // Call the offline rendering completion event listener and resolve the
+     // promise too.
+     DispatchEvent(*OfflineAudioCompletionEvent::Create(rendered_buffer));
+--- a/third_party/blink/renderer/modules/webaudio/realtime_analyser.cc
++++ b/third_party/blink/renderer/modules/webaudio/realtime_analyser.cc
+@@ -33,6 +33,8 @@
+ 
+ #include "base/compiler_specific.h"
+ #include "media/base/audio_bus.h"
++#include "third_party/blink/public/common/features.h"
++#include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
+ #include "third_party/blink/renderer/platform/audio/audio_bus.h"
+ #include "third_party/blink/renderer/platform/audio/audio_utilities.h"
+ #include "third_party/blink/renderer/platform/audio/vector_math.h"
+@@ -98,7 +100,8 @@ bool RealtimeAnalyser::SetFftSize(uint32
+ }
+ 
+ void RealtimeAnalyser::GetFloatFrequencyData(DOMFloat32Array* destination_array,
+-                                             double current_time) {
++                                             double current_time,
++                                             ExecutionContext* context) {
+   DCHECK(IsMainThread());
+   DCHECK(destination_array);
+ 
+@@ -115,16 +118,22 @@ void RealtimeAnalyser::GetFloatFrequency
+     const float* source = magnitude_buffer_.Data();
+     float* destination = destination_array->Data();
+ 
++    const bool kJitterEnabled = base::FeatureList::IsEnabled(
++        blink::features::kHeliumNoiseAudio);
++
+     for (unsigned i = 0; i < len; ++i) {
+       const float linear_value = UNSAFE_TODO(source[i]);
+       const double db_mag = audio_utilities::LinearToDecibels(linear_value);
+-      UNSAFE_TODO(destination[i]) = static_cast<float>(db_mag);
++      auto db_value = static_cast<float>(db_mag);
++      UNSAFE_TODO(destination[i]) = kJitterEnabled ?
++          BaseAudioContext::JitterAudioData(db_value, context) : db_value;
+     }
+   }
+ }
+ 
+ void RealtimeAnalyser::GetByteFrequencyData(DOMUint8Array* destination_array,
+-                                            double current_time) {
++                                            double current_time,
++                                            ExecutionContext* context) {
+   DCHECK(IsMainThread());
+   DCHECK(destination_array);
+ 
+@@ -150,15 +159,22 @@ void RealtimeAnalyser::GetByteFrequencyD
+     const float* source = magnitude_buffer_.Data();
+     unsigned char* destination = destination_array->Data();
+ 
++    const bool kJitterEnabled = base::FeatureList::IsEnabled(
++        blink::features::kHeliumNoiseAudio);
++
+     for (unsigned i = 0; i < len; ++i) {
+       const float linear_value = UNSAFE_TODO(source[i]);
+       const double db_mag = audio_utilities::LinearToDecibels(linear_value);
+ 
+       // The range m_minDecibels to m_maxDecibels will be scaled to byte values
+       // from 0 to UCHAR_MAX.
+-      const double scaled_value =
++      double scaled_value =
+           UCHAR_MAX * (db_mag - min_decibels) * range_scale_factor;
+ 
++      if (kJitterEnabled) {
++        scaled_value = BaseAudioContext::JitterAudioData(scaled_value, context);
++      }
++
+       // Clip to valid range.
+       UNSAFE_TODO(destination[i]) =
+           static_cast<unsigned char>(ClampTo(scaled_value, 0, UCHAR_MAX));
+@@ -167,7 +183,8 @@ void RealtimeAnalyser::GetByteFrequencyD
+ }
+ 
+ void RealtimeAnalyser::GetFloatTimeDomainData(
+-    DOMFloat32Array* destination_array) {
++    DOMFloat32Array* destination_array,
++    ExecutionContext* context) {
+   DCHECK(IsMainThread());
+   DCHECK(destination_array);
+ 
+@@ -183,18 +200,26 @@ void RealtimeAnalyser::GetFloatTimeDomai
+ 
+     const unsigned write_index = GetWriteIndex();
+ 
++    const bool kJitterEnabled = base::FeatureList::IsEnabled(
++        blink::features::kHeliumNoiseAudio);
++
+     for (unsigned i = 0; i < len; ++i) {
+       // Buffer access is protected due to modulo operation.
+       float value = UNSAFE_TODO(
+           input_buffer[(i + write_index - fft_size + kInputBufferSize) %
+                        kInputBufferSize]);
+ 
++      if (kJitterEnabled) {
++        value = BaseAudioContext::JitterAudioData(value, context);
++      }
++
+       UNSAFE_TODO(destination[i]) = value;
+     }
+   }
+ }
+ 
+-void RealtimeAnalyser::GetByteTimeDomainData(DOMUint8Array* destination_array) {
++void RealtimeAnalyser::GetByteTimeDomainData(DOMUint8Array* destination_array,
++                                              ExecutionContext* context) {
+   DCHECK(IsMainThread());
+   DCHECK(destination_array);
+ 
+@@ -210,12 +235,19 @@ void RealtimeAnalyser::GetByteTimeDomain
+ 
+     const unsigned write_index = GetWriteIndex();
+ 
++    const bool kJitterEnabled = base::FeatureList::IsEnabled(
++        blink::features::kHeliumNoiseAudio);
++
+     for (unsigned i = 0; i < len; ++i) {
+       // Buffer access is protected due to modulo operation.
+-      const float value = UNSAFE_TODO(
++      float value = UNSAFE_TODO(
+           input_buffer[(i + write_index - fft_size + kInputBufferSize) %
+                        kInputBufferSize]);
+ 
++      if (kJitterEnabled) {
++        value = BaseAudioContext::JitterAudioData(value, context);
++      }
++
+       // Scale from nominal -1 -> +1 to unsigned byte.
+       const double scaled_value = 128 * (value + 1);
+ 
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -630,7 +630,6 @@
+       // AudioContext.playoutStats interface.
+       // https://chromestatus.com/feature/5172818344148992
+       name: "AudioContextPlayoutStats",
+-      origin_trial_feature_name: "AudioContextPlayoutStats",
+       status: "experimental",
+     },
+     {
+--- a/third_party/blink/renderer/modules/webaudio/analyser_handler.h
++++ b/third_party/blink/renderer/modules/webaudio/analyser_handler.h
+@@ -13,6 +13,7 @@ namespace blink {
+ 
+ class AudioNode;
+ class ExceptionState;
++class ExecutionContext;
+ 
+ class AnalyserHandler final : public AudioHandler {
+  public:
+@@ -37,17 +38,17 @@ class AnalyserHandler final : public Aud
+   }
+   void SetSmoothingTimeConstant(double k, ExceptionState&);
+ 
+-  void GetFloatFrequencyData(DOMFloat32Array* array, double current_time) {
+-    analyser_.GetFloatFrequencyData(array, current_time);
++  void GetFloatFrequencyData(DOMFloat32Array* array, double current_time, ExecutionContext* context) {
++    analyser_.GetFloatFrequencyData(array, current_time, context);
+   }
+-  void GetByteFrequencyData(DOMUint8Array* array, double current_time) {
+-    analyser_.GetByteFrequencyData(array, current_time);
++  void GetByteFrequencyData(DOMUint8Array* array, double current_time, ExecutionContext* context) {
++    analyser_.GetByteFrequencyData(array, current_time, context);
+   }
+-  void GetFloatTimeDomainData(DOMFloat32Array* array) {
+-    analyser_.GetFloatTimeDomainData(array);
++  void GetFloatTimeDomainData(DOMFloat32Array* array, ExecutionContext* context) {
++    analyser_.GetFloatTimeDomainData(array, context);
+   }
+-  void GetByteTimeDomainData(DOMUint8Array* array) {
+-    analyser_.GetByteTimeDomainData(array);
++  void GetByteTimeDomainData(DOMUint8Array* array, ExecutionContext* context) {
++    analyser_.GetByteTimeDomainData(array, context);
+   }
+ 
+  private:
+--- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
++++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+@@ -118,20 +118,22 @@ double AnalyserNode::smoothingTimeConsta
+ 
+ void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatFrequencyData(array.Get(),
+-                                             context()->currentTime());
++                                             context()->currentTime(),
++                                             GetExecutionContext());
+ }
+ 
+ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+   GetAnalyserHandler().GetByteFrequencyData(array.Get(),
+-                                            context()->currentTime());
++                                            context()->currentTime(),
++                                            GetExecutionContext());
+ }
+ 
+ void AnalyserNode::getFloatTimeDomainData(NotShared<DOMFloat32Array> array) {
+-  GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
++  GetAnalyserHandler().GetFloatTimeDomainData(array.Get(), GetExecutionContext());
+ }
+ 
+ void AnalyserNode::getByteTimeDomainData(NotShared<DOMUint8Array> array) {
+-  GetAnalyserHandler().GetByteTimeDomainData(array.Get());
++  GetAnalyserHandler().GetByteTimeDomainData(array.Get(), GetExecutionContext());
+ }
+ 
+ void AnalyserNode::ReportDidCreate() {
+--- a/third_party/blink/renderer/modules/webaudio/realtime_analyser.h
++++ b/third_party/blink/renderer/modules/webaudio/realtime_analyser.h
+@@ -36,6 +36,7 @@
+ namespace blink {
+ 
+ class AudioBus;
++class ExecutionContext;
+ 
+ class RealtimeAnalyser final {
+   DISALLOW_NEW();
+@@ -65,10 +66,10 @@ class RealtimeAnalyser final {
+   double SmoothingTimeConstant() const { return smoothing_time_constant_; }
+   void SetSmoothingTimeConstant(double k) { smoothing_time_constant_ = k; }
+ 
+-  void GetFloatFrequencyData(DOMFloat32Array*, double);
+-  void GetByteFrequencyData(DOMUint8Array*, double);
+-  void GetFloatTimeDomainData(DOMFloat32Array*);
+-  void GetByteTimeDomainData(DOMUint8Array*);
++  void GetFloatFrequencyData(DOMFloat32Array*, double, ExecutionContext*);
++  void GetByteFrequencyData(DOMUint8Array*, double, ExecutionContext*);
++  void GetFloatTimeDomainData(DOMFloat32Array*, ExecutionContext*);
++  void GetByteTimeDomainData(DOMUint8Array*, ExecutionContext*);
+ 
+   // The audio thread writes input data here.
+   void WriteInput(AudioBus*, uint32_t frames_to_process);
