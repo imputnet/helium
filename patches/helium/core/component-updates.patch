@@ -1,0 +1,220 @@
+--- a/components/component_updater/component_updater_url_constants.cc
++++ b/components/component_updater/component_updater_url_constants.cc
+@@ -15,9 +15,9 @@ namespace component_updater {
+ // The value of |kDefaultUrlSource| can be overridden with
+ // --component-updater=url-source=someurl.
+ const char kUpdaterJSONDefaultUrl[] =
+-    "https://update.googleapis.com/service/update2/json";
++    "trk:345:https://update.googleapis.com/service/update2/json";
+ 
+ const char kUpdaterJSONFallbackUrl[] =
+-    "http://update.googleapis.com/service/update2/json";
++    "trk:346:http://update.googleapis.com/service/update2/json";
+ 
+ }  // namespace component_updater
+--- a/components/helium_services/helium_services_helpers.cc
++++ b/components/helium_services/helium_services_helpers.cc
+@@ -9,6 +9,7 @@
+ #include "base/functional/bind.h"
+ #include "base/strings/stringprintf.h"
+ #include "components/helium_services/pref_names.h"
++#include "components/helium_services/schema.h"
+ #include "components/prefs/pref_service.h"
+ #include "net/base/url_util.h"
+ #include "url/gurl.h"
+@@ -88,6 +89,12 @@ bool ShouldAccessUpdateService(const Pre
+             prefs.GetBoolean(prefs::kHeliumUpdateFetchingEnabled);
+ }
+ 
++bool ShouldAccessComponentUpdateService(const PrefService& prefs) {
++    return ShouldAccessServices(prefs) &&
++            HasAcceptedSchema(prefs, 1) &&
++            prefs.GetBoolean(prefs::kHeliumUpdateFetchingEnabled);
++}
++
+ bool ShouldAccessUBlockAssets(const PrefService& prefs) {
+     return ShouldAccessServices(prefs) &&
+             prefs.GetBoolean(prefs::kHeliumUBlockAssetsEnabled);
+@@ -132,6 +139,14 @@ GURL GetBrowserUpdateURL(const PrefServi
+ #endif
+ }
+ 
++GURL GetComponentUpdateURL(const PrefService* prefs) {
++    if (!prefs || !ShouldAccessComponentUpdateService(*prefs)) {
++        return GetDummyURL();
++    }
++
++    return GetServicesBaseURL(*prefs).Resolve("/com");
++}
++
+ GURL GetUBlockAssetsURL(const PrefService& prefs) {
+     if (!ShouldAccessUBlockAssets(prefs)) {
+         return GetDummyURL();
+--- a/components/helium_services/helium_services_helpers.h
++++ b/components/helium_services/helium_services_helpers.h
+@@ -23,6 +23,7 @@ bool ShouldAccessServices(const PrefServ
+ COMPONENT_EXPORT(HELIUM) bool ShouldFetchBangs(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) bool ShouldAccessExtensionService(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) bool ShouldAccessUpdateService(const PrefService& prefs);
++COMPONENT_EXPORT(HELIUM) bool ShouldAccessComponentUpdateService(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) bool ShouldAccessUBlockAssets(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetServicesBaseURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetDummyURL();
+@@ -30,6 +31,7 @@ COMPONENT_EXPORT(HELIUM) GURL GetExtensi
+ COMPONENT_EXPORT(HELIUM) GURL GetWebstoreSnippetURL(const PrefService& prefs, std::string_view id);
+ COMPONENT_EXPORT(HELIUM) GURL GetSpellcheckURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetBrowserUpdateURL(const PrefService& prefs);
++COMPONENT_EXPORT(HELIUM) GURL GetComponentUpdateURL(const PrefService* prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetUBlockAssetsURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) std::optional<GURL> GetValidUserOverridenURL(std::string_view user_url_);
+ COMPONENT_EXPORT(HELIUM) void ConfigurePrefChangeRegistrarFor(std::string_view pref_name,
+--- a/chrome/browser/component_updater/chrome_component_updater_configurator.cc
++++ b/chrome/browser/component_updater/chrome_component_updater_configurator.cc
+@@ -26,11 +26,14 @@
+ #include "chrome/browser/component_updater/component_updater_utils.h"
+ #include "chrome/browser/component_updater/updater_state.h"
+ #include "chrome/browser/net/system_network_context_manager.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/update_client/chrome_update_query_params_delegate.h"
+ #include "chrome/common/channel_info.h"
+ #include "chrome/common/chrome_paths.h"
+ #include "components/component_updater/component_updater_command_line_config_policy.h"
+ #include "components/component_updater/configurator_impl.h"
++#include "components/helium_services/helium_services_helpers.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/services/patch/content/patch_service.h"
+ #include "components/services/unzip/content/unzip_service.h"
+@@ -55,6 +58,26 @@
+ namespace component_updater {
+ namespace {
+ 
++PrefService* GetProfilePrefs() {
++  // Browser process and profile manager are usually
++  // not null, but they may be during tests.
++  if (!g_browser_process) {
++    return nullptr;
++  }
++
++  ProfileManager* pm = g_browser_process->profile_manager();
++  if (!pm) {
++    return nullptr;
++  }
++
++  Profile* profile = pm->GetLastUsedProfileIfLoaded();
++  if (!profile) {
++    return nullptr;
++  }
++
++  return profile->GetPrefs();
++}
++
+ class ChromeConfigurator : public update_client::Configurator {
+  public:
+   ChromeConfigurator(const base::CommandLine* cmdline,
+@@ -154,12 +177,12 @@ base::TimeDelta ChromeConfigurator::Upda
+ 
+ std::vector<GURL> ChromeConfigurator::UpdateUrl() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return configurator_impl_.UpdateUrl();
++  return {helium::GetComponentUpdateURL(GetProfilePrefs())};
+ }
+ 
+ std::vector<GURL> ChromeConfigurator::PingUrl() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return configurator_impl_.PingUrl();
++  return {helium::GetComponentUpdateURL(GetProfilePrefs())};
+ }
+ 
+ std::string ChromeConfigurator::GetProdId() const {
+--- a/components/component_updater/component_installer.cc
++++ b/components/component_updater/component_installer.cc
+@@ -12,6 +12,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/containers/fixed_flat_set.h"
+ #include "base/files/file_enumerator.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+@@ -111,7 +112,21 @@ void ComponentInstaller::Register(Compon
+ 
+   std::vector<uint8_t> public_key_hash;
+   installer_policy_->GetHash(&public_key_hash);
++
++  static constexpr auto kAllowedComponents =
++    base::MakeFixedFlatSet<std::string_view>(
++      base::sorted_unique,
++        {
++          "hfnkpimlhhgieaddgfemjhofmfblmnib", // CRLSet
++        }
++    );
++
+   const auto crx_id = update_client::GetCrxIdFromPublicKeyHash(public_key_hash);
++
++  if (!kAllowedComponents.contains(crx_id)) {
++    return;
++  }
++
+   Register(base::BindOnce(&ComponentUpdateService::RegisterComponent,
+                           base::Unretained(cus)),
+            std::move(callback), cus->GetRegisteredVersion(crx_id),
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -7021,6 +7021,9 @@ Keep your key file in a safe place. You
+       <message name="IDS_COMPONENTS_SVC_STATUS_UPDATE_ERROR" desc="Service Status">
+         Update error
+       </message>
++      <message name="IDS_COMPONENTS_SVC_STATUS_ERROR_HELIUM_SERVICES" desc="Service Status">
++        Component updates are disabled. See Helium services in settings.
++      </message>
+       <message name="IDS_COMPONENTS_UNKNOWN" desc="Service Status">
+         Unknown
+       </message>
+--- a/chrome/browser/ui/webui/components/components_handler.cc
++++ b/chrome/browser/ui/webui/components/components_handler.cc
+@@ -12,8 +12,12 @@
+ #include "base/notreached.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/helium_services/helium_services_helpers.h"
++#include "components/prefs/pref_service.h"
+ #include "components/update_client/crx_update_item.h"
++#include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+ 
+ ComponentsHandler::ComponentsHandler(
+@@ -82,6 +86,20 @@ void ComponentsHandler::OnEvent(const up
+ 
+ std::u16string ComponentsHandler::ServiceStatusToString(
+     update_client::ComponentState state) {
++
++  if (state == update_client::ComponentState::kUpdateError) {
++    Profile* profile = Profile::FromBrowserContext(
++        web_ui()->GetWebContents()->GetBrowserContext());
++
++    if (profile) {
++      PrefService* prefs = profile->GetPrefs();
++      if (prefs && !helium::ShouldAccessComponentUpdateService(*prefs)) {
++        return l10n_util::GetStringUTF16(
++          IDS_COMPONENTS_SVC_STATUS_ERROR_HELIUM_SERVICES);
++      }
++    }
++  }
++
+   switch (state) {
+     case update_client::ComponentState::kNew:
+       return l10n_util::GetStringUTF16(IDS_COMPONENTS_SVC_STATUS_NEW);
+--- a/chrome/browser/ui/webui/components/components_handler.h
++++ b/chrome/browser/ui/webui/components/components_handler.h
+@@ -40,7 +40,7 @@ class ComponentsHandler : public content
+   void OnEvent(const update_client::CrxUpdateItem& item) override;
+ 
+  private:
+-  static std::u16string ServiceStatusToString(
++  std::u16string ServiceStatusToString(
+       update_client::ComponentState state);
+ 
+   base::Value::List LoadComponents();

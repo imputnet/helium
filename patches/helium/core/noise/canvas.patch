@@ -1,0 +1,421 @@
+# Some files in this patch are sourced from Chromium. They were
+# heavily modified to fit Helium's needs.
+#
+# Chromium's license header is maintained wherever applicable to 
+# respect the original authorship of code.
+#
+# Chromium LICENSE:
+#
+# Copyright 2015 The Chromium Authors
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#
+#    * Redistributions of source code must retain the above copyright
+# notice, this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above
+# copyright notice, this list of conditions and the following disclaimer
+# in the documentation and/or other materials provided with the
+# distribution.
+#    * Neither the name of Google LLC nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -29,6 +29,7 @@ namespace helium {
+   constexpr const char kDisableEchCommandLine[] = "disable-ech";
+ 
+   constexpr const char kHeliumNoiseCommandLine[] = "helium-noise";
++  constexpr const char kHeliumNoiseCanvasCommandLine[] = "helium-noise-canvas";
+ 
+ }  // namespace helium
+ 
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -20,4 +20,8 @@
+      "Helium Noise",
+      "Helium's anti-fingerprinting functionality. Adds insignificant noise to various features to deceive fingerprinting scripts. Enabled by default, must be enabled for other anti-fingerprinting features to work. Helium flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoise)},
++    {helium::kHeliumNoiseCanvasCommandLine,
++     "[Helium Noise] Canvas pixel noising",
++     "Adds insignificant noise to canvas pixels during readback to deceive canvas-based fingerprinting. Helium flag.",
++     kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseCanvas)},
+ #endif  /* CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_ */
+--- a/third_party/blink/common/features.cc
++++ b/third_party/blink/common/features.cc
+@@ -43,6 +43,10 @@ const base::FeatureParam<std::string> kS
+ BASE_FEATURE(kHeliumNoise,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++// Canvas noise for fingerprinting protection.
++BASE_FEATURE(kHeliumNoiseCanvas,
++             base::FEATURE_ENABLED_BY_DEFAULT);
++
+ // Controls whether to include information about the page's open popup in
+ // AIPageContent.
+ BASE_FEATURE(kAIPageContentIncludePopupWindows,
+--- a/third_party/blink/public/common/features.h
++++ b/third_party/blink/public/common/features.h
+@@ -42,6 +42,7 @@ BLINK_COMMON_EXPORT extern const base::F
+ // on the identifier name of the generated feature.
+ 
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoise);
++BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoiseCanvas);
+ 
+ // Controls whether to include information about the page's open popup in
+ // AIPageContent.
+--- /dev/null
++++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.cc
+@@ -0,0 +1,240 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++// -----------------------------------------------------------------------
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/core/helium_noise/canvas_noising_helper.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++#include "base/check_op.h"
++#include "base/containers/span.h"
++#include "base/containers/span_writer.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/numerics/safe_conversions.h"
++#include "third_party/blink/public/common/features.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/helium_noise/helium_noise_hash.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_high_entropy_op_type.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
++#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
++#include "ui/gfx/skia_span_util.h"
++
++namespace blink {
++
++namespace {
++
++constexpr uint8_t kMaxClosePixelDelta = 10u;
++constexpr uint8_t kMaxNoisePerChannel = 3u;
++constexpr uint8_t kChannelsPerPixel = 4u;
++constexpr std::array<uint8_t, 4u> kEmptyPixel({0, 0, 0, 0});
++
++struct PixelLocation {
++  int x;
++  int y;
++};
++
++void ClampPixelLocation(PixelLocation* location,
++                        const int width,
++                        const int height) {
++  CHECK(width >= 1 && height >= 1);
++  location->x = std::min(std::max(0, location->x), width - 1);
++  location->y = std::min(std::max(0, location->y), height - 1);
++}
++
++// Returns two random pixel locations; one close to the offset and one
++// randomly selected from the entire canvas.
++const std::pair<PixelLocation, PixelLocation> GetRandomPixelLocations(
++    HeliumNoiseHash& token_hash,
++    const PixelLocation offset,
++    const int width,
++    const int height) {
++  std::pair<PixelLocation, PixelLocation> pixel_locations;
++  // Uses 2 * log2(kMaxClosePixelDelta*2+1) = 8 bits from hash.
++  pixel_locations.first = {
++      offset.x + token_hash.GetValueBelow(kMaxClosePixelDelta * 2) -
++          kMaxClosePixelDelta + 1,
++      offset.y + token_hash.GetValueBelow(kMaxClosePixelDelta * 2) -
++          kMaxClosePixelDelta + 1};
++  // x and y might be negative or go beyond the width or height here, so we need
++  // to clamp them.
++  ClampPixelLocation(&pixel_locations.first, width, height);
++  // Uses max 2 * log2(kMaximumCanvasSize) = 40 bits from hash.
++  pixel_locations.second = {token_hash.GetValueBelow(width),
++                            token_hash.GetValueBelow(height)};
++  // Used at most 48 bits from hash
++  return pixel_locations;
++}
++
++void HeliumNoisePixel(base::span<uint8_t> pixel, HeliumNoiseHash& token_hash) {
++  base::SpanWriter writer(base::as_writable_bytes(pixel));
++  for (int i = 0; i < kChannelsPerPixel; ++i) {
++    int channel_value = pixel[i];
++    // Clamp min- and maxNoisedVal to [0, 255] and [1, 255] for the alpha
++    // channel if it was non-zero before.
++    int lowerLimit = (i == kChannelsPerPixel - 1 && channel_value > 0) ? 1 : 0;
++    int minNoisedVal = channel_value <= kMaxNoisePerChannel
++                           ? lowerLimit
++                           : channel_value - kMaxNoisePerChannel;
++    int maxNoisedVal = channel_value >= 255 - kMaxNoisePerChannel
++                           ? 255
++                           : channel_value + kMaxNoisePerChannel;
++    int noise = token_hash.GetValueBelow(
++        std::min(kMaxNoisePerChannel * 2 + 1, maxNoisedVal - minNoisedVal + 1));
++    writer.WriteU8LittleEndian(
++        base::checked_cast<uint8_t>(minNoisedVal + noise));
++  }
++}
++
++base::span<uint8_t, 4u> GetPixelAt(const int x,
++                                   const int y,
++                                   const int width,
++                                   const base::span<uint8_t> pixels) {
++  return pixels
++      .subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++      .first<4u>();
++}
++
++uint64_t GetValueFromPixelLocations(
++    const std::pair<PixelLocation, PixelLocation> locations,
++    const base::span<uint8_t> pixels,
++    int width) {
++  uint64_t result = 0u;
++  result |= base::U32FromLittleEndian(
++      GetPixelAt(locations.first.x, locations.first.y, width, pixels));
++  result <<= 32u;
++  result |= base::U32FromLittleEndian(
++      GetPixelAt(locations.second.x, locations.second.y, width, pixels));
++  return result;
++}
++
++void CopyPixelValue(const base::span<uint8_t> from_pixel,
++                    base::span<uint8_t> to_pixel) {
++  base::SpanWriter writer(base::as_writable_bytes(to_pixel));
++  writer.Write(from_pixel.first<kChannelsPerPixel>());
++}
++
++// Adds noise to the provided pixels in place, using |token_hash| as the
++// source for pseudo-randomness. This function assumes that there are 4
++// channels per pixel.
++void HeliumNoisePixels(const HeliumNoiseHash& token_hash,
++                 base::span<uint8_t> pixels,
++                 const int width,
++                 const int height) {
++  CHECK_EQ(pixels.size(),
++           static_cast<size_t>(width * height * kChannelsPerPixel));
++
++  const size_t row_size = width * kChannelsPerPixel;
++  std::vector<uint8_t> row1(row_size);
++  std::vector<uint8_t> row2(row_size);
++  base::span<uint8_t> unnoised_previous_row(row1);
++  base::span<uint8_t> unnoised_current_row(row2);
++
++  for (int y = 0; y < height; ++y) {
++    unnoised_current_row.copy_from(pixels.subspan(y * row_size, row_size));
++    for (int x = 0; x < width; ++x) {
++      auto pixel = GetPixelAt(x, y, width, pixels);
++      if (pixel == kEmptyPixel) {
++        continue;
++      }
++      if (y > 0 && x > 0 &&
++          GetPixelAt(x - 1, 0, width, unnoised_previous_row) == pixel) {
++        // same top-left pixel, copy.
++        CopyPixelValue(GetPixelAt(x - 1, y - 1, width, pixels), pixel);
++      } else if (y > 0 &&
++                 GetPixelAt(x, 0, width, unnoised_previous_row) == pixel) {
++        // same top pixel, copy.
++        CopyPixelValue(GetPixelAt(x, y - 1, width, pixels), pixel);
++      } else if (y > 0 && x < width - 1 &&
++                 GetPixelAt(x + 1, 0, width, unnoised_previous_row) == pixel) {
++        // same top-right pixel, copy.
++        CopyPixelValue(GetPixelAt(x + 1, y - 1, width, pixels), pixel);
++      } else if (x > 0 &&
++                 GetPixelAt(x - 1, 0, width, unnoised_current_row) == pixel) {
++        // same left pixel, copy.
++        CopyPixelValue(GetPixelAt(x - 1, y, width, pixels), pixel);
++      } else {
++        // otherwise, noise the pixel.
++        HeliumNoiseHash hash_copy = token_hash;
++        hash_copy.Update(base::U32FromLittleEndian(pixel));
++        // GetRandomPixelLocations consumes at most 46 bits from hash.
++        const std::pair<PixelLocation, PixelLocation> other_pixels =
++            GetRandomPixelLocations(hash_copy, {x, y}, width, height);
++        hash_copy.Update(
++            GetValueFromPixelLocations(other_pixels, pixels, width));
++        // HeliumNoisePixel consumes 12 bits from hash
++        HeliumNoisePixel(pixel, hash_copy);
++      }
++    }
++    // Previous can be overwritten (new current). Current is the now previous.
++    std::swap(unnoised_previous_row, unnoised_current_row);
++  }
++}
++
++}  // namespace
++
++// static
++bool CanvasNoisingHelper::MaybeNoiseSnapshot(
++    ExecutionContext* execution_context,
++    scoped_refptr<StaticBitmapImage>& snapshot) {
++  CHECK(snapshot);
++
++  if (!base::FeatureList::IsEnabled(
++        blink::features::kHeliumNoiseCanvas)) {
++    return false;
++  }
++
++  // Check if execution context exists and has a canvas noise token
++  if (!execution_context ||
++      !execution_context->GetHeliumNoiseTokens().contains(
++          HeliumNoiseFeature::kCanvas)) {
++    return false;
++  }
++
++  // Use kUnpremul_SkAlphaType as alpha type as we are changing the pixel values
++  // of all channels, including the alpha channel.
++  auto info = SkImageInfo::Make(
++      snapshot->GetSize().width(), snapshot->GetSize().height(),
++      viz::ToClosestSkColorType(snapshot->GetSharedImageFormat()),
++      kUnpremul_SkAlphaType, snapshot->GetColorSpace().ToSkColorSpace());
++  SkBitmap bm;
++  if (!bm.tryAllocPixels(info)) {
++    return false;
++  }
++
++  // Copy the original pixels from snapshot to the modifiable SkPixmap. SkBitmap
++  // should already allocate the correct amount of pixels, so this shouldn't
++  // fail because of memory allocation.
++  auto pixmap_to_noise = bm.pixmap();
++  PaintImage paint_image = snapshot->PaintImageForCurrentFrame();
++  if (!paint_image.readPixels(bm.info(), pixmap_to_noise.writable_addr(),
++                              bm.rowBytes(), 0, 0)) {
++    return false;
++  }
++
++  base::span<uint8_t> modify_pixels =
++      gfx::SkPixmapToWritableSpan(pixmap_to_noise);
++
++  auto token_hash = HeliumNoiseHash(
++      execution_context->GetHeliumNoiseTokens().at(
++        HeliumNoiseFeature::kCanvas));
++
++  HeliumNoisePixels(token_hash, modify_pixels, pixmap_to_noise.width(),
++              pixmap_to_noise.height());
++
++  auto noised_image = bm.asImage();
++  snapshot = blink::UnacceleratedStaticBitmapImage::Create(
++      std::move(noised_image), snapshot->Orientation());
++
++  return true;
++}
++
++}  // namespace blink
+--- /dev/null
++++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++// -----------------------------------------------------------------------
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_HELIUM_NOISE_CANVAS_NOISING_HELPER_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_HELIUM_NOISE_CANVAS_NOISING_HELPER_H_
++
++#include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
++
++namespace blink {
++
++class CORE_EXPORT CanvasNoisingHelper {
++ public:
++  // If allowed, performs noising on a copy of the snapshot StaticBitmapImage
++  // and modifies it in place. Returns true if noise was applied.
++  static bool MaybeNoiseSnapshot(ExecutionContext* execution_context,
++                                 scoped_refptr<StaticBitmapImage>& snapshot);
++
++ private:
++  CanvasNoisingHelper() = delete;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_HELIUM_NOISE_CANVAS_NOISING_HELPER_H_
+--- a/third_party/blink/renderer/core/helium_noise/build.gni
++++ b/third_party/blink/renderer/core/helium_noise/build.gni
+@@ -5,4 +5,6 @@
+ blink_core_sources_helium_noise = [
+   "helium_noise_hash.cc",
+   "helium_noise_hash.h",
++  "canvas_noising_helper.cc",
++  "canvas_noising_helper.h",
+ ]
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -72,6 +72,7 @@
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/geometry/dom_matrix.h"
++#include "third_party/blink/renderer/core/helium_noise/canvas_noising_helper.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_draw_listener.h"
+@@ -1305,6 +1306,9 @@ String HTMLCanvasElement::ToDataURLInter
+ 
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
+   if (image_bitmap) {
++    CanvasNoisingHelper::MaybeNoiseSnapshot(GetExecutionContext(),
++                                            image_bitmap);
++
+     std::unique_ptr<ImageDataBuffer> data_buffer =
+         ImageDataBuffer::Create(image_bitmap);
+     if (!data_buffer)
+@@ -1416,6 +1420,9 @@ void HTMLCanvasElement::toBlob(V8BlobCal
+   CanvasAsyncBlobCreator* async_creator = nullptr;
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(kBackBuffer);
+   if (image_bitmap) {
++    CanvasNoisingHelper::MaybeNoiseSnapshot(GetExecutionContext(),
++                                            image_bitmap);
++
+     auto* options = ImageEncodeOptions::Create();
+     options->setType(ImageEncoderUtils::MimeTypeName(encoding_mime_type));
+     async_creator = MakeGarbageCollected<CanvasAsyncBlobCreator>(
+--- a/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
++++ b/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+@@ -20,6 +20,7 @@
+ #include "third_party/blink/renderer/core/fileapi/blob.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/helium_noise/canvas_noising_helper.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+@@ -343,11 +344,13 @@ ScriptPromise<Blob> OffscreenCanvas::con
+   base::TimeTicks start_time = base::TimeTicks::Now();
+   scoped_refptr<StaticBitmapImage> image_bitmap = context_->GetImage();
+   if (image_bitmap) {
++    auto* execution_context = ExecutionContext::From(script_state);
++    CanvasNoisingHelper::MaybeNoiseSnapshot(execution_context, image_bitmap);
++
+     auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<Blob>>(
+         script_state, exception_state.GetContext());
+     CanvasAsyncBlobCreator::ToBlobFunctionType function_type =
+         CanvasAsyncBlobCreator::kOffscreenCanvasConvertToBlobPromise;
+-    auto* execution_context = ExecutionContext::From(script_state);
+     auto* async_creator = MakeGarbageCollected<CanvasAsyncBlobCreator>(
+         image_bitmap, options, function_type, start_time, execution_context,
+         resolver);

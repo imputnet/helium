@@ -5,7 +5,7 @@
 
 from third_party import unidiff
 
-LICENSE_HEADER_IGNORES = ["html", "license", "readme"]
+LICENSE_HEADER_IGNORES = ["html", "license", "readme", "deps"]
 
 patches_dir = None
 series = None
@@ -14,6 +14,10 @@ series = None
 def _read_text(path):
     with open(patches_dir / path, "r", encoding="utf-8") as f:
         return filter(str, f.read().splitlines())
+
+
+def _read_patch(path):
+    return unidiff.PatchSet('\n'.join(_read_text(path)))
 
 
 def _init(root):
@@ -59,8 +63,7 @@ def c_all_new_files_have_license_header():
         if 'helium' not in patch:
             continue
 
-        patch_set = unidiff.PatchSet('\n'.join(_read_text(patch)))
-        added_files = filter(lambda f: f.is_added_file, patch_set)
+        added_files = filter(lambda f: f.is_added_file, _read_patch(patch))
 
         for file in added_files:
             if any(p in file.path.lower() for p in LICENSE_HEADER_IGNORES):
@@ -75,8 +78,8 @@ def c_all_new_headers_have_correct_guard():
         if 'helium' not in patch:
             continue
 
-        patch_set = unidiff.PatchSet('\n'.join(_read_text(patch)))
-        added_files = filter(lambda f: f.is_added_file and f.path.endswith('.h'), patch_set)
+        added_files = filter(lambda f: f.is_added_file and f.path.endswith('.h'),
+                             _read_patch(patch))
 
         for file in added_files:
             expected_macro_name = file.path.upper() \
@@ -98,11 +101,11 @@ def c_all_new_headers_have_correct_guard():
             for _line in file[0]:
                 line = str(_line)
 
-                if '#ifndef' in line:
+                if expected["ifndef"] in line:
                     assert found["define"] is None
                     assert found["ifndef"] is None
                     found["ifndef"] = line
-                elif '#define' in line:
+                elif expected["define"] in line:
                     assert found["ifndef"] is not None
                     assert found["define"] is None
                     found["define"] = line
@@ -112,3 +115,22 @@ def c_all_new_headers_have_correct_guard():
                 assert value == f"+{expected[macro_type]}\n", \
                        f"Patch {patch} has unexpected {macro_type} in {file.path}:" \
                        f"{value_print}, expecting: {expected[macro_type]}"
+
+
+def d_no_whitespace_only_changes():
+    for patch in series:
+        if 'helium' not in patch:
+            continue
+
+        for file in _read_patch(patch):
+            for hunk in file:
+                seen_nonws = False
+                for line in hunk:
+                    line = str(line)
+
+                    if line.startswith('+') or line.startswith('-'):
+                        seen_nonws = seen_nonws or len(line.rstrip()) > 1
+
+                assert seen_nonws, \
+                    f"Patch {patch} contains hunk consisting of "\
+                    f"only whitespace characters in {file.path}: {hunk}"
