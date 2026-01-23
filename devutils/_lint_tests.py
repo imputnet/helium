@@ -5,7 +5,7 @@
 
 from third_party import unidiff
 
-LICENSE_HEADER_IGNORES = ["html", "license", "readme"]
+LICENSE_HEADER_IGNORES = ["html", "license", "readme", "deps"]
 
 patches_dir = None
 series = None
