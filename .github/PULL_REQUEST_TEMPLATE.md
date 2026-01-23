@@ -1,7 +1,7 @@
 For your pull request to not get closed without review, please confirm that:
 
-- [ ] An issue exists where the maintainers agreed that this should be implemented.
-      If such issue did not exist before, I opened one.
+- [ ] An issue exists where the maintainers agreed that this should be implemented
+      (an approved feature request, or confirmed bug).
 - [ ] I tested that my contribution works locally, and does not break anything,
       otherwise I have marked my PR as draft.
 - [ ] If my contribution is non-trivial, I did not use AI to write most of it.
