@@ -1,0 +1,669 @@
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2019, The Brave Authors
+Copyright (c) 2025, The Helium Authors
+
+Alternatively, the contents of this file may be used under the terms
+of the GNU General Public License Version 3, as described below:
+
+Copyright (C) 2025 The Helium Authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+--- a/chrome/browser/importer/importer_list.cc
++++ b/chrome/browser/importer/importer_list.cc
+@@ -27,6 +27,8 @@
+ #include "chrome/common/importer/edge_importer_utils_win.h"
+ #endif
+ 
++#include "chrome/browser/importer/chrome_importer_list.cc"
++
+ namespace {
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -171,20 +173,30 @@ std::vector<user_data_importer::SourcePr
+   if (shell_integration::IsFirefoxDefaultBrowser()) {
+     DetectFirefoxProfiles(locale, &profiles);
+     DetectBuiltinWindowsProfiles(&profiles);
++    DetectChromeProfiles(&profiles);
+   } else {
+     DetectBuiltinWindowsProfiles(&profiles);
+     DetectFirefoxProfiles(locale, &profiles);
++    DetectChromeProfiles(&profiles);
+   }
+ #elif BUILDFLAG(IS_MAC)
+   if (shell_integration::IsFirefoxDefaultBrowser()) {
+     DetectFirefoxProfiles(locale, &profiles);
+     DetectSafariProfiles(&profiles);
++    DetectChromeProfiles(&profiles);
+   } else {
+     DetectSafariProfiles(&profiles);
+     DetectFirefoxProfiles(locale, &profiles);
++    DetectChromeProfiles(&profiles);
+   }
+ #else
+-  DetectFirefoxProfiles(locale, &profiles);
++  if (shell_integration::IsFirefoxDefaultBrowser()) {
++    DetectFirefoxProfiles(locale, &profiles);
++    DetectChromeProfiles(&profiles);
++  } else {
++    DetectChromeProfiles(&profiles);
++    DetectFirefoxProfiles(locale, &profiles);
++  }
+ #endif
+   if (include_interactive_profiles) {
+     user_data_importer::SourceProfile bookmarks_profile;
+@@ -234,5 +246,11 @@ void ImporterList::SourceProfilesLoaded(
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+   source_profiles_.assign(profiles.begin(), profiles.end());
++
++  for (auto& profile : source_profiles_) {
++    if (profile.services_supported & user_data_importer::PASSWORDS)
++      profile.services_supported ^= user_data_importer::PASSWORDS;
++  }
++
+   std::move(profiles_loaded_callback).Run();
+ }
+--- a/chrome/common/importer/BUILD.gn
++++ b/chrome/common/importer/BUILD.gn
+@@ -3,11 +3,15 @@
+ # found in the LICENSE file.
+ 
+ import("//mojo/public/tools/bindings/mojom.gni")
++import("//extensions/buildflags/buildflags.gni")
+ 
+ assert(!is_fuchsia, "Fuchsia shouldn't use anything in //chrome")
+ 
+ mojom("interfaces") {
+-  sources = [ "profile_import.mojom" ]
++  sources = [
++    "profile_import.mojom",
++    "chrome_profile_import.mojom"
++  ]
+ 
+   public_deps = [
+     "//mojo/public/mojom/base",
+@@ -82,19 +86,28 @@ source_set("importer") {
+   sources = [
+     "firefox_importer_utils.cc",
+     "firefox_importer_utils.h",
++    "chrome_importer_constants.h",
++    "chrome_importer_utils.cc",
++    "chrome_importer_utils.h",
+     "importer_autofill_form_data_entry.cc",
+     "importer_autofill_form_data_entry.h",
+     "importer_bridge.cc",
+     "importer_bridge.h",
+     "pstore_declarations.h",
++    "scoped_copy_file.cc",
++    "scoped_copy_file.h",
+   ]
+-  if (is_chromeos || is_linux) {
+-    sources += [ "firefox_importer_utils_linux.cc" ]
++  if (is_linux) {
++    sources += [
++      "firefox_importer_utils_linux.cc",
++      "chrome_importer_utils_linux.cc",
++    ]
+   } else if (is_mac) {
+     sources += [
+       "firefox_importer_utils_mac.mm",
+       "safari_importer_utils.h",
+       "safari_importer_utils.mm",
++      "chrome_importer_utils_mac.mm",
+     ]
+   } else if (is_win) {
+     sources += [
+@@ -105,6 +118,7 @@ source_set("importer") {
+       "ie_importer_utils_win.h",
+       "importer_test_registry_overrider_win.cc",
+       "importer_test_registry_overrider_win.h",
++      "chrome_importer_utils_win.cc",
+     ]
+   }
+   deps = [
+@@ -113,10 +127,19 @@ source_set("importer") {
+     "//chrome/common:ini_parser",
+     "//components/favicon_base",
+     "//components/user_data_importer/common",
++    "//components/webdata/common",
+     "//content/public/common",
++    "//extensions/buildflags",
+     "//ui/base",
+     "//url",
++    "//sql",
+   ]
++
++  if (enable_extensions) {
++    deps += [
++      "//extensions/common",
++    ]
++  }
+ }
+ 
+ if (!is_android) {
+--- a/components/user_data_importer/common/importer_type.h
++++ b/components/user_data_importer/common/importer_type.h
+@@ -28,6 +28,16 @@ enum ImporterType {
+ #if BUILDFLAG(IS_WIN)
+   TYPE_EDGE = 6,
+ #endif
++  TYPE_CHROME = 64,
++  TYPE_EDGE_CHROMIUM = 65,
++  TYPE_VIVALDI = 66,
++  TYPE_OPERA = 67,
++  TYPE_YANDEX = 68,
++  TYPE_WHALE = 69,
++  TYPE_ARC = 70,
++  TYPE_BRAVE = 71,
++  TYPE_DIA = 72,
++  TYPE_PERPLEXITY_COMET = 73,
+ };
+ 
+ }  // namespace user_data_importer
+--- a/tools/metrics/histograms/metadata/sql/histograms.xml
++++ b/tools/metrics/histograms/metadata/sql/histograms.xml
+@@ -42,6 +42,7 @@ chromium-metrics-reviews@google.com.
+   <variant name="DBSCSessions" summary="DBSCSessions"/>
+   <variant name="DIPS" summary="DIPS"/>
+   <variant name="DownloadRecord" summary="DownloadRecord"/>
++  <variant name="Favicons" summary="Favicons"/>
+   <variant name="FileIndexService" summary="FileIndexService"/>
+   <variant name="FirefoxImporter" summary="FirefoxImporter"/>
+   <variant name="FirstPartySets" summary="FirstPartySets"/>
+--- a/components/user_data_importer/common/importer_data_types.h
++++ b/components/user_data_importer/common/importer_data_types.h
+@@ -29,7 +29,8 @@ enum ImportItem {
+   SEARCH_ENGINES = 1 << 4,
+   HOME_PAGE = 1 << 5,
+   AUTOFILL_FORM_DATA = 1 << 6,
+-  ALL = (1 << 7) - 1  // All the bits should be 1, hence the -1.
++  EXTENSIONS = 1 << 7,
++  ALL = (1 << 8) - 1  // All the bits should be 1, hence the -1.
+ };
+ 
+ // Information about a profile needed by an importer to do import work.
+@@ -111,6 +112,7 @@ enum VisitSource {
+   VISIT_SOURCE_FIREFOX_IMPORTED = 1,
+   VISIT_SOURCE_IE_IMPORTED = 2,
+   VISIT_SOURCE_SAFARI_IMPORTED = 3,
++  VISIT_SOURCE_CHROME_IMPORTED = 4,
+ };
+ 
+ }  // namespace user_data_importer
+--- a/chrome/common/importer/profile_import_process_param_traits_macros.h
++++ b/chrome/common/importer/profile_import_process_param_traits_macros.h
+@@ -23,11 +23,11 @@
+ #if BUILDFLAG(IS_WIN)
+ IPC_ENUM_TRAITS_MIN_MAX_VALUE(user_data_importer::ImporterType,
+                               user_data_importer::TYPE_UNKNOWN,
+-                              user_data_importer::TYPE_EDGE)
++                              user_data_importer::TYPE_PERPLEXITY_COMET)
+ #else
+ IPC_ENUM_TRAITS_MIN_MAX_VALUE(user_data_importer::ImporterType,
+                               user_data_importer::TYPE_UNKNOWN,
+-                              user_data_importer::TYPE_BOOKMARKS_FILE)
++                              user_data_importer::TYPE_PERPLEXITY_COMET)
+ #endif
+ 
+ IPC_ENUM_TRAITS_MIN_MAX_VALUE(user_data_importer::ImportItem,
+--- a/chrome/browser/ui/webui/settings/import_data_handler.cc
++++ b/chrome/browser/ui/webui/settings/import_data_handler.cc
+@@ -146,6 +146,9 @@ void ImportDataHandler::HandleImportData
+   if (*type_dict.FindBool(prefs::kImportDialogSearchEngine)) {
+     selected_items |= user_data_importer::SEARCH_ENGINES;
+   }
++  if (*type_dict.FindBool(prefs::kImportDialogExtensions)) {
++    selected_items |= user_data_importer::EXTENSIONS;
++  }
+ 
+   const user_data_importer::SourceProfile& source_profile =
+       importer_list_->GetSourceProfileAt(browser_index);
+@@ -225,6 +228,8 @@ void ImportDataHandler::SendBrowserProfi
+     browser_profile.Set(
+         "autofillFormData",
+         (browser_services & user_data_importer::AUTOFILL_FORM_DATA) != 0);
++    browser_profile.Set("extensions",
++                        (browser_services & user_data_importer::EXTENSIONS) != 0);
+ 
+     browser_profiles.Append(std::move(browser_profile));
+   }
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -4318,6 +4318,9 @@ inline constexpr char kServiceWorkerToCo
+ inline constexpr char kSharedWorkerBlobURLFixEnabled[] =
+     "worker.shared_worker_blob_url_fix_enabled";
+ 
++inline constexpr char kImportDialogExtensions[] =
++    "import_dialog_extensions";
++
+ // Boolean indicating whether clearing window.name when the navigation is
+ // top-level, cross-site and swaps BrowsingContextGroup is allowed or not.
+ inline constexpr char kClearWindowNameForNewBrowsingContextGroup[] =
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -1151,6 +1151,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kImportDialogSearchEngine] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kImportDialogExtensions] =
++      settings_api::PrefType::kBoolean;
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
+   // Supervised Users.  This setting is queried in our Tast tests (b/241943380).
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -58,6 +58,7 @@
+ #include "chrome/browser/ui/webui/settings/about_handler.h"
+ #include "chrome/browser/ui/webui/settings/accessibility_main_handler.h"
+ #include "chrome/browser/ui/webui/settings/appearance_handler.h"
++#include "chrome/browser/ui/webui/settings/brave_import_data_handler.h"
+ #include "chrome/browser/ui/webui/settings/browser_lifetime_handler.h"
+ #include "chrome/browser/ui/webui/settings/downloads_handler.h"
+ #include "chrome/browser/ui/webui/settings/font_handler.h"
+@@ -211,6 +212,7 @@ void SettingsUI::RegisterProfilePrefs(
+   registry->RegisterBooleanPref(prefs::kImportDialogHistory, true);
+   registry->RegisterBooleanPref(prefs::kImportDialogSavedPasswords, true);
+   registry->RegisterBooleanPref(prefs::kImportDialogSearchEngine, true);
++  registry->RegisterBooleanPref(prefs::kImportDialogExtensions, true);
+ }
+ 
+ SettingsUI::SettingsUI(content::WebUI* web_ui)
+@@ -240,7 +242,7 @@ SettingsUI::SettingsUI(content::WebUI* w
+   AddSettingsPageUIHandler(std::make_unique<DownloadsHandler>(profile));
+   AddSettingsPageUIHandler(std::make_unique<ExtensionControlHandler>());
+   AddSettingsPageUIHandler(std::make_unique<FontHandler>(profile));
+-  AddSettingsPageUIHandler(std::make_unique<ImportDataHandler>());
++  AddSettingsPageUIHandler(std::make_unique<BraveImportDataHandler>());
+   AddSettingsPageUIHandler(std::make_unique<HatsHandler>());
+ 
+ #if BUILDFLAG(IS_WIN)
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -1014,6 +1014,8 @@ void AddImportDataStrings(content::WebUI
+       {"importHistory", IDS_SETTINGS_IMPORT_HISTORY_CHECKBOX},
+       {"importFavorites", IDS_SETTINGS_IMPORT_FAVORITES_CHECKBOX},
+       {"importPasswords", IDS_SETTINGS_IMPORT_PASSWORDS_CHECKBOX},
++      // abusing some strings here so _we_ don't have to localize them
++      {"importExtensions", IDS_EXTENSIONS_TOOLBAR_TITLE},
+       {"importSearch", IDS_SETTINGS_IMPORT_SEARCH_ENGINES_CHECKBOX},
+       {"importAutofillFormData",
+        IDS_SETTINGS_IMPORT_AUTOFILL_FORM_DATA_CHECKBOX},
+--- a/chrome/browser/resources/settings/people_page/import_data_dialog.html
++++ b/chrome/browser/resources/settings/people_page/import_data_dialog.html
+@@ -84,6 +84,11 @@
+                 pref="{{prefs.import_dialog_autofill_form_data}}"
+                 label="$i18n{importAutofillFormData}" no-set-pref>
+             </settings-checkbox>
++            <settings-checkbox id="importDialogExtensions"
++              hidden="[[!selected_.extensions]]"
++              pref="{{prefs.import_dialog_extensions}}"
++              label="$i18n{importExtensions}" no-set-pref>
++            </settings-checkbox>
+           </div>
+         </div>
+       </div>
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1252,6 +1252,10 @@ static_library("ui") {
+       "webui/settings/accessibility_main_handler.h",
+       "webui/settings/appearance_handler.cc",
+       "webui/settings/appearance_handler.h",
++      "webui/settings/brave_import_data_handler.cc",
++      "webui/settings/brave_import_data_handler.h",
++      "webui/settings/brave_importer_observer.cc",
++      "webui/settings/brave_importer_observer.h",
+       "webui/settings/browser_lifetime_handler.cc",
+       "webui/settings/browser_lifetime_handler.h",
+       "webui/settings/captions_handler.cc",
+@@ -1410,6 +1414,13 @@ static_library("ui") {
+       ]
+     }
+ 
++    if (is_mac) {
++      sources += [
++        "webui/settings/brave_full_disk_access_confirm_dialog_delegate.h",
++        "webui/settings/brave_full_disk_access_confirm_dialog_delegate_mac.mm",
++      ]
++    }
++
+     # Non-android deps for "ui" target.
+     deps += [
+       ":browser_tab_strip",
+--- a/chrome/browser/ui/webui/settings/import_data_handler.h
++++ b/chrome/browser/ui/webui/settings/import_data_handler.h
+@@ -36,9 +36,9 @@ class ImportDataHandler : public Setting
+   void RegisterMessages() override;
+   void OnJavascriptAllowed() override {}
+   void OnJavascriptDisallowed() override;
+-
++  friend class BraveImportDataHandler;
+  private:
+-  void StartImport(const user_data_importer::SourceProfile& source_profile,
++  virtual void StartImport(const user_data_importer::SourceProfile& source_profile,
+                    uint16_t imported_items);
+ 
+   // Handler for the "importData" message. First argument is the selected
+--- a/chrome/browser/importer/BUILD.gn
++++ b/chrome/browser/importer/BUILD.gn
+@@ -6,6 +6,10 @@ assert(is_win || is_mac || is_linux || i
+ 
+ source_set("importer") {
+   sources = [
++    "brave_external_process_importer_client.h",
++    "brave_external_process_importer_host.h",
++    "brave_in_process_importer_bridge.h",
++    "extensions_import_helpers.h",
+     "external_process_importer_client.h",
+     "external_process_importer_host.h",
+     "firefox_profile_lock.h",
+@@ -37,6 +41,10 @@ source_set("impl") {
+   public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+ 
+   sources = [
++    "brave_external_process_importer_client.cc",
++    "brave_external_process_importer_host.cc",
++    "brave_in_process_importer_bridge.cc",
++    "extensions_import_helpers.cc",
+     "external_process_importer_client.cc",
+     "external_process_importer_host.cc",
+     "firefox_profile_lock.cc",
+--- a/chrome/browser/importer/external_process_importer_host.h
++++ b/chrome/browser/importer/external_process_importer_host.h
+@@ -79,8 +79,13 @@ class ExternalProcessImporterHost
+   void NotifyImportStarted();
+   void NotifyImportItemStarted(user_data_importer::ImportItem item);
+   void NotifyImportItemEnded(user_data_importer::ImportItem item);
+-  void NotifyImportEnded();
++  void virtual NotifyImportEnded();
+ 
++  friend class BraveExternalProcessImporterHost;
++  void set_parent_view(gfx::NativeView parent_view) {
++    parent_view_ = parent_view;
++  }
++  gfx::NativeView parent_view_ = gfx::NativeView();
+  private:
+   // ExternalProcessImporterHost deletes itself in OnImportEnded().
+   ~ExternalProcessImporterHost() override;
+--- a/components/history/core/browser/history_types.h
++++ b/components/history/core/browser/history_types.h
+@@ -55,6 +55,8 @@ enum VisitSource {
+   SOURCE_SAFARI_IMPORTED = 5,
+   SOURCE_ACTOR = 6,
+   SOURCE_OS_MIGRATION_IMPORTED = 7,
++  SOURCE_CHROME_IMPORTED = 8,
++  SOURCE_BRAVE_IMPORTED = 9,
+ };
+ 
+ // Corresponds to the "id" column of the "visits" SQL table.
+--- a/components/history/core/browser/visit_database.cc
++++ b/components/history/core/browser/visit_database.cc
+@@ -122,6 +122,8 @@ VisitSource VisitSourceFromInt(int value
+     case SOURCE_SAFARI_IMPORTED:
+     case SOURCE_ACTOR:
+     case SOURCE_OS_MIGRATION_IMPORTED:
++    case SOURCE_CHROME_IMPORTED:
++    case SOURCE_BRAVE_IMPORTED:
+       return converted;
+   }
+   // In cases of database corruption, SOURCE_BROWSED is a safe default value.
+--- a/chrome/browser/importer/in_process_importer_bridge.cc
++++ b/chrome/browser/importer/in_process_importer_bridge.cc
+@@ -52,6 +52,8 @@ history::VisitSource ConvertImporterVisi
+       return history::SOURCE_IE_IMPORTED;
+     case user_data_importer::VISIT_SOURCE_SAFARI_IMPORTED:
+       return history::SOURCE_SAFARI_IMPORTED;
++    case user_data_importer::VISIT_SOURCE_CHROME_IMPORTED:
++      return history::SOURCE_CHROME_IMPORTED;
+   }
+   NOTREACHED();
+ }
+--- a/chrome/utility/BUILD.gn
++++ b/chrome/utility/BUILD.gn
+@@ -90,6 +90,12 @@ static_library("utility") {
+     sources += [
+       "importer/bookmarks_file_importer.cc",
+       "importer/bookmarks_file_importer.h",
++      "importer/brave_external_process_importer_bridge.cc",
++      "importer/brave_external_process_importer_bridge.h",
++      "importer/brave_profile_import_impl.cc",
++      "importer/brave_profile_import_impl.h",
++      "importer/chrome_importer.cc",
++      "importer/chrome_importer.h",
+       "importer/external_process_importer_bridge.cc",
+       "importer/external_process_importer_bridge.h",
+       "importer/importer.cc",
+--- a/chrome/utility/services.cc
++++ b/chrome/utility/services.cc
+@@ -57,7 +57,9 @@
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+ #include "chrome/common/importer/profile_import.mojom.h"
++#include "chrome/common/importer/chrome_profile_import.mojom.h"
+ #include "chrome/utility/importer/profile_import_impl.h"
++#include "chrome/utility/importer/brave_profile_import_impl.h"
+ #include "components/mirroring/service/mirroring_service.h"
+ #include "services/proxy_resolver/proxy_resolver_factory_impl.h"  // nogncheck
+ #include "services/proxy_resolver/public/mojom/proxy_resolver.mojom.h"
+@@ -138,6 +140,13 @@ static_assert(BUILDFLAG(ENABLE_PRINTING)
+ 
+ namespace {
+ 
++#if !BUILDFLAG(IS_ANDROID)
++auto RunBraveProfileImporter(
++    mojo::PendingReceiver<chrome::mojom::ChromeProfileImport> receiver) {
++  return std::make_unique<BraveProfileImportImpl>(std::move(receiver));
++}
++#endif
++
+ auto RunFilePatcher(mojo::PendingReceiver<patch::mojom::FilePatcher> receiver) {
+   return std::make_unique<patch::FilePatcherImpl>(std::move(receiver));
+ }
+@@ -435,6 +444,7 @@ void RegisterMainThreadServices(mojo::Se
+   services.Add(RunPassageEmbeddingsService);
+ 
+ #if !BUILDFLAG(IS_ANDROID)
++  services.Add(RunBraveProfileImporter);
+   services.Add(RunProfileImporter);
+   services.Add(RunMirroringService);
+ #endif  // !BUILDFLAG(IS_ANDROID)
+--- a/chrome/utility/importer/external_process_importer_bridge.h
++++ b/chrome/utility/importer/external_process_importer_bridge.h
+@@ -72,7 +72,7 @@ class ExternalProcessImporterBridge : pu
+ 
+   std::u16string GetLocalizedString(int message_id) override;
+   // End ImporterBridge implementation.
+-
++  friend class BraveExternalProcessImporterBridge;
+  private:
+   ~ExternalProcessImporterBridge() override;
+ 
+--- a/chrome/browser/importer/external_process_importer_host.cc
++++ b/chrome/browser/importer/external_process_importer_host.cc
+@@ -8,6 +8,8 @@
+ 
+ #include "base/functional/bind.h"
+ #include "chrome/browser/bookmarks/bookmark_model_factory.h"
++#include "chrome/browser/importer/brave_external_process_importer_client.h"
++#include "chrome/browser/importer/brave_in_process_importer_bridge.h"
+ #include "chrome/browser/importer/external_process_importer_client.h"
+ #include "chrome/browser/importer/firefox_profile_lock.h"
+ #include "chrome/browser/importer/importer_lock_dialog.h"
+@@ -102,10 +104,10 @@ void ExternalProcessImporterHost::Launch
+   // bridge lives in the external process (see ProfileImportThread).
+   // The ExternalProcessImporterClient created in the next line owns the bridge,
+   // and will delete it.
+-  InProcessImporterBridge* bridge =
+-      new InProcessImporterBridge(writer_.get(),
++  BraveInProcessImporterBridge* bridge =
++      new BraveInProcessImporterBridge(writer_.get(),
+                                   weak_ptr_factory_.GetWeakPtr());
+-  client_ = new ExternalProcessImporterClient(
++  client_ = new BraveExternalProcessImporterClient(
+       weak_ptr_factory_.GetWeakPtr(), source_profile_, items_, bridge);
+   client_->Start();
+ }
+--- a/chrome/browser/importer/in_process_importer_bridge.h
++++ b/chrome/browser/importer/in_process_importer_bridge.h
+@@ -59,7 +59,7 @@ class InProcessImporterBridge : public I
+ 
+   std::u16string GetLocalizedString(int message_id) override;
+   // End ImporterBridge implementation.
+-
++  friend class BraveInProcessImporterBridge;
+  private:
+   ~InProcessImporterBridge() override;
+ 
+--- a/chrome/browser/importer/importer_uma.cc
++++ b/chrome/browser/importer/importer_uma.cc
+@@ -35,6 +35,7 @@ enum ImporterTypeMetrics {
+ 
+ void LogImporterUseToMetrics(const std::string& metric_postfix,
+                              user_data_importer::ImporterType type) {
++  return;
+   ImporterTypeMetrics metrics_type = IMPORTER_METRICS_UNKNOWN;
+   switch (type) {
+     case user_data_importer::TYPE_UNKNOWN:
+@@ -59,6 +60,9 @@ void LogImporterUseToMetrics(const std::
+     case user_data_importer::TYPE_BOOKMARKS_FILE:
+       metrics_type = IMPORTER_METRICS_BOOKMARKS_FILE;
+       break;
++    default:
++      metrics_type = IMPORTER_METRICS_UNKNOWN;
++      break;
+   }
+ 
+   // Note: This leaks memory, which is the expected behavior as the factory
+--- a/chrome/browser/importer/external_process_importer_client.h
++++ b/chrome/browser/importer/external_process_importer_client.h
+@@ -48,10 +48,10 @@ class ExternalProcessImporterClient
+       const ExternalProcessImporterClient&) = delete;
+ 
+   // Launches the task to start the external process.
+-  void Start();
++  virtual void Start();
+ 
+   // Called by the ExternalProcessImporterHost on import cancel.
+-  void Cancel();
++  virtual void Cancel();
+ 
+   // chrome::mojom::ProfileImportObserver:
+   void OnImportStart() override;
+@@ -82,6 +82,8 @@ class ExternalProcessImporterClient
+       const std::vector<ImporterAutofillFormDataEntry>&
+           autofill_form_data_entry_group) override;
+ 
++ friend class BraveExternalProcessImporterClient;
++
+  protected:
+   ~ExternalProcessImporterClient() override;
+ 
+@@ -97,7 +99,7 @@ class ExternalProcessImporterClient
+   // The Mojo connections need to be torn down on the same thread that created
+   // them, but the destructor is not guaranteed to be run on that thread so we
+   // tear down the connections explicitly.
+-  void CloseMojoHandles();
++  virtual void CloseMojoHandles();
+ 
+   // These variables store data being collected from the importer until the
+   // entire group has been collected and is ready to be written to the profile.
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -11415,6 +11415,15 @@ Check your passwords anytime in <ph name
+             Microsoft Edge
+           </message>
+         </if>
++        <message name="IDS_IMPORTED_FROM_BOOKMARK_FOLDER" desc="Name for bookmark panel folder imported from another browser">
++          Imported from <ph name="BROWSER_NAME">$1<ex>Chrome</ex></ph>
++        </message>
++        <message name="IDS_EXTENSIONS_IMPORTER_LOCK_TITLE" desc="Dialog title for importer lock dialog">
++          Import profile still in use
++        </message>
++        <message name="IDS_EXTENSIONS_IMPORTER_LOCK_TEXT" desc="The message to be displayed in the importer-lock dialog">
++          To continue importing data, first close the browser you're importing from.
++        </message>
+         <message name="IDS_IMPORT_FROM_FIREFOX" desc="browser combo box: Mozilla Firefox">
+           Mozilla Firefox
+         </message>
+--- a/chrome/browser/importer/importer_lock_dialog.h
++++ b/chrome/browser/importer/importer_lock_dialog.h
+@@ -21,6 +21,11 @@ void ShowImportLockDialog(gfx::NativeWin
+                           base::OnceCallback<void(bool)> callback,
+                           int importer_lock_title_id = IDS_IMPORTER_LOCK_TITLE,
+                           int importer_lock_text_id = IDS_IMPORTER_LOCK_TEXT);
++void ShowImportLockDialog(gfx::NativeView parent_view,
++                          gfx::NativeWindow parent,
++                          base::OnceCallback<void(bool)> callback,
++                          int importer_lock_title_id = IDS_IMPORTER_LOCK_TITLE,
++                          int importer_lock_text_id = IDS_IMPORTER_LOCK_TEXT);
+ 
+ }  // namespace importer
+ 
+--- a/chrome/browser/ui/views/importer/import_lock_dialog_view.cc
++++ b/chrome/browser/ui/views/importer/import_lock_dialog_view.cc
+@@ -27,8 +27,36 @@ void ShowImportLockDialog(gfx::NativeWin
+                              importer_lock_title_id, importer_lock_text_id);
+ }
+ 
++void ShowImportLockDialog(gfx::NativeView parent_view,
++                          gfx::NativeWindow parent,
++                          base::OnceCallback<void(bool)> callback,
++                          int importer_lock_title_id,
++                          int importer_lock_text_id) {
++  ImportLockDialogView::Show(parent_view, parent, std::move(callback),
++                             importer_lock_title_id, importer_lock_text_id);
++}
++
+ }  // namespace importer
+ 
++
++// static
++void ImportLockDialogView::Show(gfx::NativeView parent_view,
++                                gfx::NativeWindow parent,
++                                base::OnceCallback<void(bool)> callback,
++                                int importer_lock_title_id,
++                                int importer_lock_text_id) {
++  views::DialogDelegate::CreateDialogWidget(
++      new ImportLockDialogView(std::move(callback), importer_lock_title_id,
++                               importer_lock_text_id),
++      parent, parent_view)
++      ->Show();
++  base::RecordAction(UserMetricsAction("ImportLockDialogView_Shown"));
++}
++
++ui::mojom::ModalType ImportLockDialogView::GetModalType() const {
++  return ui::mojom::ModalType::kChild;
++}
++
+ // static
+ void ImportLockDialogView::Show(gfx::NativeWindow parent,
+                                 base::OnceCallback<void(bool)> callback,
+--- a/chrome/browser/ui/views/importer/import_lock_dialog_view.h
++++ b/chrome/browser/ui/views/importer/import_lock_dialog_view.h
+@@ -23,6 +23,12 @@ class ImportLockDialogView : public view
+                    base::OnceCallback<void(bool)> callback,
+                    int importer_lock_title_id = IDS_IMPORTER_LOCK_TITLE,
+                    int importer_lock_text_id = IDS_IMPORTER_LOCK_TEXT);
++  static void Show(gfx::NativeView parent_view,
++                   gfx::NativeWindow parent,
++                   base::OnceCallback<void(bool)> callback,
++                   int importer_lock_title_id = IDS_IMPORTER_LOCK_TITLE,
++                   int importer_lock_text_id = IDS_IMPORTER_LOCK_TEXT);
++  ui::mojom::ModalType GetModalType() const override;
+ 
+  private:
+   ImportLockDialogView(base::OnceCallback<void(bool)> callback,

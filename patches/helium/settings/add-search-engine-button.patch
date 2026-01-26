@@ -1,0 +1,183 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -2389,6 +2389,9 @@
+   <message name="IDS_SETTINGS_SEARCH_ENGINES_ADD_SITE_SEARCH" desc="Title for a dialog that allows adding a new site search engine.">
+     Add site search
+   </message>
++  <message name="IDS_SETTINGS_SEARCH_ENGINES_ADD_SEARCH_ENGINE" desc="Title for a dialog that allows adding a new search engine.">
++    Add search engine
++  </message>
+   <message name="IDS_SETTINGS_SEARCH_ENGINES_EDIT_SEARCH_ENGINE" desc="Title for a dialog that allows editing an existing search engine.">
+     Edit search engine
+   </message>
+--- a/components/components_strings.grd
++++ b/components/components_strings.grd
+@@ -391,6 +391,9 @@
+       <message name="IDS_ADD" desc="Used for Add on buttons">
+         Add
+       </message>
++      <message name="IDS_ADD_AS_DEFAULT" desc="Used on a button to add information and then set it as default.">
++        Add as default
++      </message>
+       <message name="IDS_MOVE" desc="Used for Move on buttons" formatter_data="android_java">
+         Move
+       </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -172,6 +172,7 @@ namespace {
+ void AddCommonStrings(content::WebUIDataSource* html_source, Profile* profile) {
+   static constexpr webui::LocalizedString kLocalizedStrings[] = {
+       {"add", IDS_ADD},
++      {"addAsDefault", IDS_ADD_AS_DEFAULT},
+       {"advancedPageTitle", IDS_SETTINGS_ADVANCED},
+       {"back", IDS_ACCNAME_BACK},
+       {"basicPageTitle", IDS_SETTINGS_BASIC},
+@@ -2747,6 +2748,8 @@ void AddSearchEnginesStrings(content::We
+        IDS_SETTINGS_SEARCH_ENGINES_PAGE_EXPLANATION},
+       {"searchEnginesAddSiteSearch",
+        IDS_SETTINGS_SEARCH_ENGINES_ADD_SITE_SEARCH},
++      {"searchEnginesAddSearchEngine",
++       IDS_SETTINGS_SEARCH_ENGINES_ADD_SEARCH_ENGINE},
+       {"searchEnginesEditSearchEngine",
+        IDS_SETTINGS_SEARCH_ENGINES_EDIT_SEARCH_ENGINE},
+       {"searchEnginesViewSearchEngine",
+--- a/chrome/browser/resources/settings/search_page/search_engine_edit_dialog.ts
++++ b/chrome/browser/resources/settings/search_page/search_engine_edit_dialog.ts
+@@ -21,7 +21,7 @@ import {loadTimeData} from '../i18n_setu
+ 
+ import {getTemplate} from './search_engine_edit_dialog.html.js';
+ import type {SearchEngine, SearchEnginesBrowserProxy, SearchEnginesInfo} from './search_engines_browser_proxy.js';
+-import {SearchEnginesBrowserProxyImpl} from './search_engines_browser_proxy.js';
++import {ChoiceMadeLocation, SearchEnginesBrowserProxyImpl} from './search_engines_browser_proxy.js';
+ 
+ /**
+  * The |modelIndex| to use when a new search engine is added. Must match
+@@ -62,6 +62,7 @@ export class SettingsSearchEngineEditDia
+        * should be added.
+        */
+       model: Object,
++      isNewPrimary: Boolean,
+ 
+       searchEngine_: String,
+       keyword_: String,
+@@ -79,6 +80,7 @@ export class SettingsSearchEngineEditDia
+   }
+ 
+   declare model: SearchEngine|null;
++  declare isNewPrimary: boolean;
+   declare private searchEngine_: string;
+   declare private keyword_: string;
+   declare private queryUrl_: string;
+@@ -116,8 +118,10 @@ export class SettingsSearchEngineEditDia
+       this.queryUrl_ = this.model.url;
+       this.suggestionsUrl_ = this.model.suggestionsUrl;
+     } else {
+-      this.dialogTitle_ = loadTimeData.getString('searchEnginesAddSiteSearch');
+-      this.actionButtonText_ = loadTimeData.getString('add');
++      this.dialogTitle_ = loadTimeData.getString(
++        this.isNewPrimary ? 'searchEnginesAddSearchEngine' : 'searchEnginesAddSiteSearch');
++      this.actionButtonText_ = loadTimeData.getString(
++        this.isNewPrimary ? 'addAsDefault' : 'add');
+       this.readonly_ = false;
+       this.showPolicySubtitle_ = false;
+     }
+@@ -167,7 +171,28 @@ export class SettingsSearchEngineEditDia
+     this.browserProxy_.searchEngineEditCompleted(
+         this.searchEngine_, this.keyword_, this.queryUrl_,
+         this.suggestionsUrl_);
+-    this.$.dialog.close();
++    const done = () => this.$.dialog.close();
++    if (!this.isNewPrimary) {
++      return done();
++    }
++
++    this.browserProxy_.getSearchEnginesList()
++      .then(engines => {
++        const engine = engines.actives.find(
++          e => e.keyword === this.keyword_
++        );
++
++        if (!engine) {
++          return;
++        }
++
++        this.browserProxy_.setDefaultSearchEngine(
++          engine.modelIndex,
++          ChoiceMadeLocation.SEARCH_ENGINE_SETTINGS,
++          null
++        );
++      })
++      .finally(done);
+   }
+ 
+   private validateElement_(inputElement: CrInputElement) {
+--- a/chrome/browser/resources/settings/search_page/search_engines_page.html
++++ b/chrome/browser/resources/settings/search_page/search_engines_page.html
+@@ -47,6 +47,11 @@
+           $i18n{searchEnginesSearchEnginesExplanation}
+         </div>
+       </div>
++      <cr-button class="secondary-button header-aligned-button"
++                  aria-label="$i18n{searchEnginesAddButtonAriaLabel}"
++                  on-click="onAddPrimarySearchEngineClick_" id="addPrimarySearchEngine">
++        $i18n{add}
++      </cr-button>
+     </div>
+     <settings-search-engines-list hidden="[[!matchingDefaultEngines_.length]]"
+         engines="[[matchingDefaultEngines_]]" show-shortcut>
+@@ -59,6 +64,7 @@
+ 
+     <template is="dom-if" if="[[showEditDialog_]]" restamp>
+       <settings-search-engine-edit-dialog model="[[dialogModel_]]"
++          is-new-primary="[[isNewPrimary_]]"
+           on-close="onCloseEditDialog_">
+       </settings-search-engine-edit-dialog>
+     </template>
+--- a/chrome/browser/resources/settings/search_page/search_engines_page.ts
++++ b/chrome/browser/resources/settings/search_page/search_engines_page.ts
+@@ -135,6 +135,11 @@ export class SettingsSearchEnginesPageEl
+         value: null,
+       },
+ 
++      isNewPrimary_: {
++        type: Boolean,
++        value: false,
++      },
++
+       showEditDialog_: {
+         type: Boolean,
+         value: false,
+@@ -167,6 +172,7 @@ export class SettingsSearchEnginesPageEl
+   declare private omniboxExtensionListBlurred_: boolean;
+   declare private dialogModel_: SearchEngine|null;
+   declare private dialogAnchorElement_: HTMLElement|null;
++  declare private isNewPrimary_: boolean;
+   declare private showEditDialog_: boolean;
+   declare private showDeleteConfirmationDialog_: boolean;
+   private browserProxy_: SearchEnginesBrowserProxy =
+@@ -190,9 +196,11 @@ export class SettingsSearchEnginesPageEl
+   }
+ 
+   private openEditDialog_(
+-      searchEngine: SearchEngine|null, anchorElement: HTMLElement) {
++      searchEngine: SearchEngine|null,
++      anchorElement: HTMLElement, primary = false) {
+     this.dialogModel_ = searchEngine;
+     this.dialogAnchorElement_ = anchorElement;
++    this.isNewPrimary_ = primary;
+     this.showEditDialog_ = true;
+   }
+ 
+@@ -256,6 +264,12 @@ export class SettingsSearchEnginesPageEl
+     this.extensions = searchEnginesInfo.extensions;
+   }
+ 
++  private onAddPrimarySearchEngineClick_(e: Event) {
++    e.preventDefault();
++    this.openEditDialog_(
++        null, this.shadowRoot!.querySelector('#addPrimarySearchEngine')!, true);
++  }
++
+   private onAddSearchEngineClick_(e: Event) {
+     e.preventDefault();
+     this.openEditDialog_(

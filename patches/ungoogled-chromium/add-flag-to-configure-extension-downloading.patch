@@ -1,0 +1,112 @@
+# Add extension-mime-request-handling chrome://flag to tweak the behavior of
+# extension MIME types
+
+--- a/chrome/browser/download/download_crx_util.cc
++++ b/chrome/browser/download/download_crx_util.cc
+@@ -9,6 +9,7 @@
+ #include <memory>
+ 
+ #include "base/auto_reset.h"
++#include "base/command_line.h"
+ #include "base/notimplemented.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/extensions/crx_installer.h"
+@@ -114,6 +115,14 @@ scoped_refptr<extensions::CrxInstaller>
+   return installer;
+ }
+ 
++bool ShouldDownloadAsRegularFile() {
++    const base::CommandLine& command_line =
++        *base::CommandLine::ForCurrentProcess();
++    return command_line.HasSwitch("extension-mime-request-handling") &&
++        command_line.GetSwitchValueASCII("extension-mime-request-handling") ==
++        "download-as-regular-file";
++}
++
+ bool IsExtensionDownload(const DownloadItem& download_item) {
+   if (download_item.GetTargetDisposition() ==
+       DownloadItem::TARGET_DISPOSITION_PROMPT)
+@@ -122,7 +131,7 @@ bool IsExtensionDownload(const DownloadI
+   if (download_item.GetMimeType() == extensions::Extension::kMimeType ||
+       extensions::UserScript::IsURLUserScript(download_item.GetURL(),
+                                               download_item.GetMimeType())) {
+-    return true;
++    return !ShouldDownloadAsRegularFile();
+   } else {
+     return false;
+   }
+--- a/chrome/browser/download/download_crx_util.h
++++ b/chrome/browser/download/download_crx_util.h
+@@ -35,6 +35,10 @@ scoped_refptr<extensions::CrxInstaller>
+     Profile* profile,
+     const download::DownloadItem& download_item);
+ 
++// Returns true if the user wants all extensions to be downloaded as regular
++// files.
++bool ShouldDownloadAsRegularFile();
++
+ // Returns true if this is an extension download. This also considers user
+ // scripts to be extension downloads, since we convert those automatically.
+ bool IsExtensionDownload(const download::DownloadItem& download_item);
+--- a/chrome/browser/download/download_target_determiner.cc
++++ b/chrome/browser/download/download_target_determiner.cc
+@@ -1129,10 +1129,12 @@ DownloadConfirmationReason DownloadTarge
+     return DownloadConfirmationReason::SAVE_AS;
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+-  // Don't prompt for extension downloads if the installation site is allow
+-  // listed.
+-  if (download_crx_util::IsTrustedExtensionDownload(GetProfile(), *download_))
+-    return DownloadConfirmationReason::NONE;
++  if (!download_crx_util::ShouldDownloadAsRegularFile()) {
++    // Don't prompt for extension downloads.
++    if (download_crx_util::IsTrustedExtensionDownload(GetProfile(), *download_) ||
++        filename.MatchesExtension(extensions::kExtensionFileExtension))
++      return DownloadConfirmationReason::NONE;
++  }
+ #endif
+ 
+   // Don't prompt for file types that are marked for opening automatically.
+--- a/chrome/browser/extensions/extension_management.cc
++++ b/chrome/browser/extensions/extension_management.cc
+@@ -331,6 +331,13 @@ bool ExtensionManagement::IsInstallation
+ bool ExtensionManagement::IsOffstoreInstallAllowed(
+     const GURL& url,
+     const GURL& referrer_url) const {
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  if (command_line.HasSwitch("extension-mime-request-handling") &&
++      command_line.GetSwitchValueASCII("extension-mime-request-handling") ==
++      "always-prompt-for-install") {
++    return true;
++  }
+   // No allowed install sites specified, disallow by default.
+   if (!global_settings_->install_sources.has_value())
+     return false;
+--- a/chrome/browser/ungoogled_flag_choices.h
++++ b/chrome/browser/ungoogled_flag_choices.h
+@@ -4,4 +4,13 @@
+ 
+ #ifndef CHROME_BROWSER_UNGOOGLED_FLAG_CHOICES_H_
+ #define CHROME_BROWSER_UNGOOGLED_FLAG_CHOICES_H_
++const FeatureEntry::Choice kExtensionHandlingChoices[] = {
++    {flags_ui::kGenericExperimentChoiceDefault, "", ""},
++    {"Download as regular file",
++     "extension-mime-request-handling",
++     "download-as-regular-file"},
++    {"Always prompt for install",
++     "extension-mime-request-handling",
++     "always-prompt-for-install"},
++};
+ #endif  // CHROME_BROWSER_UNGOOGLED_FLAG_CHOICES_H_
+--- a/chrome/browser/ungoogled_flag_entries.h
++++ b/chrome/browser/ungoogled_flag_entries.h
+@@ -8,4 +8,8 @@
+      "SetIpv6ProbeFalse",
+      "Forces the result of the browser's IPv6 probing (i.e. IPv6 connectivity test) to be unsuccessful. This causes IPv4 addresses to be prioritized over IPv6 addresses. Without this flag, the probing result is set to be successful, which causes IPv6 to be used over IPv4 when possible. ungoogled-chromium flag.",
+      kOsAll, FEATURE_VALUE_TYPE(net::features::kSetIpv6ProbeFalse)},
++    {"extension-mime-request-handling",
++     "Handling of extension MIME type requests",
++     "Used when deciding how to handle a request for a CRX or User Script MIME type. ungoogled-chromium flag.",
++     kOsAll, MULTI_VALUE_TYPE(kExtensionHandlingChoices)},
+ #endif  // CHROME_BROWSER_UNGOOGLED_FLAG_ENTRIES_H_
