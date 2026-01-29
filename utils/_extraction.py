@@ -252,6 +252,11 @@ def extract_zip_file(archive_path, output_dir, relative_to, extractors=None):
     """
     get_logger().debug('Using pure Python zip extractor')
 
+    if relative_to is not None and (output_dir / relative_to).exists():
+        get_logger().error('Temporary unpacking directory already exists: %s',
+                           output_dir / relative_to)
+        raise FileExistsError()
+
     with zipfile.ZipFile(str(archive_path), 'r') as zip_file_obj:
         for filename in zip_file_obj.namelist():
             try:
@@ -260,6 +265,8 @@ def extract_zip_file(archive_path, output_dir, relative_to, extractors=None):
             except BaseException:
                 get_logger().exception('Exception thrown for zip member: %s', filename)
                 raise
+
+    _process_relative_to(output_dir, relative_to)
 
 
 def extract_with_7z(archive_path, output_dir, relative_to, extractors=None):
