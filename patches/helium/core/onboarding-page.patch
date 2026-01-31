@@ -34,24 +34,24 @@
    registry->RegisterBooleanPref(
 --- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 +++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
-@@ -58,6 +58,7 @@
- #include "chrome/common/chrome_version.h"
+@@ -59,6 +59,7 @@
  #include "chrome/common/pref_names.h"
  #include "chrome/common/webui_url_constants.h"
-+#include "components/helium_services/pref_names.h"
  #include "components/custom_handlers/protocol_handler_registry.h"
++#include "components/helium_services/pref_names.h"
  #include "components/prefs/pref_service.h"
  #include "components/privacy_sandbox/privacy_sandbox_features.h"
+ #include "components/signin/public/base/signin_switches.h"
 @@ -488,6 +489,15 @@ StartupBrowserCreatorImpl::DetermineStar
    LaunchResult launch_result =
        tabs.empty() ? LaunchResult::kNormally : LaunchResult::kWithGivenUrls;
  
-+  bool no_first_run = base::CommandLine::ForCurrentProcess()->HasSwitch(
-+                        switches::kNoFirstRun);
++  bool no_first_run =
++      base::CommandLine::ForCurrentProcess()->HasSwitch(switches::kNoFirstRun);
 +  if (!is_incognito_or_guest && !no_first_run) {
 +    if (!profile_->GetPrefs()->GetBoolean(prefs::kHeliumDidOnboarding)) {
-+      UrlsToTabs({ GURL(chrome::kHeliumSetupURL) }, &tabs);
-+      return { tabs, LaunchResult::kWithGivenUrls };
++      UrlsToTabs({GURL(chrome::kHeliumSetupURL)}, &tabs);
++      return {tabs, LaunchResult::kWithGivenUrls};
 +    }
 +  }
 +
@@ -133,14 +133,14 @@
      "webui/omnibox/omnibox_ui.cc",
 --- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
 +++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
-@@ -38,6 +38,7 @@
- #include "chrome/browser/ui/webui/net_export_ui.h"
+@@ -39,6 +39,7 @@
  #include "chrome/browser/ui/webui/net_internals/net_internals_ui.h"
  #include "chrome/browser/ui/webui/ntp_tiles_internals_ui.h"
-+#include "chrome/browser/ui/webui/onboarding/onboarding_page_ui.h"
  #include "chrome/browser/ui/webui/omnibox/omnibox_ui.h"
++#include "chrome/browser/ui/webui/onboarding/onboarding_page_ui.h"
  #include "chrome/browser/ui/webui/policy/policy_ui.h"
  #include "chrome/browser/ui/webui/predictors/predictors_ui.h"
+ #include "chrome/browser/ui/webui/privacy_sandbox/privacy_sandbox_internals_ui.h"
 @@ -429,6 +430,7 @@ void RegisterChromeWebUIConfigs() {
  #if !BUILDFLAG(IS_CHROMEOS) && !BUILDFLAG(IS_ANDROID)
    map.AddWebUIConfig(std::make_unique<ManagedUserProfileNoticeUIConfig>());
@@ -151,7 +151,7 @@
    map.AddWebUIConfig(std::make_unique<SigninErrorUIConfig>());
 --- /dev/null
 +++ b/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,44 @@
 +// Copyright 2025 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -166,13 +166,16 @@
 +#include "chrome/common/webui_url_constants.h"
 +#include "components/helium_onboarding/resources/grit/helium_onboarding_generated.h"
 +#include "components/helium_onboarding/resources/grit/helium_onboarding_generated_map.h"
++#include "content/public/browser/web_contents.h"
 +#include "content/public/browser/web_ui_controller.h"
 +#include "content/public/browser/web_ui_data_source.h"
 +#include "ui/webui/webui_util.h"
 +
 +HeliumOnboardingPage::HeliumOnboardingPage(content::WebUI* web_ui)
 +    : WebUIController(web_ui) {
-+  Profile* profile = Profile::FromWebUI(web_ui);
++  content::BrowserContext* browser_context =
++      web_ui->GetWebContents()->GetBrowserContext();
++  Profile* profile = Profile::FromBrowserContext(browser_context);
 +  content::WebUIDataSource* source =
 +      content::WebUIDataSource::CreateAndAdd(profile, chrome::kHeliumSetupHost);
 +
@@ -183,7 +186,7 @@
 +  source->DisableTrustedTypesCSP();
 +
 +  web_ui->AddMessageHandler(
-+      std::make_unique<OnboardingMessageHandler>(profile));
++      std::make_unique<OnboardingMessageHandler>(browser_context));
 +  web_ui->AddMessageHandler(
 +      std::make_unique<settings::SearchEnginesHandler>(profile));
 +  web_ui->AddMessageHandler(
@@ -229,7 +232,7 @@
 +#endif  // CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_PAGE_UI_H_
 --- /dev/null
 +++ b/chrome/browser/ui/webui/onboarding/onboarding_handler.cc
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,281 @@
 +// Copyright 2025 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -241,22 +244,27 @@
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/values.h"
 +#include "chrome/browser/browser_process.h"
++#include "chrome/browser/extensions/webstore_install_with_prompt.h"
++#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/profiles/profile_attributes_storage.h"
 +#include "chrome/browser/profiles/profile_manager.h"
 +#include "chrome/browser/profiles/profiles_state.h"
-+#include "chrome/browser/themes/theme_service.h"
-+#include "chrome/browser/themes/theme_service_factory.h"
-+#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/common/extensions/webstore_install_result.h"
 +#include "components/helium_services/pref_names.h"
 +#include "components/helium_services/schema.h"
 +#include "components/prefs/pref_change_registrar.h"
 +#include "components/prefs/pref_service.h"
 +#include "content/public/browser/web_contents.h"
-+#include "ui/color/color_provider.h"
-+#include "ui/gfx/color_utils.h"
++#include "content/public/browser/web_ui.h"
++#include "extensions/browser/extension_registrar.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/common/extension.h"
 +
-+OnboardingMessageHandler::OnboardingMessageHandler(Profile* profile)
-+    : profile_(profile), pref_service_(profile->GetPrefs()) {
++OnboardingMessageHandler::OnboardingMessageHandler(
++    content::BrowserContext* browser_context)
++    : browser_context_(browser_context),
++      profile_(Profile::FromBrowserContext(browser_context)),
++      pref_service_(profile_->GetPrefs()) {
 +  pref_change_registrar_.Init(pref_service_);
 +
 +  for (const auto [key, _] : GetPreferencesDict()) {
@@ -265,13 +273,9 @@
 +        base::BindRepeating(&OnboardingMessageHandler::OnPreferencesChanged,
 +                            base::Unretained(this)));
 +  }
-+
-+  ThemeServiceFactory::GetForProfile(profile_)->AddObserver(this);
 +}
 +
-+OnboardingMessageHandler::~OnboardingMessageHandler() {
-+  ThemeServiceFactory::GetForProfile(profile_)->RemoveObserver(this);
-+}
++OnboardingMessageHandler::~OnboardingMessageHandler() = default;
 +
 +base::Value::Dict OnboardingMessageHandler::GetPreferencesDict() {
 +  std::vector<PrefService::PreferenceValueAndStore> values =
@@ -291,14 +295,32 @@
 +  return output;
 +}
 +
-+void OnboardingMessageHandler::OnThemeChanged() {
-+  AllowJavascript();
-+  FireWebUIListener("ntp-background-changed", GetNTPBackgroundColor());
-+}
-+
 +void OnboardingMessageHandler::OnPreferencesChanged() {
 +  AllowJavascript();
 +  FireWebUIListener("helium-prefs-changed", GetPreferencesDict());
++}
++
++void OnboardingMessageHandler::OnExtensionLoaded(
++    content::BrowserContext*,
++    const extensions::Extension* extension) {
++  AllowJavascript();
++  FireWebUIListener("extension-state-changed",
++                    base::Value::Dict().Set(extension->id(), true));
++}
++
++void OnboardingMessageHandler::OnExtensionUnloaded(
++    content::BrowserContext*,
++    const extensions::Extension* extension,
++    extensions::UnloadedExtensionReason reason) {
++  using extensions::UnloadedExtensionReason;
++  if (reason != UnloadedExtensionReason::DISABLE &&
++      reason != UnloadedExtensionReason::UNINSTALL) {
++    return;
++  }
++
++  AllowJavascript();
++  FireWebUIListener("extension-state-changed",
++                    base::Value::Dict().Set(extension->id(), false));
 +}
 +
 +void OnboardingMessageHandler::RegisterMessages() {
@@ -323,24 +345,98 @@
 +      base::BindRepeating(&OnboardingMessageHandler::HandleSetProfileName,
 +                          base::Unretained(this)));
 +  web_ui()->RegisterMessageCallback(
-+      "getBackgroundColor",
-+      base::BindRepeating(&OnboardingMessageHandler::HandleGetBackgroundColor,
++      "getExtensions",
++      base::BindRepeating(&OnboardingMessageHandler::HandleGetExtensions,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "installExtension",
++      base::BindRepeating(&OnboardingMessageHandler::HandleInstallExtension,
 +                          base::Unretained(this)));
 +}
 +
-+base::Value OnboardingMessageHandler::GetNTPBackgroundColor() {
-+  return base::Value(color_utils::SkColorToRgbaString(
-+      web_ui()->GetWebContents()->GetColorProvider().GetColor(
-+          kColorNewTabPageBackground)));
-+}
-+
-+void OnboardingMessageHandler::HandleGetBackgroundColor(
++void OnboardingMessageHandler::HandleGetExtensions(
 +    const base::Value::List& args) {
 +  CHECK_EQ(1U, args.size());
 +  const auto& callback_id = args[0].GetString();
++  auto* registry = extensions::ExtensionRegistry::Get(browser_context_);
++
++  base::Value::Dict filtered_extension_data;
++  for (const auto& extension : registry->enabled_extensions()) {
++    filtered_extension_data.Set(extension->id(), true);
++  }
++
++  for (const auto& extension : registry->disabled_extensions()) {
++    filtered_extension_data.Set(extension->id(), false);
++  }
++
++  // If no one asked for a list of extensions yet, they probably don't
++  // care about extension changes, so we defer the observer init to here
++  // to avoid sending useless events.
++  if (!extension_registry_observation_.IsObserving()) {
++    extension_registry_observation_.Observe(registry);
++  }
 +
 +  AllowJavascript();
-+  ResolveJavascriptCallback(base::Value(callback_id), GetNTPBackgroundColor());
++  ResolveJavascriptCallback(base::Value(std::move(callback_id)),
++                            std::move(filtered_extension_data));
++}
++
++void OnboardingMessageHandler::HandleInstallExtension(
++    const base::Value::List& args) {
++  CHECK_EQ(2U, args.size());
++  const auto& callback_id = args[0].GetString();
++  const auto& extension_id = args[1].GetString();
++
++  // If the extension is already installed, but disabled, enable it.
++  const auto* registry = extensions::ExtensionRegistry::Get(browser_context_);
++  if (const auto* extension = registry->GetInstalledExtension(extension_id)) {
++    DoEnableExtension(callback_id, extension->id());
++    return;
++  }
++
++  // Otherwise, do the whole dance of installing an extension.
++  DoInstallExtension(callback_id, extension_id);
++}
++
++void OnboardingMessageHandler::DoEnableExtension(
++    const std::string& callback_id,
++    const std::string& extension_id) {
++  extensions::ExtensionRegistrar::Get(browser_context_)
++      ->EnableExtension(extension_id);
++  AllowJavascript();
++  ResolveJavascriptCallback(base::Value(callback_id), base::Value());
++}
++
++void OnboardingMessageHandler::DoInstallExtension(
++    const std::string& callback_id,
++    const std::string& extension_id) {
++  gfx::NativeWindow window =
++      web_ui()->GetWebContents()->GetTopLevelNativeWindow();
++
++  // Pass a weak_ptr for the callback, as WebstoreInstallWithPrompt is
++  // ref-counted and might outlive OnboardingMessageHandler.
++  auto installer = base::MakeRefCounted<extensions::WebstoreInstallWithPrompt>(
++      extension_id, profile_, window,
++      base::BindOnce(&OnboardingMessageHandler::OnExtensionInstallFinished,
++                     weak_ptr_factory_.GetWeakPtr(), callback_id));
++
++  installer->BeginInstall();
++}
++
++void OnboardingMessageHandler::OnExtensionInstallFinished(
++    std::string callback_id,
++    bool success,
++    const std::string& error,
++    extensions::webstore_install::Result result) {
++  AllowJavascript();
++  if (success) {
++    ResolveJavascriptCallback(base::Value(callback_id), base::Value());
++    return;
++  }
++
++  RejectJavascriptCallback(
++      base::Value(callback_id),
++      base::Value::Dict().Set("error", error).Set("code", result));
 +}
 +
 +void OnboardingMessageHandler::HandleGetPreferences(
@@ -420,7 +516,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/ui/webui/onboarding/onboarding_handler.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,76 @@
 +// Copyright 2025 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -433,17 +529,23 @@
 +
 +#include "base/memory/raw_ptr.h"
 +#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
 +#include "base/values.h"
 +#include "chrome/browser/profiles/profile.h"
-+#include "chrome/browser/themes/theme_service_observer.h"
++#include "chrome/common/extensions/webstore_install_result.h"
 +#include "components/prefs/pref_change_registrar.h"
 +#include "components/prefs/pref_service.h"
 +#include "content/public/browser/web_ui_message_handler.h"
++#include "extensions/browser/extension_registry_observer.h"
++
++namespace content {
++class BrowserContext;
++}
 +
 +class OnboardingMessageHandler : public content::WebUIMessageHandler,
-+                                 public ThemeServiceObserver {
++                                 public extensions::ExtensionRegistryObserver {
 + public:
-+  explicit OnboardingMessageHandler(Profile* profile);
++  explicit OnboardingMessageHandler(content::BrowserContext* browser_context);
 +  OnboardingMessageHandler(const OnboardingMessageHandler&) = delete;
 +  OnboardingMessageHandler& operator=(const OnboardingMessageHandler&) = delete;
 +  ~OnboardingMessageHandler() override;
@@ -457,19 +559,37 @@
 +  void HandleSetPreference(const base::Value::List& args);
 +  void HandleGetProfileName(const base::Value::List& args);
 +  void HandleSetProfileName(const base::Value::List& args);
-+  void HandleGetBackgroundColor(const base::Value::List& args);
++  void HandleGetExtensions(const base::Value::List& args);
++  void HandleInstallExtension(const base::Value::List& args);
 +  void OnPreferencesChanged();
 +
-+  base::Value GetNTPBackgroundColor();
++  void DoInstallExtension(const std::string& callback_id,
++                          const std::string& extension_id);
++  void DoEnableExtension(const std::string& callback_id,
++                         const std::string& extension_id);
++  void OnExtensionInstallFinished(std::string callback_id,
++                                  bool success,
++                                  const std::string& error,
++                                  extensions::webstore_install::Result);
 +
-+  // ThemeServiceObserver:
-+  void OnThemeChanged() override;
++  // extensions::ExtensionRegistryObserver:
++  void OnExtensionLoaded(content::BrowserContext*,
++                         const extensions::Extension*) override;
++  void OnExtensionUnloaded(content::BrowserContext*,
++                           const extensions::Extension*,
++                           extensions::UnloadedExtensionReason) override;
 +
++  raw_ptr<content::BrowserContext> browser_context_ = nullptr;
 +  raw_ptr<Profile> profile_ = nullptr;
 +  raw_ptr<PrefService> pref_service_ = nullptr;
 +  PrefChangeRegistrar pref_change_registrar_;
 +
 +  base::WeakPtrFactory<OnboardingMessageHandler> weak_ptr_factory_{this};
++
++  // extensions:ExtensionRegistryObserver:
++  base::ScopedObservation<extensions::ExtensionRegistry,
++                          extensions::ExtensionRegistryObserver>
++      extension_registry_observation_{this};
 +};
 +
 +#endif  // CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_HANDLER_H_
