@@ -1,0 +1,195 @@
+Index: src/chrome/app/settings_strings.grdp
+===================================================================
+--- src.orig/chrome/app/settings_strings.grdp
++++ src/chrome/app/settings_strings.grdp
+@@ -211,6 +211,9 @@
+   <message name="IDS_SETTINGS_BEHAVIOR" desc="Name of the settings page which allows users to control browser behavior.">
+     Behavior
+   </message>
++  <message name="IDS_SETTINGS_USE_CENTERED_ADDRESS_BAR" desc="Label for the toggle to use a centered, narrower address bar.">
++    Use centered address bar
++  </message>
+   <message name="IDS_SETTINGS_CUSTOM_WEB_ADDRESS" desc="Sub label describing an empty custom web address for the Show home button setting.">
+     Custom
+   </message>
+Index: src/chrome/browser/extensions/api/settings_private/prefs_util.cc
+===================================================================
+--- src.orig/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ src/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -255,6 +255,9 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+   (*s_allowlist)[::prefs::kShowMenuButton] =
+       settings_api::PrefType::kBoolean;
+ 
++  (*s_allowlist)[::prefs::kLocationBarIsCentered] =
++      settings_api::PrefType::kBoolean;
++
+   // Appearance settings.
+   (*s_allowlist)[::prefs::kCurrentThemeID] = settings_api::PrefType::kString;
+   (*s_allowlist)[::prefs::kPinnedActions] = settings_api::PrefType::kList;
+Index: src/chrome/browser/resources/settings/appearance_page/appearance_behavior_page.html
+===================================================================
+--- src.orig/chrome/browser/resources/settings/appearance_page/appearance_behavior_page.html
++++ src/chrome/browser/resources/settings/appearance_page/appearance_behavior_page.html
+@@ -1,7 +1,12 @@
+ <style include="cr-shared-style settings-shared"></style>
+ <settings-section page-title="$i18n{behaviorPageTitle}">
+ 
+-  <settings-toggle-button id="newTabNextToActive"
++  <settings-toggle-button id="centeredAddressBar"
++      pref="{{prefs.helium.browser.use_centered_location_bar}}"
++      label="$i18n{useCenteredAddressBar}">
++  </settings-toggle-button>
++
++  <settings-toggle-button class="hr" id="newTabNextToActive"
+       pref="{{prefs.helium.browser.new_tab_next_to_active}}"
+       label="$i18n{openNewTabNextToActive}">
+   </settings-toggle-button>
+Index: src/chrome/browser/ui/browser_ui_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_ui_prefs.cc
++++ src/chrome/browser/ui/browser_ui_prefs.cc
+@@ -137,6 +137,8 @@ void RegisterBrowserUserPrefs(user_prefs
+   registry->RegisterBooleanPref(prefs::kShowExtensionsButton, true);
+   registry->RegisterBooleanPref(prefs::kShowMenuButton, true);
+ 
++  registry->RegisterBooleanPref(prefs::kLocationBarIsCentered, false);
++
+   registry->RegisterInt64Pref(prefs::kDefaultBrowserLastDeclined, 0);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateOnDesktop, true);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInAppsMenu, true);
+Index: src/chrome/browser/ui/views/toolbar/toolbar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ src/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -563,6 +563,11 @@ void ToolbarView::Init() {
+     app_menu_button_->SetVisible(show_menu_button_.GetValue());
+   }
+ 
++  location_bar_is_centered_.Init(
++      prefs::kLocationBarIsCentered, prefs,
++      base::BindRepeating(&ToolbarView::OnLocationBarIsCenteredChanged,
++                          base::Unretained(this)));
++
+   InitLayout();
+ 
+   for (auto* button : std::array<views::Button*, 5>{back_, forward_, reload_,
+@@ -916,6 +921,7 @@ void ToolbarView::Layout(PassKey) {
+   // Call super implementation to ensure layout manager and child layouts
+   // happen.
+   LayoutSuperclass<AccessiblePaneView>(this);
++  MaybeNarrowLocationBar();
+ }
+ 
+ void ToolbarView::OnThemeChanged() {
+@@ -1307,6 +1313,60 @@ void ToolbarView::OnShowMenuButtonChange
+   InvalidateLayout();
+ }
+ 
++void ToolbarView::OnLocationBarIsCenteredChanged() {
++  InvalidateLayout();
++}
++
++void ToolbarView::MaybeNarrowLocationBar() {
++  if (features::IsHeliumCatEnabled()) {
++    return;
++  }
++
++  if (!location_bar_is_centered_.GetValue()) {
++    return;
++  }
++
++  if (display_mode_ != DisplayMode::kNormal || !location_bar_ ||
++      !location_bar_->GetVisible()) {
++    return;
++  }
++
++  const int toolbar_width = container_view_->width();
++
++  double margin_pct = 0.0;
++  if (toolbar_width >= 1000) {
++    margin_pct = 0.12;
++  } else if (toolbar_width >= 850) {
++    margin_pct = 0.09;
++  } else if (toolbar_width >= 700) {
++    margin_pct = 0.05;
++  }
++
++  if (margin_pct == 0.0) {
++    return;
++  }
++
++  gfx::Rect bounds = location_bar_->bounds();
++  const int total_margin = static_cast<int>(toolbar_width * margin_pct);
++  constexpr int kMaxLocationBarWidth = 900;
++
++  int new_width = std::min(bounds.width() - total_margin, kMaxLocationBarWidth);
++  new_width = std::max(new_width, location_bar_->GetMinimumSize().width());
++
++  int desired_x = (toolbar_width - new_width) / 2;
++  int left_limit = bounds.x() + total_margin / 3;
++  int right_limit = bounds.x() + bounds.width() - new_width - total_margin / 2;
++  if (left_limit <= right_limit) {
++    desired_x = std::clamp(desired_x, left_limit, right_limit);
++  } else {
++    desired_x = bounds.x() + (bounds.width() - new_width) / 2;
++  }
++  bounds.set_x(desired_x);
++  bounds.set_width(new_width);
++
++  location_bar_->SetBoundsRect(bounds);
++}
++
+ void ToolbarView::OnTouchUiChanged() {
+   if (display_mode_ == DisplayMode::kNormal) {
+     // Update the internal margins for touch layout.
+Index: src/chrome/browser/ui/views/toolbar/toolbar_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ src/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -290,6 +290,10 @@ class ToolbarView : public views::Access
+ 
+   void OnShowMenuButtonChanged();
+ 
++  void OnLocationBarIsCenteredChanged();
++
++  void MaybeNarrowLocationBar();
++
+   void OnTouchUiChanged();
+ 
+   void UpdateClipPath();
+@@ -351,6 +355,8 @@ class ToolbarView : public views::Access
+ 
+   BooleanPrefMember show_menu_button_;
+ 
++  BooleanPrefMember location_bar_is_centered_;
++
+   BooleanPrefMember show_chrome_labs_button_;
+ 
+   // The display mode used when laying out the toolbar.
+Index: src/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ src/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -510,6 +510,7 @@ void AddAppearanceStrings(content::WebUI
+       {"appearancePageTitle", IDS_SETTINGS_APPEARANCE},
+       {"appearanceBehaviorPageTitle", IDS_SETTINGS_APPEARANCE_AND_BEHAVIOR},
+       {"behaviorPageTitle", IDS_SETTINGS_BEHAVIOR},
++      {"useCenteredAddressBar", IDS_SETTINGS_USE_CENTERED_ADDRESS_BAR},
+       {"customWebAddress", IDS_SETTINGS_CUSTOM_WEB_ADDRESS},
+       {"enterCustomWebAddress", IDS_SETTINGS_ENTER_CUSTOM_WEB_ADDRESS},
+       {"homeButtonDisabled", IDS_SETTINGS_HOME_BUTTON_DISABLED},
+Index: src/chrome/common/pref_names.h
+===================================================================
+--- src.orig/chrome/common/pref_names.h
++++ src/chrome/common/pref_names.h
+@@ -1371,6 +1371,10 @@ inline constexpr char kShowExtensionsBut
+ // toolbar.
+ inline constexpr char kShowMenuButton[] = "helium.browser.show_menu_button";
+ 
++// A boolean pref set to true if the address bar should be centered and narrowed.
++// When false (default), the address bar uses its full width.
++inline constexpr char kLocationBarIsCentered[] = "helium.browser.use_centered_location_bar";
++
+ // A boolean pref set to true if Gemini integration be enabled. This is managed
+ // by enterprise policy.
+ inline constexpr char kGeminiSettings[] = "browser.gemini_settings";
