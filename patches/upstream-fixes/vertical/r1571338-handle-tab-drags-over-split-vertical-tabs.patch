@@ -1,0 +1,318 @@
+From f66097c307c81e58ac6f22af2b86be2cf504971e Mon Sep 17 00:00:00 2001
+From: Kaan Alsan <alsan@chromium.org>
+Date: Mon, 19 Jan 2026 13:15:26 -0800
+Subject: [PATCH] Handle tab drags over split vertical tabs
+
+Implements tab strip model updates to happen when dragging a vertical
+tab over a split-tab slot.
+
+Bug: 439963720
+Change-Id: I8b004e6a63140375cc0cc34b9d2d9507722ac917
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7490134
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Commit-Queue: Kaan Alsan <alsan@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1571338}
+---
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_split_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_split_tab_view.cc
+@@ -12,6 +12,8 @@
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/views/tabs/glow_hover_controller.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h"
+ #include "components/tabs/public/tab_collection.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -186,5 +188,11 @@ void VerticalSplitTabView::UpdateBorder(
+   }
+ }
+ 
++void VerticalSplitTabView::OnTabDragOver() {
++  auto* controller = collection_node_->GetController();
++  CHECK(controller);
++  controller->GetDragHandler().DraggedTabsOverNode(*collection_node_);
++}
++
+ BEGIN_METADATA(VerticalSplitTabView)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_split_tab_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_split_tab_view.h
+@@ -42,6 +42,8 @@ class VerticalSplitTabView : public view
+     return hover_controller_.get();
+   }
+ 
++  void OnTabDragOver();
++
+  private:
+   void ResetCollectionNode();
+   void OnDataChanged();
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
+@@ -18,6 +18,7 @@
+ #include "chrome/browser/ui/views/tabs/tab_strip_types.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
++#include "components/tabs/public/split_tab_collection.h"
+ #include "components/tabs/public/tab_collection.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -141,6 +142,9 @@ void VerticalTabDragHandlerImpl::Dragged
+     case TabCollectionNode::Type::TAB:
+       HandleTabDragOverTab(node);
+       break;
++    case TabCollectionNode::Type::SPLIT:
++      HandleTabDragOverSplit(node);
++      break;
+     case TabCollectionNode::Type::GROUP:
+       HandleTabDragOverGroup(node);
+       break;
+@@ -160,6 +164,29 @@ void VerticalTabDragHandlerImpl::HandleT
+                                        tab->GetGroup());
+ }
+ 
++void VerticalTabDragHandlerImpl::HandleTabDragOverSplit(
++    const TabCollectionNode& node) {
++  const auto* split_collection = static_cast<const tabs::SplitTabCollection*>(
++      std::get<const tabs::TabCollection*>(node.GetNodeData()));
++  CHECK(split_collection);
++  split_tabs::SplitTabData* split_data = split_collection->data();
++  CHECK(split_data);
++  gfx::Range tab_range = split_data->GetIndexRange();
++  int first_tab_in_split = tab_range.GetMin();
++  int last_tab_in_split = tab_range.GetMax();
++
++  const auto& selection_model = tab_strip_model_->selection_model();
++  int first_selected_index =
++      *selection_model.GetListSelectionModel().selected_indices().cbegin();
++  int insertion_idx =
++      (first_selected_index < first_tab_in_split)
++          ? last_tab_in_split - selection_model.selected_tabs().size()
++          : first_tab_in_split;
++
++  tab_strip_model_->MoveSelectedTabsTo(
++      insertion_idx, split_data->ListTabs().front()->GetGroup());
++}
++
+ void VerticalTabDragHandlerImpl::HandleTabDragOverGroup(
+     const TabCollectionNode& node) {
+   const auto* tab_group =
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
+@@ -118,6 +118,7 @@ class VerticalTabDragHandlerImpl : publi
+ 
+   // Handlers for drag operations over various node types.
+   void HandleTabDragOverTab(const TabCollectionNode& node);
++  void HandleTabDragOverSplit(const TabCollectionNode& node);
+   void HandleTabDragOverGroup(const TabCollectionNode& node);
+   void HandleTabDragOverUnpinnedContainer(const TabCollectionNode& node);
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_interactive_uitest.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_interactive_uitest.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_forward.h"
++#include "base/test/bind.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_finder.h"
+ #include "chrome/browser/ui/browser_list.h"
+@@ -11,6 +12,7 @@
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h"
+ #include "chrome/browser/ui/views/test/vertical_tabs_interactive_test_mixin.h"
+ #include "chrome/common/chrome_constants.h"
+@@ -117,8 +119,17 @@ class VerticalTabDragHandlerTest
+   auto MoveMouseToTabAsync(int tab_index) {
+     const char kTabToMoveMouseTo[] = "Tab to move mouse to";
+     return Steps(
+-        NameDescendantViewByType<VerticalTabView>(kBrowserViewElementId,
+-                                                  kTabToMoveMouseTo, tab_index),
++        NameView(
++            kTabToMoveMouseTo, base::BindLambdaForTesting([&, tab_index]() {
++              TabStripModel* tab_strip_model = browser()->GetTabStripModel();
++              tabs::TabInterface* tab =
++                  tab_strip_model->GetTabAtIndex(tab_index);
++              RootTabCollectionNode* root_node =
++                  GetBrowserView()
++                      .vertical_tab_strip_region_view_for_testing()
++                      ->root_node_for_testing();
++              return root_node->GetNodeForHandle(tab->GetHandle())->view();
++            })),
+         WithView(
+             kTabToMoveMouseTo, base::BindOnce([](views::View* view) {
+               const gfx::Point point = view->GetBoundsInScreen().CenterPoint();
+@@ -322,6 +333,129 @@ IN_PROC_BROWSER_TEST_F(VerticalTabDragHa
+       }));
+ }
+ 
++// TODO(crbug.com/476509652): This test flakes because drag handling hit tests
++// against the view's position in the layout (skipping animation), which means
++// that if a layout cycle hasn't happened between drag loop iterations then
++// the tab strip model updates might bounce. This should be fixed once a more
++// robust hit-testing approach is implemented.
++IN_PROC_BROWSER_TEST_F(VerticalTabDragHandlerTest, DISABLED_DragOverSplit) {
++  DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kFourthTab);
++  TabStripModel* tab_strip_model = browser()->GetTabStripModel();
++  ASSERT_NE(nullptr, tab_strip_model);
++  RunTestSequence(
++      AddInstrumentedTab(kSecondTab, GURL(chrome::kChromeUIBookmarksURL), 1),
++      AddInstrumentedTab(kThirdTab, GURL(chrome::kChromeUISettingsURL), 2),
++      AddInstrumentedTab(kFourthTab, GURL(chrome::kChromeUIVersionURL), 3),
++      Do([&]() {
++        tab_strip_model->ActivateTabAt(
++            2, TabStripUserGestureDetails(
++                   TabStripUserGestureDetails::GestureType::kOther));
++        tab_strip_model->AddToNewSplit(
++            {3}, {}, split_tabs::SplitTabCreatedSource::kTabContextMenu);
++      }),
++      PollState(kTabOrderPoller, GetTabOrder(tab_strip_model)),
++      WaitForState(kTabOrderPoller, URLs({
++                                        url::kAboutBlankURL,
++                                        chrome::kChromeUIBookmarksURL,
++                                        chrome::kChromeUISettingsURL,
++                                        chrome::kChromeUIVersionURL,
++                                    })),
++      DragTabTo(1, GetBrowserView().GetBoundsInScreen().top_right() +
++                       gfx::Vector2d(50, 50)),
++      PollState(kDragStatePoller, GetDragActive()), MoveMouseToTabAsync(0),
++      WaitForState(kTabOrderPoller, URLs({
++                                        chrome::kChromeUIBookmarksURL,
++                                        url::kAboutBlankURL,
++                                        chrome::kChromeUISettingsURL,
++                                        chrome::kChromeUIVersionURL,
++                                    })),
++      // Dragging from index 0 to index 2 (split) should put the dragged tab to
++      // index 3.
++      MoveMouseToTabAsync(2),
++      WaitForState(kTabOrderPoller, URLs({
++                                        url::kAboutBlankURL,
++                                        chrome::kChromeUISettingsURL,
++                                        chrome::kChromeUIVersionURL,
++                                        chrome::kChromeUIBookmarksURL,
++                                    })),
++      // Dragging from index 3 to index 2 (split) should put the dragged tab to
++      // index 1.
++      MoveMouseToTabAsync(2),
++      WaitForState(kTabOrderPoller, URLs({
++                                        url::kAboutBlankURL,
++                                        chrome::kChromeUIBookmarksURL,
++                                        chrome::kChromeUISettingsURL,
++                                        chrome::kChromeUIVersionURL,
++                                    })),
++      ReleaseMouseAsync());
++}
++
++// TODO(crbug.com/476509652): This test flakes because drag handling hit tests
++// against the view's position in the layout (skipping animation), which means
++// that if a layout cycle hasn't happened between drag loop iterations then
++// the tab strip model updates might bounce. This should be fixed once a more
++// robust hit-testing approach is implemented.
++IN_PROC_BROWSER_TEST_F(VerticalTabDragHandlerTest,
++                       DISABLED_DragOverSplitInGroup) {
++  DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kFourthTab);
++  TabStripModel* tab_strip_model = browser()->GetTabStripModel();
++  ASSERT_NE(nullptr, tab_strip_model);
++  RunTestSequence(
++      AddInstrumentedTab(kSecondTab, GURL(chrome::kChromeUIBookmarksURL), 1),
++      AddInstrumentedTab(kThirdTab, GURL(chrome::kChromeUISettingsURL), 2),
++      AddInstrumentedTab(kFourthTab, GURL(chrome::kChromeUIVersionURL), 3),
++      AddTabsToNewGroup({2, 3}), Do([&]() {
++        tab_strip_model->ActivateTabAt(
++            2, TabStripUserGestureDetails(
++                   TabStripUserGestureDetails::GestureType::kOther));
++        tab_strip_model->AddToNewSplit(
++            {3}, {}, split_tabs::SplitTabCreatedSource::kTabContextMenu);
++      }),
++      PollState(kTabOrderPoller, GetTabOrder(tab_strip_model)),
++      WaitForState(kTabOrderPoller, URLs({
++                                        url::kAboutBlankURL,
++                                        chrome::kChromeUIBookmarksURL,
++                                        TabGroupURLs({
++                                            chrome::kChromeUISettingsURL,
++                                            chrome::kChromeUIVersionURL,
++                                        }),
++                                    })),
++      DragTabTo(1, GetBrowserView().GetBoundsInScreen().top_right() +
++                       gfx::Vector2d(50, 50)),
++      PollState(kDragStatePoller, GetDragActive()), MoveMouseToTabAsync(0),
++      WaitForState(kTabOrderPoller, URLs({
++                                        chrome::kChromeUIBookmarksURL,
++                                        url::kAboutBlankURL,
++                                        TabGroupURLs({
++                                            chrome::kChromeUISettingsURL,
++                                            chrome::kChromeUIVersionURL,
++                                        }),
++                                    })),
++      // Dragging from index 0 to index 2 (split) should put the dragged tab to
++      // index 3.
++      MoveMouseToTabAsync(2),
++      WaitForState(kTabOrderPoller, URLs({
++                                        url::kAboutBlankURL,
++                                        TabGroupURLs({
++                                            chrome::kChromeUISettingsURL,
++                                            chrome::kChromeUIVersionURL,
++                                            chrome::kChromeUIBookmarksURL,
++                                        }),
++                                    })),
++      // Dragging from index 3 to index 2 (split) should put the dragged tab to
++      // index 1.
++      MoveMouseToTabAsync(2),
++      WaitForState(kTabOrderPoller, URLs({
++                                        url::kAboutBlankURL,
++                                        TabGroupURLs({
++                                            chrome::kChromeUIBookmarksURL,
++                                            chrome::kChromeUISettingsURL,
++                                            chrome::kChromeUIVersionURL,
++                                        }),
++                                    })),
++      ReleaseMouseAsync());
++}
++
+ // TODO(crbug.com/40249472): Disabled because this flakes on all platforms.
+ IN_PROC_BROWSER_TEST_F(VerticalTabDragHandlerTest, DISABLED_DragInGroup) {
+   TabStripModel* tab_strip_model = browser()->GetTabStripModel();
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h"
+@@ -249,6 +250,9 @@ void VerticalTabGroupView::HandleTabDrag
+       GetViewAtPoint(layout_manager_->target_layout(), point_in_container);
+   if (auto* tab_view = views::AsViewClass<VerticalTabView>(view_at_point)) {
+     tab_view->OnTabDragOver();
++  } else if (auto* split_tab_view =
++                 views::AsViewClass<VerticalSplitTabView>(view_at_point)) {
++    split_tab_view->OnTabDragOver();
+   } else {
+     // If the drag isn't over any tab views including the header, then treat it
+     // as a drag over the group view container.
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
+@@ -139,6 +140,9 @@ void VerticalUnpinnedTabContainerView::H
+   } else if (auto* group_view =
+                  views::AsViewClass<VerticalTabGroupView>(view_at_point)) {
+     group_view->OnTabDragOver();
++  } else if (auto* split_tab_view =
++                 views::AsViewClass<VerticalSplitTabView>(view_at_point)) {
++    split_tab_view->OnTabDragOver();
+   } else {
+     // If the drag isn't over any child views, then treat it as a drag over
+     // the unpinned tab container.

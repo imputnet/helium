@@ -1,0 +1,428 @@
+From 1f4585b399458c42f3d0d6e5751b1ae967b567ee Mon Sep 17 00:00:00 2001
+From: Kaan Alsan <alsan@chromium.org>
+Date: Thu, 05 Feb 2026 16:34:27 -0800
+Subject: [PATCH] Ensure dragged vertical tabs are contiguous when removing from group
+
+This CL updates VerticalTabDragHandler to avoid using
+TabStripModel::RemoveFromGroup, which may move the selected tab indices
+into positions that are not contiguous. This caused some crashes because
+the tab drag operations expect the dragged tabs to be contiguous.
+
+This is achieved by having TabDragController provide that point in
+screen when a drag exits a TabDragTarget, allowing VerticalTabGroupView
+to determine which side the drag exited from.
+
+Change-Id: Ibc7d55f721d1580efcccc6db23af34fc80531b0a
+Bug: 476509652
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7546281
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Commit-Queue: Kaan Alsan <alsan@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1580497}
+---
+
+--- a/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.cc
+@@ -110,7 +110,8 @@ TabDragContext* MultiContentsViewDropTar
+ 
+ void MultiContentsViewDropTargetController::OnTabDragEntered() {}
+ 
+-void MultiContentsViewDropTargetController::OnTabDragExited() {
++void MultiContentsViewDropTargetController::OnTabDragExited(
++    const gfx::Point& point_in_screen) {
+   ResetDropTargetTimers();
+   HideDropTarget();
+ }
+--- a/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h
++++ b/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h
+@@ -69,7 +69,7 @@ class MultiContentsViewDropTargetControl
+   TabDragContext* OnTabDragUpdated(TabDragTarget::DragController& controller,
+                                    const gfx::Point& point_in_screen) override;
+   void OnTabDragEntered() override;
+-  void OnTabDragExited() override;
++  void OnTabDragExited(const gfx::Point& point_in_screen) override;
+   void OnTabDragEnded() override;
+   bool CanDropTab() override;
+   void HandleTabDrop(TabDragTarget::DragController& controller) override;
+--- a/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller_unittest.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller_unittest.cc
+@@ -319,7 +319,7 @@ TEST_F(MultiContentsViewDropTargetContro
+   EXPECT_TRUE(drop_target_view().GetVisible());
+ 
+   // Exiting the drag should hide it.
+-  controller().OnTabDragExited();
++  controller().OnTabDragExited(gfx::Point());
+   FastForward(kHideDropTargetDelay + kHideDropTargetAnimation);
+   EXPECT_FALSE(drop_target_view().GetVisible());
+ }
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -922,7 +922,7 @@ TabDragController::Liveness TabDragContr
+       return Liveness::kDeleted;
+     }
+     target_context = context;
+-    UpdateDragTarget(drop_target);
++    UpdateDragTarget(drop_target, point_in_screen);
+     if (current_drag_target_) {
+       TabDragContext* delegate_context =
+           current_drag_target_->OnTabDragUpdated(*this, point_in_screen);
+@@ -954,9 +954,10 @@ TabDragController::Liveness TabDragContr
+   return Liveness::kAlive;
+ }
+ 
+-void TabDragController::UpdateDragTarget(TabDragTarget* new_target) {
++void TabDragController::UpdateDragTarget(TabDragTarget* new_target,
++                                         const gfx::Point& point_in_screen) {
+   if (current_drag_target_ && current_drag_target_ != new_target) {
+-    current_drag_target_->OnTabDragExited();
++    current_drag_target_->OnTabDragExited(point_in_screen);
+   }
+   current_drag_target_ = new_target;
+   if (current_drag_target_) {
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
+@@ -544,7 +544,8 @@ class TabDragController : public views::
+ #endif  // defined(USE_AURA)
+ 
+   // Updates the current drag target, and fires relevant handler events.
+-  void UpdateDragTarget(TabDragTarget* new_target);
++  void UpdateDragTarget(TabDragTarget* new_target,
++                        const gfx::Point& point_in_screen);
+   void ResetDragTarget();
+ 
+   static void SetTabDragPointResolver(TabDragPointResolver& resolver);
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller_interactive_uitest.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller_interactive_uitest.cc
+@@ -180,7 +180,9 @@ class FakeTabDragTarget : public TabDrag
+     return nullptr;
+   }
+   void OnTabDragEntered() override { drag_entered_ = true; }
+-  void OnTabDragExited() override { drag_exited_ = true; }
++  void OnTabDragExited(const gfx::Point& point_in_screen) override {
++    drag_exited_ = true;
++  }
+   void OnTabDragEnded() override { drag_ended_ = true; }
+   bool CanDropTab() override { return can_drop_; }
+   void HandleTabDrop(DragController& controller) override {
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_target.h
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_target.h
+@@ -59,7 +59,7 @@ class TabDragTarget {
+       const gfx::Point& point_in_screen) = 0;
+ 
+   // Invoked when this delegate is no longer targeted by the controller.
+-  virtual void OnTabDragExited() = 0;
++  virtual void OnTabDragExited(const gfx::Point& point_in_screen) = 0;
+ 
+   // Notification for the end of a drag, for any reason (e.g. drop, cancel,
+   // etc.).
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
+@@ -130,7 +130,8 @@ TabDragContext* VerticalDraggedTabsConta
+   return GetDragHandler().GetDragContext();
+ }
+ 
+-void VerticalDraggedTabsContainer::OnTabDragExited() {
++void VerticalDraggedTabsContainer::OnTabDragExited(
++    const gfx::Point& point_in_screen) {
+   ResetDragState();
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
+@@ -53,7 +53,7 @@ class VerticalDraggedTabsContainer : pub
+   TabDragContext* OnTabDragUpdated(TabDragTarget::DragController& controller,
+                                    const gfx::Point& point_in_screen) override;
+   void OnTabDragEntered() override {}
+-  void OnTabDragExited() override;
++  void OnTabDragExited(const gfx::Point& point_in_screen) override;
+   void OnTabDragEnded() override;
+   bool CanDropTab() final;
+   void HandleTabDrop(TabDragTarget::DragController& controller) final {}
+@@ -74,6 +74,12 @@ class VerticalDraggedTabsContainer : pub
+   std::optional<DraggedViewVisualData> GetVisualDataForDraggedView(
+       const views::View& view) const;
+ 
++  // Returns the bounds of the box containing all dragged views, adjusted to
++  // the point `point_in_container`, and clamped to the bounds of the
++  // container.
++  gfx::Rect GetDraggingViewsBoundsAtPoint(
++      const gfx::Point& point_in_container) const;
++
+   // Helper for getting the view at a given point, excluding dragged views.
+   views::View* GetViewAtPoint(const views::ProposedLayout& layout,
+                               const gfx::Point& point);
+@@ -94,7 +100,7 @@ class VerticalDraggedTabsContainer : pub
+   // Handles a dragged tab that is parented within this target.
+   // `point_in_container` is a point relative to this target's view.
+   virtual void HandleTabDragInContainer(
+-      const gfx::Point point_in_container) = 0;
++      const gfx::Point& point_in_container) = 0;
+ 
+   // Updates state related to dragging tabs, to be used when this container
+   // starts handling a drag.
+@@ -116,12 +122,6 @@ class VerticalDraggedTabsContainer : pub
+   // the last drag point.
+   void UpdateDraggingViewTransforms(const gfx::Point& point_in_container);
+ 
+-  // Returns the bounds of the box containing all dragged views, adjusted to
+-  // the point `point_in_container`, and clamped to the bounds of the
+-  // container.
+-  gfx::Rect GetDraggingViewsBoundsAtPoint(
+-      const gfx::Point& point_in_container) const;
+-
+   bool IsHorizontalDragSupported() const;
+ 
+   const raw_ref<const views::View> host_view_;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.cc
+@@ -166,7 +166,7 @@ void VerticalPinnedTabContainerView::Upd
+ }
+ 
+ void VerticalPinnedTabContainerView::HandleTabDragInContainer(
+-    const gfx::Point point_in_container) {
++    const gfx::Point& point_in_container) {
+   const views::ProposedLayout& target_layout = layout_manager_->target_layout();
+   views::View* view_at_point =
+       GetViewAtPoint(target_layout, point_in_container);
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.h
+@@ -39,7 +39,7 @@ class VerticalPinnedTabContainerView : p
+   bool IsTabStripCollapsed() const override;
+   views::ScrollView* GetScrollViewForContainer() const override;
+   void UpdateLayoutForDrag() override;
+-  void HandleTabDragInContainer(const gfx::Point point_in_container) override;
++  void HandleTabDragInContainer(const gfx::Point& point_in_container) override;
+ 
+   void ResetCollectionNode();
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
+@@ -262,12 +262,44 @@ void VerticalTabDragHandlerImpl::HandleD
+     case TabCollectionNode::Type::GROUP:
+       HandleTabDragOverGroup(node);
+       break;
+-    case TabCollectionNode::Type::UNPINNED:
+-      HandleTabDragOverUnpinnedContainer(node, position_hint);
++    default:
++      NOTREACHED();
++  }
++}
++
++void VerticalTabDragHandlerImpl::HandleDraggedTabsOutOfGroup(
++    const TabCollectionNode& node,
++    DragPositionHint position_hint) {
++  CHECK_EQ(node.type(), TabCollectionNode::Type::GROUP);
++
++  const auto* tab_group =
++      static_cast<const tabs::TabGroupTabCollection*>(
++          std::get<const tabs::TabCollection*>(node.GetNodeData()))
++          ->GetTabGroup();
++  CHECK(tab_group);
++
++  const auto& selection_model = tab_strip_model_->selection_model();
++  int insertion_idx;
++  switch (position_hint) {
++    case DragPositionHint::kBottom: {
++      int last_tab_in_group =
++          tab_strip_model_->GetIndexOfTab(tab_group->GetLastTab());
++      insertion_idx =
++          last_tab_in_group - selection_model.selected_tabs().size() + 1;
++      break;
++    }
++    case DragPositionHint::kTop: {
++      int first_tab_in_group =
++          tab_strip_model_->GetIndexOfTab(tab_group->GetFirstTab());
++      insertion_idx = first_tab_in_group;
+       break;
++    }
+     default:
+       NOTREACHED();
+   }
++
++  insertion_idx = std::clamp(insertion_idx, 0, tab_strip_model_->count() - 1);
++  tab_strip_model_->MoveSelectedTabsTo(insertion_idx, std::nullopt);
+ }
+ 
+ void VerticalTabDragHandlerImpl::HandleTabDragOverTab(
+@@ -342,16 +374,15 @@ void VerticalTabDragHandlerImpl::HandleT
+   int first_selected_index =
+       *selection_model.GetListSelectionModel().selected_indices().cbegin();
+ 
+-  auto dragged_group = GetDraggingGroupHeaderId();
+   if (tab_strip_model_->IsGroupCollapsed(tab_group->id()) ||
+-      dragged_group.has_value()) {
+-    // If dragging over a collapsed group or dragging a group header, then
++      IsDraggingGroups()) {
++    // If dragging over a collapsed group or dragging a group, then
+     // move the dragged tabs/header before or after the dragged-over group.
+     int insertion_idx =
+         (first_selected_index < first_tab_in_group)
+             ? last_tab_in_group - selection_model.selected_tabs().size() + 1
+             : first_tab_in_group;
+-    if (dragged_group.has_value()) {
++    if (auto dragged_group = GetDraggingGroupHeaderId()) {
+       tab_strip_model_->MoveGroupTo(*dragged_group, insertion_idx);
+     } else {
+       tab_strip_model_->MoveSelectedTabsTo(insertion_idx, std::nullopt);
+@@ -368,41 +399,6 @@ void VerticalTabDragHandlerImpl::HandleT
+   }
+ }
+ 
+-void VerticalTabDragHandlerImpl::HandleTabDragOverUnpinnedContainer(
+-    const TabCollectionNode& node,
+-    std::optional<DragPositionHint> position_hint) {
+-  if (position_hint == DragPositionHint::kBottom) {
+-    int insertion_index =
+-        tab_strip_model_->count() -
+-        tab_strip_model_->selection_model().selected_tabs().size();
+-    if (auto group = GetDraggingGroupHeaderId(); group.has_value()) {
+-      tab_strip_model_->MoveGroupTo(*group, insertion_index);
+-    } else {
+-      // Move the selected tabs to the end.
+-      tab_strip_model_->MoveSelectedTabsTo(insertion_index, std::nullopt);
+-    }
+-    return;
+-  }
+-
+-  if (IsDraggingGroups()) {
+-    return;
+-  }
+-
+-  // TODO(crbug.com/439963720): Re-evaluate whether this logic is needed once drag
+-  // hit-testing is improved.
+-  const tabs::TabInterface* selected_tab =
+-      *tab_strip_model_->selection_model().selected_tabs().cbegin();
+-
+-  if (selected_tab->GetGroup().has_value()) {
+-    ui::ListSelectionModel::SelectedIndices selected =
+-        tab_strip_model_->selection_model()
+-            .GetListSelectionModel()
+-            .selected_indices();
+-    std::vector<int> tab_indices(selected.begin(), selected.end());
+-    tab_strip_model_->RemoveFromGroup(tab_indices);
+-  }
+-}
+-
+ TabDragContext* VerticalTabDragHandlerImpl::GetDragContext() {
+   return this;
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
+@@ -46,6 +46,11 @@ class VerticalTabDragHandler {
+       const TabCollectionNode& node,
+       std::optional<DragPositionHint> position_hint) = 0;
+ 
++  // Handles tab strip model updates to reflect a drag exiting a group.
++  // Position hint is used to determine where the drag is, relative to the node.
++  virtual void HandleDraggedTabsOutOfGroup(const TabCollectionNode& node,
++                                           DragPositionHint position_hint) = 0;
++
+   // Returns the drag context for this handler.
+   virtual TabDragContext* GetDragContext() = 0;
+ 
+@@ -90,6 +95,8 @@ class VerticalTabDragHandlerImpl : publi
+   void HandleDraggedTabsOverNode(
+       const TabCollectionNode& node,
+       std::optional<DragPositionHint> position_hint) override;
++  void HandleDraggedTabsOutOfGroup(const TabCollectionNode& node,
++                                   DragPositionHint position_hint) override;
+   TabDragContext* GetDragContext() override;
+   bool IsViewDragging(const views::View& view) const override;
+   bool IsDraggingPinnedTabs() const override;
+@@ -163,9 +170,6 @@ class VerticalTabDragHandlerImpl : publi
+   void HandleTabDragOverTab(const TabCollectionNode& node);
+   void HandleTabDragOverSplit(const TabCollectionNode& node);
+   void HandleTabDragOverGroup(const TabCollectionNode& node);
+-  void HandleTabDragOverUnpinnedContainer(
+-      const TabCollectionNode& node,
+-      std::optional<DragPositionHint> position_hint);
+ 
+   // Returns the group id of the dragged group header, or null if the drag
+   // was not initiated by a group header.
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -278,7 +278,7 @@ void VerticalTabGroupView::UpdateLayoutF
+ }
+ 
+ void VerticalTabGroupView::HandleTabDragInContainer(
+-    const gfx::Point point_in_container) {
++    const gfx::Point& point_in_container) {
+   views::View* view_at_point =
+       GetViewAtPoint(layout_manager_->target_layout(), point_in_container);
+   const TabCollectionNode* node = collection_node_;
+@@ -292,6 +292,19 @@ void VerticalTabGroupView::HandleTabDrag
+   GetDragHandler().HandleDraggedTabsOverNode(*node, std::nullopt);
+ }
+ 
++void VerticalTabGroupView::OnTabDragExited(const gfx::Point& point_in_screen) {
++  auto dragging_tabs_bounds = GetDraggingViewsBoundsAtPoint(
++      views::View::ConvertPointFromScreen(this, point_in_screen));
++  if (dragging_tabs_bounds.y() < 0) {
++    GetDragHandler().HandleDraggedTabsOutOfGroup(*collection_node_,
++                                                 DragPositionHint::kTop);
++  } else if (dragging_tabs_bounds.bottom() > height()) {
++    GetDragHandler().HandleDraggedTabsOutOfGroup(*collection_node_,
++                                                 DragPositionHint::kBottom);
++  }
++  VerticalDraggedTabsContainer::OnTabDragExited(point_in_screen);
++}
++
+ void VerticalTabGroupView::InitHeaderDrag(const ui::MouseEvent& event) {
+   GetDragHandler().InitializeDrag(*collection_node_, event);
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -66,7 +66,8 @@ class VerticalTabGroupView
+   bool IsTabStripCollapsed() const override;
+   views::ScrollView* GetScrollViewForContainer() const override;
+   void UpdateLayoutForDrag() override;
+-  void HandleTabDragInContainer(const gfx::Point point_in_container) override;
++  void HandleTabDragInContainer(const gfx::Point& point_in_container) override;
++  void OnTabDragExited(const gfx::Point& point_in_screen) override;
+ 
+   void ResetCollectionNode();
+   void OnDataChanged();
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -170,17 +170,11 @@ void VerticalUnpinnedTabContainerView::U
+ }
+ 
+ void VerticalUnpinnedTabContainerView::HandleTabDragInContainer(
+-    const gfx::Point point_in_container) {
++    const gfx::Point& point_in_container) {
+   const views::ProposedLayout& target_layout = layout_manager_->target_layout();
+-  if (point_in_container.y() >= target_layout.host_size.height()) {
+-    GetDragHandler().HandleDraggedTabsOverNode(*collection_node_,
+-                                               DragPositionHint::kBottom);
+-    return;
+-  }
+-
+   views::View* view_at_point =
+       GetViewAtPoint(target_layout, point_in_container);
+-  const TabCollectionNode* node = collection_node_;
++  const TabCollectionNode* node = nullptr;
+   if (auto* tab_view = views::AsViewClass<VerticalTabView>(view_at_point)) {
+     node = tab_view->collection_node();
+   } else if (auto* group_view =
+@@ -203,8 +197,9 @@ void VerticalUnpinnedTabContainerView::H
+                  views::AsViewClass<VerticalSplitTabView>(view_at_point)) {
+     node = split_tab_view->collection_node();
+   }
+-  CHECK(node);
+-  GetDragHandler().HandleDraggedTabsOverNode(*node, std::nullopt);
++  if (node) {
++    GetDragHandler().HandleDraggedTabsOverNode(*node, std::nullopt);
++  }
+ }
+ 
+ VerticalDraggedTabsContainer&
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
+@@ -50,7 +50,7 @@ class VerticalUnpinnedTabContainerView
+   bool IsTabStripCollapsed() const override;
+   views::ScrollView* GetScrollViewForContainer() const override;
+   void UpdateLayoutForDrag() override;
+-  void HandleTabDragInContainer(const gfx::Point point_in_container) override;
++  void HandleTabDragInContainer(const gfx::Point& point_in_container) override;
+ 
+   void ResetCollectionNode();
+ 

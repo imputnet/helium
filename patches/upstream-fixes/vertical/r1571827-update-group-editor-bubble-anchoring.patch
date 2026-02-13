@@ -1,0 +1,164 @@
+From f682b0ef10324ad5c3393a072eb9814def1a1461 Mon Sep 17 00:00:00 2001
+From: Caroline Rising <corising@chromium.org>
+Date: Tue, 20 Jan 2026 12:46:46 -0800
+Subject: [PATCH] [Vertical tabs] Update group editor bubble anchoring and triggering
+
+Trigger the group editor bubble to be shown after a group has been
+created. Update the editor bubble anchor based on tab strip collapsed
+state.
+
+Bug: 439961150
+Change-Id: Ic10a286762c295df00d5063b451a7b6d88796c0c
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7487248
+Reviewed-by: David Pennington <dpenning@chromium.org>
+Commit-Queue: Caroline Rising <corising@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1571827}
+---
+
+--- a/chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.cc
+@@ -11,6 +11,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_collection.h"
+ #include "components/tabs/public/tab_collection_types.h"
+@@ -173,18 +174,23 @@ void RootTabCollectionNode::OnTabGroupCh
+   if (tab_strip_model_->closing_all()) {
+     return;
+   }
+-
+-  if (change.type != TabGroupChange::kVisualsChanged) {
+-    return;
+-  }
+-
+   TabCollectionNode* group_node =
+       GetNodeForHandle(change.model->group_model()
+                            ->GetTabGroup(change.group)
+                            ->GetCollectionHandle());
+-  if (group_node) {
+-    group_node->NotifyDataChanged();
++  if (!group_node) {
++    return;
+   }
++
++  if (change.type == TabGroupChange::kEditorOpened) {
++    group_node->GetController()->ShowGroupEditorBubble(group_node);
++  }
++
++  if (change.type != TabGroupChange::kVisualsChanged) {
++    return;
++  }
++
++  group_node->NotifyDataChanged();
+ }
+ 
+ void RootTabCollectionNode::OnTabChangedAt(tabs::TabInterface* tab,
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -180,8 +180,17 @@ void VerticalTabGroupView::ToggleCollaps
+ 
+ views::Widget* VerticalTabGroupView::ShowGroupEditorBubble(
+     bool stop_context_menu_propagation) {
+-  return collection_node_->GetController()->ShowGroupEditorBubble(
+-      GetTabGroupFromNode(collection_node_)->id(), group_header_,
++  auto* controller =
++      collection_node_ ? collection_node_->GetController() : nullptr;
++  bool is_tab_strip_collapsed = controller && controller->IsCollapsed();
++  // When the tab strip is collapsed, anchor to the group header, otherwise
++  // anchor to the editor bubble button.
++  views::View* anchor_view =
++      is_tab_strip_collapsed
++          ? static_cast<views::View*>(group_header_)
++          : static_cast<views::View*>(group_header_->editor_bubble_button());
++   return collection_node_->GetController()->ShowGroupEditorBubble(
++      GetTabGroupFromNode(collection_node_)->id(), anchor_view,
+       stop_context_menu_propagation);
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -54,9 +54,7 @@ class VerticalTabGroupView
+ 
+   const TabCollectionNode* collection_node() const { return collection_node_; }
+ 
+-  VerticalTabGroupHeaderView* group_header_for_testing() {
+-    return group_header_;
+-  }
++  VerticalTabGroupHeaderView* group_header() { return group_header_; }
+ 
+  private:
+   // VerticalDraggedTabsContainer:
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view_browsertest.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view_browsertest.cc
+@@ -124,7 +124,7 @@ IN_PROC_BROWSER_TEST_F(VerticalTabGroupV
+       root_node()->children()[1]->children()[1].get();
+   VerticalTabGroupHeaderView* group_header =
+       static_cast<VerticalTabGroupView*>(group_node->get_view_for_testing())
+-          ->group_header_for_testing();
++          ->group_header();
+   EXPECT_EQ(group_header->collapse_icon_for_testing()
+                 ->GetImageModel()
+                 .GetVectorIcon()
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container_interactive_uitest.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container_interactive_uitest.cc
+@@ -47,7 +47,7 @@ IN_PROC_BROWSER_TEST_F(VerticalTabStripB
+                   ui::test::InteractionTestUtil::InputType::kDontCare),
+       EnsurePresent(tab_groups::STGEverythingMenu::kCreateNewTabGroup),
+       SelectMenuItem(tab_groups::STGEverythingMenu::kCreateNewTabGroup),
+-      WaitForShow(kTabGroupEditorBubbleId),
++      WaitForShow(kTabGroupHeaderElementId),
+       CheckResult([this]() { return browser()->tab_strip_model()->count(); },
+                   2));
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
+@@ -20,6 +20,7 @@
+ #include "chrome/browser/ui/views/tabs/tab_group_editor_bubble_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h"
+ #include "components/tabs/public/tab_collection_types.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -198,6 +199,14 @@ void VerticalTabStripController::ToggleT
+   }
+ }
+ 
++void VerticalTabStripController::ShowGroupEditorBubble(
++    const TabCollectionNode* group_node) {
++  auto* group_header_view =
++      static_cast<VerticalTabGroupView*>(group_node->view())->group_header();
++  group_header_view->ShowContextMenuForViewImpl(
++      group_header_view, gfx::Point(), ui::mojom::MenuSourceType::kNone);
++}
++
+ views::Widget* VerticalTabStripController::ShowGroupEditorBubble(
+     const tab_groups::TabGroupId& group_id,
+     views::View* anchor_view,
+@@ -208,7 +217,7 @@ views::Widget* VerticalTabStripControlle
+       /*stop_context_menu_propagation=*/stop_context_menu_propagation);
+ }
+ 
+-bool VerticalTabStripController::IsCollapsed() {
++bool VerticalTabStripController::IsCollapsed() const {
+   tabs::VerticalTabStripStateController* state_controller =
+       tabs::VerticalTabStripStateController::From(browser_view_->browser());
+   return state_controller && state_controller->IsCollapsed();
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h
+@@ -50,10 +50,11 @@ class VerticalTabStripController : publi
+   void ExtendSelectionTo(const tabs::TabInterface* tab_interface);
+   void ToggleTabGroupCollapsedState(const TabGroup* group,
+                                     ToggleTabGroupCollapsedStateOrigin origin);
++  void ShowGroupEditorBubble(const TabCollectionNode* group_node);
+   views::Widget* ShowGroupEditorBubble(const tab_groups::TabGroupId& group_id,
+                                        views::View* anchor_view,
+                                        bool stop_context_menu_propagation);
+-  bool IsCollapsed();
++  bool IsCollapsed() const;
+ 
+   TabContextMenuController* GetTabContextMenuController() {
+     return context_menu_controller_.get();

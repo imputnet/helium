@@ -1,0 +1,766 @@
+From e0917160dd9b98880dbef9ac300f38fb4e5f5085 Mon Sep 17 00:00:00 2001
+From: Kaan Alsan <alsan@chromium.org>
+Date: Fri, 30 Jan 2026 09:49:05 -0800
+Subject: [PATCH] Support dragging vertical tab group headers
+
+Change-Id: Idfd88ce57a91b85522e93ab9d64e50eb9982aa03
+Bug: 476084254
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7526869
+Reviewed-by: David Pennington <dpenning@chromium.org>
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Commit-Queue: Kaan Alsan <alsan@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1577348}
+---
+
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_context.h
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_context.h
+@@ -131,7 +131,7 @@ class TabDragContext : public views::Vie
+   virtual bool IsTabDetachable(const TabSlotView* view) const = 0;
+   virtual bool IsTabPinned(const TabSlotView* tab) const = 0;
+   virtual TabSlotView* GetTabGroupHeader(
+-      const tab_groups::TabGroupId& group) const = 0;
++      const tab_groups::TabGroupId& group) = 0;
+   virtual TabStripModel* GetTabStripModel() = 0;
+ 
+   // Returns the tab drag controller owned by this delegate, or null if none.
+--- a/chrome/browser/ui/views/tabs/dragging/test/mock_tab_drag_context.h
++++ b/chrome/browser/ui/views/tabs/dragging/test/mock_tab_drag_context.h
+@@ -37,7 +37,7 @@ class MockTabDragContext : public TabDra
+   MOCK_METHOD(TabSlotView*,
+               GetTabGroupHeader,
+               (const tab_groups::TabGroupId& group),
+-              (const, override));
++              (override));
+   MOCK_METHOD(TabStripModel*, GetTabStripModel, (), (override));
+   MOCK_METHOD(TabDragController*, GetDragController, (), (override));
+   MOCK_METHOD(void,
+--- a/chrome/browser/ui/views/tabs/tab_strip.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip.cc
+@@ -434,8 +434,11 @@ class TabStrip::TabDragContextImpl : pub
+     return tab_strip_->IsTabPinned(tab);
+   }
+ 
+-  TabSlotView* GetTabGroupHeader(
+-      const tab_groups::TabGroupId& group) const override {
++  TabSlotView* GetTabGroupHeader(const tab_groups::TabGroupId& group) override {
++    return std::as_const(*this).GetTabGroupHeader(group);
++  }
++
++  TabSlotView* GetTabGroupHeader(const tab_groups::TabGroupId& group) const {
+     return tab_strip_->group_header(group);
+   }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
+@@ -9,7 +9,9 @@
+ 
+ #include "base/check_deref.h"
+ #include "base/functional/bind.h"
++#include "base/notreached.h"
+ #include "base/types/to_address.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+@@ -18,8 +20,10 @@
+ #include "chrome/browser/ui/views/tabs/tab_strip_types.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
++#include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/split_tab_collection.h"
+ #include "components/tabs/public/tab_collection.h"
++#include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -36,17 +40,21 @@ namespace {
+ class VerticalTabSlotView : public TabSlotView {
+   METADATA_HEADER(VerticalTabSlotView, TabSlotView)
+  public:
+-  explicit VerticalTabSlotView(const TabCollectionNode& node) : node_(node) {
+-    // TODO(crbug.com/439963720): Support dragging other types.
+-    CHECK(node_->type() == TabCollectionNode::Type::TAB);
+-  }
++  explicit VerticalTabSlotView(const TabCollectionNode& node) : node_(node) {}
+ 
+   ~VerticalTabSlotView() override = default;
+   VerticalTabSlotView(const VerticalTabSlotView&) = delete;
+   VerticalTabSlotView& operator=(const VerticalTabSlotView&) = delete;
+ 
+   TabSlotView::ViewType GetTabSlotViewType() const override {
+-    return ViewType::kTab;
++    switch (node_->type()) {
++      case TabCollectionNode::Type::TAB:
++        return ViewType::kTab;
++      case TabCollectionNode::Type::GROUP:
++        return ViewType::kTabGroupHeader;
++      default:
++        NOTREACHED();
++    }
+   }
+ 
+   TabSizeInfo GetTabSizeInfo() const override { return TabSizeInfo(); }
+@@ -65,6 +73,16 @@ ui::mojom::DragEventSource EventSourceFr
+                                 : ui::mojom::DragEventSource::kMouse;
+ }
+ 
++const TabGroup& TabGroupDataFromNode(const TabCollectionNode& node) {
++  CHECK_EQ(node.type(), TabCollectionNode::Type::GROUP);
++  const auto* collection = static_cast<const tabs::TabGroupTabCollection*>(
++      std::get<const tabs::TabCollection*>(node.GetNodeData()));
++  CHECK(collection);
++  const auto* group_data = collection->GetTabGroup();
++  CHECK(group_data);
++  return *group_data;
++}
++
+ }  // namespace
+ 
+ VerticalTabDragHandlerImpl::VerticalTabDragHandlerImpl(
+@@ -81,20 +99,52 @@ void VerticalTabDragHandlerImpl::Initial
+   ResetDragState();
+   drag_controller_ = std::make_unique<TabDragController>();
+ 
++  DragInitData drag_init_data;
++  switch (node.type()) {
++    case TabCollectionNode::Type::TAB:
++      drag_init_data = GetDragInitDataForTabDrag(node);
++      break;
++    case TabCollectionNode::Type::GROUP:
++      drag_init_data = GetDragInitDataForGroupHeaderDrag(node);
++      break;
++    default:
++      NOTREACHED();
++  }
++
++  CHECK(drag_init_data.source_dragged_view);
++
++  const gfx::Point offset_from_source = event.location();
++  if (drag_controller_->Init(this, drag_init_data.source_dragged_view,
++                             drag_init_data.dragged_views, offset_from_source,
++                             drag_init_data.list_selection_model,
++                             EventSourceFromEvent(event)) ==
++      TabDragController::Liveness::kDeleted) {
++    ResetDragState();
++  }
++}
++
++VerticalTabDragHandlerImpl::DragInitData::DragInitData() = default;
++VerticalTabDragHandlerImpl::DragInitData::~DragInitData() = default;
++VerticalTabDragHandlerImpl::DragInitData::DragInitData(
++    const VerticalTabDragHandlerImpl::DragInitData&) = default;
++VerticalTabDragHandlerImpl::DragInitData&
++VerticalTabDragHandlerImpl::DragInitData::operator=(
++    const VerticalTabDragHandlerImpl::DragInitData&) = default;
++
++VerticalTabDragHandlerImpl::DragInitData
++VerticalTabDragHandlerImpl::GetDragInitDataForTabDrag(
++    TabCollectionNode& source_node) {
+   const auto& selected_tabs =
+       tab_strip_model_->selection_model().selected_tabs();
+ 
+-  std::vector<TabSlotView*> dragged_views;
+-  dragged_views.reserve(selected_tabs.size());
++  DragInitData drag_init_data;
++  drag_init_data.dragged_views.reserve(selected_tabs.size());
+ 
+-  TabSlotView* source_dragged_view = nullptr;
+-
+-  CHECK_EQ(node.type(), TabCollectionNode::Type::TAB);
+   const auto* source_tab =
+-      std::get<const tabs::TabInterface*>(node.GetNodeData());
++      std::get<const tabs::TabInterface*>(source_node.GetNodeData());
++  CHECK(source_tab);
+ 
+   // Track the node and build a shim view for each selected node.
+-  ui::ListSelectionModel list_selection_model;
+   for (tabs::TabInterface* tab : selected_tabs) {
+     // Filter out selections that don't match the pinned state of the latest
+     // selected tab.
+@@ -102,29 +152,40 @@ void VerticalTabDragHandlerImpl::Initial
+       continue;
+     }
+     size_t index = tab_strip_model_->GetIndexOfTab(tab);
+-    list_selection_model.AddIndexToSelection(index);
++    drag_init_data.list_selection_model.AddIndexToSelection(index);
+     TabCollectionNode* selected_node =
+         root_node_->GetNodeForHandle(tab->GetHandle());
+     CHECK(selected_node);
+     auto* slot_view = &GetOrCreateSlotViewForNode(*selected_node);
+     slot_view->SetBoundsRect(selected_node->view()->GetLocalBounds());
+-    dragged_views.push_back(slot_view);
+-    if (selected_node == &node) {
+-      source_dragged_view = slot_view;
+-      list_selection_model.set_active(index);
++    drag_init_data.dragged_views.push_back(slot_view);
++    if (selected_node == &source_node) {
++      drag_init_data.source_dragged_view = slot_view;
++      drag_init_data.list_selection_model.set_active(index);
+     }
+   }
+-  dragged_views.shrink_to_fit();
+-
+-  CHECK(source_dragged_view);
++  drag_init_data.dragged_views.shrink_to_fit();
++  return drag_init_data;
++}
+ 
+-  const gfx::Point offset_from_source = event.location();
+-  if (drag_controller_->Init(this, source_dragged_view, dragged_views,
+-                             offset_from_source, list_selection_model,
+-                             EventSourceFromEvent(event)) ==
+-      TabDragController::Liveness::kDeleted) {
+-    ResetDragState();
++VerticalTabDragHandlerImpl::DragInitData
++VerticalTabDragHandlerImpl::GetDragInitDataForGroupHeaderDrag(
++    TabCollectionNode& source_node) {
++  DragInitData drag_init_data;
++  drag_init_data.source_dragged_view = &GetOrCreateSlotViewForNode(source_node);
++  drag_init_data.dragged_views.push_back(drag_init_data.source_dragged_view);
++  for (const auto& child : source_node.children()) {
++    if (child->type() == TabCollectionNode::Type::SPLIT) {
++      for (const auto& split_child : child->children()) {
++        drag_init_data.dragged_views.push_back(
++            &GetOrCreateSlotViewForNode(*split_child.get()));
++      }
++    } else {
++      drag_init_data.dragged_views.push_back(
++          &GetOrCreateSlotViewForNode(*child.get()));
++    }
+   }
++  return drag_init_data;
+ }
+ 
+ bool VerticalTabDragHandlerImpl::ContinueDrag(views::View& event_source_view,
+@@ -190,7 +251,11 @@ void VerticalTabDragHandlerImpl::HandleT
+     ++insertion_idx;
+   }
+   insertion_idx = std::clamp(insertion_idx, 0, tab_strip_model_->count() - 1);
+-  tab_strip_model_->MoveSelectedTabsTo(insertion_idx, tab->GetGroup());
++  if (auto group = GetDraggingGroupHeaderId(); group.has_value()) {
++    tab_strip_model_->MoveGroupTo(*group, insertion_idx);
++  } else {
++    tab_strip_model_->MoveSelectedTabsTo(insertion_idx, tab->GetGroup());
++  }
+ }
+ 
+ void VerticalTabDragHandlerImpl::HandleTabDragOverSplit(
+@@ -212,8 +277,12 @@ void VerticalTabDragHandlerImpl::HandleT
+           ? last_tab_in_split - selection_model.selected_tabs().size()
+           : first_tab_in_split;
+ 
+-  tab_strip_model_->MoveSelectedTabsTo(
+-      insertion_idx, split_data->ListTabs().front()->GetGroup());
++  if (auto group = GetDraggingGroupHeaderId(); group.has_value()) {
++    tab_strip_model_->MoveGroupTo(*group, insertion_idx);
++  } else {
++    tab_strip_model_->MoveSelectedTabsTo(
++        insertion_idx, split_data->ListTabs().front()->GetGroup());
++  }
+ }
+ 
+ void VerticalTabDragHandlerImpl::HandleTabDragOverGroup(
+@@ -223,7 +292,6 @@ void VerticalTabDragHandlerImpl::HandleT
+           std::get<const tabs::TabCollection*>(node.GetNodeData()))
+           ->GetTabGroup();
+   CHECK(tab_group);
+-
+   const auto& selection_model = tab_strip_model_->selection_model();
+ 
+   if (std::all_of(selection_model.selected_tabs().begin(),
+@@ -242,13 +310,23 @@ void VerticalTabDragHandlerImpl::HandleT
+   int first_selected_index =
+       *selection_model.GetListSelectionModel().selected_indices().cbegin();
+ 
+-  if (tab_strip_model_->IsGroupCollapsed(tab_group->id())) {
+-    // Selected tabs need to be inserted outside the group if collapsed.
+-    int insertion_idx = (first_selected_index < first_tab_in_group)
+-                            ? last_tab_in_group
+-                            : first_tab_in_group;
+-    tab_strip_model_->MoveSelectedTabsTo(insertion_idx, std::nullopt);
++  auto dragged_group = GetDraggingGroupHeaderId();
++  if (tab_strip_model_->IsGroupCollapsed(tab_group->id()) ||
++      dragged_group.has_value()) {
++    // If dragging over a collapsed group or dragging a group header, then
++    // move the dragged tabs/header before or after the dragged-over group.
++    int insertion_idx =
++        (first_selected_index < first_tab_in_group)
++            ? last_tab_in_group - selection_model.selected_tabs().size() + 1
++            : first_tab_in_group;
++    if (dragged_group.has_value()) {
++      tab_strip_model_->MoveGroupTo(*dragged_group, insertion_idx);
++    } else {
++      tab_strip_model_->MoveSelectedTabsTo(insertion_idx, std::nullopt);
++    }
+   } else {
++    // If dragging over an expanded group, move the selected tabs to the
++    // beginning or end of the group.
+     int insertion_idx =
+         (first_selected_index < first_tab_in_group)
+             ? first_tab_in_group - selection_model.selected_tabs().size()
+@@ -262,11 +340,19 @@ void VerticalTabDragHandlerImpl::HandleT
+     const TabCollectionNode& node,
+     std::optional<DragPositionHint> position_hint) {
+   if (position_hint == DragPositionHint::kBottom) {
+-    // Move the selected tabs to the end.
+-    tab_strip_model_->MoveSelectedTabsTo(
++    int insertion_index =
+         tab_strip_model_->count() -
+-            tab_strip_model_->selection_model().selected_tabs().size(),
+-        std::nullopt);
++        tab_strip_model_->selection_model().selected_tabs().size();
++    if (auto group = GetDraggingGroupHeaderId(); group.has_value()) {
++      tab_strip_model_->MoveGroupTo(*group, insertion_index);
++    } else {
++      // Move the selected tabs to the end.
++      tab_strip_model_->MoveSelectedTabsTo(insertion_index, std::nullopt);
++    }
++    return;
++  }
++
++  if (GetDraggingGroupHeaderId().has_value()) {
+     return;
+   }
+ 
+@@ -309,6 +395,12 @@ bool VerticalTabDragHandlerImpl::IsDragg
+                      [](const auto& tab_data) { return tab_data.pinned; });
+ }
+ 
++std::optional<tab_groups::TabGroupId>
++VerticalTabDragHandlerImpl::GetDraggingGroupHeaderId() const {
++  return drag_controller_ ? drag_controller_->GetSessionData().group()
++                          : std::nullopt;
++}
++
+ views::View* VerticalTabDragHandlerImpl::ViewFromTabSlot(
+     TabSlotView* view) const {
+   auto* slot_view = views::AsViewClass<VerticalTabSlotView>(view);
+@@ -367,8 +459,9 @@ content::WebContents* VerticalTabDragHan
+     TabSlotView* view) {
+   auto* slot_view = views::AsViewClass<VerticalTabSlotView>(view);
+   CHECK(slot_view);
+-  // TODO(crbug.com/439963720): Support dragging other types.
+-  CHECK(slot_view->node().type() == TabCollectionNode::Type::TAB);
++  if (slot_view->node().type() != TabCollectionNode::Type::TAB) {
++    return nullptr;
++  }
+   const tabs::TabInterface* tab =
+       std::get<const tabs::TabInterface*>(slot_view->node().GetNodeData());
+   CHECK(tab);
+@@ -386,9 +479,9 @@ bool VerticalTabDragHandlerImpl::IsTabDe
+ }
+ 
+ TabSlotView* VerticalTabDragHandlerImpl::GetTabGroupHeader(
+-    const tab_groups::TabGroupId& group) const {
+-  // TODO(crbug.com/439963720): Support dragging tab groups.
+-  return nullptr;
++    const tab_groups::TabGroupId& group_id) {
++  TabCollectionNode* node = GetNodeForTabGroup(group_id);
++  return node ? &GetOrCreateSlotViewForNode(*node) : nullptr;
+ }
+ 
+ TabStripModel* VerticalTabDragHandlerImpl::GetTabStripModel() {
+@@ -441,6 +534,30 @@ void VerticalTabDragHandlerImpl::Stopped
+     CHECK(dragged_view);
+     dragged_view->DestroyLayer();
+   }
++
++  if (!drag_controller_) {
++    return;
++  }
++
++  const DragSessionData& drag_data = drag_controller_->GetSessionData();
++  if (!drag_data.group_drag_data_.has_value()) {
++    return;
++  }
++  // Offset by 1 to account for the group header.
++  const int drag_data_index =
++      1 + drag_data.group_drag_data_->active_tab_index_within_group;
++  const int index = tab_strip_model_->GetIndexOfWebContents(
++      drag_data.tab_drag_data_[drag_data_index].contents);
++
++  // The tabs in the group may have been closed during the drag.
++  if (index != TabStripModel::kNoTab) {
++    ui::ListSelectionModel selection;
++    CHECK_GE(index, 0);
++    selection.AddIndexToSelection(static_cast<size_t>(index));
++    selection.set_active(static_cast<size_t>(index));
++    selection.set_anchor(static_cast<size_t>(index));
++    tab_strip_model_->SetSelectionFromModel(selection);
++  }
+ }
+ 
+ void VerticalTabDragHandlerImpl::SetDragControllerCallbackForTesting(
+@@ -460,6 +577,13 @@ TabCollectionNode* VerticalTabDragHandle
+   return root_node_->GetNodeForHandle(tab->GetHandle());
+ }
+ 
++TabCollectionNode* VerticalTabDragHandlerImpl::GetNodeForTabGroup(
++    const tab_groups::TabGroupId& group_id) {
++  auto* group = tab_strip_model_->group_model()->GetTabGroup(group_id);
++  CHECK(group);
++  return root_node_->GetNodeForHandle(group->GetCollectionHandle());
++}
++
+ TabSlotView& VerticalTabDragHandlerImpl::GetOrCreateSlotViewForNode(
+     TabCollectionNode& node) {
+   CHECK(node.view());
+@@ -470,6 +594,22 @@ TabSlotView& VerticalTabDragHandlerImpl:
+ 
+   auto tab_slot_view = std::make_unique<VerticalTabSlotView>(node);
+   tab_slot_view->SetBoundsRect(node.view()->GetLocalBounds());
++
++  switch (node.type()) {
++    case TabCollectionNode::Type::TAB: {
++      const tabs::TabInterface* tab =
++          std::get<const tabs::TabInterface*>(node.GetNodeData());
++      CHECK(tab);
++      tab_slot_view->SetGroup(tab->GetGroup());
++      tab_slot_view->SetSplit(tab->GetSplit());
++    } break;
++    case TabCollectionNode::Type::GROUP:
++      tab_slot_view->SetGroup(TabGroupDataFromNode(node).id());
++      break;
++    default:
++      NOTREACHED();
++  }
++
+   auto& tab_slot_view_ref = *tab_slot_view.get();
+   slot_views_.insert(
+       {&node, node.view()->AddChildView(std::move(tab_slot_view))});
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_types.h"
++#include "components/tab_groups/tab_group_id.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/events/event.h"
+@@ -55,6 +56,11 @@ class VerticalTabDragHandler {
+   // Returns true if there is an ongoing drag that includes a pinned tab.
+   virtual bool IsDraggingPinnedTabs() const = 0;
+ 
++  // Returns the group id of the dragged group header, or null if a group
++  // header is not being dragged.
++  virtual std::optional<tab_groups::TabGroupId> GetDraggingGroupHeaderId()
++      const = 0;
++
+   // For vertical tabs, `TabSlotView` doesn't represent the actual tab
+   // view. This method converts `view` to its actual tab view, or nullptr
+   // if this handler doesn't manage it.
+@@ -89,6 +95,8 @@ class VerticalTabDragHandlerImpl : publi
+   TabDragContext* GetDragContext() override;
+   bool IsViewDragging(const views::View& view) const override;
+   bool IsDraggingPinnedTabs() const override;
++  std::optional<tab_groups::TabGroupId> GetDraggingGroupHeaderId()
++      const override;
+   views::View* ViewFromTabSlot(TabSlotView* view) const override;
+ 
+   // TabDragContext
+@@ -103,7 +111,7 @@ class VerticalTabDragHandlerImpl : publi
+   bool IsTabDetachable(const TabSlotView* view) const override;
+   bool IsTabPinned(const TabSlotView* tab) const override;
+   TabSlotView* GetTabGroupHeader(
+-      const tab_groups::TabGroupId& group) const override;
++      const tab_groups::TabGroupId& group_id) override;
+   TabStripModel* GetTabStripModel() override;
+   TabDragController* GetDragController() override;
+   void OwnDragController(
+@@ -118,7 +126,27 @@ class VerticalTabDragHandlerImpl : publi
+   TabDragPositioningDelegate* GetPositioningDelegate() override;
+ 
+  private:
++  // Encapsulates data needed to initialize a drag session.
++  struct DragInitData {
++    DragInitData();
++    ~DragInitData();
++    DragInitData(const DragInitData&);
++    DragInitData& operator=(const DragInitData&);
++
++    raw_ptr<TabSlotView> source_dragged_view = nullptr;
++    std::vector<TabSlotView*> dragged_views;
++    ui::ListSelectionModel list_selection_model;
++  };
++
++  // Helpers for initialize a drag, according to the type of `source_node`.
++  // These helpers will create the `TabSlotView`s for the dragged
++  // tabs as needed.
++  DragInitData GetDragInitDataForTabDrag(TabCollectionNode& source_node);
++  DragInitData GetDragInitDataForGroupHeaderDrag(
++      TabCollectionNode& source_node);
++
+   TabCollectionNode* GetNodeForContents(content::WebContents* contents);
++  TabCollectionNode* GetNodeForTabGroup(const tab_groups::TabGroupId& group_id);
+ 
+   // Creates a `TabSlotView` for `node`, used for compatibility with the
+   // core dragging system. The created slot view is cached in `slot_views_`.
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_interactive_uitest.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_interactive_uitest.cc
+@@ -22,6 +22,7 @@
+ #include "chrome/test/base/ui_test_utils.h"
+ #include "chrome/test/interaction/interactive_browser_test.h"
+ #include "components/tab_groups/tab_group_id.h"
++#include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/test/browser_test.h"
+ #include "ui/base/ozone_buildflags.h"
+@@ -29,6 +30,7 @@
+ #include "ui/events/event.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/gfx/scoped_animation_duration_scale_mode.h"
++#include "ui/views/interaction/interactive_views_test.h"
+ #include "ui/views/view.h"
+ #include "url/gurl.h"
+ #include "url/url_constants.h"
+@@ -125,6 +127,50 @@ class VerticalTabDragHandlerTest
+         }));
+   }
+ 
++  auto DragGroupHeaderTo(int group_index, const gfx::Point& point) {
++    // DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kGroupToDrag);
++    const char kGroupToDrag[] = "Group to drag";
++    DEFINE_LOCAL_STATE_IDENTIFIER_VALUE(ui::test::PollingStateObserver<bool>,
++                                        kViewVisiblePoller);
++    return Steps(
++        NameDescendantViewByType<VerticalTabGroupHeaderView>(
++            kBrowserViewElementId, kGroupToDrag, group_index),
++        WaitForShow(kGroupToDrag),
++
++        // Even though the view is showing, it animates in from 0 size.
++        // Poll for it to have a non-empty size.
++        PollState(
++            kViewVisiblePoller,
++            base::RepeatingCallback(base::BindLambdaForTesting([&,
++                                                                group_index]() {
++              TabStripModel* tab_strip_model = browser()->GetTabStripModel();
++              auto groups = tab_strip_model->group_model()->ListTabGroups();
++              if (groups.size() <= static_cast<size_t>(group_index)) {
++                return false;
++              }
++              auto group_id = groups[group_index];
++              RootTabCollectionNode* root_node =
++                  GetBrowserView()
++                      .vertical_tab_strip_region_view_for_testing()
++                      ->root_node_for_testing();
++              return !root_node
++                          ->GetNodeForHandle(tab_strip_model->group_model()
++                                                 ->GetTabGroup(group_id)
++                                                 ->GetCollectionHandle())
++                          ->view()
++                          ->GetVisibleBounds()
++                          .IsEmpty();
++            }))),
++        WaitForState(kViewVisiblePoller, true), MoveMouseTo(kGroupToDrag),
++        ClickMouse(ui_controls::MouseButton::LEFT, /*release=*/false),
++        Do([&]() {
++          // TODO(crbug.com/40249472): Since DnD creates a blocking
++          // loop, the initiating mouse movement must be executed
++          // asynchronously.
++          ASSERT_TRUE(ui_controls::SendMouseMove(point.x(), point.y()));
++        }));
++  }
++
+   // TODO(crbug.com/40249472): Due to the nature of dragging, events for
+   // ending the drag must be executed asynchronoulsy.
+   auto ReleaseMouseAsync() {
+@@ -904,3 +950,47 @@ IN_PROC_BROWSER_TEST_F(VerticalTabDragHa
+                                     })),
+       ReleaseMouseAsync());
+ }
++
++// TODO(crbug.com/40249472): Tab DnD tests not working on ChromeOS and Mac, and
++// flakes on Wayland
++#if !BUILDFLAG(IS_MAC) && !BUILDFLAG(IS_CHROMEOS) && \
++    !BUILDFLAG(IS_OZONE_WAYLAND)
++#define MAYBE_DragGroupHeader DragGroupHeader
++#else
++#define MAYBE_DragGroupHeader DISABLED_DragGroupHeader
++#endif
++IN_PROC_BROWSER_TEST_F(VerticalTabDragHandlerTest, MAYBE_DragGroupHeader) {
++  DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kFourthTab);
++  TabStripModel* tab_strip_model = browser()->GetTabStripModel();
++  ASSERT_NE(nullptr, tab_strip_model);
++  RunTestSequence(
++      AddInstrumentedTab(kSecondTab, GURL(chrome::kChromeUIBookmarksURL), 1),
++      AddInstrumentedTab(kThirdTab, GURL(chrome::kChromeUISettingsURL), 2),
++      AddInstrumentedTab(kFourthTab, GURL(chrome::kChromeUIVersionURL), 3),
++      AddTabsToNewGroup({1, 2}),
++      PollState(kTabOrderPoller, GetTabOrder(tab_strip_model)),
++      WaitForState(kTabOrderPoller,
++                   URLs({url::kAboutBlankURL,
++                         TabGroupURLs({chrome::kChromeUIBookmarksURL,
++                                       chrome::kChromeUISettingsURL}),
++                         chrome::kChromeUIVersionURL})),
++
++      Log("Starting drag"),
++      DragGroupHeaderTo(0, GetBrowserView().GetBoundsInScreen().top_right() +
++                               gfx::Vector2d(50, 50)),
++      PollState(kDragStatePoller, GetDragActive()),
++      WaitForState(kDragStatePoller, true),
++
++      Log("Moving tabs to index 0"), MoveMouseToTabAsync(0),
++      WaitForState(kTabOrderPoller,
++                   URLs({TabGroupURLs({chrome::kChromeUIBookmarksURL,
++                                       chrome::kChromeUISettingsURL}),
++                         url::kAboutBlankURL, chrome::kChromeUIVersionURL})),
++
++      Log("Moving tabs to index 3"), MoveMouseToTabAsync(3),
++      WaitForState(kTabOrderPoller,
++                   URLs({url::kAboutBlankURL, chrome::kChromeUIVersionURL,
++                         TabGroupURLs({chrome::kChromeUIBookmarksURL,
++                                       chrome::kChromeUISettingsURL})})),
++      ReleaseMouseAsync());
++}
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.cc
+@@ -47,7 +47,7 @@ END_METADATA
+ }  // namespace
+ 
+ VerticalTabGroupHeaderView::VerticalTabGroupHeaderView(
+-    Delegate* delegate,
++    Delegate& delegate,
+     const tab_groups::TabGroupVisualData* tab_group_visual_data)
+     : group_header_label_(
+           AddChildView(std::make_unique<VerticalTabGroupHeaderLabel>())),
+@@ -89,11 +89,22 @@ bool VerticalTabGroupHeaderView::OnMouse
+     return false;
+   }
+ 
++  // Potentially start the drag for the mouse press.
++  // Follow-up mouse-movement events will update the drag controller and
++  // eventually kick off the drag-loop.
++  delegate_->InitHeaderDrag(event);
++
+   // Return true so that we receive subsequent MouseRelease event.
+   return true;
+ }
+ 
++bool VerticalTabGroupHeaderView::OnMouseDragged(const ui::MouseEvent& event) {
++  return delegate_->ContinueHeaderDrag(event);
++}
++
+ void VerticalTabGroupHeaderView::OnMouseReleased(const ui::MouseEvent& event) {
++  delegate_->CancelHeaderDrag();
++
+   bool open_editor_bubble =
+       event.IsRightMouseButton() && !editor_bubble_tracker_.is_open();
+   bool toggle_collapse = event.IsLeftMouseButton();
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.h
+@@ -19,7 +19,7 @@ class TabGroupVisualData;
+ namespace views {
+ class ImageView;
+ class Label;
+-}
++}  // namespace views
+ 
+ // View for a tab group header in the vertical tabstrip.
+ class VerticalTabGroupHeaderView : public views::FlexLayoutView,
+@@ -34,10 +34,14 @@ class VerticalTabGroupHeaderView : publi
+         ToggleTabGroupCollapsedStateOrigin origin) = 0;
+     virtual views::Widget* ShowGroupEditorBubble(
+         bool stop_context_menu_propagation) = 0;
++
++    virtual void InitHeaderDrag(const ui::MouseEvent& event) = 0;
++    virtual bool ContinueHeaderDrag(const ui::MouseEvent& event) = 0;
++    virtual void CancelHeaderDrag() = 0;
+   };
+ 
+-  explicit VerticalTabGroupHeaderView(
+-      Delegate* delegate,
++  VerticalTabGroupHeaderView(
++      Delegate& delegate,
+       const tab_groups::TabGroupVisualData* tab_group_visual_data);
+   VerticalTabGroupHeaderView(const VerticalTabGroupHeaderView&) = delete;
+   VerticalTabGroupHeaderView& operator=(const VerticalTabGroupHeaderView&) =
+@@ -47,6 +51,7 @@ class VerticalTabGroupHeaderView : publi
+   // views::View:
+   bool OnKeyPressed(const ui::KeyEvent& event) override;
+   bool OnMousePressed(const ui::MouseEvent& event) override;
++  bool OnMouseDragged(const ui::MouseEvent& event) override;
+   void OnMouseReleased(const ui::MouseEvent& event) override;
+   void OnGestureEvent(ui::GestureEvent* event) override;
+ 
+@@ -64,7 +69,7 @@ class VerticalTabGroupHeaderView : publi
+  private:
+   const raw_ptr<views::Label> group_header_label_ = nullptr;
+   const raw_ptr<views::ImageView> collapse_icon_ = nullptr;
+-  const raw_ptr<Delegate> delegate_ = nullptr;
++  const raw_ref<Delegate> delegate_;
+ 
+   TabGroupEditorBubbleTracker editor_bubble_tracker_;
+ };
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -60,7 +60,7 @@ VerticalTabGroupView::VerticalTabGroupVi
+       tab_group_visual_data_(
+           *GetTabGroupFromNode(collection_node_)->visual_data()),
+       group_header_(AddChildView(std::make_unique<VerticalTabGroupHeaderView>(
+-          this,
++          *this,
+           &tab_group_visual_data_))),
+       group_line_(AddChildView(std::make_unique<views::View>())),
+       layout_manager_(*SetLayoutManager(
+@@ -274,5 +274,17 @@ void VerticalTabGroupView::HandleTabDrag
+   GetDragHandler().HandleDraggedTabsOverNode(*node, std::nullopt);
+ }
+ 
++void VerticalTabGroupView::InitHeaderDrag(const ui::MouseEvent& event) {
++  GetDragHandler().InitializeDrag(*collection_node_, event);
++}
++
++bool VerticalTabGroupView::ContinueHeaderDrag(const ui::MouseEvent& event) {
++  return GetDragHandler().ContinueDrag(*group_header_, event);
++}
++
++void VerticalTabGroupView::CancelHeaderDrag() {
++  GetDragHandler().EndDrag(EndDragReason::kCancel);
++}
++
+ BEGIN_METADATA(VerticalTabGroupView)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -46,6 +46,9 @@ class VerticalTabGroupView
+   void ToggleCollapsedState(ToggleTabGroupCollapsedStateOrigin origin) override;
+   views::Widget* ShowGroupEditorBubble(
+       bool stop_context_menu_propagation) override;
++  void InitHeaderDrag(const ui::MouseEvent& event) override;
++  bool ContinueHeaderDrag(const ui::MouseEvent& event) override;
++  void CancelHeaderDrag() override;
+ 
+   // TabCollectionAnimatingLayoutManager::Delegate:
+   bool IsViewDragging(const views::View& child_view) const override;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -182,7 +182,14 @@ void VerticalUnpinnedTabContainerView::H
+     node = tab_view->collection_node();
+   } else if (auto* group_view =
+                  views::AsViewClass<VerticalTabGroupView>(view_at_point)) {
+-    node = group_view->collection_node();
++    // Don't set the node if dragging a group header over another group view to
++    // avoid bouncing the group view around.
++    // TODO(crbug.com/476509652): This shouldn't be necessary once hit-testing
++    // is improved.
++    if (!GetDragHandler().GetDraggingGroupHeaderId().has_value() ||
++        group_view->IsCollapsed()) {
++      node = group_view->collection_node();
++    }
+   } else if (auto* split_tab_view =
+                  views::AsViewClass<VerticalSplitTabView>(view_at_point)) {
+     node = split_tab_view->collection_node();
+@@ -194,6 +201,12 @@ void VerticalUnpinnedTabContainerView::H
+ VerticalDraggedTabsContainer&
+ VerticalUnpinnedTabContainerView::GetTabDragTarget(
+     const gfx::Point& point_in_screen) {
++  if (GetDragHandler().GetDraggingGroupHeaderId().has_value()) {
++    // Don't consider other tab group views as a drag target if we're dragging
++    // a group header already.
++    return *this;
++  }
++
+   gfx::Point point_in_container =
+       views::View::ConvertPointFromScreen(this, point_in_screen);
+   // Use the center of the bounds so views with padding are still targetable
