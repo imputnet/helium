@@ -30,6 +30,8 @@ REPLACEMENT_REGEXES_STR = [
 REPLACEMENT_REGEXES = list(map(lambda line: (re.compile(line[0]), line[1]),
                                REPLACEMENT_REGEXES_STR))
 
+IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios']
+
 
 def replace(text):
     """Replaces instances of Chrom(e | ium) with Helium, where desired"""
@@ -90,6 +92,15 @@ def get_substitutable_files(tree):
     for root, _, files in os.walk(tree):
         root = Path(root)
         if out in root.parents:
+            continue
+
+        should_ignore = False
+        for dir_name in IGNORE_DIRS:
+            if dir_name in root.parts:
+                should_ignore = True
+                break
+
+        if should_ignore:
             continue
 
         yield from map(lambda filename, root=root: root / filename, filter(is_substitutable, files))
