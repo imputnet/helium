@@ -1,14 +1,6 @@
 --- a/chrome/browser/ui/tabs/features.cc
 +++ b/chrome/browser/ui/tabs/features.cc
-@@ -4,6 +4,7 @@
- 
- #include "chrome/browser/ui/tabs/features.h"
- 
-+#include "base/check.h"
- #include "base/feature_list.h"
- #include "chrome/browser/ui/ui_features.h"
- 
-@@ -15,14 +16,17 @@ BASE_FEATURE(kDebugUITabStrip, base::FEA
+@@ -15,7 +15,7 @@ BASE_FEATURE(kDebugUITabStrip, base::FEA
  
  BASE_FEATURE(kTabGroupHome, base::FEATURE_DISABLED_BY_DEFAULT);
  
@@ -17,17 +9,6 @@
  
  BASE_FEATURE(kTabSelectionByPointer, base::FEATURE_ENABLED_BY_DEFAULT);
  
- BASE_FEATURE(kProjectsPanel, base::FEATURE_DISABLED_BY_DEFAULT);
- 
- bool IsVerticalTabsFeatureEnabled() {
--  return base::FeatureList::IsEnabled(kVerticalTabs);
-+  // The vertical tabs feature must be enabled for Helium layout
-+  // to function properly.
-+  CHECK(base::FeatureList::IsEnabled(kVerticalTabs));
-+  return true;
- }
- 
- bool IsProjectsPanelFeatureEnabled() {
 --- a/chrome/browser/sync/prefs/chrome_syncable_prefs_database.cc
 +++ b/chrome/browser/sync/prefs/chrome_syncable_prefs_database.cc
 @@ -394,7 +394,7 @@ enum {
@@ -52,38 +33,65 @@
  #endif  // BUILDFLAG(IS_ANDROID)
 --- a/chrome/browser/ui/tabs/tab_metrics_provider.cc
 +++ b/chrome/browser/ui/tabs/tab_metrics_provider.cc
-@@ -27,7 +27,7 @@ VerticalTabsState TabMetricsProvider::Ge
+@@ -8,6 +8,7 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/prefs/pref_service.h"
+@@ -27,7 +28,8 @@ VerticalTabsState TabMetricsProvider::Ge
    size_t vertical_tab_profiles = 0;
    for (Profile* profile : profiles) {
      if (profile->GetPrefs() &&
 -        profile->GetPrefs()->GetBoolean(prefs::kVerticalTabsEnabled)) {
-+        profile->GetPrefs()->GetInteger(prefs::kHeliumLayout) == 2) {
++        profile->GetPrefs()->GetInteger(prefs::kHeliumLayout) ==
++        std::to_underlying(HeliumLayoutType::kVertical)) {
        vertical_tab_profiles++;
      }
    }
 --- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
-@@ -31,14 +31,14 @@ bool GetDefaultTabSearchRightAligned() {
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
+ 
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/common/chrome_features.h"
+@@ -31,14 +32,16 @@ bool GetDefaultTabSearchRightAligned() {
  void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
    registry->RegisterBooleanPref(prefs::kTabSearchRightAligned,
                                  GetDefaultTabSearchRightAligned());
 -  registry->RegisterBooleanPref(
 -      prefs::kVerticalTabsEnabled, false,
 +  registry->RegisterIntegerPref(
-+      prefs::kHeliumLayout, 0,
++      prefs::kHeliumLayout,
++      std::to_underlying(HeliumLayoutType::kHorizontal),
        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
  }
  
  TabSearchPosition GetTabSearchPosition(const Profile* profile) {
    if (tabs::IsVerticalTabsFeatureEnabled() &&
 -      profile->GetPrefs()->GetBoolean(prefs::kVerticalTabsEnabled)) {
-+      profile->GetPrefs()->GetInteger(prefs::kHeliumLayout) == 2) {
++      profile->GetPrefs()->GetInteger(prefs::kHeliumLayout) ==
++          std::to_underlying(HeliumLayoutType::kVertical)) {
      return TabSearchPosition::kVerticalTabstrip;
    }
  
 --- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
 +++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
-@@ -46,7 +46,7 @@ VerticalTabStripStateController::Vertica
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_list.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/prefs/pref_notifier_impl.h"
+@@ -46,7 +47,7 @@ VerticalTabStripStateController::Vertica
    pref_change_registrar_.Init(pref_service_);
  
    pref_change_registrar_.Add(
@@ -92,36 +100,36 @@
        base::BindRepeating(&VerticalTabStripStateController::NotifyStateChanged,
                            base::Unretained(this)));
  
-@@ -92,11 +92,11 @@ VerticalTabStripStateController* Vertica
+@@ -92,11 +93,14 @@ VerticalTabStripStateController* Vertica
  }
  
  bool VerticalTabStripStateController::ShouldDisplayVerticalTabs() const {
 -  return pref_service_->GetBoolean(prefs::kVerticalTabsEnabled);
-+  return pref_service_->GetInteger(prefs::kHeliumLayout) == 2;
++  return pref_service_->GetInteger(prefs::kHeliumLayout) ==
++         std::to_underlying(HeliumLayoutType::kVertical);
  }
  
  void VerticalTabStripStateController::SetVerticalTabsEnabled(bool enabled) {
 -  pref_service_->SetBoolean(prefs::kVerticalTabsEnabled, enabled);
-+  pref_service_->SetInteger(prefs::kHeliumLayout, enabled ? 2 : 0);
++  HeliumLayoutType layout = enabled ? HeliumLayoutType::kVertical
++                                    : HeliumLayoutType::kHorizontal;
++  pref_service_->SetInteger(prefs::kHeliumLayout, std::to_underlying(layout));
  }
  
  bool VerticalTabStripStateController::IsCollapsed() const {
 --- a/chrome/common/pref_names.h
 +++ b/chrome/common/pref_names.h
-@@ -1313,6 +1313,12 @@ inline constexpr char kNewTabNextToActiv
+@@ -1313,6 +1313,9 @@ inline constexpr char kNewTabNextToActiv
  // cycling through tabs with Ctrl+Tab.
  inline constexpr char kTabCyclingMRU[] = "helium.browser.mru_tab_cycling";
  
-+// An integer pref that controls the browser layout.
-+// 0 = Horizontal
-+// 1 = Compact
-+// 2 = Vertical
++// An enum (HeliumLayoutType) pref that controls the browser layout.
 +inline constexpr char kHeliumLayout[] = "helium.browser.layout";
 +
  // A boolean pref set to true if a Home button to open the Home pages should be
  // visible on the toolbar.
  inline constexpr char kShowHomeButton[] = "browser.show_home_button";
-@@ -1989,9 +1995,6 @@ inline constexpr char kGoogleSearchSideP
+@@ -1989,9 +1992,6 @@ inline constexpr char kGoogleSearchSideP
  // True when the tab search button is on the right side of the tab strip even in
  // RTL.
  inline constexpr char kTabSearchRightAligned[] = "tab_search.is_right_aligned";
@@ -160,11 +168,11 @@
 +class BrowserWindowInterface;
 +class PrefService;
 +
-+// Browser layout types
 +enum class HeliumLayoutType {
-+  kHorizontal = 0,  // Traditional horizontal tab strip
-+  kToolbar = 1,     // Compact layout with tabs in the toolbar
-+  kVertical = 2,    // Vertical tab strip on the side
++  kHorizontal = 0,
++  kToolbar = 1,
++  kVertical = 2,
++  kMaxValue = kVertical,
 +};
 +
 +class HeliumLayoutStateController {
@@ -206,7 +214,7 @@
 +#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_LAYOUT_STATE_CONTROLLER_H_
 --- /dev/null
 +++ b/chrome/browser/ui/helium/helium_layout_state_controller.cc
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,70 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -214,6 +222,7 @@
 +#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
 +
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/features.h"
 +#include "chrome/common/pref_names.h"
 +#include "components/prefs/pref_service.h"
 +
@@ -248,16 +257,22 @@
 +
 +void HeliumLayoutStateController::SetBrowserLayout(
 +    HeliumLayoutType layout) {
-+  pref_service_->SetInteger(prefs::kHeliumLayout,
-+                            static_cast<int>(layout));
++  pref_service_->SetInteger(prefs::kHeliumLayout, std::to_underlying(layout));
 +}
 +
 +HeliumLayoutType HeliumLayoutStateController::GetBrowserLayout() const {
 +  int layout_value = pref_service_->GetInteger(prefs::kHeliumLayout);
-+  if (layout_value < 0 ||
-+      layout_value > static_cast<int>(HeliumLayoutType::kVertical)) {
++
++  if (!tabs::IsVerticalTabsFeatureEnabled() &&
++      layout_value == std::to_underlying(HeliumLayoutType::kVertical)) {
 +    return HeliumLayoutType::kHorizontal;
 +  }
++
++  if (layout_value < std::to_underlying(HeliumLayoutType::kHorizontal) ||
++      layout_value > std::to_underlying(HeliumLayoutType::kMaxValue)) {
++    return HeliumLayoutType::kHorizontal;
++  }
++
 +  return static_cast<HeliumLayoutType>(layout_value);
 +}
 +
