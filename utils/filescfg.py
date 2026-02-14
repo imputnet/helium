@@ -9,6 +9,7 @@ Operations with FILES.cfg (for portable packages)
 """
 
 import argparse
+import ast
 import datetime
 import platform
 import sys
@@ -28,10 +29,30 @@ def filescfg_generator(cfg_path, build_outputs, cpu_arch, excluded_files=None):
     cpu_arch is a platform.architecture() string
     """
     resolved_build_outputs = build_outputs.resolve()
-    exec_globals = {'__builtins__': None}
+    # Safely parse the configuration file using AST instead of exec()
     with cfg_path.open() as cfg_file:
-        exec(cfg_file.read(), exec_globals) # pylint: disable=exec-used
-    for file_spec in exec_globals['FILES']:
+        cfg_content = cfg_file.read()
+        try:
+            tree = ast.parse(cfg_content, str(cfg_path))
+        except SyntaxError as e:
+            raise ValueError(f'Invalid Python syntax in {cfg_path}: {e}') from e
+        
+        # Extract FILES variable from AST
+        files_list = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == 'FILES':
+                        # Safely evaluate the literal value
+                        files_list = ast.literal_eval(node.value)
+                        break
+            if files_list is not None:
+                break
+        
+        if files_list is None:
+            raise ValueError(f'FILES variable not found in {cfg_path}')
+    
+    for file_spec in files_list:
         # Only include files for official builds
         if 'official' not in file_spec['buildtype']:
             continue
