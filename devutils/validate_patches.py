@@ -136,11 +136,34 @@ def _deps_var(deps_globals):
 
 
 def _parse_deps(deps_text):
-    """Returns a dict of parsed DEPS data"""
-    deps_globals = {'__builtins__': None}
-    deps_globals['Var'] = _deps_var(deps_globals)
-    exec(deps_text, deps_globals) #pylint: disable=exec-used
+    """Returns a dict of parsed DEPS data using safe AST evaluation"""
+    if not _validate_deps(deps_text):
+        raise ValueError('DEPS file failed validation - potentially unsafe content')
+    tree = ast.parse(deps_text)
+    deps_globals = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    deps_globals[target.id] = _safe_eval_node(node.value, deps_globals)
     return deps_globals
+
+def _safe_eval_node(node, context):
+    """Safely evaluate AST node without exec()"""
+    if isinstance(node, ast.Dict):
+        return {_safe_eval_node(k, context): _safe_eval_node(v, context) for k, v in zip(node.keys, node.values)}
+    elif isinstance(node, ast.List):
+        return [_safe_eval_node(item, context) for item in node.elts]
+    elif isinstance(node, (ast.Str, ast.Constant)):
+        return node.s if isinstance(node, ast.Str) else node.value
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'Var':
+        if node.args and isinstance(node.args[0], (ast.Str, ast.Constant)):
+            var_name = node.args[0].s if isinstance(node.args[0], ast.Str) else node.args[0].value
+            return context.get('vars', {}).get(var_name, f'${{{var_name}}}')
+        raise ValueError(f'Invalid Var() call')
+    elif isinstance(node, ast.Name):
+        return context.get(node.id)
+    raise ValueError(f'Unsupported node type: {type(node).__name__}')
 
 
 def _download_googlesource_file(download_session, repo_url, version, relative_path):
