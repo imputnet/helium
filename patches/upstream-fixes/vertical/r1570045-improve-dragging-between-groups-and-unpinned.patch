@@ -1,0 +1,309 @@
+From 3bdc9ff45553aa7467d0733e355711b81a002350 Mon Sep 17 00:00:00 2001
+From: Eshwar Stalin <estalin@chromium.org>
+Date: Thu, 15 Jan 2026 15:16:24 -0800
+Subject: [PATCH] [Vertical Tabs] Improve dragging between groups and unpinned container
+
+This CL addresses two issues with dragging tabs between groups and
+unpinned container. First it ensures the views aren't clipped to the
+bounds of the host view (instead it clips to the scroll view). Secondly,
+we ensure the model changes for group id based on the container rather
+than when dragging over tabs or group headers.
+
+Note, there is still future improvements needed to better handle
+cross-over points rather than solely relying on pointer position over
+view to match the horizontal tab strip behavior.
+
+Change-Id: Ibdf2c94da1db79acadeb5c1e6cf4373c175cdab0
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7477307
+Commit-Queue: Eshwar Stalin <estalin@chromium.org>
+Reviewed-by: Kaan Alsan <alsan@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1570045}
+---
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h"
++#include "ui/views/controls/scroll_view.h"
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_utils.h"
+@@ -22,9 +23,12 @@
+ namespace {
+ 
+ // Returns the expected Y coordinate for the view of a tab being dragged at
+-// `point`.
+-int GetYForDraggedTab(const views::View& view, const gfx::Point& point) {
+-  return std::max(0.0f, point.y() - (view.height() * 0.5f));
++// `point`. Clamps minimum to `drag_clamp_min_y`.
++int GetYForDraggedTab(const views::View& dragging_view,
++                      const gfx::Point& point,
++                      int drag_clamp_min_y) {
++  return std::max(static_cast<float>(drag_clamp_min_y),
++                  point.y() - (dragging_view.height() * 0.5f));
+ }
+ 
+ }  // namespace
+@@ -48,13 +52,9 @@ VerticalDraggedTabsContainer& VerticalDr
+         dragging_views_.contains(child)) {
+       continue;
+     }
+-    if (auto* unpinned_container =
+-            views::AsViewClass<VerticalUnpinnedTabContainerView>(child)) {
+-      return unpinned_container->GetTabDragTarget(point_in_screen);
+-    }
+     if (auto* group_view = views::AsViewClass<VerticalTabGroupView>(child)) {
+       if (!group_view->IsCollapsed()) {
+-        return group_view->GetTabDragTarget(point_in_screen);
++        return *group_view;
+       }
+     }
+   }
+@@ -82,10 +82,9 @@ TabDragContext* VerticalDraggedTabsConta
+ 
+   // Used to determine whether the layout should snap into position without
+   // animating at the end of this drag cycle.
+-  bool is_initial_drag = false;
+-  if (dragging_views_.empty()) {
++  bool is_initial_drag = dragging_views_.empty();
++  if (is_initial_drag) {
+     InitializeDragState(drag_controller);
+-    is_initial_drag = true;
+   }
+ 
+   UpdateDraggingViewTransforms(point_in_container);
+@@ -153,11 +152,13 @@ void VerticalDraggedTabsContainer::Reset
+ 
+ void VerticalDraggedTabsContainer::UpdateDraggingViewTransforms(
+     const gfx::Point& point_in_container) {
++  int drag_clamp_min_y = GetMinYForDragToClamp();
+   for (views::View* tab_view : dragging_views_) {
+     // Use a transformation to render the dragged views, offset from the
+     // container's origin.
+     gfx::Transform transform;
+-    transform.Translate(0, GetYForDraggedTab(*tab_view, point_in_container));
++    transform.Translate(
++        0, GetYForDraggedTab(*tab_view, point_in_container, drag_clamp_min_y));
+     tab_view->SetTransform(transform);
+     // Applying a transformation for the first time destroys the clip mask
+     // layer. Reapply the clip path in case.
+@@ -165,6 +166,15 @@ void VerticalDraggedTabsContainer::Updat
+   }
+ }
+ 
++int VerticalDraggedTabsContainer::GetMinYForDragToClamp() const {
++  auto* scroll_view = GetScrollViewForContainer();
++  CHECK(scroll_view);
++  gfx::Point limit_point;
++  limit_point = views::View::ConvertPointToTarget(
++      scroll_view, base::to_address(host_view_), limit_point);
++  return limit_point.y();
++}
++
+ std::optional<int> VerticalDraggedTabsContainer::GetYForDraggedTabBounds(
+     const views::View& view) const {
+   if (!dragging_views_.contains(&view)) {
+@@ -175,8 +185,10 @@ std::optional<int> VerticalDraggedTabsCo
+     // `dragging_views_` but will not have a transformation, which let's
+     // the tab view animate into its correct slot.
+     return GetYForDraggedTab(
+-        view, views::View::ConvertPointFromScreen(base::to_address(host_view_),
+-                                                  last_drag_point_in_screen_));
++        view,
++        views::View::ConvertPointFromScreen(base::to_address(host_view_),
++                                            last_drag_point_in_screen_),
++        GetMinYForDragToClamp());
+   }
+   // If the tab is being dragged, then it is rendered using
+   // transformations, offset from the container's origin.
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
+@@ -16,6 +16,7 @@ class VerticalTabDragHandler;
+ namespace views {
+ class View;
+ struct ProposedLayout;
++class ScrollView;
+ }  // namespace views
+ 
+ // `VerticalDraggedTabsContainer` is an abstract class that can be derived to
+@@ -52,11 +53,11 @@ class VerticalDraggedTabsContainer : pub
+   // ViewObserver
+   void OnViewBoundsChanged(views::View* observed_view) override;
+ 
++ protected:
+   // Returns the expected Y coordinate for a dragged tab view's bounds, or null
+   // if the view isn't being dragged in this.
+   std::optional<int> GetYForDraggedTabBounds(const views::View& view) const;
+ 
+- protected:
+   // Helper for getting the view at a given point, excluding dragged views.
+   views::View* GetViewAtPoint(const views::ProposedLayout& layout,
+                               const gfx::Point& point);
+@@ -65,6 +66,9 @@ class VerticalDraggedTabsContainer : pub
+   virtual VerticalTabDragHandler& GetDragHandler() = 0;
+   virtual const VerticalTabDragHandler& GetDragHandler() const = 0;
+ 
++  // Returns the scroll view for the container.
++  virtual views::ScrollView* GetScrollViewForContainer() const = 0;
++
+   // Invalidates the layout of the host view, skipping animations.
+   virtual void UpdateLayoutForDrag() = 0;
+ 
+@@ -85,6 +89,10 @@ class VerticalDraggedTabsContainer : pub
+   // the last drag point.
+   void UpdateDraggingViewTransforms(const gfx::Point& point_in_container);
+ 
++  // Returns the minimum top bounds to clamp the transformation applied to the
++  // drag view. This is to ensure the dragged view transform doesn't clip.
++  int GetMinYForDragToClamp() const;
++
+   const raw_ref<const views::View> host_view_;
+ 
+   // Child views that are being dragged.
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
+@@ -195,17 +195,28 @@ void VerticalTabDragHandlerImpl::HandleT
+                             : first_tab_in_group;
+     tab_strip_model_->MoveSelectedTabsTo(insertion_idx, std::nullopt);
+   } else {
+-    int insertion_idx = (first_selected_index < first_tab_in_group)
+-                            ? first_tab_in_group
+-                            : last_tab_in_group;
++    int insertion_idx =
++        (first_selected_index < first_tab_in_group)
++            ? first_tab_in_group - selection_model.selected_tabs().size()
++            : last_tab_in_group + 1;
++    insertion_idx = std::clamp(insertion_idx, 0, tab_strip_model_->count() - 1);
+     tab_strip_model_->MoveSelectedTabsTo(insertion_idx, tab_group->id());
+   }
+ }
+ 
+ void VerticalTabDragHandlerImpl::HandleTabDragOverUnpinnedContainer(
+     const TabCollectionNode& node) {
+-  tab_strip_model_->MoveSelectedTabsTo(tab_strip_model_->count() - 1,
+-                                       std::nullopt);
++  const tabs::TabInterface* selected_tab =
++      *tab_strip_model_->selection_model().selected_tabs().cbegin();
++
++  if (selected_tab->GetGroup().has_value()) {
++    ui::ListSelectionModel::SelectedIndices selected =
++        tab_strip_model_->selection_model()
++            .GetListSelectionModel()
++            .selected_indices();
++    std::vector<int> tab_indices(selected.begin(), selected.end());
++    tab_strip_model_->RemoveFromGroup(tab_indices);
++  }
+ }
+ 
+ TabDragContext* VerticalTabDragHandlerImpl::GetDragContext() {
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -234,23 +234,25 @@ const VerticalTabDragHandler& VerticalTa
+   return collection_node_->GetController()->GetDragHandler();
+ }
+ 
++views::ScrollView* VerticalTabGroupView::GetScrollViewForContainer() const {
++  return views::ScrollView::GetScrollViewForContents(
++      const_cast<views::View*>(parent()));
++}
++
+ void VerticalTabGroupView::UpdateLayoutForDrag() {
+   layout_manager_->ResetToTargetLayout();
+ }
+ 
+ void VerticalTabGroupView::HandleTabDragInContainer(
+     const gfx::Point point_in_container) {
+-  // If the drag is on or above the group header, treat this as a drag over
+-  // group as a whole, rather than a drag over an individual tab.
+-  if (point_in_container.y() <= group_header_->bounds().bottom()) {
+-    GetDragHandler().DraggedTabsOverNode(*collection_node_);
+-    return;
+-  }
+-
+   views::View* view_at_point =
+       GetViewAtPoint(layout_manager_->target_layout(), point_in_container);
+   if (auto* tab_view = views::AsViewClass<VerticalTabView>(view_at_point)) {
+     tab_view->OnTabDragOver();
++  } else {
++    // If the drag isn't over any tab views including the header, then treat it
++    // as a drag over the group view container.
++    GetDragHandler().DraggedTabsOverNode(*collection_node_);
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -50,8 +50,6 @@ class VerticalTabGroupView
+   // TabCollectionAnimatingLayoutManager::Delegate:
+   bool IsViewDragging(const views::View& child_view) const override;
+ 
+-  void OnDataChanged();
+-
+   bool IsCollapsed() const;
+ 
+   // Handler when a tab that is not in the group is dragged over this.
+@@ -65,10 +63,12 @@ class VerticalTabGroupView
+   // VerticalDraggedTabsContainer:
+   VerticalTabDragHandler& GetDragHandler() override;
+   const VerticalTabDragHandler& GetDragHandler() const override;
++  views::ScrollView* GetScrollViewForContainer() const override;
+   void UpdateLayoutForDrag() override;
+   void HandleTabDragInContainer(const gfx::Point point_in_container) override;
+ 
+   void ResetCollectionNode();
++  void OnDataChanged();
+   void UpdateChildVisibilityForCollapseState(bool collapsed);
+ 
+   raw_ptr<TabCollectionNode> collection_node_ = nullptr;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/views/controls/scroll_view.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/layout/proposed_layout.h"
+@@ -118,6 +119,12 @@ const VerticalTabDragHandler& VerticalUn
+   return collection_node_->GetController()->GetDragHandler();
+ }
+ 
++views::ScrollView* VerticalUnpinnedTabContainerView::GetScrollViewForContainer()
++    const {
++  return views::ScrollView::GetScrollViewForContents(
++      const_cast<VerticalUnpinnedTabContainerView*>(this));
++}
++
+ void VerticalUnpinnedTabContainerView::UpdateLayoutForDrag() {
+   layout_manager_->ResetToTargetLayout();
+ }
+@@ -132,13 +139,10 @@ void VerticalUnpinnedTabContainerView::H
+   } else if (auto* group_view =
+                  views::AsViewClass<VerticalTabGroupView>(view_at_point)) {
+     group_view->OnTabDragOver();
+-  } else if (point_in_container.y() >= target_layout.host_size.height()) {
+-    // If the drag exceeds the bounds all the children, then let the drag
+-    // handler determine where to put the dragged tab(s) relative to this node.
++  } else {
++    // If the drag isn't over any child views, then treat it as a drag over
++    // the unpinned tab container.
+     GetDragHandler().DraggedTabsOverNode(*collection_node_);
+-    // TODO(crbug.com/439963720): Consider having a maximum drag coordinate that
+-    // will cause the dragged tabs to detach. For now, the dragged tab will
+-    // remain attached as long as it falls in the bounds of this container.
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
+@@ -43,6 +43,7 @@ class VerticalUnpinnedTabContainerView
+   // VerticalDraggedTabsContainer:
+   VerticalTabDragHandler& GetDragHandler() override;
+   const VerticalTabDragHandler& GetDragHandler() const override;
++  views::ScrollView* GetScrollViewForContainer() const override;
+   void UpdateLayoutForDrag() override;
+   void HandleTabDragInContainer(const gfx::Point point_in_container) override;
+ 

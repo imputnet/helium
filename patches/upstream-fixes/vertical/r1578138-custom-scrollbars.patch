@@ -1,0 +1,286 @@
+From 390b973e18c2d23ef3d861ffca674c6e0814cf54 Mon Sep 17 00:00:00 2001
+From: Caroline Rising <corising@chromium.org>
+Date: Mon, 02 Feb 2026 07:50:23 -0800
+Subject: [PATCH] [Vertical tabs] Create custom scrollbars for the tab containers.
+
+Custom scroll bars will replace the os level scrollbars used. These have
+a rounded rect thumb, and appear thin until hovered.
+
+screencast: https://screencast.googleplex.com/cast/NTg0NzgwMzg4NzYxNjAwMHw2MjdiM2YzZS0xYg
+
+Bug: 477296856
+Change-Id: I4b54f4fa0ed99158bc2750503020d967afe97c05
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7528657
+Reviewed-by: David Pennington <dpenning@chromium.org>
+Commit-Queue: Caroline Rising <corising@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1578138}
+---
+
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -15,6 +15,7 @@ source_set("vertical") {
+     "vertical_pinned_tab_container_view.h",
+     "vertical_split_tab_view.h",
+     "vertical_tab_strip_bottom_container.h",
++    "vertical_tab_strip_scroll_bar.h",
+     "vertical_tab_strip_top_container.h",
+     "vertical_tab_strip_view.h",
+     "vertical_unpinned_tab_container_view.h",
+@@ -51,6 +52,7 @@ source_set("impl") {
+     "vertical_tab_group_view.cc",
+     "vertical_tab_group_view.h",
+     "vertical_tab_strip_bottom_container.cc",
++    "vertical_tab_strip_scroll_bar.cc",
+     "vertical_tab_strip_top_container.cc",
+     "vertical_tab_strip_view.cc",
+     "vertical_tab_view.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_scroll_bar.cc
+@@ -0,0 +1,157 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_scroll_bar.h"
++
++#include <memory>
++
++#include "base/functional/bind.h"
++#include "base/i18n/rtl.h"
++#include "cc/paint/paint_flags.h"
++#include "third_party/skia/include/core/SkPath.h"
++#include "third_party/skia/include/core/SkPathBuilder.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/compositor/layer.h"
++#include "ui/compositor/scoped_layer_animation_settings.h"
++#include "ui/gfx/canvas.h"
++#include "ui/native_theme/overlay_scrollbar_constants.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/scrollbar/base_scroll_bar_thumb.h"
++#include "ui/views/layout/fill_layout.h"
++
++namespace {
++
++// Total thickness of the thumb (matches visuals when hovered).
++constexpr int kThumbThickness = 10;
++constexpr int kThumbUnhoveredOffset = 5;
++constexpr int kThumbUnhoveredTrailingPadding = 2;
++
++}  // namespace
++
++VerticalTabStripScrollBar::Thumb::Thumb(VerticalTabStripScrollBar* scroll_bar)
++    : views::BaseScrollBarThumb(scroll_bar) {
++  // |scroll_bar| isn't done being constructed; it's not safe to do anything
++  // that might reference it yet.
++}
++
++VerticalTabStripScrollBar::Thumb::~Thumb() = default;
++
++void VerticalTabStripScrollBar::Thumb::Init() {
++  SetFlipCanvasOnPaintForRTLUI(true);
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++  // Animate all changes to the layer except the first one.
++  OnStateChanged();
++  layer()->SetAnimator(ui::LayerAnimator::CreateImplicitAnimator());
++}
++
++gfx::Size VerticalTabStripScrollBar::Thumb::CalculatePreferredSize(
++    const views::SizeBounds& /*available_size*/) const {
++  // The visual size of the thumb is kThumbThickness, but it slides back and
++  // forth by thumb_hover_offset(). To make event targeting work well, expand
++  // the width of the thumb such that it's always taking up the full width of
++  // the track regardless of the offset.
++  return gfx::Size(kThumbThickness + kThumbUnhoveredOffset,
++                   kThumbThickness + kThumbUnhoveredOffset);
++}
++
++void VerticalTabStripScrollBar::Thumb::OnPaint(gfx::Canvas* canvas) {
++  cc::PaintFlags fill_flags;
++  fill_flags.setStyle(cc::PaintFlags::kFill_Style);
++  fill_flags.setColor(GetColorProvider()->GetColor(ui::kColorSysStateDisabled));
++  gfx::RectF fill_bounds(GetLocalBounds());
++  fill_bounds.Inset(gfx::InsetsF::TLBR(
++      0, kThumbUnhoveredOffset, 0,
++      GetState() == views::Button::STATE_NORMAL
++          ? kThumbUnhoveredOffset + kThumbUnhoveredTrailingPadding
++          : 0));
++  float rounded_corners = fill_bounds.width() / 2.0f;
++  canvas->DrawRoundRect(fill_bounds, rounded_corners, fill_flags);
++}
++
++void VerticalTabStripScrollBar::Thumb::OnBoundsChanged(
++    const gfx::Rect& previous_bounds) {
++  Show();
++}
++
++void VerticalTabStripScrollBar::Thumb::OnStateChanged() {
++  if (GetState() == views::Button::STATE_NORMAL) {
++    gfx::Transform translation;
++    const int direction = base::i18n::IsRTL() ? -1 : 1;
++    translation.Translate(gfx::Vector2d(direction * kThumbUnhoveredOffset, 0));
++    layer()->SetTransform(translation);
++
++    if (GetWidget()) {
++      StartHideCountdown();
++    }
++  } else {
++    hide_timer_.Stop();
++    Show();
++    layer()->SetTransform(gfx::Transform());
++  }
++  SchedulePaint();
++}
++
++void VerticalTabStripScrollBar::Thumb::Show() {
++  if (layer()->GetTargetOpacity() != 1.0f) {
++    layer()->SetOpacity(1.0f);
++  }
++  hide_timer_.Stop();
++  // Don't start the hide countdown if the thumb is still hovered or pressed.
++  if (GetState() == views::Button::STATE_NORMAL) {
++    StartHideCountdown();
++  }
++}
++
++void VerticalTabStripScrollBar::Thumb::Hide() {
++  ui::ScopedLayerAnimationSettings settings(layer()->GetAnimator());
++  settings.SetTransitionDuration(ui::GetOverlayScrollbarFadeDuration());
++  if (layer()->GetTargetOpacity() != 0.0f) {
++    layer()->SetOpacity(0.0f);
++  }
++}
++
++void VerticalTabStripScrollBar::Thumb::StartHideCountdown() {
++  hide_timer_.Start(FROM_HERE, ui::GetOverlayScrollbarFadeDelay(),
++                    base::BindOnce(&VerticalTabStripScrollBar::Thumb::Hide,
++                                   base::Unretained(this)));
++}
++
++BEGIN_METADATA(VerticalTabStripScrollBar, Thumb)
++END_METADATA
++
++VerticalTabStripScrollBar::VerticalTabStripScrollBar()
++    : views::ScrollBar(views::ScrollBar::Orientation::kVertical) {
++  // Allow the thumb to take up the whole size of the scrollbar.  Layout need
++  // only set the thumb cross-axis coordinate; ScrollBar::Update() will set the
++  // thumb size/offset.
++  SetLayoutManager(std::make_unique<views::FillLayout>());
++  auto* thumb = new Thumb(this);
++  SetThumb(thumb);
++  thumb->Init();
++}
++
++VerticalTabStripScrollBar::~VerticalTabStripScrollBar() = default;
++
++gfx::Insets VerticalTabStripScrollBar::GetInsets() const {
++  return gfx::Insets::TLBR(0, -kThumbUnhoveredOffset, 0, 0);
++}
++
++bool VerticalTabStripScrollBar::OverlapsContent() const {
++  return true;
++}
++
++gfx::Rect VerticalTabStripScrollBar::GetTrackBounds() const {
++  return GetContentsBounds();
++}
++
++int VerticalTabStripScrollBar::GetThickness() const {
++  return kThumbThickness;
++}
++
++BEGIN_METADATA(VerticalTabStripScrollBar)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_scroll_bar.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_SCROLL_BAR_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_SCROLL_BAR_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/timer/timer.h"
++#include "ui/views/controls/scrollbar/base_scroll_bar_thumb.h"
++#include "ui/views/controls/scrollbar/scroll_bar.h"
++
++// The transparent vertical scrollbar which overlays its contents and expands on
++// hover. Used for the pinned and unpinned tab containers in the vertical tab
++// strip.
++class VerticalTabStripScrollBar : public views::ScrollBar {
++  METADATA_HEADER(VerticalTabStripScrollBar, ScrollBar)
++
++ public:
++  VerticalTabStripScrollBar();
++
++  VerticalTabStripScrollBar(const VerticalTabStripScrollBar&) = delete;
++  VerticalTabStripScrollBar& operator=(const VerticalTabStripScrollBar&) =
++      delete;
++
++  ~VerticalTabStripScrollBar() override;
++
++  // ScrollBar:
++  gfx::Insets GetInsets() const override;
++  bool OverlapsContent() const override;
++  gfx::Rect GetTrackBounds() const override;
++  int GetThickness() const override;
++
++ private:
++  class Thumb : public views::BaseScrollBarThumb {
++    METADATA_HEADER(Thumb, BaseScrollBarThumb)
++
++   public:
++    explicit Thumb(VerticalTabStripScrollBar* scroll_bar);
++
++    Thumb(const Thumb&) = delete;
++    Thumb& operator=(const Thumb&) = delete;
++
++    ~Thumb() override;
++
++    void Init();
++
++    // Shows this (effectively, the thumb) without delay.
++    void Show();
++    // Hides this with a delay.
++    void Hide();
++    // Starts a countdown that hides this when it fires.
++    void StartHideCountdown();
++
++   protected:
++    // BaseScrollBarThumb:
++    gfx::Size CalculatePreferredSize(
++        const views::SizeBounds& /*available_size*/) const override;
++    void OnPaint(gfx::Canvas* canvas) override;
++    void OnBoundsChanged(const gfx::Rect& previous_bounds) override;
++    void OnStateChanged() override;
++
++   private:
++    base::OneShotTimer hide_timer_;
++  };
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_SCROLL_BAR_H_
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
+@@ -11,6 +11,7 @@
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_scroll_bar.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_id.h"
+@@ -35,6 +36,8 @@ void SetScrollViewProperties(views::Scro
+       views::ScrollView::ScrollBarMode::kDisabled);
+   scroll_view->SetOverflowGradientMask(
+       views::ScrollView::GradientDirection::kVertical);
++  scroll_view->SetVerticalScrollBar(
++      std::make_unique<VerticalTabStripScrollBar>());
+ }
+ }  // namespace
+ 

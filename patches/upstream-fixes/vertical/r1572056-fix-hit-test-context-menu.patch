@@ -1,0 +1,175 @@
+[Backported to Helium M145]
+
+From 6da37ac5811c5d799a44a51299d72bb84b3f6b31 Mon Sep 17 00:00:00 2001
+From: David Pennington <dpenning@chromium.org>
+Date: Tue, 20 Jan 2026 21:14:23 -0800
+Subject: [PATCH] [Vertical Tabs] Allow targeting vertical tabs region for context menu
+
+Bug: 475550117
+Change-Id: I35b621652d7eab3661a8d28561ae490208fc753e
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7467241
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Commit-Queue: David Pennington <dpenning@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1572056}
+---
+
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -8,6 +8,7 @@
+ #include <variant>
+ 
+ #include "base/callback_list.h"
++#include "base/containers/adapters.h"
+ #include "base/functional/bind.h"
+ #include "base/notimplemented.h"
+ #include "chrome/browser/ui/browser_actions.h"
+@@ -315,13 +316,29 @@ void VerticalTabStripRegionView::Animati
+ 
+ bool VerticalTabStripRegionView::IsPositionInWindowCaption(
+     const gfx::Point& point) {
+-  gfx::Point point_in_target = point;
+-  views::View::ConvertPointToTarget(this, top_button_container_,
+-                                    &point_in_target);
+-  if (top_button_container_->HitTestPoint(point_in_target)) {
+-    return top_button_container_->IsPositionInWindowCaption(point_in_target);
++  // Check the resize area first, it should always take precedence over other
++  // children regardless of order.
++  if (IsHitInView(resize_area_, point)) {
++    return false;
+   }
+-  return false;
++
++  for (views::View* child : children()) {
++    if (!child->GetVisible()) {
++      continue;
++    }
++    gfx::Point point_in_child = point;
++    views::View::ConvertPointToTarget(this, child, &point_in_child);
++    if (child->HitTestPoint(point_in_child)) {
++      if (child == top_button_container_) {
++        return top_button_container_->IsPositionInWindowCaption(point_in_child);
++      }
++      if (child == tab_strip_view_) {
++        return tab_strip_view_->IsPositionInWindowCaption(point_in_child);
++      }
++      return false;
++    }
++  }
++  return true;
+ }
+ 
+ void VerticalTabStripRegionView::CreateTabStripController(
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
+@@ -22,6 +22,7 @@
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_utils.h"
+ 
+ namespace {
+ constexpr int kRegionVeritcalInteriorMargin = 8;
+@@ -150,6 +151,46 @@ void VerticalTabStripView::SetCollapsedS
+   }
+ }
+ 
++bool VerticalTabStripView::IsPositionInWindowCaption(const gfx::Point& point) {
++  for (views::View* child : children()) {
++    if (!child->GetVisible()) {
++      continue;
++    }
++
++    gfx::Point point_in_child = point;
++    ConvertPointToTarget(this, child, &point_in_child);
++    if (!child->HitTestPoint(point_in_child)) {
++      continue;
++    }
++
++    auto* scroll_view = views::AsViewClass<views::ScrollView>(child);
++    if (!scroll_view) {
++      return true;
++    }
++
++    if (scroll_view->vertical_scroll_bar()->GetVisible()) {
++      gfx::Point point_in_sb = point_in_child;
++      ConvertPointToTarget(scroll_view, scroll_view->vertical_scroll_bar(),
++                           &point_in_sb);
++      if (scroll_view->vertical_scroll_bar()->HitTestPoint(point_in_sb)) {
++        return false;
++      }
++    }
++
++    if (scroll_view->contents()) {
++      gfx::Point point_in_content = point_in_child;
++      ConvertPointToTarget(scroll_view, scroll_view->contents(),
++                           &point_in_content);
++      if (scroll_view->contents()->HitTestPoint(point_in_content)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  return true;
++}
++
+ views::View* VerticalTabStripView::AddScrollViewContents(
+     std::unique_ptr<views::View> view) {
+   if (auto* container =
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h
+@@ -37,6 +37,8 @@ class VerticalTabStripView final : publi
+ 
+   void SetCollapsedState(bool is_collapsed);
+ 
++  bool IsPositionInWindowCaption(const gfx::Point& point);
++
+   // LayoutDelegate:
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -21,9 +21,34 @@
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_targeter.h"
++#include "ui/views/view_targeter_delegate.h"
+ 
+ namespace {
+ constexpr int kTabVerticalPadding = 2;
++
++class VerticalUnpinnedTabContainerViewTargeter
++    : public views::ViewTargeterDelegate {
++ public:
++  explicit VerticalUnpinnedTabContainerViewTargeter(views::View* view)
++      : view_(view) {}
++  ~VerticalUnpinnedTabContainerViewTargeter() override = default;
++
++  bool DoesIntersectRect(const views::View* target,
++                         const gfx::Rect& rect) const override {
++    gfx::Rect content_bounds;
++    for (const views::View* child : view_->children()) {
++      if (child->GetVisible()) {
++        content_bounds.Union(child->GetMirroredBounds());
++      }
++    }
++    return content_bounds.Intersects(rect);
++  }
++
++ private:
++  raw_ptr<views::View> view_;
++};
++
+ }  // namespace
+ 
+ VerticalUnpinnedTabContainerView::VerticalUnpinnedTabContainerView(
+@@ -34,6 +59,8 @@ VerticalUnpinnedTabContainerView::Vertic
+           std::make_unique<TabCollectionAnimatingLayoutManager>(
+               std::make_unique<views::DelegatingLayoutManager>(this),
+               this))) {
++  SetEventTargeter(std::make_unique<views::ViewTargeter>(
++      std::make_unique<VerticalUnpinnedTabContainerViewTargeter>(this)));
+   collection_node->set_remove_child_from_node(base::BindRepeating(
+       &TabCollectionAnimatingLayoutManager::AnimateAndDestroyChildView,
+       base::Unretained(&layout_manager_.get())));

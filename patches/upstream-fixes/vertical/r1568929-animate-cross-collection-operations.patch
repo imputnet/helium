@@ -1,0 +1,477 @@
+From 1378fb442ea8f202d5ac07e325c63f2206c4aa43 Mon Sep 17 00:00:00 2001
+From: Thomas Lukaszewicz <tluk@chromium.org>
+Date: Tue, 13 Jan 2026 22:29:44 -0800
+Subject: [PATCH] [Vertical Tabs] Animate cross-TabCollectionNode view move operations
+
+This CL updates TabCollectionAnimatingLayoutManager to handle
+TabCollectionNode::MoveChild() operations.
+
+The target view's screen coordinates are captured and the view is
+animated from these coordinates by the manager of the target view.
+
+Views are updated to paint to layer for the duration of the
+animation to allow views to be positioned outside parent view
+bounds.
+
+See collection-move screencast below
+http://screencast/cast/NTM0NDQzNjYyMjk4MzE2OHxkZjFkNjNkNC1mNg
+
+Bug: 459824840
+Change-Id: I573d1243f563bcb35152d1ae898069932e3aecef
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7415085
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Commit-Queue: Tom Lukaszewicz <tluk@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1568929}
+---
+
+--- a/chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.cc
++++ b/chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.cc
+@@ -14,6 +14,7 @@
+ #include "ui/gfx/animation/animation.h"
+ #include "ui/gfx/animation/tween.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_class_properties.h"
+ 
+ namespace {
+ 
+@@ -22,13 +23,19 @@ namespace {
+ // are removed from the View tree once they are no longer required.
+ DEFINE_UI_CLASS_PROPERTY_KEY(bool, kPendingDeletion, false)
+ 
++// Stores the bounds in screen coordinates of the associated View prior to being
++// removed from its host TabCollectionNode. Used for collection move animations.
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(gfx::Rect, kPreviousCollectionBounds)
++
+ }  // namespace
+ 
+ TabCollectionAnimatingLayoutManager::TabCollectionAnimatingLayoutManager(
+-    std::unique_ptr<LayoutManagerBase> target_layout_manager)
++    std::unique_ptr<LayoutManagerBase> target_layout_manager,
++    Delegate* delegate)
+     : target_layout_manager_(
+           CHECK_DEREF(AddOwnedLayout(std::move(target_layout_manager)))),
+-      animation_(this) {
++      animation_(this),
++      delegate_(delegate) {
+   // TODO(crbug.com/459824840): Determine the appropriate animation duration.
+   // Currently set to match the duration of TabContainerImpl.
+   animation_.SetSlideDuration(
+@@ -76,6 +83,10 @@ void TabCollectionAnimatingLayoutManager
+   // Do not invalidate the target layout as the animation progresses, only the
+   // animating layout manager requires invalidation.
+   InvalidateHost(/*mark_layouts_changed=*/false);
++
++  // Clear any View-specific metadata and state no longer needed once the most
++  // recent animation has finished.
++  ClearViewAnimationMetadata();
+ }
+ 
+ views::ProposedLayout
+@@ -180,7 +191,7 @@ void TabCollectionAnimatingLayoutManager
+   InvalidateHost(/*mark_layouts_changed=*/false);
+ }
+ 
+-void TabCollectionAnimatingLayoutManager::AnimateAndRemoveChildView(
++void TabCollectionAnimatingLayoutManager::AnimateAndDestroyChildView(
+     views::View* child_view) {
+   DCHECK(base::Contains(host_view()->children(), child_view));
+   child_view->SetCanProcessEventsWithinSubtree(false);
+@@ -189,6 +200,18 @@ void TabCollectionAnimatingLayoutManager
+   InvalidateHost(/*mark_layouts_changed=*/true);
+ }
+ 
++std::unique_ptr<views::View>
++TabCollectionAnimatingLayoutManager::RemoveChildViewForReparenting(
++    views::View* child_view) {
++  DCHECK(base::Contains(host_view()->children(), child_view));
++  if (delegate_ && !delegate_->IsViewDragging(*child_view)) {
++    child_view->SetProperty(kPreviousCollectionBounds,
++                            child_view->GetBoundsInScreen());
++    child_view->SetPaintToLayer();
++  }
++  return host_view()->RemoveChildViewT(child_view);
++}
++
+ views::ProposedLayout TabCollectionAnimatingLayoutManager::InterpolateLayout(
+     double value) const {
+   views::ProposedLayout result;
+@@ -222,10 +245,19 @@ views::ProposedLayout TabCollectionAnima
+       // Animate-in new Views from empty bounds.
+       // TODO(crbug.com/459824840): We may want to snap new children to target
+       // bounds in the case of a tab drag-and-drop.
+-      gfx::Rect initial_bounds = target_child.bounds;
+-      initial_bounds.set_height(0);
+-      interpolated_child.bounds = gfx::Tween::RectValueBetween(
+-          value, initial_bounds, target_child.bounds);
++      gfx::Rect* previous_container_bounds =
++          target_child.child_view->GetProperty(kPreviousCollectionBounds);
++      if (previous_container_bounds) {
++        gfx::Rect initial_bounds = views::View::ConvertRectFromScreen(
++            host_view(), *previous_container_bounds);
++        interpolated_child.bounds = gfx::Tween::RectValueBetween(
++            value, initial_bounds, target_child.bounds);
++      } else {
++        gfx::Rect initial_bounds = target_child.bounds;
++        initial_bounds.set_height(0);
++        interpolated_child.bounds = gfx::Tween::RectValueBetween(
++            value, initial_bounds, target_child.bounds);
++      }
+     }
+     result.child_layouts.push_back(interpolated_child);
+   }
+@@ -297,3 +329,10 @@ void TabCollectionAnimatingLayoutManager
+     }
+   }
+ }
++
++void TabCollectionAnimatingLayoutManager::ClearViewAnimationMetadata() {
++  for (views::View* child_view : host_view()->children()) {
++    child_view->DestroyLayer();
++    child_view->ClearProperty(kPreviousCollectionBounds);
++  }
++}
+--- a/chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h
++++ b/chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h
+@@ -7,6 +7,8 @@
+ 
+ #include <memory>
+ 
++#include "base/functional/callback_forward.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/memory/raw_ref.h"
+ #include "ui/gfx/animation/animation_delegate.h"
+ #include "ui/gfx/animation/slide_animation.h"
+@@ -20,8 +22,17 @@
+ class TabCollectionAnimatingLayoutManager : public views::LayoutManagerBase,
+                                             public gfx::AnimationDelegate {
+  public:
++  class Delegate {
++   public:
++    virtual bool IsViewDragging(const views::View& child_view) const = 0;
++
++   protected:
++    virtual ~Delegate() = default;
++  };
++
+   explicit TabCollectionAnimatingLayoutManager(
+-      std::unique_ptr<LayoutManagerBase> target_layout_manager);
++      std::unique_ptr<LayoutManagerBase> target_layout_manager,
++      Delegate* delegate = nullptr);
+   TabCollectionAnimatingLayoutManager(
+       const TabCollectionAnimatingLayoutManager&) = delete;
+   TabCollectionAnimatingLayoutManager& operator=(
+@@ -47,7 +58,13 @@ class TabCollectionAnimatingLayoutManage
+   // Animates the removal of `child_view` from the `host_view()` associated with
+   // this layout manager. `child_view` will be destroyed by the layout manager
+   // asynchronously.
+-  void AnimateAndRemoveChildView(views::View* child_view);
++  void AnimateAndDestroyChildView(views::View* child_view);
++
++  // Handles removing `child_view` from the `host_view()` for reparenting views
++  // to other TabCollectionNode views. Records relevant metadata used for
++  // animating move operations.
++  std::unique_ptr<views::View> RemoveChildViewForReparenting(
++      views::View* child_view);
+ 
+   const views::ProposedLayout& target_layout() const { return target_layout_; }
+ 
+@@ -75,6 +92,12 @@ class TabCollectionAnimatingLayoutManage
+   // calculated.
+   void RemoveNonAnimatingPendingDeleteViews();
+ 
++  // Clears any child view metadata and state relevant only for the most
++  // recent animation sequence, e.g. any state needed to animate Views moving
++  // between independent TabCollectionNodes. Invoked after the current
++  // `animation_` has ended.
++  void ClearViewAnimationMetadata();
++
+   // The layout manager that defines the goal state.
+   const raw_ref<LayoutManagerBase> target_layout_manager_;
+ 
+@@ -91,6 +114,8 @@ class TabCollectionAnimatingLayoutManage
+ 
+   // The current animation progress.
+   double current_offset_ = 1.0;
++
++  const raw_ptr<Delegate> delegate_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_TAB_COLLECTION_ANIMATING_LAYOUT_MANAGER_H_
+--- a/chrome/browser/ui/views/tabs/vertical/tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/vertical/tab_collection_node.cc
+@@ -294,7 +294,11 @@ void TabCollectionNode::MoveChild(base::
+     }
+ 
+     std::unique_ptr<views::View> removed_view =
+-        src_parent_node->node_view_->RemoveChildViewT(child_node->node_view_);
++        src_parent_node->detach_child_from_node_
++            ? src_parent_node->detach_child_from_node_.Run(
++                  child_node->node_view_)
++            : src_parent_node->node_view_->RemoveChildViewT(
++                  child_node->node_view_);
+     std::unique_ptr<TabCollectionNode> removed_node = std::move(*it);
+     src_parent_node->children_.erase(it);
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/tab_collection_node.h
++++ b/chrome/browser/ui/views/tabs/vertical/tab_collection_node.h
+@@ -39,6 +39,8 @@ class TabCollectionNode {
+       CustomRemoveChildViewCallback;
+   typedef base::RepeatingCallback<void(std::unique_ptr<views::View>, size_t)>
+       CustomAttachChildViewCallback;
++  typedef base::RepeatingCallback<std::unique_ptr<views::View>(views::View*)>
++      CustomDetachChildViewCallback;
+   typedef std::vector<std::unique_ptr<TabCollectionNode>> NodeChildren;
+ 
+   using ViewFactory =
+@@ -106,6 +108,11 @@ class TabCollectionNode {
+     attach_child_to_node_ = std::move(attach_child_to_node);
+   }
+ 
++  void set_detach_child_from_node(
++      CustomDetachChildViewCallback detach_child_from_node) {
++    detach_child_from_node_ = std::move(detach_child_from_node);
++  }
++
+   base::CallbackListSubscription RegisterWillDestroyCallback(
+       base::OnceClosure callback);
+ 
+@@ -168,6 +175,11 @@ class TabCollectionNode {
+   // overridden.
+   CustomAttachChildViewCallback attach_child_to_node_;
+ 
++  // Custom callback invoked when reparent an existing view as child to another
++  // container. Used when the default RemoveChildViewT behavior needs to be
++  // overridden.
++  CustomDetachChildViewCallback detach_child_from_node_;
++
+   // The view created for this node. (for tab:tabview, for unpinned: the
+   // unpinned_container_view).
+   raw_ptr<views::View> node_view_ = nullptr;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
+@@ -63,6 +63,7 @@ class VerticalDraggedTabsContainer : pub
+ 
+  private:
+   virtual VerticalTabDragHandler& GetDragHandler() = 0;
++  virtual const VerticalTabDragHandler& GetDragHandler() const = 0;
+ 
+   // Invalidates the layout of the host view, skipping animations.
+   virtual void UpdateLayoutForDrag() = 0;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.cc
+@@ -28,7 +28,7 @@ VerticalPinnedTabContainerView::Vertical
+       SetLayoutManager(std::make_unique<TabCollectionAnimatingLayoutManager>(
+           std::make_unique<views::DelegatingLayoutManager>(this)));
+   collection_node->set_remove_child_from_node(base::BindRepeating(
+-      &TabCollectionAnimatingLayoutManager::AnimateAndRemoveChildView,
++      &TabCollectionAnimatingLayoutManager::AnimateAndDestroyChildView,
+       base::Unretained(layout_manager)));
+ 
+   node_destroyed_subscription_ = collection_node_->RegisterWillDestroyCallback(
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h"
+ 
++#include <algorithm>
+ #include <memory>
+ 
+ #include "base/check_deref.h"
+@@ -211,6 +212,11 @@ TabDragContext* VerticalTabDragHandlerIm
+   return this;
+ }
+ 
++bool VerticalTabDragHandlerImpl::IsViewDragging(const views::View& view) const {
++  return std::ranges::find(dragged_tabs_, &view, &TabCollectionNode::view) !=
++         dragged_tabs_.end();
++}
++
+ bool VerticalTabDragHandlerImpl::CanAcceptEvent(const ui::Event& event) {
+   // The drag context has to be able to process mouse events during the drag.
+   // By default, this is predicated on visibility, but the handler should not
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
+@@ -40,6 +40,10 @@ class VerticalTabDragHandler {
+   // Returns the drag context for this handler.
+   virtual TabDragContext* GetDragContext() = 0;
+ 
++  // Returns true if `view` belongs to a TabCollectionNode currently being
++  // dragged.
++  virtual bool IsViewDragging(const views::View& view) const = 0;
++
+   // For vertical tabs, `TabSlotView` doesn't represent the actual tab
+   // view. This method converts `view` to its actual tab view, or nullptr
+   // if this handler doesn't manage it.
+@@ -71,6 +75,7 @@ class VerticalTabDragHandlerImpl : publi
+   void EndDrag(EndDragReason reason) override;
+   void DraggedTabsOverNode(const TabCollectionNode& node) override;
+   TabDragContext* GetDragContext() override;
++  bool IsViewDragging(const views::View& view) const override;
+ 
+   // TabDragContext
+   bool CanAcceptEvent(const ui::Event& event) override;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -28,6 +28,7 @@
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/rounded_corners_f.h"
+ #include "ui/views/background.h"
++#include "ui/views/controls/scroll_view.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view.h"
+@@ -62,10 +63,15 @@ VerticalTabGroupView::VerticalTabGroupVi
+       group_line_(AddChildView(std::make_unique<views::View>())),
+       layout_manager_(*SetLayoutManager(
+           std::make_unique<TabCollectionAnimatingLayoutManager>(
+-              std::make_unique<views::DelegatingLayoutManager>(this)))) {
++              std::make_unique<views::DelegatingLayoutManager>(this),
++              this))) {
+   collection_node->set_remove_child_from_node(base::BindRepeating(
+-      &TabCollectionAnimatingLayoutManager::AnimateAndRemoveChildView,
++      &TabCollectionAnimatingLayoutManager::AnimateAndDestroyChildView,
+       base::Unretained(&layout_manager_.get())));
++  collection_node->set_detach_child_from_node(base::BindRepeating(
++      &TabCollectionAnimatingLayoutManager::RemoveChildViewForReparenting,
++      base::Unretained(&layout_manager_.get())));
++
+   node_destroyed_subscription_ =
+       collection_node_->RegisterWillDestroyCallback(base::BindOnce(
+           &VerticalTabGroupView::ResetCollectionNode, base::Unretained(this)));
+@@ -178,6 +184,10 @@ views::Widget* VerticalTabGroupView::Sho
+       stop_context_menu_propagation);
+ }
+ 
++bool VerticalTabGroupView::IsViewDragging(const views::View& child_view) const {
++  return GetDragHandler().IsViewDragging(child_view);
++}
++
+ void VerticalTabGroupView::ResetCollectionNode() {
+   collection_node_ = nullptr;
+ }
+@@ -216,6 +226,12 @@ VerticalTabDragHandler& VerticalTabGroup
+   CHECK(collection_node_);
+   CHECK(collection_node_->GetController());
+   return collection_node_->GetController()->GetDragHandler();
++}
++
++const VerticalTabDragHandler& VerticalTabGroupView::GetDragHandler() const {
++  CHECK(collection_node_);
++  CHECK(collection_node_->GetController());
++  return collection_node_->GetController()->GetDragHandler();
+ }
+ 
+ void VerticalTabGroupView::UpdateLayoutForDrag() {
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -21,10 +21,12 @@ class VerticalTabDragHandler;
+ class VerticalTabGroupHeaderView;
+ 
+ // Container for a tab group in the vertical tabstrip.
+-class VerticalTabGroupView : public views::View,
+-                             public views::LayoutDelegate,
+-                             public VerticalTabGroupHeaderView::Delegate,
+-                             public VerticalDraggedTabsContainer {
++class VerticalTabGroupView
++    : public views::View,
++      public views::LayoutDelegate,
++      public VerticalTabGroupHeaderView::Delegate,
++      public VerticalDraggedTabsContainer,
++      public TabCollectionAnimatingLayoutManager::Delegate {
+   METADATA_HEADER(VerticalTabGroupView, views::View)
+ 
+  public:
+@@ -45,6 +47,9 @@ class VerticalTabGroupView : public view
+   views::Widget* ShowGroupEditorBubble(
+       bool stop_context_menu_propagation) override;
+ 
++  // TabCollectionAnimatingLayoutManager::Delegate:
++  bool IsViewDragging(const views::View& child_view) const override;
++
+   void OnDataChanged();
+ 
+   bool IsCollapsed() const;
+@@ -59,6 +64,7 @@ class VerticalTabGroupView : public view
+  private:
+   // VerticalDraggedTabsContainer:
+   VerticalTabDragHandler& GetDragHandler() override;
++  const VerticalTabDragHandler& GetDragHandler() const override;
+   void UpdateLayoutForDrag() override;
+   void HandleTabDragInContainer(const gfx::Point point_in_container) override;
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -30,9 +30,13 @@ VerticalUnpinnedTabContainerView::Vertic
+       collection_node_(collection_node),
+       layout_manager_(*SetLayoutManager(
+           std::make_unique<TabCollectionAnimatingLayoutManager>(
+-              std::make_unique<views::DelegatingLayoutManager>(this)))) {
++              std::make_unique<views::DelegatingLayoutManager>(this),
++              this))) {
+   collection_node->set_remove_child_from_node(base::BindRepeating(
+-      &TabCollectionAnimatingLayoutManager::AnimateAndRemoveChildView,
++      &TabCollectionAnimatingLayoutManager::AnimateAndDestroyChildView,
++      base::Unretained(&layout_manager_.get())));
++  collection_node->set_detach_child_from_node(base::BindRepeating(
++      &TabCollectionAnimatingLayoutManager::RemoveChildViewForReparenting,
+       base::Unretained(&layout_manager_.get())));
+ 
+   node_destroyed_subscription_ = collection_node_->RegisterWillDestroyCallback(
+@@ -92,6 +96,11 @@ views::ProposedLayout VerticalUnpinnedTa
+   return layouts;
+ }
+ 
++bool VerticalUnpinnedTabContainerView::IsViewDragging(
++    const views::View& child_view) const {
++  return GetDragHandler().IsViewDragging(child_view);
++}
++
+ void VerticalUnpinnedTabContainerView::ResetCollectionNode() {
+   collection_node_ = nullptr;
+ }
+@@ -100,6 +109,13 @@ VerticalTabDragHandler& VerticalUnpinned
+   CHECK(collection_node_);
+   CHECK(collection_node_->GetController());
+   return collection_node_->GetController()->GetDragHandler();
++}
++
++const VerticalTabDragHandler& VerticalUnpinnedTabContainerView::GetDragHandler()
++    const {
++  CHECK(collection_node_);
++  CHECK(collection_node_->GetController());
++  return collection_node_->GetController()->GetDragHandler();
+ }
+ 
+ void VerticalUnpinnedTabContainerView::UpdateLayoutForDrag() {
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
+@@ -17,9 +17,11 @@ class TabCollectionNode;
+ class VerticalTabDragHandler;
+ 
+ // Container for the vertical tabstrip's unpinned tabs.
+-class VerticalUnpinnedTabContainerView : public views::View,
+-                                         public views::LayoutDelegate,
+-                                         public VerticalDraggedTabsContainer {
++class VerticalUnpinnedTabContainerView
++    : public views::View,
++      public views::LayoutDelegate,
++      public VerticalDraggedTabsContainer,
++      public TabCollectionAnimatingLayoutManager::Delegate {
+   METADATA_HEADER(VerticalUnpinnedTabContainerView, views::View)
+ 
+  public:
+@@ -34,9 +36,13 @@ class VerticalUnpinnedTabContainerView :
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override;
+ 
++  // TabCollectionAnimatingLayoutManager::Delegate:
++  bool IsViewDragging(const views::View& child_view) const override;
++
+  private:
+   // VerticalDraggedTabsContainer:
+   VerticalTabDragHandler& GetDragHandler() override;
++  const VerticalTabDragHandler& GetDragHandler() const override;
+   void UpdateLayoutForDrag() override;
+   void HandleTabDragInContainer(const gfx::Point point_in_container) override;
+ 
