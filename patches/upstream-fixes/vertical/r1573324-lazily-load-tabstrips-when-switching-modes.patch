@@ -1,0 +1,796 @@
+From 71c287856f514829a6dcae14a4458d3ca5a1468f Mon Sep 17 00:00:00 2001
+From: Darryl James <dljames@chromium.org>
+Date: Thu, 22 Jan 2026 14:44:28 -0800
+Subject: [PATCH] Reland "[Vertical Tabs] Lazily Load TabStrips when Switching Modes"
+
+This reverts commit 57de341fa7b9d85001358f9fb1ae80532b2754eb.
+
+Reason for revert: Guard guard root_node before use in VerticalTabStripRegionView::InitializeTabStrip and VerticalTabStripRegionView::ResetTabStrip
+
+Original change's description:
+> Revert "[Vertical Tabs] Lazily Load TabStrips when Switching Modes"
+>
+> This reverts commit 757777b28fc5e6c16fa45a253af222363919bdae.
+>
+> Reason for revert: breaks multiple Linux and Mac bots 
+> First failure: https://ci.chromium.org/ui/p/chromium/builders/ci/linux-bfcache-rel/80596
+>
+> Original change's description:
+> > [Vertical Tabs] Lazily Load TabStrips when Switching Modes
+> >
+> > Change-Id: I2df5ca6b6d666a523834324b439cbb671bd69981
+> > Bug: 468100896
+> > Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7508566
+> > Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+> > Commit-Queue: Darryl James <dljames@chromium.org>
+> > Cr-Commit-Position: refs/heads/main@{#1572767}
+>
+> Bug: 468100896, 477782072
+> No-Presubmit: true
+> No-Tree-Checks: true
+> No-Try: true
+> Bug: 468100896
+> Change-Id: I6076211bd73fde7b00d40959bc47e0281b8f141d
+> Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7510563
+> Owners-Override: Viktor Semeniuk <vsemeniuk@google.com>
+> Auto-Submit: Viktor Semeniuk <vsemeniuk@google.com>
+> Bot-Commit: Rubber Stamper <rubber-stamper@appspot.gserviceaccount.com>
+> Commit-Queue: Rubber Stamper <rubber-stamper@appspot.gserviceaccount.com>
+> Cr-Commit-Position: refs/heads/main@{#1572818}
+
+Bug: 468100896, 477782072
+Bug: 468100896
+Change-Id: Ifcef1ca9a70af8cbb44122aaedfae36a2e999ddf
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7511474
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Commit-Queue: Darryl James <dljames@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1573324}
+---
+
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -970,6 +970,8 @@ BrowserView::BrowserView(Browser* browse
+ 
+     vertical_tab_strip_region_view_ =
+         AddChildView(std::move(vertical_tab_strip_container));
++  } else {
++    horizontal_tab_strip_region_view_->InitializeTabStrip();
+   }
+ 
+   if (tabs::IsProjectsPanelFeatureEnabled()) {
+@@ -1437,6 +1439,14 @@ bool BrowserView::IsInSplitView() const
+ 
+ void BrowserView::OnVerticalTabStripStateChanged(
+     tabs::VerticalTabStripStateController* controller) {
++  if (controller->ShouldDisplayVerticalTabs()) {
++    horizontal_tab_strip_region_view_->ResetTabStrip();
++    vertical_tab_strip_region_view_->InitializeTabStrip();
++  } else {
++    vertical_tab_strip_region_view_->ResetTabStrip();
++    horizontal_tab_strip_region_view_->InitializeTabStrip();
++  }
++
+   UpdateTabSearchBubbleHost();
+   InvalidateLayout();
+ }
+@@ -5301,8 +5311,13 @@ void BrowserView::AddedToWidget() {
+                 weak_ptr_factory_.GetWeakPtr()));
+   }
+ 
+-  if (vertical_tab_strip_region_view_) {
+-    vertical_tab_strip_region_view_->CreateTabStripController(this);
++  if (auto* const vertical_tab_strip_state_controller =
++          tabs::VerticalTabStripStateController::From(browser_)) {
++    if (vertical_tab_strip_state_controller->ShouldDisplayVerticalTabs()) {
++      vertical_tab_strip_region_view_->InitializeTabStrip();
++    } else {
++      horizontal_tab_strip_region_view_->InitializeTabStrip();
++    }
+   }
+ 
+   dialog_anchor_ = std::make_unique<user_education::ViewSubregionAnchor>(
+--- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+@@ -120,10 +120,7 @@ std::unique_ptr<TabStrip> CreateTabStrip
+   auto tabstrip_controller = std::make_unique<BrowserTabStripController>(
+       browser_view->browser()->GetTabStripModel(), browser_view,
+       std::move(tab_menu_model_factory));
+-  BrowserTabStripController* tabstrip_controller_ptr =
+-      tabstrip_controller.get();
+   auto tab_strip = std::make_unique<TabStrip>(std::move(tabstrip_controller));
+-  tabstrip_controller_ptr->InitFromModel(tab_strip.get());
+   return tab_strip;
+ }
+ 
+@@ -417,6 +414,10 @@ views::View::Views HorizontalTabStripReg
+ // FlexLayout doesn't currently support. Because of this the TSB bounds are
+ // manually calculated.
+ void HorizontalTabStripRegionView::Layout(PassKey) {
++  if (!tab_strip_set_) {
++    return;
++  }
++
+   const bool tab_search_container_before_tab_strip =
+       tab_search_container_ && render_tab_search_before_tab_strip_;
+   if (tab_search_container_before_tab_strip) {
+@@ -529,9 +530,27 @@ views::View* HorizontalTabStripRegionVie
+                          : AccessiblePaneView::GetDefaultFocusableChild();
+ }
+ 
++void HorizontalTabStripRegionView::InitializeTabStrip() {
++  if (tab_strip_set_) {
++    return;
++  }
++
++  tab_strip_->Initialize();
++  static_cast<BrowserTabStripController*>(tab_strip_->controller())
++      ->InitFromModel(tab_strip_);
++  tab_strip_set_ = true;
++}
++
++void HorizontalTabStripRegionView::ResetTabStrip() {
++  tab_strip_set_ = false;
++  static_cast<BrowserTabStripController*>(tab_strip_->controller())->Reset();
++  tab_strip_->Reset();
++}
++
+ bool HorizontalTabStripRegionView::IsTabStripEditable() const {
+   return tab_strip_->IsTabStripEditable();
+ }
++
+ void HorizontalTabStripRegionView::DisableTabStripEditingForTesting() const {
+   tab_strip_->DisableTabStripEditingForTesting();  // IN-TEST
+ }
+--- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h
+@@ -97,6 +97,8 @@ class HorizontalTabStripRegionView final
+   TabStrip* tab_strip() { return tab_strip_; }
+ 
+   // TabStripRegionView:
++  void InitializeTabStrip() override;
++  void ResetTabStrip() override;
+   gfx::Size GetMinimumSize() const override;
+   gfx::Size CalculatePreferredSize(
+       const views::SizeBounds& available_size) const override;
+@@ -136,6 +138,8 @@ class HorizontalTabStripRegionView final
+   // on `offset`. This should only used for views that show before tab strip.
+   void AdjustViewBoundsRect(View* view, int offset);
+ 
++  bool tab_strip_set_ = false;
++
+   raw_ptr<const Profile> profile_ = nullptr;
+   raw_ptr<TabStripActionContainer> tab_strip_action_container_ = nullptr;
+   raw_ptr<views::View> tab_strip_container_ = nullptr;
+--- a/chrome/browser/ui/views/frame/tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/tab_strip_region_view.h
+@@ -26,6 +26,10 @@ class TabStripRegionView : public views:
+  public:
+   ~TabStripRegionView() override = default;
+ 
++  // -- Life Time Management --
++  virtual void InitializeTabStrip() = 0;
++  virtual void ResetTabStrip() = 0;
++
+   // -- View State Queries --
+   virtual bool IsTabStripEditable() const = 0;
+   virtual void DisableTabStripEditingForTesting() const = 0;
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -58,7 +58,8 @@ VerticalTabStripRegionView::VerticalTabS
+     actions::ActionItem* root_action_item,
+     BrowserWindowInterface* browser,
+     BrowserView* browser_view)
+-    : tab_strip_model_(browser->GetTabStripModel()),
++    : browser_view_(browser_view),
++      tab_strip_model_(browser_view->browser()->GetTabStripModel()),
+       state_controller_(state_controller),
+       resize_animation_(this) {
+   flex_layout_ = SetLayoutManager(std::make_unique<views::FlexLayout>());
+@@ -105,21 +106,22 @@ VerticalTabStripRegionView::VerticalTabS
+ 
+   GetViewAccessibility().SetRole(ax::mojom::Role::kTabList);
+ 
+-  root_node_ = std::make_unique<RootTabCollectionNode>(
+-      browser->GetTabStripModel(),
+-      base::BindRepeating(&VerticalTabStripRegionView::SetTabStripView,
+-                          base::Unretained(this)));
+-
+   SetBackground(std::make_unique<TopContainerBackground>(
+       browser_view, TopContainerBackground::ColorChoice::kFrameColor));
+   UpdateBackgroundColors();
+ }
+ 
+ VerticalTabStripRegionView::~VerticalTabStripRegionView() {
+-  root_node_->SetController(nullptr);
++  if (root_node_) {
++    root_node_->SetController(nullptr);
++  }
++
+   tab_strip_controller_.reset();
+-  auto handler = RemoveChildViewT(drag_handler_);
+-  drag_handler_ = nullptr;
++
++  if (drag_handler_) {
++    auto handler = RemoveChildViewT(drag_handler_);
++    drag_handler_ = nullptr;
++  }
+ }
+ 
+ void VerticalTabStripRegionView::AddedToWidget() {
+@@ -142,6 +144,56 @@ views::View* VerticalTabStripRegionView:
+   return top_button_container_;
+ }
+ 
++void VerticalTabStripRegionView::InitializeTabStrip() {
++  if (root_node_) {
++    return;
++  }
++
++  root_node_ = std::make_unique<RootTabCollectionNode>(
++      tab_strip_model_,
++      base::BindRepeating(&VerticalTabStripRegionView::SetTabStripView,
++                          base::Unretained(this)),
++      base::BindRepeating(&VerticalTabStripRegionView::ClearTabStripView,
++                          base::Unretained(this)));
++
++  std::unique_ptr<TabMenuModelFactory> tab_menu_model_factory;
++  if (browser_view_ && browser_view_->browser()->app_controller()) {
++    tab_menu_model_factory =
++        browser_view_->browser()->app_controller()->GetTabMenuModelFactory();
++  }
++
++  TabStripModel* tab_strip_model = browser_view_->browser()->GetTabStripModel();
++  CHECK(tab_strip_model);
++  auto drag_handler = std::make_unique<VerticalTabDragHandlerImpl>(
++      *tab_strip_model, *root_node_.get());
++  drag_handler_ = drag_handler.get();
++
++  CHECK(!tab_strip_controller_);
++  tab_strip_controller_ = std::make_unique<VerticalTabStripController>(
++      tab_strip_model, browser_view_, *AddChildView(std::move(drag_handler)),
++      std::move(tab_menu_model_factory));
++
++  root_node_->SetController(tab_strip_controller_.get());
++
++  root_node_->Init();
++}
++
++void VerticalTabStripRegionView::ResetTabStrip() {
++  if (!root_node_) {
++    return;
++  }
++
++  root_node_->Reset();
++
++  root_node_->SetController(nullptr);
++  tab_strip_controller_.reset();
++
++  CHECK(drag_handler_);
++  RemoveChildViewT(std::exchange(drag_handler_, nullptr));
++
++  root_node_.reset();
++}
++
+ bool VerticalTabStripRegionView::IsTabStripEditable() const {
+   // TODO(crbug.com/467710547): This needs to consider the drag context. Wait
+   // until that is implemented before updating this function.
+@@ -341,29 +393,6 @@ bool VerticalTabStripRegionView::IsPosit
+   return true;
+ }
+ 
+-void VerticalTabStripRegionView::CreateTabStripController(
+-    BrowserView* browser_view) {
+-  std::unique_ptr<TabMenuModelFactory> tab_menu_model_factory;
+-  if (browser_view && browser_view->browser()->app_controller()) {
+-    tab_menu_model_factory =
+-        browser_view->browser()->app_controller()->GetTabMenuModelFactory();
+-  }
+-
+-  TabStripModel* tab_strip_model = browser_view->browser()->GetTabStripModel();
+-  CHECK(tab_strip_model);
+-  auto drag_handler = std::make_unique<VerticalTabDragHandlerImpl>(
+-      *tab_strip_model, *root_node_.get());
+-  drag_handler_ = drag_handler.get();
+-
+-  tab_strip_controller_ = std::make_unique<VerticalTabStripController>(
+-      tab_strip_model, browser_view, *AddChildView(std::move(drag_handler)),
+-      std::move(tab_menu_model_factory));
+-
+-  if (root_node_) {
+-    root_node_->SetController(tab_strip_controller_.get());
+-  }
+-}
+-
+ void VerticalTabStripRegionView::SetToolbarHeightForLayout(
+     const int toolbar_height) {
+   top_button_container_->SetToolbarHeightForLayout(toolbar_height);
+@@ -403,6 +432,12 @@ views::View* VerticalTabStripRegionView:
+   return tab_strip_view_;
+ }
+ 
++void VerticalTabStripRegionView::ClearTabStripView(views::View* view) {
++  CHECK(tab_strip_view_);
++  CHECK(tab_strip_view_ == view);
++  RemoveChildViewT(std::exchange(tab_strip_view_, nullptr));
++}
++
+ void VerticalTabStripRegionView::OnCollapsedStateChanged(
+     tabs::VerticalTabStripStateController* state_controller) {
+   if (target_collapse_state_.collapsed != state_controller->IsCollapsed()) {
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -100,6 +100,8 @@ class VerticalTabStripRegionView final :
+   views::View* GetDefaultFocusableChild() override;
+ 
+   // TabStripRegionView
++  void InitializeTabStrip() override;
++  void ResetTabStrip() override;
+   bool IsTabStripEditable() const override;
+   void DisableTabStripEditingForTesting() const override;
+   bool IsTabStripCloseable() const override;
+@@ -127,8 +129,6 @@ class VerticalTabStripRegionView final :
+ 
+   bool IsPositionInWindowCaption(const gfx::Point& point);
+ 
+-  void CreateTabStripController(BrowserView* browser_view);
+-
+   // These methods provide the toolbar height and exclusion width, before the
+   // layout of this view, for use in calculating positioning of child views. If
+   // an exclusion width is provided, nothing can be rendered within the
+@@ -141,6 +141,7 @@ class VerticalTabStripRegionView final :
+ 
+  private:
+   views::View* SetTabStripView(std::unique_ptr<views::View> view);
++  void ClearTabStripView(views::View* view);
+ 
+   void OnCollapsedStateChanged(
+       tabs::VerticalTabStripStateController* state_controller);
+@@ -151,6 +152,8 @@ class VerticalTabStripRegionView final :
+ 
+   bool IsFrameActive() const;
+ 
++  raw_ptr<BrowserView> browser_view_;
++
+   // When false simulates a non-editable tabstrip. For testing only.
+   bool tab_strip_editable_for_testing_ = true;
+ 
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -159,7 +159,6 @@ BrowserTabStripController::BrowserTabStr
+     // Use the default one.
+     menu_model_factory_ = std::make_unique<TabMenuModelFactory>();
+   }
+-  model_->SetTabStripUI(this);
+ 
+   should_show_discard_indicator_ = g_browser_process->local_state()->GetBoolean(
+       performance_manager::user_tuning::prefs::kDiscardRingTreatmentEnabled);
+@@ -184,6 +183,7 @@ BrowserTabStripController::~BrowserTabSt
+ 
+ void BrowserTabStripController::InitFromModel(TabStrip* tabstrip) {
+   tabstrip_ = tabstrip;
++  model_->SetTabStripUI(this);
+ 
+   // Walk the model, calling our insertion observer method for each item within
+   // it.
+@@ -192,7 +192,37 @@ void BrowserTabStripController::InitFrom
+     tabs_to_add.emplace_back(model_->GetTabAtIndex(i), i);
+   }
+   AddTabs(tabs_to_add);
++
++  // Add group data.
++  if (model_->SupportsTabGroups()) {
++    for (const tab_groups::TabGroupId& group_id :
++         model_->group_model()->ListTabGroups()) {
++      tabstrip_->OnGroupCreated(group_id);
++
++      for (const int index : model_->group_model()
++                                 ->GetTabGroup(group_id)
++                                 ->ListTabs()
++                                 .ToIntVector()) {
++        tabstrip_->AddTabToGroup(group_id, index);
++      }
++
++      tabstrip_->OnGroupContentsChanged(group_id);
++    }
++  }
++
++  // Add split data.
++  for (const split_tabs::SplitTabId& split_id : model_->ListSplits()) {
++    split_tabs::SplitTabData* data = model_->GetSplitData(split_id);
++    tabstrip_->OnSplitCreated(data->GetIndexRange().ToIntVector(), split_id);
++  }
++}
++
++void BrowserTabStripController::Reset() {
++  // Stop observing.
++  model_->RemoveObserver(this);
++  tabstrip_ = nullptr;
+ }
++
+ // TODO(crbug.com/435178910): Change this to return a
+ // TabStripModelSelectionState instead of a ListSelectionModel.
+ ui::ListSelectionModel BrowserTabStripController::GetSelectionModel() const {
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
+@@ -52,6 +52,7 @@ class BrowserTabStripController : public
+   ~BrowserTabStripController() override;
+ 
+   void InitFromModel(TabStrip* tabstrip);
++  void Reset();
+ 
+   // TabStripController implementation:
+   ui::ListSelectionModel GetSelectionModel() const override;
+--- a/chrome/browser/ui/views/tabs/tab_strip.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip.cc
+@@ -1092,11 +1092,6 @@ TabStrip::TabStrip(std::unique_ptr<TabSt
+     : controller_(std::move(controller)),
+       hover_card_controller_(std::make_unique<TabHoverCardController>(this)),
+       drag_context_(*AddChildView(std::make_unique<TabDragContextImpl>(this))),
+-      tab_container_(
+-          *AddChildViewAt(MakeTabContainer(this,
+-                                           hover_card_controller_.get(),
+-                                           base::to_address(drag_context_)),
+-                          0)),
+       style_(TabStyle::Get()) {
+   // TODO(pbos): This is probably incorrect, the background of individual tabs
+   // depend on their selected state. This should probably be pushed down into
+@@ -1112,25 +1107,47 @@ TabStrip::~TabStrip() {
+   // Eliminate the hover card first to avoid order-of-operation issues.
+   hover_card_controller_.reset();
+ 
+-  // Disengage the drag controller before doing any additional cleanup. This
+-  // call can interact with child views so we can't reliably do it during member
+-  // destruction.
+-  // End any ongoing drag session.
+-  drag_context_->DestroyDragController();
+-  // Immediately clean up that drag session instead of allowing things to
+-  // animate back into place over time.
+-  drag_context_->CompleteEndDragAnimations();
+-
+-  // `tab_container_`'s tabs may call back to us or to `drag_context_` from
+-  // their destructors. Delete them first so that if they call back we aren't in
+-  // a weird state.
+-  RemoveChildViewT(base::to_address(tab_container_));
+-  RemoveChildViewT(base::to_address(drag_context_));
+-
++  if (tab_container_) {
++    // Disengage the drag controller before doing any additional cleanup. This
++    // call can interact with child views so we can't reliably do it during
++    // member destruction. End any ongoing drag session.
++    drag_context_->DestroyDragController();
++    // Immediately clean up that drag session instead of allowing things to
++    // animate back into place over time.
++    drag_context_->CompleteEndDragAnimations();
++
++    // `tab_container_`'s tabs may call back to us or to `drag_context_` from
++    // their destructors. Delete them first so that if they call back we aren't
++    // in a weird state.
++    RemoveChildViewT(base::to_address(tab_container_));
++    RemoveChildViewT(base::to_address(drag_context_));
++  }
+   CHECK(!IsInObserverList())
+       << "TabStrip should not be in any observer lists at destruction.";
+ }
+ 
++void TabStrip::Initialize() {
++  CHECK(!tab_container_);
++  tab_container_ =
++      AddChildViewAt(MakeTabContainer(this, hover_card_controller_.get(),
++                                      base::to_address(drag_context_)),
++                     0);
++}
++
++void TabStrip::Reset() {
++  UpdateHoverCard(nullptr, HoverCardUpdateType::kTabRemoved);
++  RemoveChildViewT(std::exchange(tab_container_, nullptr));
++  selected_tabs_.Clear();
++
++  // Reset any other transient state.
++  last_mouse_move_location_ = gfx::Point();
++  new_tab_button_pressed_start_time_.reset();
++  mouse_entered_tabstrip_time_.reset();
++  has_reported_time_mouse_entered_to_switch_ = false;
++  has_reported_tab_drag_metrics_ = false;
++  last_tab_drag_time_.reset();
++}
++
+ void TabStrip::SetAvailableWidthCallback(
+     base::RepeatingCallback<int()> available_width_callback) {
+   tab_container_->SetAvailableWidthCallback(available_width_callback);
+@@ -1527,6 +1544,10 @@ TabGroup* TabStrip::GetTabGroup(const ta
+ }
+ 
+ std::optional<int> TabStrip::GetModelIndexOf(const TabSlotView* view) const {
++  if (!tab_container_) {
++    return std::nullopt;
++  }
++
+   const std::optional<int> viewmodel_index =
+       tab_container_->GetModelIndexOf(view);
+ 
+@@ -1979,7 +2000,9 @@ void TabStrip::OnMouseEventInTab(views::
+ }
+ 
+ void TabStrip::UpdateHoverCard(Tab* tab, HoverCardUpdateType update_type) {
+-  tab_container_->UpdateHoverCard(tab, update_type);
++  if (tab_container_) {
++    tab_container_->UpdateHoverCard(tab, update_type);
++  }
+ }
+ 
+ bool TabStrip::HoverCardIsShowingForTab(Tab* tab) {
+@@ -2108,6 +2131,10 @@ views::SizeBounds TabStrip::GetAvailable
+ }
+ 
+ gfx::Size TabStrip::GetMinimumSize() const {
++  if (!tab_container_) {
++    return gfx::Size();
++  }
++
+   // `tab_container_` and `drag_context_` overlap (both share TabStrip's
+   // origin), so we need to be able to cover the union of their bounds.
+   gfx::Size min_size = tab_container_->GetMinimumSize();
+@@ -2118,6 +2145,10 @@ gfx::Size TabStrip::GetMinimumSize() con
+ 
+ gfx::Size TabStrip::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
++  if (!tab_container_) {
++    return gfx::Size();
++  }
++
+   // `tab_container_` and `drag_context_` overlap (both share TabStrip's
+   // origin), so we need to be able to cover the union of their bounds.
+   gfx::Size preferred_size = tab_container_->GetPreferredSize(available_size);
+@@ -2127,6 +2158,10 @@ gfx::Size TabStrip::CalculatePreferredSi
+ }
+ 
+ void TabStrip::Layout(PassKey) {
++  if (!tab_container_) {
++    return;
++  }
++
+   if (tab_container_->bounds() != GetLocalBounds()) {
+     UpdateHoverCard(nullptr,
+                     TabSlotController::HoverCardUpdateType::kAnimating);
+--- a/chrome/browser/ui/views/tabs/tab_strip.h
++++ b/chrome/browser/ui/views/tabs/tab_strip.h
+@@ -85,6 +85,12 @@ class TabStrip : public views::View,
+   TabStrip& operator=(const TabStrip&) = delete;
+   ~TabStrip() override;
+ 
++  // Initializes the `tab_container_` so tabs can be added to it.
++  void Initialize();
++
++  // Resets the tab strip by removing the tabs in `tab_container_` .
++  void Reset();
++
+   void SetAvailableWidthCallback(
+       base::RepeatingCallback<int()> available_width_callback);
+ 
+@@ -439,7 +445,7 @@ class TabStrip : public views::View,
+   raw_ref<TabDragContextImpl, AcrossTasksDanglingUntriaged> drag_context_;
+ 
+   // The View parent for the tabs and the various group views.
+-  raw_ref<TabContainer, AcrossTasksDanglingUntriaged> tab_container_;
++  raw_ptr<TabContainer, AcrossTasksDanglingUntriaged> tab_container_;
+ 
+   // Location of the mouse at the time of the last move.
+   gfx::Point last_mouse_move_location_;
+--- a/chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.cc
+@@ -38,19 +38,27 @@ tabs::ConstChildPtr GetNodeFromHandle(
+ 
+ RootTabCollectionNode::RootTabCollectionNode(
+     TabStripModel* tab_strip_model,
+-    CustomAddChildViewCallback add_node_view_to_parent)
++    CustomAddChildViewCallback add_node_view_to_parent,
++    CustomRemoveChildViewCallback remove_node_view_from_parent)
+     : TabCollectionNode(tab_strip_model->Root()),
+-      tab_strip_model_(tab_strip_model) {
++      tab_strip_model_(tab_strip_model),
++      add_node_view_to_parent_(add_node_view_to_parent),
++      remove_node_view_from_parent_(remove_node_view_from_parent) {}
++
++RootTabCollectionNode::~RootTabCollectionNode() = default;
++
++void RootTabCollectionNode::Init() {
+   tab_strip_model_->Root()->AddObserver(this);
+-  tab_strip_model_->AddObserver(this);
+-  add_node_view_to_parent.Run(Initialize());
++  tab_strip_model_->SetTabStripUI(this);
++  add_node_view_to_parent_.Run(Initialize());
+ }
+ 
+-RootTabCollectionNode::~RootTabCollectionNode() {
+-  if (tab_strip_model_) {
+-    tab_strip_model_->Root()->RemoveObserver(this);
+-    tab_strip_model_->RemoveObserver(this);
+-  }
++void RootTabCollectionNode::Reset() {
++  tab_strip_model_->Root()->RemoveObserver(this);
++  tab_strip_model_->RemoveObserver(this);
++  Deinitialize();
++  views::View* view = std::exchange(node_view_, nullptr);
++  remove_node_view_from_parent_.Run(view);
+ }
+ 
+ void RootTabCollectionNode::OnChildrenAdded(
+@@ -61,7 +69,7 @@ void RootTabCollectionNode::OnChildrenAd
+     tabs::ConstChildPtr child = GetNodeFromHandle(handle);
+     GetNodeForHandle(position.parent_handle)
+         ->AddNewChild(GetPassKey(), child, position.index,
+-                      insert_from_detached);
++                      /*perform_initialization=*/insert_from_detached);
+   }
+ }
+ 
+@@ -74,7 +82,8 @@ void RootTabCollectionNode::OnChildrenRe
+   }
+ 
+   for (auto& handle : handles) {
+-    parent_node->RemoveChild(GetPassKey(), handle);
++    parent_node->RemoveChild(GetPassKey(), handle,
++                             /*perform_deinitialization=*/false);
+   }
+ }
+ 
+@@ -98,7 +107,8 @@ void RootTabCollectionNode::OnChildMoved
+   if (pin_state_changed) {
+     // Pin state change is treated as a remove and add instead of an attach and
+     // detach since we have separate concurrent animations in each container.
+-    src_parent_node->RemoveChild(GetPassKey(), moved_node_handle);
++    src_parent_node->RemoveChild(GetPassKey(), moved_node_handle,
++                                 /*perform_deinitialization=*/false);
+     dst_parent_node->AddNewChild(
+         GetPassKey(), GetNodeFromHandle(moved_node_handle), to_position.index,
+         /*perform_initialization=*/true);
+--- a/chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.h
++++ b/chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.h
+@@ -24,9 +24,13 @@ class RootTabCollectionNode : public Tab
+  public:
+   explicit RootTabCollectionNode(
+       TabStripModel* tab_strip_model,
+-      CustomAddChildViewCallback add_node_view_to_parent);
++      CustomAddChildViewCallback add_node_view_to_parent,
++      CustomRemoveChildViewCallback remove_node_view_from_parent);
+   ~RootTabCollectionNode() override;
+ 
++  void Init();
++  void Reset();
++
+  private:
+   using SelectionHandles = base::flat_set<tabs::TabHandle>;
+ 
+@@ -58,6 +62,8 @@ class RootTabCollectionNode : public Tab
+ 
+   raw_ptr<TabStripModel> tab_strip_model_;
+   SelectionHandles selected_tabs_;
++  CustomAddChildViewCallback add_node_view_to_parent_;
++  CustomRemoveChildViewCallback remove_node_view_from_parent_;
+   base::WeakPtrFactory<RootTabCollectionNode> weak_ptr_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/vertical/tab_collection_node.cc
+@@ -163,6 +163,31 @@ std::unique_ptr<views::View> TabCollecti
+   return node_view;
+ }
+ 
++void TabCollectionNode::Deinitialize() {
++  if (std::holds_alternative<const tabs::TabCollection*>(node_data_)) {
++    const tabs::TabCollection* collection =
++        std::get<const tabs::TabCollection*>(node_data_);
++    for (const auto& child_data : collection->GetChildren()) {
++      tabs::TabCollectionNodeHandle child_handle;
++      if (std::holds_alternative<std::unique_ptr<tabs::TabCollection>>(
++              child_data)) {
++        child_handle =
++            std::get<std::unique_ptr<tabs::TabCollection>>(child_data)
++                ->GetHandle();
++      } else {
++        CHECK(std::holds_alternative<std::unique_ptr<tabs::TabInterface>>(
++            child_data));
++        child_handle = std::get<std::unique_ptr<tabs::TabInterface>>(child_data)
++                           ->GetHandle();
++      }
++      RemoveChild(GetPassKey(), child_handle,
++                  /*perform_deinitialization=*/true);
++    }
++  } else {
++    CHECK(std::holds_alternative<const tabs::TabInterface*>(node_data_));
++  }
++}
++
+ // TODO(crbug.com/450976282): Consider having a map at the root level.
+ TabCollectionNode* TabCollectionNode::GetNodeForHandle(
+     const tabs::TabCollectionNodeHandle& handle) {
+@@ -227,9 +252,9 @@ void TabCollectionNode::AddNewChild(base
+   EnsureFocusOrder(model_index);
+ }
+ 
+-void TabCollectionNode::RemoveChild(
+-    base::PassKey<TabCollectionNode> pass_key,
+-    const tabs::TabCollectionNodeHandle& handle) {
++void TabCollectionNode::RemoveChild(base::PassKey<TabCollectionNode> pass_key,
++                                    const tabs::TabCollectionNodeHandle& handle,
++                                    bool perform_deinitialization) {
+   for (auto it = children_.begin(); it != children_.end(); ++it) {
+     TabCollectionNode* child_node = it->get();
+ 
+@@ -237,6 +262,10 @@ void TabCollectionNode::RemoveChild(
+       continue;
+     }
+ 
++    if (perform_deinitialization) {
++      child_node->Deinitialize();
++    }
++
+     views::View* node_to_remove = child_node->node_view_;
+     children_.erase(it);
+     if (remove_child_from_node_) {
+--- a/chrome/browser/ui/views/tabs/vertical/tab_collection_node.h
++++ b/chrome/browser/ui/views/tabs/vertical/tab_collection_node.h
+@@ -54,6 +54,9 @@ class TabCollectionNode {
+   // as a child of this.
+   std::unique_ptr<views::View> Initialize();
+ 
++  // Deinitializes all the child nodes in a recursive manner.
++  void Deinitialize();
++
+   // Gets the collection under this subtree that has the associated handle.
+   // Returns nullptr if no such node exists.
+   TabCollectionNode* GetNodeForHandle(
+@@ -73,7 +76,8 @@ class TabCollectionNode {
+ 
+   // Removes the child and removes and destroys the view.
+   void RemoveChild(base::PassKey<TabCollectionNode> pass_key,
+-                   const tabs::TabCollectionNodeHandle& handle);
++                   const tabs::TabCollectionNodeHandle& handle,
++                   bool perform_deinitialization);
+ 
+   // Moves the node to the new index within the same parent. Also updates the
+   // z-order of the moved child to the highest to ensure it shows over other
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
+@@ -56,6 +56,9 @@ VerticalTabStripView::VerticalTabStripVi
+ 
+   collection_node->set_add_child_to_node(base::BindRepeating(
+       &VerticalTabStripView::AddScrollViewContents, base::Unretained(this)));
++
++  collection_node->set_remove_child_from_node(base::BindRepeating(
++      &VerticalTabStripView::RemoveScrollViewContents, base::Unretained(this)));
+ }
+ 
+ VerticalTabStripView::~VerticalTabStripView() = default;
+@@ -207,5 +210,21 @@ views::View* VerticalTabStripView::AddSc
+   return pinned_tabs_scroll_view_->SetContents(std::move(view));
+ }
+ 
++void VerticalTabStripView::RemoveScrollViewContents(views::View* view) {
++  if (views::IsViewClass<VerticalUnpinnedTabContainerView>(view)) {
++    unpinned_tabs_container_view_ = nullptr;
++    unpinned_tabs_scroll_view_->SetContents(nullptr);
++    return;
++  }
++  if (views::IsViewClass<VerticalPinnedTabContainerView>(view)) {
++    pinned_tabs_container_view_ = nullptr;
++    pinned_tabs_scroll_view_->SetContents(nullptr);
++    return;
++  }
++  // |view| should only ever be VerticalUnpinnedTabContainerView or
++  // VerticalPinnedTabContainerView.
++  NOTREACHED();
++}
++
+ BEGIN_METADATA(VerticalTabStripView)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h
+@@ -45,6 +45,7 @@ class VerticalTabStripView final : publi
+ 
+  private:
+   views::View* AddScrollViewContents(std::unique_ptr<views::View> view);
++  void RemoveScrollViewContents(views::View* view);
+ 
+   raw_ptr<views::ScrollView> pinned_tabs_scroll_view_ = nullptr;
+   raw_ptr<VerticalPinnedTabContainerView> pinned_tabs_container_view_ = nullptr;

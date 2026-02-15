@@ -1,0 +1,145 @@
+From a790ee16984c39839af6f7371d5e020d674315ee Mon Sep 17 00:00:00 2001
+From: Eshwar Stalin <estalin@chromium.org>
+Date: Mon, 02 Feb 2026 13:55:59 -0800
+Subject: [PATCH] [Vertical Tabs] Fix a CHECK failure during tab dragging
+
+Currently there are times InitializeDragState is run multiple times when
+dragging between unpinned and groups which causes a CHECK failure with
+dragging_views_bounds_ not being empty.
+
+This is because unpinned container when handling dragging in container
+sometime triggers model updates for the group. This results in the drag
+tabs to remain parented to the groups instead of being parented to
+unpinned container. The root issue here is groups themselves are a drag
+target except when collapsed or if we are in header drag. These are the
+only cases where we should trigger model updates using the group
+collection node. Otherwise, we need to trigger model updates using the
+unpinned collection node to ensure correct parenting of dragging views.
+
+Additionally, better handling header dragging over other groups using
+the group header as cross over point to prevent bouncing issue.
+
+Fixed: 481021603
+Change-Id: Id61cf3754117d29dac8507a0d2e36ab52e902440
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7537139
+Reviewed-by: Kaan Alsan <alsan@chromium.org>
+Commit-Queue: Eshwar Stalin <estalin@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1578378}
+---
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
+@@ -147,8 +147,10 @@ void VerticalDraggedTabsContainer::OnVie
+   // The transformation coordinates are relative to the host view's coordinates,
+   // so they must be updated as the bounds change to ensure the dragged tabs
+   // remain at the same point in the screen.
+-  UpdateDraggingViewTransforms(views::View::ConvertPointFromScreen(
+-      base::to_address(host_view_), last_drag_point_in_screen_));
++  if (!dragging_views_.empty()) {
++    UpdateDraggingViewTransforms(views::View::ConvertPointFromScreen(
++        base::to_address(host_view_), last_drag_point_in_screen_));
++  }
+ }
+ 
+ // TODO(crbug.com/476084253): Animate selected tabs into a contiguous layout.
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
+@@ -586,31 +586,36 @@ TabCollectionNode* VerticalTabDragHandle
+ 
+ TabSlotView& VerticalTabDragHandlerImpl::GetOrCreateSlotViewForNode(
+     TabCollectionNode& node) {
++  auto update_tab_slot_view = [&node](TabSlotView& slot_view) -> void {
++    switch (node.type()) {
++      case TabCollectionNode::Type::TAB: {
++        const tabs::TabInterface* tab =
++            std::get<const tabs::TabInterface*>(node.GetNodeData());
++        CHECK(tab);
++        slot_view.SetGroup(tab->GetGroup());
++        slot_view.SetSplit(tab->GetSplit());
++      } break;
++      case TabCollectionNode::Type::GROUP:
++        slot_view.SetGroup(TabGroupDataFromNode(node).id());
++        break;
++      default:
++        NOTREACHED();
++    }
++  };
++
+   CHECK(node.view());
+   auto it = slot_views_.find(&node);
+   if (it != slot_views_.end()) {
++    update_tab_slot_view(*it->second);
+     return *it->second;
+   }
+ 
+   auto tab_slot_view = std::make_unique<VerticalTabSlotView>(node);
+   tab_slot_view->SetBoundsRect(node.view()->GetLocalBounds());
+ 
+-  switch (node.type()) {
+-    case TabCollectionNode::Type::TAB: {
+-      const tabs::TabInterface* tab =
+-          std::get<const tabs::TabInterface*>(node.GetNodeData());
+-      CHECK(tab);
+-      tab_slot_view->SetGroup(tab->GetGroup());
+-      tab_slot_view->SetSplit(tab->GetSplit());
+-    } break;
+-    case TabCollectionNode::Type::GROUP:
+-      tab_slot_view->SetGroup(TabGroupDataFromNode(node).id());
+-      break;
+-    default:
+-      NOTREACHED();
+-  }
+-
+   auto& tab_slot_view_ref = *tab_slot_view.get();
++  update_tab_slot_view(tab_slot_view_ref);
++
+   slot_views_.insert(
+       {&node, node.view()->AddChildView(std::move(tab_slot_view))});
+   node_destroyed_callbacks_.push_back(node.RegisterWillDestroyCallback(
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -185,13 +185,19 @@ void VerticalUnpinnedTabContainerView::H
+     node = tab_view->collection_node();
+   } else if (auto* group_view =
+                  views::AsViewClass<VerticalTabGroupView>(view_at_point)) {
+-    // Don't set the node if dragging a group header over another group view to
+-    // avoid bouncing the group view around.
+-    // TODO(crbug.com/476509652): This shouldn't be necessary once hit-testing
+-    // is improved.
+-    if (!GetDragHandler().GetDraggingGroupHeaderId().has_value() ||
+-        group_view->IsCollapsed()) {
++    // Groups themselves are a drag target except when they are collapsed or
++    // if we are in header drag which are the only cases we handle here.
++    if (group_view->IsCollapsed()) {
+       node = group_view->collection_node();
++    } else if (GetDragHandler().GetDraggingGroupHeaderId().has_value()) {
++      // For header drag check if the point overlaps with the group's header.
++      auto* group_layout = target_layout.GetLayoutFor(group_view);
++      CHECK(group_layout);
++      if (gfx::Point point_in_group =
++              point_in_container - group_layout->bounds.OffsetFromOrigin();
++          group_view->group_header()->bounds().Contains(point_in_group)) {
++        node = group_view->collection_node();
++      }
+     }
+   } else if (auto* split_tab_view =
+                  views::AsViewClass<VerticalSplitTabView>(view_at_point)) {
+@@ -216,12 +222,14 @@ VerticalUnpinnedTabContainerView::GetTab
+   // from the sides of the tabstrip.
+   point_in_container.set_x(bounds().x() + bounds().width() / 2);
+ 
+-  for (views::View* child : children()) {
+-    if (!child->GetVisible() || !child->bounds().Contains(point_in_container) ||
+-        IsViewDragging(*child)) {
++  const views::ProposedLayout& target_layout = layout_manager_->target_layout();
++  for (const views::ChildLayout& layout : target_layout.child_layouts) {
++    if (!layout.visible || !layout.bounds.Contains(point_in_container) ||
++        IsViewDragging(*layout.child_view)) {
+       continue;
+     }
+-    if (auto* group_view = views::AsViewClass<VerticalTabGroupView>(child)) {
++    if (auto* group_view =
++            views::AsViewClass<VerticalTabGroupView>(layout.child_view)) {
+       if (!group_view->IsCollapsed()) {
+         return *group_view;
+       }

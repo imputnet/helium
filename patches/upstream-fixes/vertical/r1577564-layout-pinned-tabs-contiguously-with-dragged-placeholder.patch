@@ -1,0 +1,235 @@
+From c99516d11f7f49a90caf34884556e867b1219a35 Mon Sep 17 00:00:00 2001
+From: Kaan Alsan <alsan@chromium.org>
+Date: Fri, 30 Jan 2026 14:42:41 -0800
+Subject: [PATCH] Lay out pinned tabs contiguously with dragged tabs placeholder
+
+This address a visual bug where non-dragged tabs don't appear
+contiguously when dragging multiple pinned tabs. Instead, they appear in
+the "expected" position according to the tabstrp model index which
+leaves a space after the dragged tabs placeholder.
+
+Demo: https://screencast.googleplex.com/cast/NDk4MTUwMjc0Mjg4ODQ0OHwwMGYyMTVhMy1mOA
+
+Bug: 476081516
+Change-Id: Ie8c2a304d0613f5244d7b87d31126bafd47ad257
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7534824
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Commit-Queue: Kaan Alsan <alsan@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1577564}
+---
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
+@@ -212,7 +212,8 @@ void VerticalDraggedTabsContainer::AddVi
+     bool is_source_dragged_view) {
+   gfx::Rect bounds = gfx::Rect(dragging_view->GetPreferredSize({}));
+   bounds.set_y(dragging_views_bounds_.height());
+-  dragging_views_.insert({dragging_view, bounds.OffsetFromOrigin()});
++  dragging_views_.insert(
++      {dragging_view, {.offset = bounds.OffsetFromOrigin()}});
+ 
+   static constexpr int kDraggedViewVerticalPadding = 2;
+   dragging_views_bounds_.set_height(dragging_views_bounds_.height() +
+@@ -227,17 +228,24 @@ void VerticalDraggedTabsContainer::AddVi
+ void VerticalDraggedTabsContainer::AddViewToSquashedDragLayout(
+     views::View* dragging_view,
+     bool is_source_dragged_view) {
+-  dragging_views_.insert({dragging_view, {0, 0}});
+   if (is_source_dragged_view) {
+     dragging_views_bounds_.set_size(dragging_view->bounds().size());
+-  } else {
+-    dragging_view->layer()->SetVisible(false);
+   }
++  dragging_views_.insert(
++      {dragging_view,
++       {.offset = gfx::Vector2d(), .should_hide = !is_source_dragged_view}});
+ }
+ 
+ void VerticalDraggedTabsContainer::ResetDragState() {
+-  for (auto& [view, _] : dragging_views_) {
++  // Don't immediately clear `dragging_views_` so that the host view has a
++  // chance to lay the dragged views out at their expected positions rather
++  // than relying on `VerticalDraggedTabsContainer` to lay them out with
++  // transforms.
++  for (auto& [view, visual_data] : dragging_views_) {
+     view->SetTransform(gfx::Transform());
++
++    // The next layout update should allow the view to be shown by the host.
++    visual_data.should_hide = false;
+   }
+   UpdateLayoutForDrag();
+   dragging_views_.clear();
+@@ -251,15 +259,19 @@ void VerticalDraggedTabsContainer::Updat
+     const gfx::Point& point_in_container) {
+   const gfx::Rect bounding_box_for_point =
+       GetDraggingViewsBoundsAtPoint(point_in_container);
+-  for (auto& [dragged_view, offset] : dragging_views_) {
++  for (auto& [dragged_view, visual_data] : dragging_views_) {
++    if (visual_data.should_hide) {
++      continue;
++    }
+     // Use a transformation to render the dragged views, offset from the
+     // container's origin.
+     gfx::Transform transform;
+-    transform.Translate(IsHorizontalDragSupported()
+-                            ? bounding_box_for_point.x() + offset.x()
++    transform.Translate(
++        IsHorizontalDragSupported()
++            ? bounding_box_for_point.x() + visual_data.offset.x()
+ 
+-                            : 0,
+-                        bounding_box_for_point.y() + offset.y());
++            : 0,
++        bounding_box_for_point.y() + visual_data.offset.y());
+     dragged_view->SetTransform(transform);
+   }
+ }
+@@ -278,8 +290,8 @@ gfx::Rect VerticalDraggedTabsContainer::
+   return bounding_box_for_point;
+ }
+ 
+-std::optional<gfx::Point>
+-VerticalDraggedTabsContainer::GetOriginForDraggedTabBounds(
++std::optional<VerticalDraggedTabsContainer::DraggedViewVisualData>
++VerticalDraggedTabsContainer::GetVisualDataForDraggedView(
+     const views::View& view) const {
+   auto it = dragging_views_.find(&view);
+   if (it == dragging_views_.end()) {
+@@ -293,14 +305,19 @@ VerticalDraggedTabsContainer::GetOriginF
+         base::to_address(host_view_), last_drag_point_in_screen_);
+     const gfx::Rect bounding_box_for_point =
+         GetDraggingViewsBoundsAtPoint(point_in_container);
+-    return gfx::Point(IsHorizontalDragSupported()
+-                          ? bounding_box_for_point.x() + it->second.x()
+-                          : 0,
+-                      bounding_box_for_point.y() + it->second.y());
++    return std::make_optional(DraggedViewVisualData{
++        .offset = gfx::Vector2d(
++            IsHorizontalDragSupported()
++                ? bounding_box_for_point.x() + it->second.offset.x()
++                : 0,
++            bounding_box_for_point.y() + it->second.offset.y()),
++        .should_hide = it->second.should_hide,
++    });
+   }
+   // If the tab is being dragged, then it is rendered using
+   // transformations, offset from the container's origin.
+-  return gfx::Point();
++  return DraggedViewVisualData{.offset = gfx::Vector2d(),
++                               .should_hide = it->second.should_hide};
+ }
+ 
+ views::View* VerticalDraggedTabsContainer::GetViewAtPoint(
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
+@@ -64,11 +64,14 @@ class VerticalDraggedTabsContainer : pub
+   void OnViewBoundsChanged(views::View* observed_view) override;
+ 
+  protected:
+-  // Returns the expected coordinates for a dragged tab view's bounds, or
+-  // null if the view isn't being dragged in this.
+-  // A value of 0 is used by default for the X-coordinate if dragging along the
+-  // x-axis is not supported.
+-  std::optional<gfx::Point> GetOriginForDraggedTabBounds(
++  struct DraggedViewVisualData {
++    gfx::Vector2d offset;
++    bool should_hide = false;
++  };
++
++  // Returns the expected visual data, relative to the host view, for a dragged
++  // view. Returns std::nullopt if the view is not being dragged.
++  std::optional<DraggedViewVisualData> GetVisualDataForDraggedView(
+       const views::View& view) const;
+ 
+   // Helper for getting the view at a given point, excluding dragged views.
+@@ -129,9 +132,9 @@ class VerticalDraggedTabsContainer : pub
+   // The bounding box of all the dragged views, relative to the drag point.
+   gfx::Rect dragging_views_bounds_;
+ 
+-  // Child views that are being dragged, mapped to their offset within
+-  // `dragging_views_bounds_`.
+-  base::flat_map<raw_ptr<views::View>, gfx::Vector2d> dragging_views_;
++  // Child views that are being dragged, mapped to their DraggedViewVisualData,
++  // whose offset is relative within `dragging_views_bounds_`.
++  base::flat_map<raw_ptr<views::View>, DraggedViewVisualData> dragging_views_;
+ 
+   const DragAxes drag_axes_;
+   const DragLayout drag_layout_;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.cc
+@@ -103,20 +103,31 @@ views::ProposedLayout VerticalPinnedTabC
+     gfx::Rect bounds =
+         gfx::Rect(child->GetPreferredSize(views::SizeBounds(child_width, {})));
+     bounds.set_width(child_width);
+-    if (row_index != 0) {
+-      x += kTabPadding;
+-    }
+-    bounds.set_origin(GetOriginForDraggedTabBounds(*child).value_or({x, y}));
+-    x += bounds.width();
+-    total_width = std::max(total_width, x);
+-    total_height = std::max(total_height, (y + bounds.height()));
+-    layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
+-    row_index++;
+-    if (row_index >= children_on_row) {
+-      y = total_height + kTabPadding;
+-      row_index = 0;
+-      x = 0;
++
++    auto drag_data = GetVisualDataForDraggedView(*child);
++    bounds.set_y(drag_data ? drag_data->offset.y() : y);
++    bounds.set_x(drag_data ? drag_data->offset.x() : x);
++
++    const bool should_show_child =
++        drag_data.has_value() ? !drag_data->should_hide : true;
++    if (should_show_child) {
++      if (row_index != 0) {
++        x += kTabPadding;
++        bounds.set_x(bounds.x() + kTabPadding);
++      }
++      x += bounds.width();
++      total_width = std::max(total_width, x);
++      total_height = std::max(total_height, (y + bounds.height()));
++
++      row_index++;
++      if (row_index >= children_on_row) {
++        y = total_height + kTabPadding;
++        row_index = 0;
++        x = 0;
++      }
+     }
++
++    layouts.child_layouts.emplace_back(child, should_show_child, bounds);
+   }
+   layouts.host_size = gfx::Size(total_width, total_height);
+   return layouts;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -140,8 +140,11 @@ views::ProposedLayout VerticalTabGroupVi
+   // fill available width.
+   for (auto* child : children) {
+     gfx::Rect bounds = gfx::Rect(child->GetPreferredSize());
+-    bounds.set_y(
+-        GetOriginForDraggedTabBounds(*child).value_or({0, height}).y());
++
++    auto drag_data = GetVisualDataForDraggedView(*child);
++    CHECK(!drag_data || !drag_data->should_hide);
++    bounds.set_y(drag_data ? drag_data->offset.y() : height);
++
+     // If the tab strip is not collapsed then the groups tabs should be inset.
+     bounds.set_x(is_tab_strip_collapsed
+                      ? GetLayoutConstant(
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -104,8 +104,10 @@ views::ProposedLayout VerticalUnpinnedTa
+                           {});
+     gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(child_bounds));
+     bounds.set_x(x);
+-    bounds.set_y(
+-        GetOriginForDraggedTabBounds(*child).value_or({0, height}).y());
++
++    auto drag_data = GetVisualDataForDraggedView(*child);
++    CHECK(!drag_data || !drag_data->should_hide);
++    bounds.set_y(drag_data ? drag_data->offset.y() : height);
+ 
+     // If width is bounded, child views should respect the width constraints and
+     // take up the available width excluding trailing horizontal padding.
