@@ -80,18 +80,11 @@ def parse_args():
     return args
 
 
-def is_substitutable(filename):
-    """Determines whether a file should be name-substituted"""
-    if filename.startswith('.'):
-        return False
-
-    return filename.split('.')[-1].lower() in ['xtb', 'grd', 'grdp']
-
-
-def get_substitutable_files(tree):
+def get_substitutable_files(tree, exts):
     """
-    Finds all candidates for substitution, which are source
-    string files (.grd*), or localization files (.xtb).
+    Finds all candidates for substitution, which have one of the
+    desired extensions - typically string files (.grd*),
+    or localization files (.xtb).
     """
     out = tree / 'out'
 
@@ -109,7 +102,13 @@ def get_substitutable_files(tree):
         if should_ignore:
             continue
 
-        yield from map(lambda filename, root=root: root / filename, filter(is_substitutable, files))
+        for filename in files:
+            if filename.startswith('.'):
+                continue
+            ext = filename.split('.')[-1].lower()
+            if ext not in exts:
+                continue
+            yield root / filename
 
 
 def substitute_file(args):
@@ -160,7 +159,7 @@ def maybe_make_tarball(tar_path, modified_files):
 
 def do_substitution(tree, tarpath, workers, dry_run):
     """Performs name substitutions on all candidate files"""
-    files = list(get_substitutable_files(tree))
+    files = list(get_substitutable_files(tree, ['grd', 'grdp', 'xtb']))
     print(f"Found {len(files)} files to process")
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
