@@ -65,7 +65,9 @@ def parse_args():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--sub', action='store_true')
     group.add_argument('--unsub', action='store_true')
-    parser.add_argument('--backup-path', metavar='<tarball-path>', type=Path)
+    group = parser.add_mutually_exclusive_group(required=False)
+    group.add_argument('--backup-path', metavar='<tarball-path>', type=Path)
+    group.add_argument('--dry-run', action='store_true')
     parser.add_argument('-t', metavar='source_tree', type=Path, required=True)
     parser.add_argument('--workers', type=int, default=os.cpu_count())
 
@@ -114,7 +116,7 @@ def substitute_file(args):
     Replaces strings in a particular file, and returns
     (arcname, original_content) if file was modified, otherwise None.
     """
-    path, tree, save_original = args
+    path, tree, save_original, dry_run = args
     arcname = str(path.relative_to(tree))
 
     with open(path, 'r', encoding='utf-8') as file:
@@ -123,8 +125,9 @@ def substitute_file(args):
     replaced = replace(text)
     if text != replaced:
         print(f"Replaced strings in {arcname}")
-        with open(path, 'w', encoding='utf-8') as file:
-            file.write(replaced)
+        if not dry_run:
+            with open(path, 'w', encoding='utf-8') as file:
+                file.write(replaced)
 
         if save_original:
             return (arcname, text)
@@ -154,14 +157,14 @@ def maybe_make_tarball(tar_path, modified_files):
             tar.addfile(tarinfo, io.BytesIO(content))
 
 
-def do_substitution(tree, tarpath, workers):
+def do_substitution(tree, tarpath, workers, dry_run):
     """Performs name substitutions on all candidate files"""
     files = list(get_substitutable_files(tree))
     print(f"Found {len(files)} files to process")
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         save_original = tarpath is not None
-        file_args = [(path, tree, save_original) for path in files]
+        file_args = [(path, tree, save_original, dry_run) for path in files]
         results = executor.map(substitute_file, file_args)
         modified_files = [r for r in results if r is not None]
 
@@ -180,8 +183,8 @@ def main():
     if args.sub:
         if args.backup_path is not None and args.backup_path.exists():
             raise FileExistsError("unsub tarball already exists, aborting")
-        do_substitution(args.t, args.backup_path, args.workers)
-    elif args.unsub and args.backup_path:
+        do_substitution(args.t, args.backup_path, args.workers, args.dry_run)
+    elif args.unsub and args.backup_path and not args.dry_run:
         do_unsubstitution(args.t, args.backup_path)
 
 
