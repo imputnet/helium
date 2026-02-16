@@ -15,6 +15,7 @@ REPLACEMENT_REGEXES_STR = [
     (r'("BEGIN_LINK_CHROMIUM")(.*?Chromium)(.*?<ph name="END_LINK_CHROMIUM")', r'\1\2_unreplace\3'),
 
     # main replacement(s)
+    (r'(\b)chrome://', r'\1helium://'),
     (r'(?:Google )?Chrom(e|ium)(?!\w)', r'Helium'),
 
     # post-replacement cleanup
@@ -69,19 +70,50 @@ def compute_fp(message):
 
 def replace_text(text):
     """Replaces instances of Chrom(e | ium) with Helium in strings"""
+    had_match = False
     for regex, replacement in REPLACEMENT_REGEXES:
-        text = re.sub(regex, replacement, text)
-    return text
+        if regex.search(text):
+            had_match = True
+            text = regex.sub(replacement, text)
+
+    return text, had_match
 
 
 def replace_grit_message(msg):
-    """Replaces instances of Chrom(e | ium) with Helium in a .grd <message>."""
+    """
+    Replaces instances of Chrom(e | ium) with Helium
+    in a <message> or <translation> element (and its children).
+    """
+    had_any_match = False
+
     if msg.text:
-        msg.text = replace_text(msg.text)
+        text, match = replace_text(msg.text)
+        msg.text = text
+        had_any_match |= match
+
     if msg.tail:
-        msg.tail = replace_text(msg.tail)
+        tail, match = replace_text(msg.tail)
+        msg.tail = tail
+        had_any_match |= match
+
     for child in msg:
-        replace_grit_message(child)
+        had_any_match |= replace_grit_message(child)
+
+    return had_any_match
+
+
+def replace_xtb_translation(msg, fp_map):
+    """
+    Replaces instances of Chrom(e | ium) with Helium in a
+    .xtb <translation>.
+    """
+    if not replace_grit_message(msg):
+        return False
+
+    msg_id = msg.get('id')
+    if msg_id in fp_map:
+        msg.set('id', fp_map[msg_id])
+    return True
 
 
 def replace_grit_tree(text):
@@ -91,13 +123,26 @@ def replace_grit_tree(text):
 
     for message in xml_tree.findall('.//message'):
         old_fp = compute_fp(message)
-        replace_grit_message(message)
-        new_fp = compute_fp(message)
-
-        if old_fp != new_fp:
+        if replace_grit_message(message):
+            new_fp = compute_fp(message)
             fp_map[old_fp] = new_fp
 
     return ET.tostring(xml_tree), fp_map
+
+
+def replace_xtb_tree(text, fp_map):
+    """Same as replace_grit_tree(), but on .xtb translation files."""
+    xml_tree = ET.fromstring(text)
+    changed = False
+
+    for translation in xml_tree.findall('.//translation'):
+        assert translation.get('id')
+        changed |= replace_xtb_translation(translation, fp_map)
+
+    if changed:
+        return ET.tostring(xml_tree)
+
+    return None
 
 
 def merge_fp_maps(results):

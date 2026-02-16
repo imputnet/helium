@@ -15,13 +15,15 @@ import io
 
 import name_substitution_utils as util
 
-IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios']
+IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios', 'testdata']
 
 
 def replacement_sanity():
     """Sanity check to ensure replacement regexes are working as intended"""
     before_after = [
+        ('chrome://about', 'helium://about'),
         ('Chrome Root Program', 'Chrome Root Program'),
+        (' Chrome  ', ' Helium  '),
         ('Chrome Web Store', 'Chrome Web Store'),
         ('Chromium Web Store', 'Chromium Web Store'),
         ('Chrome Remote Desktop', 'Chrome Remote Desktop'),
@@ -32,7 +34,9 @@ def replacement_sanity():
     ]
 
     for source, expected in before_after:
-        assert util.replace_text(source) == expected
+        modified, match = util.replace_text(source)
+        assert match, f"sanity: {expected} should have a match"
+        assert modified == expected, f"sanity: {modified} != {expected}"
 
 
 def parse_args():
@@ -86,7 +90,7 @@ def get_substitutable_files(tree, exts):
             yield root / filename
 
 
-def substitute_file(args):
+def substitute_grit_file(args):
     """
     Replaces strings in a particular file, and returns
     ((arcname, original_content), fp_map) if file was modified and needs backup,
@@ -109,6 +113,31 @@ def substitute_file(args):
             file.write(replaced)
 
     return ((arcname, text) if save_original else None, fp_map)
+
+
+def substitute_xtb_file(args):
+    """
+    Replaces strings in an .xtb file, and returns
+    ((arcname, original_content)) if file was modified and needs backup,
+    (None) if file was modified,
+    otherwise None.
+    """
+    path, tree, fp_map, save_original, dry_run = args
+    arcname = str(path.relative_to(tree))
+
+    with open(path, 'r', encoding='utf-8') as file:
+        text = file.read()
+
+    replaced = util.replace_xtb_tree(text, fp_map)
+    if not replaced:
+        return None
+
+    print(f"Replaced strings in {arcname}")
+    if not dry_run:
+        with open(path, 'w', encoding='utf-8') as file:
+            file.write(replaced)
+
+    return ((arcname, text) if save_original else None, )
 
 
 def do_unsubstitution(tree, tarpath):
@@ -135,14 +164,22 @@ def maybe_make_tarball(tar_path, modified_files):
 
 def do_substitution(tree, tarpath, workers, dry_run):
     """Performs name substitutions on all candidate files"""
-    files = list(get_substitutable_files(tree, ['grd', 'grdp', 'xtb']))
-    print(f"Found {len(files)} files to process")
+    files = list(get_substitutable_files(tree, ['grd', 'grdp']))
+    save_original = tarpath is not None
+    print(f"Found {len(files)} .grd files to process")
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        save_original = tarpath is not None
         file_args = [(path, tree, save_original, dry_run) for path in files]
-        results = executor.map(substitute_file, file_args)
+        results = executor.map(substitute_grit_file, file_args)
         modified_files = [r for r in results if r is not None]
+
+    fp_map = util.merge_fp_maps(modified_files)
+    files = list(get_substitutable_files(tree, ['xtb']))
+    print(f"Found {len(files)} .xtb files to process")
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        file_args = [(path, tree, fp_map, save_original, dry_run) for path in files]
+        results = executor.map(substitute_xtb_file, file_args)
+        modified_files += [r for r in results if r is not None]
 
     maybe_make_tarball(tarpath, modified_files)
     print(f"Modified {len(modified_files)} files")
