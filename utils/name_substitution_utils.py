@@ -127,7 +127,7 @@ def replace_grit_tree(text):
             new_fp = compute_fp(message)
             fp_map[old_fp] = new_fp
 
-    return xml.tostring(xml_tree), fp_map
+    return xml.tostring(xml_tree, encoding='unicode'), fp_map
 
 
 def replace_xtb_tree(text, fp_map):
@@ -140,7 +140,7 @@ def replace_xtb_tree(text, fp_map):
         changed |= replace_xtb_translation(translation, fp_map)
 
     if changed:
-        return xml.tostring(xml_tree)
+        return xml.tostring(xml_tree, encoding='unicode')
 
     return None
 
