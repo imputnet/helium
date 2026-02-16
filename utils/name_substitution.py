@@ -8,39 +8,14 @@
 from concurrent.futures import ProcessPoolExecutor
 from tarfile import TarInfo
 from pathlib import Path
-import name_substitution_utils as util
 import argparse
 import tarfile
 import os
-import re
 import io
 
-REPLACEMENT_REGEXES_STR = [
-    # stuff we don't want to replace
-    (r'(\w+) Root Program', r'\1_unreplace Root Program'),
-    (r'(\w+) Web( S|s)tore', r'\1_unreplace Web Store'),
-    (r'(\w+) Remote Desktop', r'\1_unreplace Remote Desktop'),
-    (r'("BEGIN_LINK_CHROMIUM")(.*?Chromium)(.*?<ph name="END_LINK_CHROMIUM")', r'\1\2_unreplace\3'),
-
-    # main replacement(s)
-    (r'(?:Google )?Chrom(e|ium)(?!\w)', r'Helium'),
-
-    # post-replacement cleanup
-    (r'((?:Google )?Chrom(e|ium))_unreplace', r'\1'),
-    (r'_unreplace', r'')
-]
-
-REPLACEMENT_REGEXES = list(map(lambda line: (re.compile(line[0]), line[1]),
-                               REPLACEMENT_REGEXES_STR))
+import name_substitution_utils as util
 
 IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios']
-
-
-def replace(text):
-    """Replaces instances of Chrom(e | ium) with Helium, where desired"""
-    for regex, replacement in REPLACEMENT_REGEXES:
-        text = re.sub(regex, replacement, text)
-    return text
 
 
 def replacement_sanity():
@@ -57,7 +32,7 @@ def replacement_sanity():
     ]
 
     for source, expected in before_after:
-        assert replace(source) == expected
+        assert util.replace_text(source) == expected
 
 
 def parse_args():
@@ -114,7 +89,9 @@ def get_substitutable_files(tree, exts):
 def substitute_file(args):
     """
     Replaces strings in a particular file, and returns
-    (arcname, original_content) if file was modified, otherwise None.
+    ((arcname, original_content), fp_map) if file was modified and needs backup,
+    (None, fp_map) if file was modified,
+    otherwise None.
     """
     path, tree, save_original, dry_run = args
     arcname = str(path.relative_to(tree))
@@ -122,17 +99,16 @@ def substitute_file(args):
     with open(path, 'r', encoding='utf-8') as file:
         text = file.read()
 
-    replaced = replace(text)
-    if text != replaced:
-        print(f"Replaced strings in {arcname}")
-        if not dry_run:
-            with open(path, 'w', encoding='utf-8') as file:
-                file.write(replaced)
+    replaced, fp_map = util.replace_grit_tree(text)
+    if not fp_map:
+        return None
 
-        if save_original:
-            return (arcname, text)
+    print(f"Replaced strings in {arcname}")
+    if not dry_run:
+        with open(path, 'w', encoding='utf-8') as file:
+            file.write(replaced)
 
-    return None
+    return ((arcname, text) if save_original else None, fp_map)
 
 
 def do_unsubstitution(tree, tarpath):
