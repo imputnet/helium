@@ -647,15 +647,7 @@
    std::vector<ContentsContainerView*> contents_container_views() const {
 --- a/chrome/browser/ui/views/frame/multi_contents_view.cc
 +++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
-@@ -48,6 +48,7 @@
- 
- namespace {
- constexpr int kSnapDistance = 15;
-+constexpr float kContentCornerRadius = 8.0f;
- }
- 
- void MultiContentsView::ContentsSeparators::Reset() {
-@@ -337,6 +338,11 @@ void MultiContentsView::OnResize(int res
+@@ -337,6 +337,11 @@ void MultiContentsView::OnResize(int res
    }
  }
  
@@ -667,49 +659,31 @@
  double MultiContentsView::CalculateRatioWithSnapPoints(
      double end_width,
      double total_width) const {
-@@ -616,12 +622,29 @@ int MultiContentsView::GetMinViewWidth(g
- }
+@@ -617,11 +622,10 @@ int MultiContentsView::GetMinViewWidth(g
  
  void MultiContentsView::UpdateContentsBorderAndOverlay() {
-+  const bool is_vertical_tabs = browser_view_->ShouldDrawVerticalTabStrip();
-+  const bool is_in_split = IsInSplitView();
-+
-+  const gfx::RoundedCornersF no_radii;
-+  const gfx::RoundedCornersF leading_corner_radii =
-+      gfx::RoundedCornersF{kContentCornerRadius, 0, 0, 0};
-+
-+  const gfx::RoundedCornersF& bg_radii =
-+      (is_vertical_tabs && is_in_split) ? leading_corner_radii : no_radii;
-+
-+  SetBackgroundRadii(bg_radii);
-+
    for (auto* contents_container_view : contents_container_views_) {
-     const bool is_active =
-         contents_container_view->contents_view() == GetActiveContentsView();
--    contents_container_view->UpdateBorderAndOverlay(
--        IsInSplitView(), is_active,
--        is_active && active_contents_view_highlighted_);
+-    const bool is_active =
+-        contents_container_view->contents_view() == GetActiveContentsView();
 +    const bool is_first_view =
 +        contents_container_view == contents_container_views_.front();
-+    const bool round_leading_corner =
-+        is_vertical_tabs && (!is_in_split || is_first_view);
-+    const gfx::RoundedCornersF& contents_radii =
-+        round_leading_corner ? leading_corner_radii : no_radii;
-+
-+    contents_container_view->UpdateBorderAndOverlay(contents_radii);
+     contents_container_view->UpdateBorderAndOverlay(
+-        IsInSplitView(), is_active,
+-        is_active && active_contents_view_highlighted_);
++        IsInSplitView(), is_first_view);
    }
  }
  
 --- a/chrome/browser/ui/views/frame/contents_container_view.h
 +++ b/chrome/browser/ui/views/frame/contents_container_view.h
-@@ -25,6 +25,7 @@ class ActorOverlayWebView;
- 
- namespace gfx {
- class Rect;
-+class RoundedCornersF;
- }  // namespace gfx
- 
- namespace glic {
+@@ -19,6 +19,7 @@
+ class BrowserView;
+ class ContentsContainerOutline;
+ class ContentsWebView;
++class LeadingCornerFillView;
+ class MultiContentsViewMiniToolbar;
+ class ScrimView;
+ class ActorOverlayWebView;
 @@ -109,9 +110,7 @@ class ContentsContainerView : public vie
                                SkColor outline_color,
                                int font_size);
@@ -717,27 +691,215 @@
 -  void UpdateBorderAndOverlay(bool is_in_split,
 -                              bool is_active,
 -                              bool is_highlighted);
-+  void UpdateBorderAndOverlay(const gfx::RoundedCornersF& contents_radii);
++  void UpdateBorderAndOverlay(bool is_in_split, bool is_first_view);
  
    void ShowCaptureContentsBorder();
    void HideCaptureContentsBorder();
+@@ -131,7 +130,6 @@ class ContentsContainerView : public vie
+   void UpdateDevToolsDockedPlacement();
+ 
+   // views::View:
+-  void ChildVisibilityChanged(View* child) override;
+   void Layout(PassKey) override;
+ 
+   // views::ViewObserver:
+@@ -173,6 +171,9 @@ class ContentsContainerView : public vie
+   // open.
+   raw_ptr<ScrimView> contents_scrim_view_ = nullptr;
+ 
++  // Overlay rounded corner used in vertical layout.
++  raw_ptr<LeadingCornerFillView> leading_corner_fill_view_ = nullptr;
++
+   // The view that contains the Glic Actor Overlay. The Actor Overlay is a UI
+   // overlay that is shown on top of the web contents.
+   raw_ptr<ActorOverlayWebView> actor_overlay_web_view_ = nullptr;
 --- a/chrome/browser/ui/views/frame/contents_container_view.cc
 +++ b/chrome/browser/ui/views/frame/contents_container_view.cc
-@@ -148,10 +148,11 @@ std::vector<views::View*> ContentsContai
-   return accessible_panes;
+@@ -7,12 +7,15 @@
+ #include <memory>
+ #include <optional>
+ 
++#include "base/i18n/rtl.h"
++#include "base/scoped_observation.h"
+ #include "chrome/browser/actor/ui/actor_overlay_web_view.h"
+ #include "chrome/browser/devtools/devtools_contents_resizing_strategy.h"
+ #include "chrome/browser/enterprise/watermark/watermark_view.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/read_anything/read_anything_immersive_overlay_view.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/view_ids.h"
+@@ -28,13 +31,17 @@
+ #include "chrome/common/chrome_features.h"
+ #include "components/search/ntp_features.h"
+ #include "content/public/browser/web_contents.h"
++#include "third_party/skia/include/core/SkPathBuilder.h"
++#include "third_party/skia/include/core/SkRRect.h"
+ #include "ui/accessibility/accessibility_features.h"
++#include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/geometry/rect.h"
+-#include "ui/views/border.h"
++#include "ui/gfx/geometry/skia_conversions.h"
++#include "ui/gfx/scoped_canvas.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/layout/fill_layout.h"
+ #include "ui/views/layout/proposed_layout.h"
+@@ -42,6 +49,7 @@
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
+ 
+ #if BUILDFLAG(ENABLE_GLIC)
+ #include "chrome/browser/glic/browser_ui/context_sharing_border_view.h"
+@@ -58,6 +66,94 @@ constexpr int kNewTabFooterSeparatorHeig
+ constexpr int kNewTabFooterHeight = 56;
+ }  // namespace
+ 
++class LeadingCornerFillView final : public views::View,
++                                    public views::WidgetObserver {
++  METADATA_HEADER(LeadingCornerFillView, views::View)
++
++ public:
++  LeadingCornerFillView() {
++    SetPaintToLayer();
++    layer()->SetFillsBoundsOpaquely(false);
++    SetCanProcessEventsWithinSubtree(false);
++    SetVisible(false);
++  }
++
++  gfx::Size CalculatePreferredSize(const views::SizeBounds&) const override {
++    return gfx::Size(corner_radius_, corner_radius_);
++  }
++
++  void SetCornerRadius(int corner_radius) {
++    if (corner_radius_ == corner_radius) {
++      return;
++    }
++    corner_radius_ = corner_radius;
++    SetVisible(corner_radius_ > 0);
++    PreferredSizeChanged();
++    SchedulePaint();
++  }
++
++  void OnThemeChanged() override {
++    View::OnThemeChanged();
++    SchedulePaint();
++  }
++
++  void AddedToWidget() override {
++    View::AddedToWidget();
++    if (auto* widget = GetWidget()) {
++      widget_observation_.Observe(widget);
++    }
++  }
++
++  void RemovedFromWidget() override {
++    widget_observation_.Reset();
++    View::RemovedFromWidget();
++  }
++
++  void OnPaint(gfx::Canvas* canvas) override {
++    if (corner_radius_ <= 0) {
++      return;
++    }
++
++    const float corner_radius = static_cast<float>(corner_radius_);
++    const bool is_rtl = base::i18n::IsRTL();
++    const SkVector rounded_vector = {corner_radius, corner_radius};
++    const SkVector radii[4] = {
++        is_rtl ? SkVector{0, 0} : rounded_vector,
++        is_rtl ? rounded_vector : SkVector{0, 0},
++        {0, 0},
++        {0, 0},
++    };
++
++    const SkRect bounds = gfx::RectToSkRect(GetLocalBounds());
++    SkPathBuilder path;
++    path.addRect(bounds);
++    path.addRRect(SkRRect::MakeRectRadii(bounds, radii));
++    SkPath outer_corner_path = path.detach();
++    outer_corner_path.setFillType(SkPathFillType::kEvenOdd);
++
++    gfx::ScopedCanvas scoped_canvas(canvas);
++    canvas->ClipPath(outer_corner_path, /*anti_alias=*/true);
++    canvas->DrawColor(GetColorProvider()->GetColor(
++        GetWidget() && !GetWidget()->ShouldPaintAsActive()
++            ? ui::kColorFrameInactive
++            : ui::kColorFrameActive));
++  }
++
++  // views::WidgetObserver:
++  void OnWidgetActivationChanged(views::Widget* /*widget*/,
++                                 bool /*active*/) override {
++    SchedulePaint();
++  }
++
++ private:
++  int corner_radius_ = 0;
++  base::ScopedObservation<views::Widget, views::WidgetObserver>
++      widget_observation_{this};
++};
++
++BEGIN_METADATA(LeadingCornerFillView)
++END_METADATA
++
+ ContentsContainerView::ContentsContainerView(BrowserView* browser_view)
+     : browser_view_(browser_view),
+       web_contents_modal_dialog_host_(browser_view_, this) {
+@@ -81,6 +177,8 @@ ContentsContainerView::ContentsContainer
+   contents_view_ = AddChildView(
+       std::make_unique<ContentsWebView>(browser_view->GetProfile()));
+   contents_view_->SetID(VIEW_ID_TAB_CONTAINER);
++  leading_corner_fill_view_ =
++      AddChildView(std::make_unique<LeadingCornerFillView>());
+ 
+   if (base::FeatureList::IsEnabled(ntp_features::kNtpFooter)) {
+     new_tab_footer_view_separator_ =
+@@ -149,13 +247,15 @@ std::vector<views::View*> ContentsContai
  }
  
--void ContentsContainerView::UpdateBorderAndOverlay(bool is_in_split,
+ void ContentsContainerView::UpdateBorderAndOverlay(bool is_in_split,
 -                                                   bool is_active,
 -                                                   bool is_highlighted) {
-+void ContentsContainerView::UpdateBorderAndOverlay(
-+    const gfx::RoundedCornersF& contents_radii) {
-   SetBorder(nullptr);
-+  contents_view_->SetBackgroundRadii(contents_radii);
-+  contents_view_->holder()->SetCornerRadii(contents_radii);
+-  SetBorder(nullptr);
+-}
+-
+-void ContentsContainerView::ChildVisibilityChanged(View* child) {
+-  return;
++                                                   bool is_first_view) {
++  const bool show_corner_fill =
++      browser_view_->ShouldDrawVerticalTabStrip() &&
++      (!is_in_split || is_first_view);
++  const int corner_radius =
++      show_corner_fill
++          ? GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius)
++          : 0;
++  leading_corner_fill_view_->SetCornerRadius(corner_radius);
  }
  
- void ContentsContainerView::ChildVisibilityChanged(View* child) {
+ void ContentsContainerView::Layout(PassKey pass_key) {
+@@ -399,6 +499,14 @@ views::ProposedLayout ContentsContainerV
+   layouts.child_layouts.emplace_back(
+       contents_view_.get(), contents_view_->GetVisible(), contents_rect);
+ 
++  if (leading_corner_fill_view_) {
++    const gfx::Size corner_size = leading_corner_fill_view_->GetPreferredSize();
++    const gfx::Rect corner_bounds(contents_rect.origin(), corner_size);
++    layouts.child_layouts.emplace_back(
++        leading_corner_fill_view_.get(),
++        leading_corner_fill_view_->GetVisible(), corner_bounds);
++  }
++
+ #if BUILDFLAG(ENABLE_GLIC)
+   if (glic_border_) {
+     // |glic_border_| should not be seen over devtools.
 --- a/chrome/browser/ui/views/frame/browser_view.cc
 +++ b/chrome/browser/ui/views/frame/browser_view.cc
 @@ -1251,10 +1251,19 @@ int BrowserView::GetTabStripHeight() con
