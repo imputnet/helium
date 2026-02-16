@@ -5,7 +5,7 @@
 
 import re
 import sys
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as xml
 
 REPLACEMENT_REGEXES_STR = [
     # stuff we don't want to replace
@@ -118,7 +118,7 @@ def replace_xtb_translation(msg, fp_map):
 
 def replace_grit_tree(text):
     """Replaces instances of Chrom(e | ium) with Helium, where desired"""
-    xml_tree = ET.fromstring(text)
+    xml_tree = xml.fromstring(text)
     fp_map = {}
 
     for message in xml_tree.findall('.//message'):
@@ -127,12 +127,12 @@ def replace_grit_tree(text):
             new_fp = compute_fp(message)
             fp_map[old_fp] = new_fp
 
-    return ET.tostring(xml_tree), fp_map
+    return xml.tostring(xml_tree), fp_map
 
 
 def replace_xtb_tree(text, fp_map):
     """Same as replace_grit_tree(), but on .xtb translation files."""
-    xml_tree = ET.fromstring(text)
+    xml_tree = xml.fromstring(text)
     changed = False
 
     for translation in xml_tree.findall('.//translation'):
@@ -140,7 +140,7 @@ def replace_xtb_tree(text, fp_map):
         changed |= replace_xtb_translation(translation, fp_map)
 
     if changed:
-        return ET.tostring(xml_tree)
+        return xml.tostring(xml_tree)
 
     return None
 
