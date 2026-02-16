@@ -101,18 +101,20 @@ def substitute_grit_file(args):
     arcname = str(path.relative_to(tree))
 
     with open(path, 'r', encoding='utf-8') as file:
-        text = file.read()
+        original_text = file.read()
 
+    text = original_text.replace('&#36;', '!!dollar-sign-literal!!')
     replaced, fp_map = util.replace_grit_tree(text)
     if not fp_map:
         return None
 
     print(f"Replaced strings in {arcname}")
+    replaced = replaced.replace('!!dollar-sign-literal!!', '&#36;')
     if not dry_run:
         with open(path, 'w', encoding='utf-8') as file:
             file.write(replaced)
 
-    return ((arcname, text) if save_original else None, fp_map)
+    return ((arcname, original_text) if save_original else None, fp_map)
 
 
 def substitute_xtb_file(args):
@@ -126,18 +128,20 @@ def substitute_xtb_file(args):
     arcname = str(path.relative_to(tree))
 
     with open(path, 'r', encoding='utf-8') as file:
-        text = file.read()
+        original_text = file.read()
 
+    text = original_text.replace('&#36;', '!!dollar-sign-literal!!')
     replaced = util.replace_xtb_tree(text, fp_map)
     if not replaced:
         return None
 
     print(f"Replaced strings in {arcname}")
+    replaced = replaced.replace('!!dollar-sign-literal!!', '&#36;')
     if not dry_run:
         with open(path, 'w', encoding='utf-8') as file:
             file.write(replaced)
 
-    return ((arcname, text) if save_original else None, )
+    return ((arcname, original_text) if save_original else None, )
 
 
 def do_unsubstitution(tree, tarpath):

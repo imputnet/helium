@@ -116,9 +116,13 @@ def replace_xtb_translation(msg, fp_map):
     return True
 
 
+def get_parser():
+    return xml.XMLParser(target=xml.TreeBuilder(insert_comments=True))
+
+
 def replace_grit_tree(text):
     """Replaces instances of Chrom(e | ium) with Helium, where desired"""
-    xml_tree = xml.fromstring(text)
+    xml_tree = xml.fromstring(text, get_parser())
     fp_map = {}
 
     for message in xml_tree.findall('.//message'):
@@ -127,12 +131,12 @@ def replace_grit_tree(text):
             new_fp = compute_fp(message)
             fp_map[old_fp] = new_fp
 
-    return xml.tostring(xml_tree, encoding='unicode'), fp_map
+    return xml.tostring(xml_tree, encoding='unicode', xml_declaration=True), fp_map
 
 
 def replace_xtb_tree(text, fp_map):
     """Same as replace_grit_tree(), but on .xtb translation files."""
-    xml_tree = xml.fromstring(text)
+    xml_tree = xml.fromstring(text, get_parser())
     changed = False
 
     for translation in xml_tree.findall('.//translation'):
@@ -140,7 +144,7 @@ def replace_xtb_tree(text, fp_map):
         changed |= replace_xtb_translation(translation, fp_map)
 
     if changed:
-        return xml.tostring(xml_tree, encoding='unicode')
+        return xml.tostring(xml_tree, encoding='unicode', xml_declaration=True)
 
     return None
 
