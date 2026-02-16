@@ -117,6 +117,7 @@ def replace_xtb_translation(msg, fp_map):
 
 
 def get_parser():
+    """Returns a parser configured to preserve comments."""
     return xml.XMLParser(target=xml.TreeBuilder(insert_comments=True))
 
 
@@ -134,14 +135,34 @@ def replace_grit_tree(text):
     return xml.tostring(xml_tree, encoding='unicode', xml_declaration=True), fp_map
 
 
+def dedup_translations_in_place(translation, seen):
+    """
+    Ensures the .xtb file never has duplicate fingerprints if two
+    strings are the same.
+    """
+
+    # If there are colliding strings after name substitution, offset the
+    # additional translations so that they don't error out the build.
+    # This usually applies to strings that have one "Chromium" and one
+    # "Chrome" variant. Since we substituted both of those with Helium,
+    # their fingerprints collide and crash the build.
+    translation_id = translation.get('id')
+    while translation_id in seen and translation_id.isdigit():
+        translation_id = str(int(translation_id) + 1)
+    translation.set('id', translation_id)
+    seen.add(translation_id)
+
+
 def replace_xtb_tree(text, fp_map):
     """Same as replace_grit_tree(), but on .xtb translation files."""
     xml_tree = xml.fromstring(text, get_parser())
     changed = False
+    ids_seen = set()
 
     for translation in xml_tree.findall('.//translation'):
         assert translation.get('id')
         changed |= replace_xtb_translation(translation, fp_map)
+        dedup_translations_in_place(translation, ids_seen)
 
     if changed:
         return xml.tostring(xml_tree, encoding='unicode', xml_declaration=True)
