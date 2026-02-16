@@ -8,6 +8,7 @@
 from concurrent.futures import ProcessPoolExecutor
 from tarfile import TarInfo
 from pathlib import Path
+import name_substitution_utils as util
 import argparse
 import tarfile
 import os
@@ -179,6 +180,8 @@ def main():
 
     if not (args.t / "OWNERS").exists():
         raise ValueError("wrong src directory")
+
+    util.add_grit_to_path(args.t)
 
     if args.sub:
         if args.backup_path is not None and args.backup_path.exists():
