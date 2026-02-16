@@ -181,7 +181,7 @@ def do_substitution(tree, tarpath, workers, dry_run):
         results = executor.map(substitute_xtb_file, file_args)
         modified_files += [r for r in results if r is not None]
 
-    maybe_make_tarball(tarpath, modified_files)
+    maybe_make_tarball(tarpath, map(lambda f: f[0], modified_files))
     print(f"Modified {len(modified_files)} files")
 
 
