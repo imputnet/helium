@@ -1,0 +1,208 @@
+[Backported to Helium M145]
+
+From 5bf6aac9914a485de2a2e5a2517425877f6a4e87 Mon Sep 17 00:00:00 2001
+From: Caroline Rising <corising@chromium.org>
+Date: Mon, 02 Feb 2026 10:13:41 -0800
+Subject: [PATCH] [Vertical Tabs] Move the new tab button below the last tab.
+
+This updates the bottom container to grow to take any available space
+so that the NTB appears below the bottommost tab. This also updates the
+VerticalTabStripView layout to correctly return the preferred size and
+allocate available space so the pinned container never takes over half
+the space if both pinned and unpinned are constrained.
+
+This cl also updates VerticalTabStripView::GetMinimumSize so that it
+won't return more space than needed.
+
+Bug: 477618575
+Change-Id: If1b419871546cf5b5fa8aedcef76327a39f7099f
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7534826
+Reviewed-by: David Pennington <dpenning@chromium.org>
+Commit-Queue: Caroline Rising <corising@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1578230}
+---
+
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -76,12 +76,17 @@ VerticalTabStripRegionView::VerticalTabS
+       AddChildView(std::make_unique<VerticalTabStripTopContainer>(
+           state_controller_, root_action_item));
+ 
+-  top_button_separator_ = AddChildView(std::make_unique<views::Separator>());
+-
+   bottom_button_container_ =
+       AddChildView(std::make_unique<VerticalTabStripBottomContainer>(
+           state_controller_, root_action_item, browser));
+ 
++  bottom_button_container_->SetProperty(
++      views::kFlexBehaviorKey,
++      views::FlexSpecification(views::MinimumFlexSizeRule::kPreferred,
++                               views::MaximumFlexSizeRule::kUnbounded));
++
++  top_button_separator_ = AddChildView(std::make_unique<views::Separator>());
++
+   gemini_button_ = AddChildView(std::make_unique<views::View>());
+ 
+   resize_area_ = AddChildView(std::make_unique<views::ResizeArea>(this));
+@@ -422,7 +427,7 @@ views::View* VerticalTabStripRegionView:
+   tab_strip_view_->SetProperty(
+       views::kFlexBehaviorKey,
+       views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToZero,
+-                               views::MaximumFlexSizeRule::kUnbounded));
++                               views::MaximumFlexSizeRule::kPreferred));
+   tab_strip_view_->SetProperty(views::kMarginsKey,
+                                gfx::Insets::VH(kRegionVerticalPadding, 0));
+   std::optional<size_t> separator_index = GetIndexOf(top_button_separator_);
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+@@ -114,6 +114,9 @@ void VerticalTabStripBottomContainer::Up
+   SetOrientation(controller->IsCollapsed()
+                      ? views::LayoutOrientation::kVertical
+                      : views::LayoutOrientation::kHorizontal);
++  SetCrossAxisAlignment(controller->IsCollapsed()
++                          ? views::LayoutAlignment::kStretch
++                          : views::LayoutAlignment::kStart);
+ 
+   if (controller->IsCollapsed()) {
+     // If collapsed, the tab group button and the new tab button share the same
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
+@@ -26,9 +26,6 @@
+ #include "ui/views/view_utils.h"
+ 
+ namespace {
+-constexpr int kRegionVeritcalInteriorMargin = 8;
+-constexpr int kRegionVerticalPadding = 5;
+-
+ void SetScrollViewProperties(views::ScrollView* scroll_view) {
+   scroll_view->SetUseContentsPreferredSize(true);
+   scroll_view->SetBackgroundColor(std::nullopt);
+@@ -69,49 +66,75 @@ VerticalTabStripView::~VerticalTabStripV
+ views::ProposedLayout VerticalTabStripView::CalculateProposedLayout(
+     const views::SizeBounds& size_bounds) const {
+   views::ProposedLayout layouts;
+-  if (!size_bounds.is_fully_bounded()) {
++  if (!size_bounds.width().is_bounded()) {
+     return layouts;
+   }
+ 
+   const int region_horizontal_padding = GetLayoutConstant(
+       is_collapsed_ ? LayoutConstant::kVerticalTabStripCollapsedPadding
+                     : LayoutConstant::kVerticalTabStripUncollapsedPadding);
++  const int region_vertical_padding =
++      GetLayoutConstant(LayoutConstant::kVerticalTabStripCollapsedPadding);
+ 
+   int y = 0;
+-
+-  // Allocate the available space between the pinned and unpinned containers so
+-  // that the pinned container will never take more than half of the available
+-  // space.
+-  int remaining_height = size_bounds.height().value() - kRegionVerticalPadding;
+-  if (tabs_separator_->GetVisible()) {
+-    remaining_height -=
+-        tabs_separator_->GetPreferredSize().height() + kRegionVerticalPadding;
++  const bool should_show_separator =
++      pinned_tabs_container_view_ &&
++      !pinned_tabs_container_view_->children().empty() && is_collapsed_;
++
++  // If the height is bounded, calculate the available space for laying out the
++  // pinned and unpinned containers.
++  int remaining_height = 0;
++  if (size_bounds.height().is_bounded()) {
++    remaining_height = size_bounds.height().value();
++    if (!pinned_tabs_container_view_->children().empty() &&
++        !unpinned_tabs_container_view_->children().empty()) {
++      remaining_height -= region_vertical_padding;
++    }
++    if (should_show_separator) {
++      remaining_height -= tabs_separator_->GetPreferredSize().height() +
++                          region_vertical_padding;
++    }
++    // Clamp the remaining height to 0 if we have less space.
++    remaining_height = std::max(remaining_height, 0);
+   }
+ 
+-  // Place the pinned container.
++  // Determine container preferred heights.
+   views::SizeBounds pinned_tab_container_size_bounds =
+-      size_bounds.Inset(gfx::Insets::TLBR(kRegionVeritcalInteriorMargin,
+-                                          region_horizontal_padding,
+-                                          kRegionVeritcalInteriorMargin, 0));
++      size_bounds.Inset(gfx::Insets::TLBR(0, region_horizontal_padding, 0, 0));
++  const int pinned_preferred_height =
++      pinned_tabs_scroll_view_
++          ->GetPreferredSize(pinned_tab_container_size_bounds)
++          .height();
++  const int unpinned_preferred_height =
++      unpinned_tabs_scroll_view_->GetPreferredSize(size_bounds).height();
++
++  // Place the pinned container.
++  int pinned_container_height = pinned_preferred_height;
++  if (size_bounds.height().is_bounded()) {
++    // The pinned container height should not be larger than half the available
++    // space unless the unpinned container will not fill that space. Also make
++    // sure the height is at least 0.
++    pinned_container_height = std::max(
++        std::min(pinned_preferred_height,
++                 std::max(remaining_height / 2,
++                          remaining_height - unpinned_preferred_height)),
++        0);
++    remaining_height -= pinned_container_height;
++  }
+   gfx::Rect pinned_container_bounds(
+       region_horizontal_padding, y,
+       pinned_tab_container_size_bounds.width().value(),
+-      pinned_tabs_scroll_view_
+-          ->GetPreferredSize(pinned_tab_container_size_bounds)
+-          .height());
+-  pinned_container_bounds.set_height(
+-      std::min(pinned_container_bounds.height(), (remaining_height / 2)));
++      pinned_container_height);
+   layouts.child_layouts.emplace_back(pinned_tabs_scroll_view_.get(),
+                                      pinned_tabs_scroll_view_->GetVisible(),
+                                      pinned_container_bounds);
+ 
+-  remaining_height -= pinned_container_bounds.height();
+-  y += pinned_container_bounds.height() + kRegionVerticalPadding;
++  if (pinned_container_bounds.height()) {
++    y += pinned_container_bounds.height() + region_vertical_padding;
++  }
+ 
+   // Place the tabs separator if visible.
+-  const bool has_pinned_tabs = pinned_tabs_container_view_ &&
+-                               !pinned_tabs_container_view_->children().empty();
+-  if (is_collapsed_ && has_pinned_tabs) {
++  if (should_show_separator) {
+     int separator_width =
+         size_bounds.width().value() - 2 * region_horizontal_padding;
+     gfx::Rect tabs_separator_bounds(
+@@ -120,7 +143,7 @@ views::ProposedLayout VerticalTabStripVi
+     layouts.child_layouts.emplace_back(tabs_separator_.get(), true,
+                                        tabs_separator_bounds);
+ 
+-    y += tabs_separator_bounds.height() + kRegionVerticalPadding;
++    y += tabs_separator_bounds.height() + region_vertical_padding;
+   } else {
+     layouts.child_layouts.emplace_back(tabs_separator_.get(), false,
+                                        gfx::Rect());
+@@ -131,13 +154,17 @@ views::ProposedLayout VerticalTabStripVi
+   // strip is collapsed, tab groups need to draw the group colored line in this
+   // space.
+   gfx::Rect unpinned_container_bounds(0, y, size_bounds.width().value(),
+-                                      remaining_height);
++                                      unpinned_preferred_height);
++  if (size_bounds.height().is_bounded()) {
++    unpinned_container_bounds.set_height(std::max(
++        std::min(unpinned_container_bounds.height(), remaining_height), 0));
++  }
+   layouts.child_layouts.emplace_back(unpinned_tabs_scroll_view_.get(),
+                                      unpinned_tabs_scroll_view_->GetVisible(),
+                                      unpinned_container_bounds);
+ 
+-  layouts.host_size =
+-      gfx::Size(size_bounds.width().value(), size_bounds.height().value());
++  layouts.host_size = gfx::Size(size_bounds.width().value(),
++                                unpinned_container_bounds.bottom());
+   return layouts;
+ }
+ 

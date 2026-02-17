@@ -5,12 +5,14 @@
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """Script to replace instances of Chrome/Chromium with Helium"""
 
+from concurrent.futures import ProcessPoolExecutor
+from tarfile import TarInfo
 from pathlib import Path
 import argparse
 import tarfile
-import asyncio
 import os
 import re
+import io
 
 REPLACEMENT_REGEXES_STR = [
     # stuff we don't want to replace
@@ -29,6 +31,8 @@ REPLACEMENT_REGEXES_STR = [
 
 REPLACEMENT_REGEXES = list(map(lambda line: (re.compile(line[0]), line[1]),
                                REPLACEMENT_REGEXES_STR))
+
+IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios']
 
 
 def replace(text):
@@ -63,6 +67,7 @@ def parse_args():
     group.add_argument('--unsub', action='store_true')
     parser.add_argument('--backup-path', metavar='<tarball-path>', type=Path)
     parser.add_argument('-t', metavar='source_tree', type=Path, required=True)
+    parser.add_argument('--workers', type=int, default=os.cpu_count())
 
     args = parser.parse_args()
 
@@ -92,16 +97,25 @@ def get_substitutable_files(tree):
         if out in root.parents:
             continue
 
+        should_ignore = False
+        for dir_name in IGNORE_DIRS:
+            if dir_name in root.parts:
+                should_ignore = True
+                break
+
+        if should_ignore:
+            continue
+
         yield from map(lambda filename, root=root: root / filename, filter(is_substitutable, files))
 
 
-async def substitute_file(tree, path, tarball=None):
+def substitute_file(args):
     """
-    Replaces strings in a particular file,
-    if there is anything to replace.
+    Replaces strings in a particular file, and returns
+    (arcname, original_content) if file was modified, otherwise None.
     """
+    path, tree, save_original = args
     arcname = str(path.relative_to(tree))
-    text = None
 
     with open(path, 'r', encoding='utf-8') as file:
         text = file.read()
@@ -109,10 +123,13 @@ async def substitute_file(tree, path, tarball=None):
     replaced = replace(text)
     if text != replaced:
         print(f"Replaced strings in {arcname}")
-        if tarball:
-            tarball.add(path, arcname=arcname, recursive=False)
         with open(path, 'w', encoding='utf-8') as file:
             file.write(replaced)
+
+        if save_original:
+            return (arcname, text)
+
+    return None
 
 
 def do_unsubstitution(tree, tarpath):
@@ -122,17 +139,37 @@ def do_unsubstitution(tree, tarpath):
     tarpath.unlink()
 
 
-async def do_substitution(tree, tarpath):
+def maybe_make_tarball(tar_path, modified_files):
+    """
+    Creates a backup tarball if requested by arguments.
+    """
+    if tar_path is None:
+        return
+
+    with tarfile.open(str(tar_path), 'w:gz') as tar:
+        for arcname, content in modified_files:
+            content = content.encode('utf-8')
+            tarinfo = TarInfo(name=arcname)
+            tarinfo.size = len(content)
+            tar.addfile(tarinfo, io.BytesIO(content))
+
+
+def do_substitution(tree, tarpath, workers):
     """Performs name substitutions on all candidate files"""
-    with tarfile.open(str(tarpath), 'w:gz') if tarpath else open(os.devnull, 'w',
-                                                                 encoding="utf-8") as cache_tar:
-        pending_substitutions = map(
-            lambda path: substitute_file(tree, path, cache_tar if tarpath else None),
-            get_substitutable_files(tree))
-        await asyncio.gather(*pending_substitutions)
+    files = list(get_substitutable_files(tree))
+    print(f"Found {len(files)} files to process")
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        save_original = tarpath is not None
+        file_args = [(path, tree, save_original) for path in files]
+        results = executor.map(substitute_file, file_args)
+        modified_files = [r for r in results if r is not None]
+
+    maybe_make_tarball(tarpath, modified_files)
+    print(f"Modified {len(modified_files)} files")
 
 
-async def main():
+def main():
     """CLI entrypoint"""
     replacement_sanity()
     args = parse_args()
@@ -143,10 +180,10 @@ async def main():
     if args.sub:
         if args.backup_path is not None and args.backup_path.exists():
             raise FileExistsError("unsub tarball already exists, aborting")
-        await do_substitution(args.t, args.backup_path)
+        do_substitution(args.t, args.backup_path, args.workers)
     elif args.unsub and args.backup_path:
         do_unsubstitution(args.t, args.backup_path)
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
