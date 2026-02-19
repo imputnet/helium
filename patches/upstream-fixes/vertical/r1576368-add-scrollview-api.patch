@@ -1,0 +1,110 @@
+From c85037d93ebf287dd174f7917e2aeb71f49a4314 Mon Sep 17 00:00:00 2001
+From: thomas lukaszewicz <tluk@chromium.org>
+Date: Wed, 28 Jan 2026 21:15:23 -0800
+Subject: [PATCH] Add ScrollView::RequestSuccessfulPresentationTimeForNextFrame()
+
+This CL adds a new API that enables clients to respond to changes in
+scroll view content bounds.
+
+This is intended to be used in combination with ScrollView scroll
+APIs (e.g. ScrollToOffset(), ScrollByOffset()) where it is necessary
+for the content bounds to have been updated for offsets to be
+computed correctly.
+
+The associated callback must wait for the compositor to generate
+the next frame. This is necessary as layer scroll calculations
+require the compositor to update layer information.
+
+Bug: 459824840
+Change-Id: If9cfb74e8982cc63440cc257b35f9fe3039eb7ae
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7528853
+Commit-Queue: Tom Lukaszewicz <tluk@chromium.org>
+Reviewed-by: Keren Zhu <kerenzhu@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1576368}
+---
+
+--- a/ui/views/controls/scroll_view.cc
++++ b/ui/views/controls/scroll_view.cc
+@@ -927,6 +927,22 @@ void ScrollView::Layout(PassKey) {
+     post_layout_callback_.Run(this);
+     CHECK_EQ(layout_needed, needs_layout());
+   }
++
++  if (next_successful_frame_post_layout_callback_) {
++    // Layout should only occur to Widget parented Views.
++    views::Widget* const widget = GetWidget();
++    CHECK(widget);
++    widget->GetCompositor()->RequestSuccessfulPresentationTimeForNextFrame(
++        base::BindOnce(
++            [](base::WeakPtr<ScrollView> self, base::OnceClosure callback,
++               const viz::FrameTimingDetails& frame_timing_details) {
++              if (self) {
++                std::move(callback).Run();
++              }
++            },
++            weak_ptr_factory_.GetWeakPtr(),
++            std::move(next_successful_frame_post_layout_callback_)));
++  }
+ }
+ 
+ bool ScrollView::OnKeyPressed(const ui::KeyEvent& event) {
+@@ -1469,6 +1485,11 @@ void ScrollView::RegisterPostLayoutCallb
+   post_layout_callback_ = post_layout_callback;
+ }
+ 
++void ScrollView::RegisterNextSuccessfulFramePostLayoutCallback(
++    base::OnceClosure callback) {
++  next_successful_frame_post_layout_callback_ = std::move(callback);
++}
++
+ View* ScrollView::GetContentsViewportForTest() const {
+   return contents_viewport_;
+ }
+--- a/ui/views/controls/scroll_view.h
++++ b/ui/views/controls/scroll_view.h
+@@ -11,6 +11,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "ui/color/color_variant.h"
+ #include "ui/compositor/layer_type.h"
+ #include "ui/views/controls/focus_ring.h"
+@@ -257,9 +258,19 @@ class VIEWS_EXPORT ScrollView : public V
+   // and to update the scrollbars to reflect the new position.
+   // The callback should not trigger any new layouts on the scroll view,
+   // otherwise it will lead to a CHECK failure.
++  // DEPRECATED: Use `RegisterNextSuccessfulFramePostLayoutCallback()` instead.
+   void RegisterPostLayoutCallback(
+       base::RepeatingCallback<void(ScrollView*)> post_layout_callback);
+ 
++  // Registers a callback that will be invoked after the compositor has
++  // submitted the next successful frame following the next layout pass. Waiting
++  // for the next frame post layout is necessary as a given layout pass will not
++  // be reflected on a content view's layer until a frame has been produced.
++  // Failing to wait for frame production will result in incorrect scroll
++  // behavior of APIs such as `ScrollToOffset()` and `ScrollByOffset()`.
++  void RegisterNextSuccessfulFramePostLayoutCallback(
++      base::OnceClosure callback);
++
+   bool is_scrolling() const {
+     return horiz_sb_->is_scrolling() || vert_sb_->is_scrolling();
+   }
+@@ -434,6 +445,8 @@ class VIEWS_EXPORT ScrollView : public V
+   // Post-layout callback.
+   base::RepeatingCallback<void(ScrollView*)> post_layout_callback_;
+ 
++  base::OnceClosure next_successful_frame_post_layout_callback_;
++
+   GradientDirection gradient_direction_ = GradientDirection::kNone;
+ 
+   // Track if the leading gradient is shown
+@@ -441,6 +454,8 @@ class VIEWS_EXPORT ScrollView : public V
+ 
+   // Track if the trailing gradient is shown
+   bool is_trailing_gradient_visible_ = false;
++
++  base::WeakPtrFactory<ScrollView> weak_ptr_factory_{this};
+ };
+ 
+ // When building with GCC this ensures that an instantiation of the
