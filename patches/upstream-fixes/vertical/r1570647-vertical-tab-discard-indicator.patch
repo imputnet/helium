@@ -1,0 +1,252 @@
+From d848dfaecedc6a6d47988fa2f68932d934dd9275 Mon Sep 17 00:00:00 2001
+From: Charles Meng <charlesmeng@chromium.org>
+Date: Fri, 16 Jan 2026 14:21:11 -0800
+Subject: [PATCH] [Vertical Tabs] Allow vertical tab icon to show discard indicator
+
+Notify vertical tab icon to update data when a tab is replaced due to
+discard. Additionally listen to the should show discard indicator pref
+on the tab icon itself.
+
+Fixed: 475302379
+Change-Id: I2e39735d8a3cd38d66217b54677f0d5a4d7c08b1
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7486606
+Commit-Queue: Charles Meng <charlesmeng@chromium.org>
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1570647}
+---
+
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -160,15 +160,6 @@ BrowserTabStripController::BrowserTabStr
+     menu_model_factory_ = std::make_unique<TabMenuModelFactory>();
+   }
+   model_->SetTabStripUI(this);
+-
+-  should_show_discard_indicator_ = g_browser_process->local_state()->GetBoolean(
+-      performance_manager::user_tuning::prefs::kDiscardRingTreatmentEnabled);
+-  local_state_registrar_.Init(g_browser_process->local_state());
+-  local_state_registrar_.Add(
+-      performance_manager::user_tuning::prefs::kDiscardRingTreatmentEnabled,
+-      base::BindRepeating(
+-          &BrowserTabStripController::OnDiscardRingTreatmentEnabledChanged,
+-          base::Unretained(this)));
+ }
+ 
+ BrowserTabStripController::~BrowserTabStripController() {
+@@ -937,11 +928,6 @@ void BrowserTabStripController::AddTabs(
+ 
+   tabstrip_->AddTabsAt(std::move(tabs_data));
+ 
+-  for (const auto& [contents, index] : contents_list) {
+-    tabstrip_->tab_at(index)->SetShouldShowDiscardIndicator(
+-        should_show_discard_indicator_);
+-  }
+-
+   // Try to show tab search IPH if needed.
+   constexpr int kTabSearchIPHTriggerThreshold = 8;
+   if (tabstrip_->GetTabCount() >= kTabSearchIPHTriggerThreshold) {
+@@ -950,15 +936,6 @@ void BrowserTabStripController::AddTabs(
+   }
+ }
+ 
+-void BrowserTabStripController::OnDiscardRingTreatmentEnabledChanged() {
+-  should_show_discard_indicator_ = g_browser_process->local_state()->GetBoolean(
+-      performance_manager::user_tuning::prefs::kDiscardRingTreatmentEnabled);
+-  for (int tab_index = 0; tab_index < tabstrip_->GetTabCount(); ++tab_index) {
+-    tabstrip_->tab_at(tab_index)->SetShouldShowDiscardIndicator(
+-        should_show_discard_indicator_);
+-  }
+-}
+-
+ bool BrowserTabStripController::IsContextMenuCommandChecked(
+     TabStripModel::ContextMenuCommand command_id) {
+   return false;
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
+@@ -197,11 +197,7 @@ class BrowserTabStripController : public
+   // tabs.
+   std::unique_ptr<ImmersiveRevealedLock> immersive_reveal_lock_;
+ 
+-  PrefChangeRegistrar local_state_registrar_;
+-
+   std::unique_ptr<TabMenuModelFactory> menu_model_factory_;
+-
+-  bool should_show_discard_indicator_ = true;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_BROWSER_TAB_STRIP_CONTROLLER_H_
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
+@@ -1079,10 +1079,6 @@ std::u16string Tab::GetTooltipText(const
+   return result;
+ }
+ 
+-void Tab::SetShouldShowDiscardIndicator(bool enabled) {
+-  icon_->SetShouldShowDiscardIndicator(enabled);
+-}
+-
+ void Tab::UpdateInsets() {
+   SetBorder(views::CreateEmptyBorder(tab_style_views()->GetContentsInsets()));
+ }
+--- a/chrome/browser/ui/views/tabs/tab.h
++++ b/chrome/browser/ui/views/tabs/tab.h
+@@ -207,8 +207,6 @@ class Tab : public gfx::AnimationDelegat
+     return alert_indicator_button_;
+   }
+ 
+-  void SetShouldShowDiscardIndicator(bool enabled);
+-
+   void UpdateInsets();
+ 
+ #if BUILDFLAG(ENABLE_GLIC)
+--- a/chrome/browser/ui/views/tabs/tab_icon.cc
++++ b/chrome/browser/ui/views/tabs/tab_icon.cc
+@@ -25,6 +25,8 @@
+ #include "chrome/common/webui_url_constants.h"
+ #include "components/feature_engagement/public/feature_constants.h"
+ #include "components/grit/components_scaled_resources.h"
++#include "components/performance_manager/public/user_tuning/prefs.h"
++#include "components/prefs/pref_service.h"
+ #include "content/public/common/url_constants.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/resource/resource_bundle.h"
+@@ -112,6 +114,13 @@ TabIcon::TabIcon()
+   DCHECK(!GetShowingLoadingAnimation());
+ 
+   SetProperty(views::kElementIdentifierKey, kTabIconElementId);
++
++  local_state_registrar_.Init(g_browser_process->local_state());
++  local_state_registrar_.Add(
++      performance_manager::user_tuning::prefs::kDiscardRingTreatmentEnabled,
++      base::BindRepeating(&TabIcon::OnDiscardRingTreatmentEnabledChanged,
++                          base::Unretained(this)));
++  OnDiscardRingTreatmentEnabledChanged();
+ }
+ 
+ TabIcon::~TabIcon() = default;
+@@ -197,9 +206,13 @@ void TabIcon::EnlargeDiscardIndicatorRad
+   increased_discard_indicator_radius_ = radius;
+ }
+ 
+-void TabIcon::SetShouldShowDiscardIndicator(bool enabled) {
+-  should_show_discard_indicator_ = enabled;
+-  bool show_discard_indicator = is_discarded_ && should_show_discard_indicator_;
++void TabIcon::OnDiscardRingTreatmentEnabledChanged() {
++  discard_ring_treatment_enabled_ =
++      g_browser_process->local_state()->GetBoolean(
++          performance_manager::user_tuning::prefs::
++              kDiscardRingTreatmentEnabled);
++  bool show_discard_indicator =
++      is_discarded_ && discard_ring_treatment_enabled_;
+   if (was_discard_indicator_shown_ != show_discard_indicator) {
+     was_discard_indicator_shown_ = show_discard_indicator;
+ 
+@@ -454,7 +467,8 @@ void TabIcon::SetIcon(const ui::ImageMod
+ 
+ void TabIcon::SetDiscarded(bool discarded) {
+   is_discarded_ = discarded;
+-  bool show_discard_indicator = is_discarded_ && should_show_discard_indicator_;
++  bool show_discard_indicator =
++      is_discarded_ && discard_ring_treatment_enabled_;
+   if (was_discard_indicator_shown_ != show_discard_indicator) {
+     was_discard_indicator_shown_ = show_discard_indicator;
+     favicon_size_animation_.SetSlideDuration(
+--- a/chrome/browser/ui/views/tabs/tab_icon.h
++++ b/chrome/browser/ui/views/tabs/tab_icon.h
+@@ -10,6 +10,7 @@
+ #include "base/time/time.h"
+ #include "chrome/browser/ui/tabs/tab_network_state.h"
+ #include "components/performance_manager/public/features.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "ui/base/interaction/element_tracker.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/base/models/image_model.h"
+@@ -83,7 +84,7 @@ class TabIcon : public views::View, publ
+   bool GetActiveStateForTesting() { return is_active_tab_; }
+ 
+   void EnlargeDiscardIndicatorRadius(int radius);
+-  void SetShouldShowDiscardIndicator(bool enabled);
++  void OnDiscardRingTreatmentEnabledChanged();
+ 
+  protected:
+   class CrashAnimation;
+@@ -195,7 +196,7 @@ class TabIcon : public views::View, publ
+   // due to a change in the discard status or a change to the pref, because
+   // we don't want to animate the discard ring in the latter case.
+   bool is_discarded_ = false;
+-  bool should_show_discard_indicator_ = true;
++  bool discard_ring_treatment_enabled_ = true;
+   bool was_discard_indicator_shown_ = false;
+ 
+   // Crash animation (in place of favicon). Lazily created since most of the
+@@ -211,6 +212,8 @@ class TabIcon : public views::View, publ
+   bool is_monochrome_favicon_ = false;
+ 
+   int increased_discard_indicator_radius_ = 0;
++
++  PrefChangeRegistrar local_state_registrar_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_TAB_ICON_H_
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -104,6 +104,7 @@ source_set("browser_tests") {
+     ":impl",
+     "//base",
+     "//chrome/browser",
++    "//chrome/browser/performance_manager/public/user_tuning",
+     "//chrome/browser/ui",
+     "//chrome/browser/ui:browser_element_identifiers",
+     "//chrome/browser/ui:ui_features",
+--- a/chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.cc
+@@ -124,21 +124,21 @@ void RootTabCollectionNode::OnTabStripMo
+     return;
+   }
+ 
+-  std::set<TabCollectionNode*> selection_changes;
++  std::set<TabCollectionNode*> changed_tabs;
+ 
+   if (selection.active_tab_changed()) {
+     if (selection.old_tab) {
+       TabCollectionNode* old_tab_node =
+           GetNodeForHandle(selection.old_tab->GetHandle());
+       if (old_tab_node) {
+-        selection_changes.insert(old_tab_node);
++        changed_tabs.insert(old_tab_node);
+       }
+     }
+     if (selection.new_tab) {
+       TabCollectionNode* new_tab_node =
+           GetNodeForHandle(selection.new_tab->GetHandle());
+       if (new_tab_node) {
+-        selection_changes.insert(new_tab_node);
++        changed_tabs.insert(new_tab_node);
+       }
+     }
+   }
+@@ -158,13 +158,22 @@ void RootTabCollectionNode::OnTabStripMo
+          base::STLSetUnion<SelectionHandles>(old_selections, new_selections)) {
+       TabCollectionNode* tab_node = GetNodeForHandle(tab_handle);
+       if (tab_node) {
+-        selection_changes.insert(tab_node);
++        changed_tabs.insert(tab_node);
+       }
+     }
+     selected_tabs_ = selected_tabs;
+   }
+ 
+-  for (auto* tab_node : selection_changes) {
++  if (change.type() == TabStripModelChange::kReplaced) {
++    // Discarding a tab causes a replace change notification to be sent. Add any
++    // replaced tab to the list of tabs to update.
++    auto* replace = change.GetReplace();
++    TabCollectionNode* tab_node = GetNodeForHandle(
++        tab_strip_model->GetTabAtIndex(replace->index)->GetHandle());
++    changed_tabs.insert(tab_node);
++  }
++
++  for (auto* tab_node : changed_tabs) {
+     tab_node->NotifyDataChanged();
+   }
+ }
