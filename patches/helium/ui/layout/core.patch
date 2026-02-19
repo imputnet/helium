@@ -53,15 +53,17 @@
    }
 --- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
-@@ -5,6 +5,7 @@
+@@ -5,7 +5,9 @@
  #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
  
  #include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
  #include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/common/chrome_features.h"
-@@ -31,14 +32,18 @@ bool GetDefaultTabSearchRightAligned() {
+ #include "chrome/common/pref_names.h"
+@@ -31,14 +33,23 @@ bool GetDefaultTabSearchRightAligned() {
  void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
    registry->RegisterBooleanPref(prefs::kTabSearchRightAligned,
                                  GetDefaultTabSearchRightAligned());
@@ -73,6 +75,11 @@
        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
 +  registry->RegisterBooleanPref(prefs::kHeliumVerticalRightAligned,
 +                                false);
++  registry->RegisterBooleanPref(prefs::kHeliumVerticalCollapsed,
++                                false);
++  registry->RegisterIntegerPref(
++      prefs::kHeliumVerticalUncollapsedWidth,
++      kVerticalTabStripDefaultUncollapsedWidth);
  }
  
  TabSearchPosition GetTabSearchPosition(const Profile* profile) {
@@ -85,7 +92,41 @@
  
 --- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
 +++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
-@@ -50,6 +50,8 @@ class VerticalTabStripStateController :
+@@ -7,15 +7,11 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+-#include "base/scoped_observation.h"
+-#include "chrome/browser/sessions/session_service_base_observer.h"
+-#include "chrome/browser/ui/browser_list_observer.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/sessions/core/session_id.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ 
+-class BrowserList;
+ class BrowserWindowInterface;
+ class PrefService;
+ class SessionService;
+@@ -26,8 +22,7 @@ class ActionItem;
+ 
+ namespace tabs {
+ 
+-class VerticalTabStripStateController : public SessionServiceBaseObserver,
+-                                        public BrowserListObserver {
++class VerticalTabStripStateController {
+  public:
+   DECLARE_USER_DATA(VerticalTabStripStateController);
+ 
+@@ -43,13 +38,15 @@ class VerticalTabStripStateController :
+       delete;
+   VerticalTabStripStateController& operator=(
+       const VerticalTabStripStateController&) = delete;
+-  ~VerticalTabStripStateController() override;
++  ~VerticalTabStripStateController();
+ 
+   static VerticalTabStripStateController* From(
+       BrowserWindowInterface* browser_window);
  
    bool ShouldDisplayVerticalTabs() const;
    void SetVerticalTabsEnabled(bool enabled);
@@ -94,17 +135,86 @@
  
    bool IsCollapsed() const;
    void SetCollapsed(bool collapsed);
+@@ -65,40 +62,24 @@ class VerticalTabStripStateController :
+   base::CallbackListSubscription RegisterOnStateChanged(
+       StateChangedCallback callback);
+ 
+-  static constexpr char kCollapsedKey[] = "vertical_tab_strip_collapsed";
+-  static constexpr char kUncollapsedWidthKey[] =
+-      "vertical_tab_strip_uncollapsed_width";
+-
+  private:
+   void NotifyStateChanged();
+ 
+-  // Updates the SessionService with the current state (collapsed status and
+-  // uncollapsed width) for the associated session ID.
+-  void UpdateSessionService();
++  // Updates pref-backed state (collapsed status and uncollapsed width).
++  void UpdatePrefs();
+ 
+   // Update the Collapse Button's Action Item (kActionToggleCollapseVertical)
+   // based on the Vertical Tab Strip's Collapse State.
+   void UpdateCollapseActionItem();
+ 
+-  // SessionServiceBase::SessionServiceBaseObserver:
+-  void OnDestroying(SessionServiceBase* service) override;
+-
+-  // BrowserListObserver:
+-  void OnBrowserAdded(Browser* browser) override;
+-
+   const raw_ptr<PrefService> pref_service_;
+   PrefChangeRegistrar pref_change_registrar_;
+   raw_ptr<actions::ActionItem> root_action_item_;
+-  raw_ptr<SessionService> session_service_;
+-  const SessionID session_id_;
+-  raw_ptr<BrowserWindowInterface> browser_window_;
+ 
+   VerticalTabStripState state_;
+ 
+   base::RepeatingCallbackList<void(VerticalTabStripStateController*)>
+       on_state_changed_callback_list_;
+-  base::ScopedObservation<BrowserList, BrowserListObserver>
+-      browser_list_observation_{this};
+   ui::ScopedUnownedUserData<VerticalTabStripStateController>
+       scoped_unowned_user_data_;
+ };
 --- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
 +++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
-@@ -15,6 +15,7 @@
+@@ -6,15 +6,11 @@
+ 
+ #include <optional>
+ 
+-#include "base/strings/string_number_conversions.h"
+-#include "base/strings/to_string.h"
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/sessions/session_service.h"
+-#include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
  #include "chrome/browser/ui/browser_actions.h"
- #include "chrome/browser/ui/browser_list.h"
+-#include "chrome/browser/ui/browser_list.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
  #include "chrome/common/pref_names.h"
  #include "chrome/grit/generated_resources.h"
  #include "components/prefs/pref_notifier_impl.h"
-@@ -45,8 +46,8 @@ VerticalTabStripStateController::Vertica
+@@ -32,58 +28,31 @@ VerticalTabStripStateController::Vertica
+     BrowserWindowInterface* browser_window,
+     PrefService* pref_service,
+     actions::ActionItem* root_action_item,
+-    SessionService* session_service,
+-    SessionID session_id,
+-    std::optional<bool> restored_state_collapsed,
+-    std::optional<int> restored_state_uncollapsed_width)
++    SessionService* /*session_service*/,
++    SessionID /*session_id*/,
++    std::optional<bool> /*restored_state_collapsed*/,
++    std::optional<int> /*restored_state_uncollapsed_width*/)
+     : pref_service_(pref_service),
+       root_action_item_(root_action_item),
+-      session_service_(session_service),
+-      session_id_(session_id),
+-      browser_window_(browser_window),
+       scoped_unowned_user_data_(browser_window->GetUnownedUserDataHost(),
                                  *this) {
    pref_change_registrar_.Init(pref_service_);
  
@@ -115,7 +225,49 @@
        base::BindRepeating(&VerticalTabStripStateController::NotifyStateChanged,
                            base::Unretained(this)));
  
-@@ -92,11 +93,24 @@ VerticalTabStripStateController* Vertica
+-  if (restored_state_collapsed.has_value()) {
+-    SetCollapsed(restored_state_collapsed.value());
+-  }
+-  if (restored_state_uncollapsed_width.has_value()) {
+-    SetUncollapsedWidth(restored_state_uncollapsed_width.value());
+-  }
++  state_.collapsed =
++      pref_service_->GetBoolean(prefs::kHeliumVerticalCollapsed);
++  state_.uncollapsed_width = pref_service_->GetInteger(
++      prefs::kHeliumVerticalUncollapsedWidth);
+ 
+   UpdateCollapseActionItem();
+-
+-  if (session_service_) {
+-    session_service_->AddObserver(this);
+-
+-    bool is_browser_ready = false;
+-    for (Browser* browser : *BrowserList::GetInstance()) {
+-      if (browser->session_id() == session_id_) {
+-        is_browser_ready = true;
+-        break;
+-      }
+-    }
+-
+-    if (!is_browser_ready) {
+-      browser_list_observation_.Observe(BrowserList::GetInstance());
+-    }
+-  }
+-
+   // TODO(crbug.com/455559992): Add uncollapsed text logic for collapse button.
+ }
+ 
+-VerticalTabStripStateController::~VerticalTabStripStateController() {
+-  if (session_service_) {
+-    session_service_->RemoveObserver(this);
+-    session_service_ = nullptr;
+-  }
+-}
++VerticalTabStripStateController::~VerticalTabStripStateController() = default;
+ 
+ // static
+ VerticalTabStripStateController* VerticalTabStripStateController::From(
+@@ -92,11 +61,24 @@ VerticalTabStripStateController* Vertica
  }
  
  bool VerticalTabStripStateController::ShouldDisplayVerticalTabs() const {
@@ -142,7 +294,29 @@
  }
  
  bool VerticalTabStripStateController::IsCollapsed() const {
-@@ -153,8 +167,10 @@ void VerticalTabStripStateController::Up
+@@ -137,24 +119,23 @@ VerticalTabStripStateController::Registe
+ }
+ 
+ void VerticalTabStripStateController::NotifyStateChanged() {
+-  UpdateSessionService();
++  UpdatePrefs();
+   UpdateCollapseActionItem();
+   on_state_changed_callback_list_.Notify(this);
+ }
+ 
+-void VerticalTabStripStateController::UpdateSessionService() {
+-  if (session_service_ && !browser_list_observation_.IsObserving()) {
+-    session_service_->AddWindowExtraData(session_id_, kCollapsedKey,
+-                                         base::ToString(state_.collapsed));
+-    session_service_->AddWindowExtraData(
+-        session_id_, kUncollapsedWidthKey,
+-        base::NumberToString(state_.uncollapsed_width));
+-  }
++void VerticalTabStripStateController::UpdatePrefs() {
++  pref_service_->SetBoolean(prefs::kHeliumVerticalCollapsed,
++                            state_.collapsed);
++  pref_service_->SetInteger(prefs::kHeliumVerticalUncollapsedWidth,
++                            state_.uncollapsed_width);
  }
  
  void VerticalTabStripStateController::UpdateCollapseActionItem() {
@@ -154,9 +328,29 @@
    const auto& text =
        IsCollapsed() ? IDS_EXPAND_VERTICAL_TABS : IDS_COLLAPSE_VERTICAL_TABS;
  
+@@ -171,19 +152,4 @@ void VerticalTabStripStateController::Up
+   }
+ }
+ 
+-void VerticalTabStripStateController::OnDestroying(
+-    SessionServiceBase* service) {
+-  if (service == session_service_) {
+-    session_service_->RemoveObserver(this);
+-    session_service_ = nullptr;
+-  }
+-}
+-
+-void VerticalTabStripStateController::OnBrowserAdded(Browser* browser) {
+-  if (browser == browser_window_->GetBrowserForMigrationOnly()) {
+-    browser_list_observation_.Reset();
+-    UpdateSessionService();
+-  }
+-}
+-
+ }  // namespace tabs
 --- a/chrome/common/pref_names.h
 +++ b/chrome/common/pref_names.h
-@@ -1313,6 +1313,13 @@ inline constexpr char kNewTabNextToActiv
+@@ -1313,6 +1313,21 @@ inline constexpr char kNewTabNextToActiv
  // cycling through tabs with Ctrl+Tab.
  inline constexpr char kTabCyclingMRU[] = "helium.browser.mru_tab_cycling";
  
@@ -167,10 +361,18 @@
 +inline constexpr char kHeliumVerticalRightAligned[] =
 +    "helium.browser.vertical_right_aligned";
 +
++// A boolean pref set to true if vertical tabs are collapsed.
++inline constexpr char kHeliumVerticalCollapsed[] =
++    "helium.browser.vertical_collapsed";
++
++// An integer pref that stores the vertical tab strip width.
++inline constexpr char kHeliumVerticalUncollapsedWidth[] =
++    "helium.browser.vertical_uncollapsed_width";
++
  // A boolean pref set to true if a Home button to open the Home pages should be
  // visible on the toolbar.
  inline constexpr char kShowHomeButton[] = "browser.show_home_button";
-@@ -1989,9 +1996,6 @@ inline constexpr char kGoogleSearchSideP
+@@ -1989,9 +2004,6 @@ inline constexpr char kGoogleSearchSideP
  // True when the tab search button is on the right side of the tab strip even in
  // RTL.
  inline constexpr char kTabSearchRightAligned[] = "tab_search.is_right_aligned";
@@ -403,3 +605,134 @@
    bool ShouldDrawWebAppFrameToolbar() const override;
    bool GetBorderlessModeEnabled() const override;
    gfx::Rect GetBoundsForTabStripRegionInBrowserView() const override;
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -12,8 +12,6 @@
+ 
+ #include "base/check_deref.h"
+ #include "base/feature_list.h"
+-#include "base/strings/string_number_conversions.h"
+-#include "base/strings/to_string.h"
+ #include "base/token.h"
+ #include "base/uuid.h"
+ #include "base/values.h"
+@@ -32,12 +30,10 @@
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/tab_group_action_context_desktop.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+-#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "chrome/common/buildflags.h"
+@@ -167,18 +163,7 @@ std::map<std::string, std::string> Brows
+ 
+ std::map<std::string, std::string>
+ BrowserLiveTabContext::GetExtraDataForWindow() const {
+-  std::map<std::string, std::string> data;
+-
+-  auto* controller =
+-      tabs::VerticalTabStripStateController::From(&browser_.get());
+-  if (controller) {
+-    data[tabs::VerticalTabStripStateController::kCollapsedKey] =
+-        base::ToString(controller->IsCollapsed());
+-    data[tabs::VerticalTabStripStateController::kUncollapsedWidthKey] =
+-        base::NumberToString(controller->GetUncollapsedWidth());
+-  }
+-
+-  return data;
++  return std::map<std::string, std::string>();
+ }
+ 
+ std::optional<tab_groups::TabGroupId> BrowserLiveTabContext::GetTabGroupForTab(
+@@ -402,7 +387,7 @@ sessions::LiveTabContext* BrowserLiveTab
+     ui::mojom::WindowShowState show_state,
+     const std::string& workspace,
+     const std::string& user_title,
+-    const std::map<std::string, std::string>& extra_data) {
++    const std::map<std::string, std::string>& /*extra_data*/) {
+   std::unique_ptr<Browser::CreateParams> create_params;
+   if (ShouldCreateAppWindowForAppName(profile, app_name)) {
+     // Only trusted app popup windows should ever be restored.
+@@ -427,26 +412,6 @@ sessions::LiveTabContext* BrowserLiveTab
+   create_params->initial_workspace = workspace;
+   create_params->user_title = user_title;
+ 
+-  if (tabs::IsVerticalTabsFeatureEnabled()) {
+-    if (extra_data.contains(
+-            tabs::VerticalTabStripStateController::kCollapsedKey)) {
+-      create_params->vertical_tab_strip_collapsed =
+-          extra_data.at(tabs::VerticalTabStripStateController::kCollapsedKey) ==
+-          "true";
+-    }
+-
+-    if (extra_data.contains(
+-            tabs::VerticalTabStripStateController::kUncollapsedWidthKey)) {
+-      int uncollapsed_width = 0;
+-      if (base::StringToInt(
+-              extra_data.at(
+-                  tabs::VerticalTabStripStateController::kUncollapsedWidthKey),
+-              &uncollapsed_width)) {
+-        create_params->vertical_tab_strip_uncollapsed_width = uncollapsed_width;
+-      }
+-    }
+-  }
+-
+   Browser* browser = Browser::Create(*create_params.get());
+ 
+   return browser->GetFeatures().live_tab_context();
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -65,12 +65,10 @@
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ #include "chrome/browser/ui/startup/startup_types.h"
+-#include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+-#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/waap/initial_webui_window_metrics_manager.h"
+ #include "chrome/browser/ui/webui/whats_new/whats_new_util.h"
+@@ -1135,7 +1133,7 @@ class SessionRestoreImpl : public Browse
+       ui::mojom::WindowShowState show_state,
+       const std::string& app_name,
+       const std::string& user_title,
+-      const std::map<std::string, std::string>& extra_data,
++      const std::map<std::string, std::string>& /*extra_data*/,
+       int32_t restore_id) {
+     Browser::CreateParams params(type, profile_, false);
+     params.initial_bounds = bounds;
+@@ -1161,26 +1159,6 @@ class SessionRestoreImpl : public Browse
+     params.initial_visible_on_all_workspaces_state = visible_on_all_workspaces;
+     params.creation_source = Browser::CreationSource::kSessionRestore;
+ 
+-    if (tabs::IsVerticalTabsFeatureEnabled()) {
+-      if (extra_data.contains(
+-              tabs::VerticalTabStripStateController::kCollapsedKey)) {
+-        params.vertical_tab_strip_collapsed =
+-            extra_data.at(
+-                tabs::VerticalTabStripStateController::kCollapsedKey) == "true";
+-      }
+-
+-      if (extra_data.contains(
+-              tabs::VerticalTabStripStateController::kUncollapsedWidthKey)) {
+-        int uncollapsed_width = 0;
+-        if (base::StringToInt(
+-                extra_data.at(tabs::VerticalTabStripStateController::
+-                                  kUncollapsedWidthKey),
+-                &uncollapsed_width)) {
+-          params.vertical_tab_strip_uncollapsed_width = uncollapsed_width;
+-        }
+-      }
+-    }
+-
+     base::TimeTicks now = base::TimeTicks::Now();
+     Browser* browser = Browser::Create(params);
+     if (auto* manager = InitialWebUIWindowMetricsManager::From(browser)) {
