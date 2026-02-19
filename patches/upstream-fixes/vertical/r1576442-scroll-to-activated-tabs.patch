@@ -1,0 +1,323 @@
+From 215ae0715affb24f938d45d4f5935bb29ecd9c38 Mon Sep 17 00:00:00 2001
+From: thomas lukaszewicz <tluk@chromium.org>
+Date: Thu, 29 Jan 2026 02:02:10 -0800
+Subject: [PATCH] [Vertical Tabs] Add support for scrolling to activated tabs
+
+This CL adds support for scrolling into view activated tabs across
+both pinned and unpinned collections.
+
+This CL handles cases where tabs may be present in nested collections
+(such as tab groups or split tabs).
+
+A static method was added to the animating layout manager that allows
+querying for view target bounds, independent of any animations that
+may currently be in progress.
+
+See video below
+http://screencast/cast/NDc0Nzk2OTUzMzMxMzAyNHwxNTA4OTI3Zi1mNw
+
+Bug: 459824840, 475613765
+Change-Id: I69fa14c6c515db50583bc0b470e043077843c888
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/7530416
+Reviewed-by: Eshwar Stalin <estalin@chromium.org>
+Commit-Queue: Tom Lukaszewicz <tluk@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1576442}
+---
+
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -431,6 +431,7 @@ views::View* VerticalTabStripRegionView:
+                                views::MaximumFlexSizeRule::kUnbounded));
+   tab_strip_view_->SetProperty(views::kMarginsKey,
+                                gfx::Insets::VH(kRegionVerticalPadding, 0));
++  tab_strip_view_->InitializeTabStrip(*tab_strip_model_);
+   std::optional<size_t> separator_index = GetIndexOf(top_button_separator_);
+   CHECK(separator_index.has_value());
+   ReorderChildView(tab_strip_view_, separator_index.value() + 1);
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -16,6 +16,7 @@ source_set("vertical") {
+     "vertical_split_tab_view.h",
+     "vertical_tab_strip_bottom_container.h",
+     "vertical_tab_strip_top_container.h",
++    "vertical_tab_strip_utils.h",
+     "vertical_tab_strip_view.h",
+     "vertical_unpinned_tab_container_view.h",
+   ]
+@@ -52,6 +53,7 @@ source_set("impl") {
+     "vertical_tab_group_view.h",
+     "vertical_tab_strip_bottom_container.cc",
+     "vertical_tab_strip_top_container.cc",
++    "vertical_tab_strip_utils.cc",
+     "vertical_tab_strip_view.cc",
+     "vertical_tab_view.cc",
+     "vertical_tab_view.h",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_utils.cc
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_utils.h"
++
++#include "chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h"
++#include "ui/views/view.h"
++#include "ui/views/view_utils.h"
++
++gfx::Rect GetVerticalTabStripViewTargetBounds(const views::View* view) {
++  CHECK(view);
++
++  const views::View* const parent = view->parent();
++  const auto has_animating_layout_manager = [](const views::View* container) {
++    // New clients of `TabCollectionAnimatingLayoutManager` should be added to
++    // this list as usage expands.
++    return views::IsViewClass<VerticalPinnedTabContainerView>(container) ||
++           views::IsViewClass<VerticalUnpinnedTabContainerView>(container) ||
++           views::IsViewClass<VerticalTabGroupView>(container);
++  };
++  if (!parent || !has_animating_layout_manager(parent)) {
++    return view->bounds();
++  }
++
++  const auto* const layout_manager =
++      static_cast<const TabCollectionAnimatingLayoutManager*>(
++          parent->GetLayoutManager());
++  CHECK(layout_manager);
++
++  const views::ChildLayout* const view_layout =
++      layout_manager->target_layout().GetLayoutFor(view);
++  return view_layout ? view_layout->bounds : view->bounds();
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_utils.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_UTILS_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_UTILS_H_
++
++#include "ui/gfx/geometry/rect.h"
++
++namespace views {
++class View;
++}
++
++// Returns the target bounds for the provided `view` in the vertical tab strip
++// hierarchy. For views managed by `TabCollectionAnimatingLayoutManager` this
++// may differ from current `View::bounds()` due to animated transitions. For
++// other views the current bounds will be returned.
++gfx::Rect GetVerticalTabStripViewTargetBounds(const views::View* view);
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_UTILS_H_
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
+@@ -9,8 +9,10 @@
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_utils.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_id.h"
+@@ -22,6 +24,7 @@
+ #include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_tracker.h"
+ #include "ui/views/view_utils.h"
+ 
+ namespace {
+@@ -38,7 +41,8 @@ void SetScrollViewProperties(views::Scro
+ }
+ }  // namespace
+ 
+-VerticalTabStripView::VerticalTabStripView(TabCollectionNode* collection_node) {
++VerticalTabStripView::VerticalTabStripView(TabCollectionNode* collection_node)
++    : collection_node_(collection_node) {
+   SetLayoutManager(std::make_unique<views::DelegatingLayoutManager>(this));
+   SetProperty(views::kElementIdentifierKey, kTabStripElementId);
+ 
+@@ -59,6 +63,10 @@ VerticalTabStripView::VerticalTabStripVi
+ 
+   collection_node->set_remove_child_from_node(base::BindRepeating(
+       &VerticalTabStripView::RemoveScrollViewContents, base::Unretained(this)));
++
++  node_destroyed_subscription_ =
++      collection_node_->RegisterWillDestroyCallback(base::BindOnce(
++          &VerticalTabStripView::ResetCollectionNode, base::Unretained(this)));
+ }
+ 
+ VerticalTabStripView::~VerticalTabStripView() = default;
+@@ -138,6 +146,33 @@ views::ProposedLayout VerticalTabStripVi
+   return layouts;
+ }
+ 
++void VerticalTabStripView::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  if (collection_node_ && selection.active_tab_changed() && selection.new_tab) {
++    TabCollectionNode* activated_node =
++        collection_node_->GetNodeForHandle(selection.new_tab->GetHandle());
++    CHECK(activated_node);
++
++    if (pinned_tabs_container_view_->Contains(activated_node->view())) {
++      pinned_tabs_scroll_view_->RegisterNextSuccessfulFramePostLayoutCallback(
++          base::BindOnce(
++              &VerticalTabStripView::DidPresentFramePostActivation,
++              base::Unretained(this), pinned_tabs_scroll_view_,
++              std::make_unique<views::ViewTracker>(activated_node->view())));
++    } else {
++      // Views must either be in the pinned or unpinned view trees.
++      DCHECK(unpinned_tabs_container_view_->Contains(activated_node->view()));
++      unpinned_tabs_scroll_view_->RegisterNextSuccessfulFramePostLayoutCallback(
++          base::BindOnce(
++              &VerticalTabStripView::DidPresentFramePostActivation,
++              base::Unretained(this), unpinned_tabs_scroll_view_,
++              std::make_unique<views::ViewTracker>(activated_node->view())));
++    }
++  }
++}
++
+ VerticalPinnedTabContainerView* VerticalTabStripView::GetPinnedTabsContainer() {
+   return pinned_tabs_container_view_;
+ }
+@@ -194,6 +229,12 @@ bool VerticalTabStripView::IsPositionInW
+   return true;
+ }
+ 
++void VerticalTabStripView::InitializeTabStrip(TabStripModel& tab_strip_model) {
++  // TODO(crbug.com/452120900): TabStripModelObserver auto-unregisters in its
++  // destructor.
++  tab_strip_model.AddObserver(this);
++}
++
+ views::View* VerticalTabStripView::AddScrollViewContents(
+     std::unique_ptr<views::View> view) {
+   if (auto* container =
+@@ -226,5 +267,46 @@ void VerticalTabStripView::RemoveScrollV
+   NOTREACHED();
+ }
+ 
++void VerticalTabStripView::ResetCollectionNode() {
++  collection_node_ = nullptr;
++}
++
++void VerticalTabStripView::DidPresentFramePostActivation(
++    views::ScrollView* scroll_view,
++    std::unique_ptr<views::ViewTracker> view_tracker) {
++  views::View* const activated_view = view_tracker->view();
++
++  // Guard against views being removed from the tree between frames.
++  if (!activated_view || !Contains(activated_view)) {
++    return;
++  }
++
++  // Get view bounds in its contents coordinates.
++  gfx::Rect activated_view_bounds =
++      GetVerticalTabStripViewTargetBounds(activated_view);
++
++  // Proceed up the hierarchy until the content view is reached, iteratively
++  // adjusting target view bounds.
++  for (views::View* v = activated_view->parent(); v != scroll_view->contents();
++       v = v->parent()) {
++    activated_view_bounds =
++        views::View::ConvertRectToTarget(v, v->parent(), activated_view_bounds);
++  }
++
++  // Get the visible bounds of the content view.
++  const gfx::Rect visible_contents_rect = scroll_view->GetVisibleRect();
++
++  // Determine the adjustment required to fit the activated view into the
++  // visible content view bounds.
++  gfx::Rect adjusted_activated_view_bounds = activated_view_bounds;
++  adjusted_activated_view_bounds.AdjustToFit(visible_contents_rect);
++
++  // Calculate the required scroll offset for the visible content bounds (the
++  // reverse of the activated view adjustment).
++  int diff = activated_view_bounds.y() - adjusted_activated_view_bounds.y();
++
++  scroll_view->ScrollByOffset({0, static_cast<float>(diff)});
++}
++
+ BEGIN_METADATA(VerticalTabStripView)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h
+@@ -6,11 +6,13 @@
+ #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_VIEW_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/view.h"
+ 
+ class TabCollectionNode;
++class TabStripModel;
+ class VerticalPinnedTabContainerView;
+ class VerticalUnpinnedTabContainerView;
+ 
+@@ -18,11 +20,13 @@ namespace views {
+ class ScrollView;
+ class Separator;
+ class View;
++class ViewTracker;
+ }  // namespace views
+ 
+ // Container that holds the pinned and unpinned tabs in the vertical tab strip.
+ class VerticalTabStripView final : public views::View,
+-                                   public views::LayoutDelegate {
++                                   public views::LayoutDelegate,
++                                   public TabStripModelObserver {
+   METADATA_HEADER(VerticalTabStripView, views::View)
+ 
+  public:
+@@ -39,14 +43,30 @@ class VerticalTabStripView final : publi
+ 
+   bool IsPositionInWindowCaption(const gfx::Point& point);
+ 
++  void InitializeTabStrip(TabStripModel& tab_strip_model);
++
+   // LayoutDelegate:
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override;
+ 
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++
+  private:
+   views::View* AddScrollViewContents(std::unique_ptr<views::View> view);
+   void RemoveScrollViewContents(views::View* view);
++  void ResetCollectionNode();
++
++  // Called when the compositor has successfully presented the next frame
++  // after an activation of `tracked_view` in `scroll_view`.
++  void DidPresentFramePostActivation(
++      views::ScrollView* scroll_view,
++      std::unique_ptr<views::ViewTracker> tracked_view);
+ 
++  raw_ptr<TabCollectionNode> collection_node_;
+   raw_ptr<views::ScrollView> pinned_tabs_scroll_view_ = nullptr;
+   raw_ptr<VerticalPinnedTabContainerView> pinned_tabs_container_view_ = nullptr;
+   raw_ptr<views::Separator> tabs_separator_ = nullptr;
+@@ -54,6 +74,7 @@ class VerticalTabStripView final : publi
+   raw_ptr<VerticalUnpinnedTabContainerView> unpinned_tabs_container_view_ =
+       nullptr;
+   bool is_collapsed_ = false;
++  base::CallbackListSubscription node_destroyed_subscription_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_VIEW_H_
