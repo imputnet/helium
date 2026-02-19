@@ -80,7 +80,7 @@
  // AIPageContent.
 --- /dev/null
 +++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.cc
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,259 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -91,9 +91,11 @@
 +
 +#include "third_party/blink/renderer/core/helium_noise/canvas_noising_helper.h"
 +
++#include <algorithm>
 +#include <array>
 +#include <cstddef>
 +#include <cstdint>
++#include <vector>
 +
 +#include "base/check_op.h"
 +#include "base/containers/span.h"
@@ -115,8 +117,10 @@
 +
 +namespace {
 +
-+constexpr uint8_t kMaxClosePixelDelta = 10u;
-+constexpr uint8_t kMaxNoisePerChannel = 3u;
++constexpr uint8_t kNearbyPixelMaxOffset = 2u;
++constexpr int kMaxSharedRgbNoise = 1;
++constexpr int kMaxIndependentRgbNoise = 1;
++constexpr int kMaxAlphaNoise = 1;
 +constexpr uint8_t kChannelsPerPixel = 4u;
 +constexpr std::array<uint8_t, 4u> kEmptyPixel({0, 0, 0, 0});
 +
@@ -135,45 +139,71 @@
 +
 +// Returns two random pixel locations; one close to the offset and one
 +// randomly selected from the entire canvas.
-+const std::pair<PixelLocation, PixelLocation> GetRandomPixelLocations(
++std::pair<PixelLocation, PixelLocation> GetRandomPixelLocations(
 +    HeliumNoiseHash& token_hash,
 +    const PixelLocation offset,
 +    const int width,
 +    const int height) {
 +  std::pair<PixelLocation, PixelLocation> pixel_locations;
-+  // Uses 2 * log2(kMaxClosePixelDelta*2+1) = 8 bits from hash.
++  // Uses at most 2 * bit_width(kNearbyPixelMaxOffset * 2) bits from hash.
 +  pixel_locations.first = {
-+      offset.x + token_hash.GetValueBelow(kMaxClosePixelDelta * 2) -
-+          kMaxClosePixelDelta + 1,
-+      offset.y + token_hash.GetValueBelow(kMaxClosePixelDelta * 2) -
-+          kMaxClosePixelDelta + 1};
++      offset.x + token_hash.GetValueBelow(kNearbyPixelMaxOffset * 2) -
++          kNearbyPixelMaxOffset + 1,
++      offset.y + token_hash.GetValueBelow(kNearbyPixelMaxOffset * 2) -
++          kNearbyPixelMaxOffset + 1};
 +  // x and y might be negative or go beyond the width or height here, so we need
 +  // to clamp them.
 +  ClampPixelLocation(&pixel_locations.first, width, height);
-+  // Uses max 2 * log2(kMaximumCanvasSize) = 40 bits from hash.
++  // Uses at most bit_width(width) + bit_width(height) bits from hash.
 +  pixel_locations.second = {token_hash.GetValueBelow(width),
 +                            token_hash.GetValueBelow(height)};
-+  // Used at most 48 bits from hash
++  // Uses at most 32 bits from hash.
 +  return pixel_locations;
++}
++
++int GetSignedNoiseValue(HeliumNoiseHash& token_hash, int max_abs_noise) {
++  if (max_abs_noise <= 0) {
++    return 0;
++  }
++  return token_hash.GetValueBelow(max_abs_noise * 2 + 1) - max_abs_noise;
 +}
 +
 +void HeliumNoisePixel(base::span<uint8_t> pixel, HeliumNoiseHash& token_hash) {
 +  base::SpanWriter writer(base::as_writable_bytes(pixel));
++  const int shared_rgb_noise =
++      GetSignedNoiseValue(token_hash, kMaxSharedRgbNoise);
 +  for (int i = 0; i < kChannelsPerPixel; ++i) {
 +    int channel_value = pixel[i];
++
++    const bool is_alpha = i == kChannelsPerPixel - 1;
++
++    // Keep alpha limits stable.
++    if (is_alpha && (channel_value == 0 || channel_value == 255)) {
++      writer.WriteU8LittleEndian(base::checked_cast<uint8_t>(channel_value));
++      continue;
++    }
++
++    const int maxNoisePerChannel =
++        is_alpha ? kMaxAlphaNoise
++                 : kMaxSharedRgbNoise + kMaxIndependentRgbNoise;
++
 +    // Clamp min- and maxNoisedVal to [0, 255] and [1, 255] for the alpha
 +    // channel if it was non-zero before.
-+    int lowerLimit = (i == kChannelsPerPixel - 1 && channel_value > 0) ? 1 : 0;
-+    int minNoisedVal = channel_value <= kMaxNoisePerChannel
-+                           ? lowerLimit
-+                           : channel_value - kMaxNoisePerChannel;
-+    int maxNoisedVal = channel_value >= 255 - kMaxNoisePerChannel
-+                           ? 255
-+                           : channel_value + kMaxNoisePerChannel;
-+    int noise = token_hash.GetValueBelow(
-+        std::min(kMaxNoisePerChannel * 2 + 1, maxNoisedVal - minNoisedVal + 1));
-+    writer.WriteU8LittleEndian(
-+        base::checked_cast<uint8_t>(minNoisedVal + noise));
++    const int lowerLimit = (is_alpha && channel_value > 0) ? 1 : 0;
++    int minNoisedVal = std::max(lowerLimit, channel_value - maxNoisePerChannel);
++    int maxNoisedVal = std::min(255, channel_value + maxNoisePerChannel);
++
++    int noise = 0;
++    if (is_alpha) {
++      noise = GetSignedNoiseValue(token_hash, kMaxAlphaNoise);
++    } else {
++      noise = shared_rgb_noise +
++              GetSignedNoiseValue(token_hash, kMaxIndependentRgbNoise);
++    }
++
++    const int noised_value =
++        std::clamp(channel_value + noise, minNoisedVal, maxNoisedVal);
++    writer.WriteU8LittleEndian(base::checked_cast<uint8_t>(noised_value));
 +  }
 +}
 +
@@ -186,9 +216,19 @@
 +      .first<4u>();
 +}
 +
++base::span<const uint8_t, 4u> GetPixelAt(
++    const int x,
++    const int y,
++    const int width,
++    const base::span<const uint8_t> pixels) {
++  return pixels
++      .subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++      .first<4u>();
++}
++
 +uint64_t GetValueFromPixelLocations(
 +    const std::pair<PixelLocation, PixelLocation> locations,
-+    const base::span<uint8_t> pixels,
++    const base::span<const uint8_t> pixels,
 +    int width) {
 +  uint64_t result = 0u;
 +  result |= base::U32FromLittleEndian(
@@ -199,7 +239,7 @@
 +  return result;
 +}
 +
-+void CopyPixelValue(const base::span<uint8_t> from_pixel,
++void CopyPixelValue(const base::span<const uint8_t> from_pixel,
 +                    base::span<uint8_t> to_pixel) {
 +  base::SpanWriter writer(base::as_writable_bytes(to_pixel));
 +  writer.Write(from_pixel.first<kChannelsPerPixel>());
@@ -209,56 +249,35 @@
 +// source for pseudo-randomness. This function assumes that there are 4
 +// channels per pixel.
 +void HeliumNoisePixels(const HeliumNoiseHash& token_hash,
-+                 base::span<uint8_t> pixels,
-+                 const int width,
-+                 const int height) {
++                       base::span<uint8_t> pixels,
++                       const int width,
++                       const int height) {
 +  CHECK_EQ(pixels.size(),
 +           static_cast<size_t>(width * height * kChannelsPerPixel));
 +
-+  const size_t row_size = width * kChannelsPerPixel;
-+  std::vector<uint8_t> row1(row_size);
-+  std::vector<uint8_t> row2(row_size);
-+  base::span<uint8_t> unnoised_previous_row(row1);
-+  base::span<uint8_t> unnoised_current_row(row2);
++  std::vector<uint8_t> source_pixel_storage(pixels.begin(), pixels.end());
++  base::span<const uint8_t> source_pixels(source_pixel_storage);
 +
 +  for (int y = 0; y < height; ++y) {
-+    unnoised_current_row.copy_from(pixels.subspan(y * row_size, row_size));
 +    for (int x = 0; x < width; ++x) {
-+      auto pixel = GetPixelAt(x, y, width, pixels);
-+      if (pixel == kEmptyPixel) {
++      auto source_pixel = GetPixelAt(x, y, width, source_pixels);
++      if (source_pixel == kEmptyPixel) {
 +        continue;
 +      }
-+      if (y > 0 && x > 0 &&
-+          GetPixelAt(x - 1, 0, width, unnoised_previous_row) == pixel) {
-+        // same top-left pixel, copy.
-+        CopyPixelValue(GetPixelAt(x - 1, y - 1, width, pixels), pixel);
-+      } else if (y > 0 &&
-+                 GetPixelAt(x, 0, width, unnoised_previous_row) == pixel) {
-+        // same top pixel, copy.
-+        CopyPixelValue(GetPixelAt(x, y - 1, width, pixels), pixel);
-+      } else if (y > 0 && x < width - 1 &&
-+                 GetPixelAt(x + 1, 0, width, unnoised_previous_row) == pixel) {
-+        // same top-right pixel, copy.
-+        CopyPixelValue(GetPixelAt(x + 1, y - 1, width, pixels), pixel);
-+      } else if (x > 0 &&
-+                 GetPixelAt(x - 1, 0, width, unnoised_current_row) == pixel) {
-+        // same left pixel, copy.
-+        CopyPixelValue(GetPixelAt(x - 1, y, width, pixels), pixel);
-+      } else {
-+        // otherwise, noise the pixel.
-+        HeliumNoiseHash hash_copy = token_hash;
-+        hash_copy.Update(base::U32FromLittleEndian(pixel));
-+        // GetRandomPixelLocations consumes at most 46 bits from hash.
-+        const std::pair<PixelLocation, PixelLocation> other_pixels =
-+            GetRandomPixelLocations(hash_copy, {x, y}, width, height);
-+        hash_copy.Update(
-+            GetValueFromPixelLocations(other_pixels, pixels, width));
-+        // HeliumNoisePixel consumes 12 bits from hash
-+        HeliumNoisePixel(pixel, hash_copy);
-+      }
++      auto pixel = GetPixelAt(x, y, width, pixels);
++      CopyPixelValue(source_pixel, pixel);
++
++      HeliumNoiseHash hash_copy = token_hash;
++      hash_copy.Update((static_cast<uint64_t>(y) << 32) |
++                       static_cast<uint32_t>(x));
++      hash_copy.Update(base::U32FromLittleEndian(source_pixel));
++      // GetRandomPixelLocations consumes at most 32 bits from hash.
++      const std::pair<PixelLocation, PixelLocation> other_pixels =
++          GetRandomPixelLocations(hash_copy, {x, y}, width, height);
++      hash_copy.Update(
++          GetValueFromPixelLocations(other_pixels, source_pixels, width));
++      HeliumNoisePixel(pixel, hash_copy);
 +    }
-+    // Previous can be overwritten (new current). Current is the now previous.
-+    std::swap(unnoised_previous_row, unnoised_current_row);
 +  }
 +}
 +
@@ -306,12 +325,12 @@
 +  base::span<uint8_t> modify_pixels =
 +      gfx::SkPixmapToWritableSpan(pixmap_to_noise);
 +
-+  auto token_hash = HeliumNoiseHash(
-+      execution_context->GetHeliumNoiseTokens().at(
-+        HeliumNoiseFeature::kCanvas));
++  auto token_hash =
++      HeliumNoiseHash(execution_context->GetHeliumNoiseTokens().at(
++          HeliumNoiseFeature::kCanvas));
 +
 +  HeliumNoisePixels(token_hash, modify_pixels, pixmap_to_noise.width(),
-+              pixmap_to_noise.height());
++                    pixmap_to_noise.height());
 +
 +  auto noised_image = bm.asImage();
 +  snapshot = blink::UnacceleratedStaticBitmapImage::Create(
