@@ -1,0 +1,170 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -11902,6 +11902,9 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_DUPLICATE" desc="The label of the 'Duplicate' Tab context menu item.">
+           Duplicate
+         </message>
++        <message name="IDS_TAB_CXMENU_HIBERNATE" desc="The label of the 'Hibernate' Tab context menu item.">
++          Hibernate
++        </message>
+         <message name="IDS_TAB_CXMENU_CLOSETAB" desc="The label of the tab context menu item for closing one or more tabs.">
+           Close
+         </message>
+@@ -12021,6 +12024,9 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_DUPLICATE" desc="In Title Case: The label of the 'Duplicate' Tab context menu item.">
+           Duplicate
+         </message>
++        <message name="IDS_TAB_CXMENU_HIBERNATE" desc="In Title Case: The label of the 'Hibernate' Tab context menu item.">
++          Hibernate
++        </message>
+         <message name="IDS_TAB_CXMENU_CLOSETAB" desc="In Title Case: The label of the tab context menu item for closing one or more tabs.">
+           Close
+         </message>
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -790,6 +790,7 @@ class TabStripModel {
+     CommandGlicSwitchToRecentConversation,
+     CommandGlicUnshare,
+ #endif
++    CommandDiscard,
+     CommandLast
+   };
+   // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -45,8 +45,11 @@
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/extensions/tab_helper.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
++#include "chrome/browser/performance_manager/policies/discard_eligibility_policy.h"
++#include "chrome/browser/performance_manager/public/user_tuning/user_tuning_utils.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/reading_list/reading_list_model_factory.h"
++#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
+ #include "chrome/browser/resource_coordinator/tab_helper.h"
+ #include "chrome/browser/send_tab_to_self/send_tab_to_self_util.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_utils.h"
+@@ -91,6 +94,7 @@
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/content_settings/core/common/content_settings_types.h"
+ #include "components/feature_engagement/public/feature_constants.h"
++#include "components/performance_manager/public/performance_manager.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/reading_list/core/reading_list_model.h"
+ #include "components/tab_groups/tab_group_id.h"
+@@ -164,6 +168,53 @@ bool ShouldForgetOpenersForTransition(ui
+                                       ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
+ }
+ 
++using DiscardEligibilityPolicy =
++    performance_manager::policies::DiscardEligibilityPolicy;
++using CanDiscardResult = performance_manager::policies::CanDiscardResult;
++
++DiscardEligibilityPolicy* GetDiscardEligibilityPolicy() {
++  if (!performance_manager::PerformanceManager::IsAvailable()) {
++    return nullptr;
++  }
++  return DiscardEligibilityPolicy::GetFromGraph(
++      performance_manager::PerformanceManager::GetGraph());
++}
++
++base::WeakPtr<performance_manager::PageNode> GetDiscardCandidatePageNode(
++    const TabStripModel* tab_strip_model,
++    int index,
++    DiscardEligibilityPolicy* eligibility_policy) {
++  CHECK(eligibility_policy);
++
++  // The active tab can't be discarded.
++  if (index == tab_strip_model->active_index()) {
++    return nullptr;
++  }
++
++  WebContents* const contents = tab_strip_model->GetWebContentsAt(index);
++  if (!contents || contents->WasDiscarded()) {
++    return nullptr;
++  }
++
++  base::WeakPtr<performance_manager::PageNode> page_node =
++      performance_manager::PerformanceManager::
++        GetPrimaryPageNodeForWebContents(contents);
++
++  if (!page_node) {
++    return nullptr;
++  }
++
++  CanDiscardResult can_discard_result = eligibility_policy->CanDiscard(
++      page_node.get(), ::mojom::LifecycleUnitDiscardReason::PROACTIVE,
++      base::TimeDelta());
++
++  if (can_discard_result != CanDiscardResult::kEligible) {
++    return nullptr;
++  }
++
++  return page_node;
++}
++
+ }  // namespace
+ 
+ TabGroupModelFactory::TabGroupModelFactory() {
+@@ -2488,6 +2539,21 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandReload:
+       return delegate_->CanReload();
+ 
++    case CommandDiscard: {
++      auto* const eligibility_policy = GetDiscardEligibilityPolicy();
++      if (!eligibility_policy) {
++        return false;
++      }
++
++      const std::vector<int> indices = GetIndicesForCommand(context_index);
++      for (int index : indices) {
++        if (GetDiscardCandidatePageNode(this, index, eligibility_policy)) {
++          return true;
++        }
++      }
++      return false;
++    }
++
+     case CommandCloseOtherTabs:
+     case CommandCloseTabsToRight: {
+       return !GetIndicesClosedByCommand(context_index, command_id).empty();
+@@ -2668,6 +2734,27 @@ void TabStripModel::ExecuteContextMenuCo
+       }
+       break;
+     }
++
++    case CommandDiscard: {
++      auto* const eligibility_policy = GetDiscardEligibilityPolicy();
++      if (!eligibility_policy) {
++        break;
++      }
++
++      const std::vector<int> indices = GetIndicesForCommand(context_index);
++      for (int index : indices) {
++        base::WeakPtr<performance_manager::PageNode> page_node =
++            GetDiscardCandidatePageNode(this, index, eligibility_policy);
++        if (!page_node) {
++          continue;
++        }
++
++        performance_manager::user_tuning::DiscardPage(
++            page_node.get(), ::mojom::LifecycleUnitDiscardReason::PROACTIVE,
++            /*ignore_minimum_time_in_background=*/true);
++      }
++      break;
++    }
+ 
+     case CommandCloseTab: {
+       base::UmaHistogramCounts1000("Tab.ContextMenu.CloseTab.SelectedTabsCount",
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -375,6 +375,9 @@ void TabMenuModel::Build(TabStripModel*
+   }
+ 
+   AddSeparator(ui::NORMAL_SEPARATOR);
++
++  AddItemWithStringId(TabStripModel::CommandDiscard, IDS_TAB_CXMENU_HIBERNATE);
++
+   AddItemWithStringId(TabStripModel::CommandCloseTab, IDS_TAB_CXMENU_CLOSETAB);
+   AddItemWithStringId(TabStripModel::CommandCloseOtherTabs,
+                       IDS_TAB_CXMENU_CLOSEOTHERTABS);
