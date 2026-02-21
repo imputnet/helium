@@ -11,41 +11,19 @@ from pathlib import Path
 import argparse
 import tarfile
 import os
-import re
 import io
 
-REPLACEMENT_REGEXES_STR = [
-    # stuff we don't want to replace
-    (r'(\w+) Root Program', r'\1_unreplace Root Program'),
-    (r'(\w+) Web( S|s)tore', r'\1_unreplace Web Store'),
-    (r'(\w+) Remote Desktop', r'\1_unreplace Remote Desktop'),
-    (r'("BEGIN_LINK_CHROMIUM")(.*?Chromium)(.*?<ph name="END_LINK_CHROMIUM")', r'\1\2_unreplace\3'),
+import name_substitution_utils as util
 
-    # main replacement(s)
-    (r'(?:Google )?Chrom(e|ium)(?!\w)', r'Helium'),
-
-    # post-replacement cleanup
-    (r'((?:Google )?Chrom(e|ium))_unreplace', r'\1'),
-    (r'_unreplace', r'')
-]
-
-REPLACEMENT_REGEXES = list(map(lambda line: (re.compile(line[0]), line[1]),
-                               REPLACEMENT_REGEXES_STR))
-
-IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios']
-
-
-def replace(text):
-    """Replaces instances of Chrom(e | ium) with Helium, where desired"""
-    for regex, replacement in REPLACEMENT_REGEXES:
-        text = re.sub(regex, replacement, text)
-    return text
+IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios', 'testdata']
 
 
 def replacement_sanity():
     """Sanity check to ensure replacement regexes are working as intended"""
     before_after = [
+        ('chrome://about', 'helium://about'),
         ('Chrome Root Program', 'Chrome Root Program'),
+        (' Chrome  ', ' Helium  '),
         ('Chrome Web Store', 'Chrome Web Store'),
         ('Chromium Web Store', 'Chromium Web Store'),
         ('Chrome Remote Desktop', 'Chrome Remote Desktop'),
@@ -56,7 +34,9 @@ def replacement_sanity():
     ]
 
     for source, expected in before_after:
-        assert replace(source) == expected
+        modified, match = util.replace_text(source)
+        assert match, f"sanity: {expected} should have a match"
+        assert modified == expected, f"sanity: {modified} != {expected}"
 
 
 def parse_args():
@@ -65,7 +45,9 @@ def parse_args():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--sub', action='store_true')
     group.add_argument('--unsub', action='store_true')
-    parser.add_argument('--backup-path', metavar='<tarball-path>', type=Path)
+    group = parser.add_mutually_exclusive_group(required=False)
+    group.add_argument('--backup-path', metavar='<tarball-path>', type=Path)
+    group.add_argument('--dry-run', action='store_true')
     parser.add_argument('-t', metavar='source_tree', type=Path, required=True)
     parser.add_argument('--workers', type=int, default=os.cpu_count())
 
@@ -77,18 +59,11 @@ def parse_args():
     return args
 
 
-def is_substitutable(filename):
-    """Determines whether a file should be name-substituted"""
-    if filename.startswith('.'):
-        return False
-
-    return filename.split('.')[-1].lower() in ['xtb', 'grd', 'grdp']
-
-
-def get_substitutable_files(tree):
+def get_substitutable_files(tree, exts):
     """
-    Finds all candidates for substitution, which are source
-    string files (.grd*), or localization files (.xtb).
+    Finds all candidates for substitution, which have one of the
+    desired extensions - typically string files (.grd*),
+    or localization files (.xtb).
     """
     out = tree / 'out'
 
@@ -106,30 +81,67 @@ def get_substitutable_files(tree):
         if should_ignore:
             continue
 
-        yield from map(lambda filename, root=root: root / filename, filter(is_substitutable, files))
+        for filename in files:
+            if filename.startswith('.'):
+                continue
+            ext = filename.split('.')[-1].lower()
+            if ext not in exts:
+                continue
+            yield root / filename
 
 
-def substitute_file(args):
+def substitute_grit_file(args):
     """
     Replaces strings in a particular file, and returns
-    (arcname, original_content) if file was modified, otherwise None.
+    ((arcname, original_content), fp_map) if file was modified and needs backup,
+    (None, fp_map) if file was modified,
+    otherwise None.
     """
-    path, tree, save_original = args
+    path, tree, save_original, dry_run = args
     arcname = str(path.relative_to(tree))
 
     with open(path, 'r', encoding='utf-8') as file:
-        text = file.read()
+        original_text = file.read()
 
-    replaced = replace(text)
-    if text != replaced:
-        print(f"Replaced strings in {arcname}")
+    text = original_text.replace('&#36;', '!!dollar-sign-literal!!')
+    replaced, fp_map = util.replace_grit_tree(text)
+    if not fp_map:
+        return None
+
+    print(f"Replaced strings in {arcname}")
+    replaced = replaced.replace('!!dollar-sign-literal!!', '&#36;')
+    if not dry_run:
         with open(path, 'w', encoding='utf-8') as file:
             file.write(replaced)
 
-        if save_original:
-            return (arcname, text)
+    return ((arcname, original_text) if save_original else None, fp_map)
 
-    return None
+
+def substitute_xtb_file(args):
+    """
+    Replaces strings in an .xtb file, and returns
+    ((arcname, original_content)) if file was modified and needs backup,
+    (None) if file was modified,
+    otherwise None.
+    """
+    path, tree, fp_map, save_original, dry_run = args
+    arcname = str(path.relative_to(tree))
+
+    with open(path, 'r', encoding='utf-8') as file:
+        original_text = file.read()
+
+    text = original_text.replace('&#36;', '!!dollar-sign-literal!!')
+    replaced = util.replace_xtb_tree(text, fp_map)
+    if not replaced:
+        return None
+
+    print(f"Replaced strings in {arcname}")
+    replaced = replaced.replace('!!dollar-sign-literal!!', '&#36;')
+    if not dry_run:
+        with open(path, 'w', encoding='utf-8') as file:
+            file.write(replaced)
+
+    return ((arcname, original_text) if save_original else None, )
 
 
 def do_unsubstitution(tree, tarpath):
@@ -154,18 +166,26 @@ def maybe_make_tarball(tar_path, modified_files):
             tar.addfile(tarinfo, io.BytesIO(content))
 
 
-def do_substitution(tree, tarpath, workers):
+def do_substitution(tree, tarpath, workers, dry_run):
     """Performs name substitutions on all candidate files"""
-    files = list(get_substitutable_files(tree))
-    print(f"Found {len(files)} files to process")
+    files = list(get_substitutable_files(tree, ['grd', 'grdp']))
+    save_original = tarpath is not None
+    print(f"Found {len(files)} .grd files to process")
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        save_original = tarpath is not None
-        file_args = [(path, tree, save_original) for path in files]
-        results = executor.map(substitute_file, file_args)
+        file_args = [(path, tree, save_original, dry_run) for path in files]
+        results = executor.map(substitute_grit_file, file_args)
         modified_files = [r for r in results if r is not None]
 
-    maybe_make_tarball(tarpath, modified_files)
+    fp_map = util.merge_fp_maps(modified_files)
+    files = list(get_substitutable_files(tree, ['xtb']))
+    print(f"Found {len(files)} .xtb files to process")
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        file_args = [(path, tree, fp_map, save_original, dry_run) for path in files]
+        results = executor.map(substitute_xtb_file, file_args)
+        modified_files += [r for r in results if r is not None]
+
+    maybe_make_tarball(tarpath, map(lambda f: f[0], modified_files))
     print(f"Modified {len(modified_files)} files")
 
 
@@ -177,11 +197,13 @@ def main():
     if not (args.t / "OWNERS").exists():
         raise ValueError("wrong src directory")
 
+    util.add_grit_to_path(args.t)
+
     if args.sub:
         if args.backup_path is not None and args.backup_path.exists():
             raise FileExistsError("unsub tarball already exists, aborting")
-        do_substitution(args.t, args.backup_path, args.workers)
-    elif args.unsub and args.backup_path:
+        do_substitution(args.t, args.backup_path, args.workers, args.dry_run)
+    elif args.unsub and args.backup_path and not args.dry_run:
         do_unsubstitution(args.t, args.backup_path)
 
 
