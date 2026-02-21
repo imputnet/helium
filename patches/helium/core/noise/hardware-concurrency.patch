@@ -1,0 +1,169 @@
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -31,6 +31,8 @@ namespace helium {
+   constexpr const char kHeliumNoiseCommandLine[] = "helium-noise";
+   constexpr const char kHeliumNoiseCanvasCommandLine[] = "helium-noise-canvas";
+   constexpr const char kHeliumNoiseAudioCommandLine[] = "helium-noise-audio";
++  constexpr const char kHeliumNoiseCpuCoresCommandLine[] =
++      "helium-noise-hw-concurrency";
+ 
+ }  // namespace helium
+ 
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -28,4 +28,9 @@
+      "[Helium Noise] Jitter audio context data",
+      "Adds insignificant jitter to audio data to deceive AudioContext-based fingerprinting. Helium flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseAudio)},
++    {helium::kHeliumNoiseCpuCoresCommandLine,
++     "[Helium Noise] Randomize number of CPU cores",
++     "Randomizes the number of cores returned by "
++     "`navigator.hardwareConcurrency` in a reasonable range. Helium flag.",
++     kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseCpuCores)},
+ #endif  /* CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_ */
+--- a/content/browser/helium_noise/noise_token_data.cc
++++ b/content/browser/helium_noise/noise_token_data.cc
+@@ -65,6 +65,8 @@ HeliumNoiseTokenData::HeliumNoiseTokenDa
+       blink::HeliumNoiseToken(base::RandUint64());
+   session_tokens_[blink::HeliumNoiseFeature::kAudio] =
+       blink::HeliumNoiseToken(base::RandUint64());
++  session_tokens_[blink::HeliumNoiseFeature::kHardware] =
++      blink::HeliumNoiseToken(base::RandUint64());
+ }
+ 
+ // static
+--- a/third_party/blink/common/features.cc
++++ b/third_party/blink/common/features.cc
+@@ -51,6 +51,9 @@ BASE_FEATURE(kHeliumNoiseCanvas,
+ BASE_FEATURE(kHeliumNoiseAudio,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++// navigator.hardwareConcurrency noising for fingerprint protection.
++BASE_FEATURE(kHeliumNoiseCpuCores, base::FEATURE_ENABLED_BY_DEFAULT);
++
+ // Controls whether to include information about the page's open popup in
+ // AIPageContent.
+ BASE_FEATURE(kAIPageContentIncludePopupWindows,
+--- a/third_party/blink/public/common/features.h
++++ b/third_party/blink/public/common/features.h
+@@ -43,6 +43,7 @@ BLINK_COMMON_EXPORT extern const base::F
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoise);
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoiseCanvas);
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoiseAudio);
++BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kHeliumNoiseCpuCores);
+ 
+ // Controls whether to include information about the page's open popup in
+ // AIPageContent.
+--- a/third_party/blink/public/common/helium_noise/noise_token.h
++++ b/third_party/blink/public/common/helium_noise/noise_token.h
+@@ -23,6 +23,7 @@ namespace blink {
+ enum class HeliumNoiseFeature {
+   kCanvas,
+   kAudio,
++  kHardware,
+ };
+ 
+ // A wrapper class for a uint64_t noise token.
+--- a/third_party/blink/public/mojom/helium_noise/noise_token.mojom
++++ b/third_party/blink/public/mojom/helium_noise/noise_token.mojom
+@@ -8,6 +8,7 @@ module blink.mojom;
+ enum HeliumNoiseFeature {
+   kCanvas,
+   kAudio,
++  kHardware,
+ };
+ 
+ // Typemapped to blink::HeliumNoiseToken
+--- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -9,6 +9,7 @@
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
++#include "third_party/blink/renderer/core/helium_noise/helium_noise_hash.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ 
+@@ -40,6 +41,52 @@ String GetReducedNavigatorPlatform() {
+ #endif
+ }
+ 
++constexpr const unsigned kMinNoisedCores = 2;
++constexpr const unsigned kMaxNoisedCores = 16;
++
++std::vector<unsigned> PossibleValuesForCoreCount(unsigned n) {
++  // Clamp the number of cores between [2..=16], as other
++  // configurations are less common.
++  n = std::clamp(n, kMinNoisedCores, kMaxNoisedCores);
++
++  // A machine with a odd number of CPUs is very uncommon.
++  // Floor it to the lower even number.
++  if (n % 2) {
++    n -= 1;
++  }
++
++  // If we can subtract some amount and still end up with
++  // a common CPU count (which is the case for most configurations)
++  // let's add it to the list of possible values.
++  std::vector<unsigned> candidates = {n};
++  if (n > 4) {
++    candidates.push_back(n - 4);
++  }
++
++  if (n > 2) {
++    candidates.push_back(n - 2);
++  }
++
++  return candidates;
++}
++
++unsigned MaybeNoiseCoreCount(ExecutionContext* execution_context, unsigned n) {
++  if (!base::FeatureList::IsEnabled(blink::features::kHeliumNoiseCpuCores) ||
++      !execution_context ||
++      !execution_context->GetHeliumNoiseTokens().contains(
++          HeliumNoiseFeature::kHardware)) {
++    return n;
++  }
++
++  auto token_hash =
++      HeliumNoiseHash(execution_context->GetHeliumNoiseTokens().at(
++          HeliumNoiseFeature::kHardware));
++  token_hash.Update(n);
++
++  auto values = PossibleValuesForCoreCount(n);
++  return values[token_hash.GetValueBelow(values.size())];
++}
++
+ }  // namespace
+ 
+ NavigatorBase::NavigatorBase(ExecutionContext* context)
+@@ -81,7 +128,7 @@ unsigned int NavigatorBase::hardwareConc
+ 
+   probe::ApplyHardwareConcurrencyOverride(
+       probe::ToCoreProbeSink(GetExecutionContext()), hardware_concurrency);
+-  return hardware_concurrency;
++  return MaybeNoiseCoreCount(GetExecutionContext(), hardware_concurrency);
+ }
+ 
+ ExecutionContext* NavigatorBase::GetUAExecutionContext() const {
+--- a/third_party/blink/public/common/helium_noise/noise_token_mojom_traits.h
++++ b/third_party/blink/public/common/helium_noise/noise_token_mojom_traits.h
+@@ -27,6 +27,8 @@ struct BLINK_COMMON_EXPORT
+         return blink::mojom::HeliumNoiseFeature::kCanvas;
+       case blink::HeliumNoiseFeature::kAudio:
+         return blink::mojom::HeliumNoiseFeature::kAudio;
++      case blink::HeliumNoiseFeature::kHardware:
++        return blink::mojom::HeliumNoiseFeature::kHardware;
+     }
+     NOTREACHED();
+   }
+@@ -40,6 +42,9 @@ struct BLINK_COMMON_EXPORT
+       case blink::mojom::HeliumNoiseFeature::kAudio:
+         *out = blink::HeliumNoiseFeature::kAudio;
+         return true;
++      case blink::mojom::HeliumNoiseFeature::kHardware:
++        *out = blink::HeliumNoiseFeature::kHardware;
++        return true;
+     }
+     return false;
+   }
