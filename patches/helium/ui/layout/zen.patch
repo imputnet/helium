@@ -1,0 +1,495 @@
+--- a/chrome/browser/ui/helium/helium_layout_state_controller.h
++++ b/chrome/browser/ui/helium/helium_layout_state_controller.h
+@@ -14,8 +14,11 @@ class PrefService;
+ enum class HeliumLayoutType {
+   kHorizontal = 0,
+   kToolbar = 1,
+   kVertical = 2,
+-  kMaxValue = kVertical,
++  kZen = 3,
++  kMaxValue = kZen,
+ };
+ 
++class ZenRevealController;
++
+ class HeliumLayoutStateController {
+@@ -37,6 +39,11 @@ class HeliumLayoutStateController {
+       BrowserWindowInterface* browser_window);
+ 
+   bool ShouldDisplayToolbarTabStrip() const;
++  bool IsZenMode() const;
++  bool IsZenRevealed() const;
++  double GetZenRevealFraction() const;
++  void SetZenRevealFraction(double fraction);
++
+   void SetBrowserLayout(HeliumLayoutType layout);
+   HeliumLayoutType GetBrowserLayout() const;
+ 
+@@ -52,6 +59,8 @@ class HeliumLayoutStateController {
+   base::RepeatingCallbackList<void(HeliumLayoutStateController*)>
+       on_state_changed_callback_list_;
+   ui::ScopedUnownedUserData<HeliumLayoutStateController>
+       scoped_unowned_user_data_;
++  std::unique_ptr<ZenRevealController> zen_reveal_controller_;
++  double zen_reveal_fraction_ = 0.0;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_LAYOUT_STATE_CONTROLLER_H_
+--- a/chrome/browser/ui/helium/helium_layout_state_controller.cc
++++ b/chrome/browser/ui/helium/helium_layout_state_controller.cc
+@@ -498,6 +498,23 @@ bool HeliumLayoutStateController::ShouldDisplayToolbarTabStrip() const {
+   return GetBrowserLayout() == HeliumLayoutType::kToolbar;
+ }
+ 
++bool HeliumLayoutStateController::IsZenMode() const {
++  return GetBrowserLayout() == HeliumLayoutType::kZen;
++}
++
++bool HeliumLayoutStateController::IsZenRevealed() const {
++  return IsZenMode() && zen_reveal_fraction_ > 0.0;
++}
++
++double HeliumLayoutStateController::GetZenRevealFraction() const {
++  return IsZenMode() ? zen_reveal_fraction_ : 1.0;
++}
++
++void HeliumLayoutStateController::SetZenRevealFraction(double fraction) {
++  zen_reveal_fraction_ = std::clamp(fraction, 0.0, 1.0);
++  NotifyStateChanged();
++}
++
+ void HeliumLayoutStateController::SetBrowserLayout(
+     HeliumLayoutType layout) {
+   pref_service_->SetInteger(prefs::kHeliumLayout, std::to_underlying(layout));
+--- /dev/null
++++ b/chrome/browser/ui/helium/zen_reveal_controller.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_ZEN_REVEAL_CONTROLLER_H_
++#define CHROME_BROWSER_UI_HELIUM_ZEN_REVEAL_CONTROLLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "ui/events/event_observer.h"
++#include "ui/gfx/animation/slide_animation.h"
++
++namespace views {
++class Widget;
++}
++
++class HeliumLayoutStateController;
++
++// Handles mouse-at-top detection and reveal animation for Zen mode.
++// When the user hovers near the top edge of the window, the top chrome
++// (toolbar, tab strip) slides down into view.
++class ZenRevealController : public ui::EventObserver,
++                            public gfx::AnimationDelegate {
++ public:
++  // Height in pixels of the trigger zone at the top of the window.
++  // Firefox parity (full-screen-api.ignore-widgets): 1px top strip.
++  static constexpr int kRevealTriggerHeightPx = 1;
++  // Delay in milliseconds before triggering reveal after mouse enters zone.
++  static constexpr int kRevealDelayMs = 150;
++  // Keep-open zone height in pixels while revealed.
++  // Firefox parity keeps nav shown while cursor stays within ~50px from top.
++  static constexpr int kRevealKeepOpenHeightPx = 50;
++  // Animation duration for reveal/hide transitions.
++  static constexpr int kAnimationDurationMs = 200;
++
++  ZenRevealController(HeliumLayoutStateController* layout_controller,
++                      views::Widget* browser_widget);
++  ~ZenRevealController() override;
++
++  // ui::EventObserver:
++  void OnEvent(const ui::Event& event) override;
++
++  // gfx::AnimationDelegate:
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override;
++
++ private:
++  void OnMouseAtTopEdge();
++  void OnMouseLeftTopEdge();
++  void StartReveal();
++  void EndReveal();
++  void UpdateRevealFraction(double fraction);
++
++  raw_ptr<HeliumLayoutStateController> layout_controller_;
++  raw_ptr<views::Widget> widget_;
++  base::OneShotTimer reveal_timer_;
++  gfx::SlideAnimation animation_;
++  bool is_revealed_ = false;
++  base::WeakPtrFactory<ZenRevealController> weak_ptr_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_HELIUM_ZEN_REVEAL_CONTROLLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/helium/zen_reveal_controller.cc
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/zen_reveal_controller.h"
++
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "ui/events/event.h"
++#include "ui/events/event_observer.h"
++#include "ui/events/event_source.h"
++#include "ui/views/widget/widget.h"
++
++ZenRevealController::ZenRevealController(
++    HeliumLayoutStateController* layout_controller,
++    views::Widget* browser_widget)
++    : layout_controller_(layout_controller),
++      widget_(browser_widget),
++      animation_(this) {
++  animation_.SetSlideDuration(base::Milliseconds(kAnimationDurationMs));
++
++  // Register for mouse events on the widget's event source.
++  if (auto* window = widget_->GetNativeWindow()) {
++    if (auto* host = window->GetHost()) {
++      if (auto* source = host->GetEventSource()) {
++        source->AddEventObserver(this);
++      }
++    }
++  }
++}
++
++ZenRevealController::~ZenRevealController() {
++  if (auto* window = widget_->GetNativeWindow()) {
++    if (auto* host = window->GetHost()) {
++      if (auto* source = host->GetEventSource()) {
++        source->RemoveEventObserver(this);
++      }
++    }
++  }
++}
++
++void ZenRevealController::OnEvent(const ui::Event& event) {
++  if (!event.IsMouseEvent()) {
++    return;
++  }
++
++  if (!widget_) {
++    return;
++  }
++
++  const auto* mouse_event = event.AsMouseEvent();
++  const gfx::Point location = mouse_event->root_location();
++  const int window_top = widget_->GetWindowBoundsInScreen().y();
++  const int y_in_window = location.y() - window_top;
++
++  // Trigger reveal when cursor is near the top edge of this window.
++  if (y_in_window <= kRevealTriggerHeightPx) {
++    OnMouseAtTopEdge();
++    return;
++  }
++
++  // Cancel delayed reveal if cursor left the trigger zone before it fired.
++  if (!is_revealed_) {
++    reveal_timer_.Stop();
++    return;
++  }
++
++  // Keep chrome revealed while cursor remains near the top controls area.
++  if (y_in_window > kRevealKeepOpenHeightPx) {
++    OnMouseLeftTopEdge();
++  }
++}
++
++void ZenRevealController::OnMouseAtTopEdge() {
++  if (is_revealed_ || reveal_timer_.IsRunning()) {
++    return;
++  }
++  reveal_timer_.Start(FROM_HERE, base::Milliseconds(kRevealDelayMs),
++                      base::BindOnce(&ZenRevealController::StartReveal,
++                                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++void ZenRevealController::OnMouseLeftTopEdge() {
++  reveal_timer_.Stop();
++  if (is_revealed_) {
++    EndReveal();
++  }
++}
++
++void ZenRevealController::StartReveal() {
++  is_revealed_ = true;
++  animation_.Show();
++}
++
++void ZenRevealController::EndReveal() {
++  is_revealed_ = false;
++  animation_.Hide();
++}
++
++void ZenRevealController::AnimationProgressed(const gfx::Animation* animation) {
++  UpdateRevealFraction(animation->GetCurrentValue());
++}
++
++void ZenRevealController::AnimationEnded(const gfx::Animation* animation) {
++  UpdateRevealFraction(is_revealed_ ? 1.0 : 0.0);
++}
++
++void ZenRevealController::UpdateRevealFraction(double fraction) {
++  if (layout_controller_) {
++    layout_controller_->SetZenRevealFraction(fraction);
++  }
++}
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1406,11 +1406,21 @@ bool BrowserView::ShouldDrawTabStrip() const {
+   // since callers may otherwise try to access it. Note that we can't just check
+   // this alone, as the tabstrip is created unconditionally even for windows
+   // that won't display it.
++  auto* helium_layout_controller = HeliumLayoutStateController::From(browser_);
++  if (helium_layout_controller && helium_layout_controller->IsZenMode()) {
++    return false;
++  }
++
+   return horizontal_tab_strip_region_view_ != nullptr &&
+          horizontal_tab_strip_region_view_->tab_strip() != nullptr;
+ }
+ 
+ bool BrowserView::ShouldDrawVerticalTabStrip() const {
++  auto* helium_layout_controller = HeliumLayoutStateController::From(browser_);
++  if (helium_layout_controller && helium_layout_controller->IsZenMode()) {
++    return false;
++  }
++
+   auto* controller = tabs::VerticalTabStripStateController::From(browser_);
+   return controller && controller->ShouldDisplayVerticalTabs();
+ }
+@@ -3061,6 +3076,13 @@ bool BrowserView::IsToolbarVisible() const {
+   // popup windows to display user profile image in title bar.
+   // crbug.com/40664556
+   if (browser_->is_type_normal() || browser_->is_type_popup()) {
++    auto* helium_layout_controller = HeliumLayoutStateController::From(browser_);
++    if (helium_layout_controller && helium_layout_controller->IsZenMode()) {
++      // In zen mode, toolbar is only "visible" when revealed (hover at top).
++      // This prevents it from taking layout space when hidden.
++      return helium_layout_controller->IsZenRevealed();
++    }
++
+     return true;
+   }
+ 
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -98,6 +98,7 @@
+ #define IDC_BROWSER_LAYOUT_COMPACT      34083
+ #define IDC_BROWSER_LAYOUT_VERTICAL     34084
+ #define IDC_BROWSER_LAYOUT_VERTICAL_RIGHT 34085
++#define IDC_BROWSER_LAYOUT_ZEN          34086
+ 
+ // Tab group Commands
+ #define IDC_ADD_NEW_TAB_TO_GROUP      34100
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -10399,6 +10399,9 @@ Keep your key file in a safe place. You can use this file to import your key in
+           <message name="IDS_BROWSER_LAYOUT_VERTICAL" desc="In Title Case: Option for vertical layout.">
+             Vertical (Experimental)
+           </message>
++          <message name="IDS_BROWSER_LAYOUT_ZEN" desc="In Title Case: Option for zen layout.">
++            Zen
++          </message>
+           <message name="IDS_BROWSER_LAYOUT_VERTICAL_RIGHT" desc="In Title Case: Option to move vertical tabs to the right side.">
+             Tabs on Right Side
+           </message>
+@@ -10417,6 +10420,9 @@ Keep your key file in a safe place. You can use this file to import your key in
+           <message name="IDS_BROWSER_LAYOUT_VERTICAL" desc="Option for vertical layout.">
+             Vertical (experimental)
+           </message>
++          <message name="IDS_BROWSER_LAYOUT_ZEN" desc="Option for zen layout.">
++            Zen
++          </message>
+           <message name="IDS_BROWSER_LAYOUT_VERTICAL_RIGHT" desc="Option to move vertical tabs to the right side.">
+             Tabs on right side
+           </message>
+--- a/chrome/browser/ui/browser_commands.h
++++ b/chrome/browser/ui/browser_commands.h
+@@ -262,6 +262,7 @@ void CloseTabSearch(Browser* browser);
+ void ToggleContextualTasksSidePanel(BrowserWindowInterface* browser);
+ void ToggleVerticalTabs(Browser* browser);
+ void SetBrowserLayout(Browser* browser, HeliumLayoutType layout);
++void ToggleZenLayout(Browser* browser);
+ void ToggleVerticalTabStripRightAligned(Browser* browser);
+ void ShowTabDeclutter(Browser* browser);
+ bool CanCloseFind(Browser* browser);
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -62,6 +62,8 @@ static_library("ui") {
+     "crypto_module_password_dialog.h",
+     "cryptuiapi_shim.h",
+     "enterprise_startup_dialog.h",
++    "helium/zen_reveal_controller.cc",
++    "helium/zen_reveal_controller.h",
+     "idle_bubble.h",
+     "incognito_allowed_url.cc",
+     "incognito_allowed_url.h",
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -2242,6 +2242,17 @@ void SetBrowserLayout(Browser* browser, HeliumLayoutType layout) {
+   }
+ }
+ 
++void ToggleZenLayout(Browser* browser) {
++  auto* controller = HeliumLayoutStateController::From(browser);
++  if (!controller) {
++    return;
++  }
++
++  controller->SetBrowserLayout(
++      controller->IsZenMode() ? HeliumLayoutType::kHorizontal
++                              : HeliumLayoutType::kZen);
++}
++
+ void ToggleVerticalTabStripRightAligned(Browser* browser) {
+   auto* controller =
+       tabs::VerticalTabStripStateController::From(browser);
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -596,6 +596,9 @@ bool BrowserCommandController::ExecuteCommandWithDisposition(
+     case IDC_BROWSER_LAYOUT_VERTICAL:
+       SetBrowserLayout(browser_, HeliumLayoutType::kVertical);
+       break;
++    case IDC_BROWSER_LAYOUT_ZEN:
++      ToggleZenLayout(browser_);
++      break;
+     case IDC_BROWSER_LAYOUT_VERTICAL_RIGHT:
+       ToggleVerticalTabStripRightAligned(browser_);
+       break;
+@@ -1512,6 +1515,7 @@ void BrowserCommandController::InitCommandState() {
+   command_updater_.UpdateCommandEnabled(IDC_BROWSER_LAYOUT_HORIZONTAL, true);
+   command_updater_.UpdateCommandEnabled(IDC_BROWSER_LAYOUT_COMPACT, true);
+   command_updater_.UpdateCommandEnabled(IDC_BROWSER_LAYOUT_VERTICAL, true);
++  command_updater_.UpdateCommandEnabled(IDC_BROWSER_LAYOUT_ZEN, true);
+   command_updater_.UpdateCommandEnabled(IDC_BROWSER_LAYOUT_VERTICAL_RIGHT,
+                                         true);
+ #if BUILDFLAG(IS_CHROMEOS)
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -153,6 +153,7 @@ const AcceleratorMapping kAcceleratorMap[] = {
+     {ui::VKEY_F10, ui::EF_SHIFT_DOWN, IDC_FOCUS_MENU_BAR},
+ #endif
+     {ui::VKEY_F11, ui::EF_NONE, IDC_FULLSCREEN},
++    {ui::VKEY_F11, ui::EF_SHIFT_DOWN, IDC_BROWSER_LAYOUT_ZEN},
+     {ui::VKEY_F12, ui::EF_NONE, IDC_DEV_TOOLS},
+     {ui::VKEY_O, ui::EF_COMMAND_DOWN, IDC_OPEN_FILE},
+ #if BUILDFLAG(IS_MAC)
+--- a/chrome/browser/ui/views/frame/system_menu_model_builder.cc
++++ b/chrome/browser/ui/views/frame/system_menu_model_builder.cc
+@@ -110,6 +110,8 @@ void SystemMenuModelBuilder::BuildSystemMenuForBrowserWindow(
+         IDC_BROWSER_LAYOUT_COMPACT, IDS_BROWSER_LAYOUT_COMPACT);
+     browser_layout_menu_contents_->AddCheckItemWithStringId(
+         IDC_BROWSER_LAYOUT_VERTICAL, IDS_BROWSER_LAYOUT_VERTICAL);
++    browser_layout_menu_contents_->AddCheckItemWithStringId(
++        IDC_BROWSER_LAYOUT_ZEN, IDS_BROWSER_LAYOUT_ZEN);
+     browser_layout_menu_contents_->AddSeparator(ui::NORMAL_SEPARATOR);
+     browser_layout_menu_contents_->AddCheckItemWithStringId(
+         IDC_BROWSER_LAYOUT_VERTICAL_RIGHT,
+--- a/chrome/browser/ui/views/frame/system_menu_model_delegate.cc
++++ b/chrome/browser/ui/views/frame/system_menu_model_delegate.cc
+@@ -52,6 +52,7 @@ bool SystemMenuModelDelegate::IsCommandIdChecked(int command_id) const {
+   if (command_id == IDC_BROWSER_LAYOUT_HORIZONTAL ||
+       command_id == IDC_BROWSER_LAYOUT_COMPACT ||
+-      command_id == IDC_BROWSER_LAYOUT_VERTICAL) {
++      command_id == IDC_BROWSER_LAYOUT_VERTICAL ||
++      command_id == IDC_BROWSER_LAYOUT_ZEN) {
+     auto* layout_controller =
+         HeliumLayoutStateController::From(browser_);
+     if (layout_controller) {
+@@ -63,6 +64,8 @@ bool SystemMenuModelDelegate::IsCommandIdChecked(int command_id) const {
+           return current_layout == HeliumLayoutType::kToolbar;
+         case IDC_BROWSER_LAYOUT_VERTICAL:
+           return current_layout == HeliumLayoutType::kVertical;
++        case IDC_BROWSER_LAYOUT_ZEN:
++          return current_layout == HeliumLayoutType::kZen;
+       }
+     }
+   }
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -286,6 +286,9 @@
+   <message name="IDS_SETTINGS_BROWSER_LAYOUT_COMPACT" desc="Compact option in the browser layout dropdown.">
+     Compact
+   </message>
++  <message name="IDS_SETTINGS_BROWSER_LAYOUT_ZEN" desc="Zen option in the browser layout dropdown.">
++    Zen
++  </message>
+   <message name="IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL" desc="Vertical option in the browser layout dropdown.">
+     Vertical (experimental)
+   </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -529,6 +529,7 @@ void AddAppearanceStrings(content::WebUIDataSource* html_source) {
+       {"browserLayout", IDS_SETTINGS_BROWSER_LAYOUT},
+       {"browserLayoutHorizontal", IDS_SETTINGS_BROWSER_LAYOUT_HORIZONTAL},
+       {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
++      {"browserLayoutZen", IDS_SETTINGS_BROWSER_LAYOUT_ZEN},
+       {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
+       {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
+       {"showHomeButton", IDS_SETTINGS_SHOW_HOME_BUTTON},
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
+@@ -30,6 +30,7 @@ class BrowserViewLayoutDelegate {
+   virtual bool ShouldDrawTabStrip() const = 0;
+   virtual bool ShouldUseTouchableTabstrip() const = 0;
+   virtual bool ShouldDrawVerticalTabStrip() const = 0;
++  virtual double GetZenModeRevealFraction() const = 0;
+   virtual bool IsVerticalTabStripCollapsed() const = 0;
+   virtual bool IsVerticalTabStripRightAligned() const = 0;
+   virtual bool ShouldDrawWebAppFrameToolbar() const = 0;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+@@ -50,6 +50,13 @@ bool BrowserViewLayoutDelegateImpl::ShouldDrawVerticalTabStrip() const {
+   return browser_view_->ShouldDrawVerticalTabStrip();
+ }
+ 
++double BrowserViewLayoutDelegateImpl::GetZenModeRevealFraction() const {
++  if (auto* controller = HeliumLayoutStateController::From(browser_view_->browser())) {
++    return controller->GetZenRevealFraction();
++  }
++  return 1.0;
++}
++
+ bool BrowserViewLayoutDelegateImpl::IsVerticalTabStripCollapsed() const {
+   return browser_view_->IsVerticalTabStripCollapsed();
+ }
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
+@@ -23,6 +23,7 @@ class BrowserViewLayoutDelegateImpl : public BrowserViewLayoutDelegate {
+   bool ShouldDrawTabStrip() const override;
+   bool ShouldUseTouchableTabstrip() const override;
+   bool ShouldDrawVerticalTabStrip() const override;
++  double GetZenModeRevealFraction() const override;
+   bool IsVerticalTabStripCollapsed() const override;
+   bool IsVerticalTabStripRightAligned() const override;
+   bool ShouldDrawWebAppFrameToolbar() const override;
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.ts
+@@ -84,6 +84,7 @@ enum BrowserLayout {
+   HORIZONTAL = 0,
+   COMPACT = 1,
+   VERTICAL = 2,
++  ZEN = 3,
+ }
+ 
+ const SettingsAppearancePageElementBase =
+@@ -224,6 +225,10 @@ export class SettingsAppearancePageElement extends SettingsAppearancePageElement
+               value: BrowserLayout.COMPACT,
+               name: loadTimeData.getString('browserLayoutCompact'),
+             },
++            {
++              value: BrowserLayout.ZEN,
++              name: loadTimeData.getString('browserLayoutZen'),
++            },
+             {
+               value: BrowserLayout.VERTICAL,
+               name: loadTimeData.getString('browserLayoutVertical'),
