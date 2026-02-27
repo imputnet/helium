@@ -1,0 +1,878 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -100,6 +100,7 @@
+ #define IDC_BROWSER_LAYOUT_VERTICAL     34084
+ #define IDC_BROWSER_LAYOUT_VERTICAL_RIGHT 34085
+ #define IDC_TOGGLE_VERTICAL_TAB_STRIP_COLLAPSED 34086
++#define IDC_HELIUM_COMMAND_LAUNCHER     34087
+ 
+ // Tab group Commands
+ #define IDC_ADD_NEW_TAB_TO_GROUP      34100
+--- a/chrome/browser/ui/browser_commands.h
++++ b/chrome/browser/ui/browser_commands.h
+@@ -258,6 +258,7 @@
+ void FindPrevious(Browser* browser);
+ void FindInPage(Browser* browser, bool find_next, bool forward_direction);
+ void ShowTabSearch(BrowserWindowInterface* bwi);
++void ShowCommandLauncher(BrowserWindowInterface* bwi);
+ void CloseTabSearch(Browser* browser);
+ void ToggleContextualTasksSidePanel(BrowserWindowInterface* browser);
+ void ToggleVerticalTabs(Browser* browser);
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -2199,6 +2199,12 @@
+       tab_search::mojom::TabOrganizationFeature::kNone);
+ }
+ 
++void ShowCommandLauncher(BrowserWindowInterface* bwi) {
++  bwi->GetBrowserForMigrationOnly()->window()->CreateTabSearchBubble(
++      tab_search::mojom::TabSearchSection::kCommand,
++      tab_search::mojom::TabOrganizationFeature::kNone);
++}
++
+ void CloseTabSearch(Browser* browser) {
+   browser->window()->CloseTabSearchBubble();
+ }
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -415,7 +415,8 @@
+          command_id == IDC_SELECT_NEXT_TAB ||
+          command_id == IDC_SELECT_PREVIOUS_TAB || command_id == IDC_EXIT ||
+          command_id == IDC_COPY_OR_INSPECT_SHORTCUT || command_id == IDC_DEV_TOOLS ||
+-         command_id == IDC_DEV_TOOLS_TOGGLE || command_id == IDC_TAB_SEARCH;
++         command_id == IDC_DEV_TOOLS_TOGGLE || command_id == IDC_TAB_SEARCH ||
++         command_id == IDC_HELIUM_COMMAND_LAUNCHER;
+ }
+ 
+ void BrowserCommandController::TabStateChanged() {
+@@ -587,6 +588,9 @@
+     case IDC_TAB_SEARCH:
+       ShowTabSearch(browser_);
+       break;
++    case IDC_HELIUM_COMMAND_LAUNCHER:
++      ShowCommandLauncher(browser_);
++      break;
+     case IDC_TAB_SEARCH_CLOSE:
+       CloseTabSearch(browser_);
+       break;
+@@ -1747,6 +1751,8 @@
+   const bool enable_tab_search_commands = browser_->is_type_normal();
+   command_updater_.UpdateCommandEnabled(IDC_TAB_SEARCH,
+                                         enable_tab_search_commands);
++  command_updater_.UpdateCommandEnabled(IDC_HELIUM_COMMAND_LAUNCHER,
++                                        enable_tab_search_commands);
+   command_updater_.UpdateCommandEnabled(IDC_TAB_SEARCH_CLOSE,
+                                         enable_tab_search_commands);
+ 
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -61,6 +61,8 @@
+     {ui::VKEY_F, ui::EF_PLATFORM_ACCELERATOR, IDC_FIND},
+     {ui::VKEY_A, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR,
+      IDC_TAB_SEARCH},
++    {ui::VKEY_K, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR,
++     IDC_HELIUM_COMMAND_LAUNCHER},
+     {ui::VKEY_V, ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN,
+      IDC_TOGGLE_VERTICAL_TAB_STRIP_COLLAPSED},
+     {ui::VKEY_G, ui::EF_PLATFORM_ACCELERATOR, IDC_FIND_NEXT},
+--- a/chrome/browser/ui/cocoa/accelerators_cocoa.mm
++++ b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+@@ -40,6 +40,8 @@
+     {IDC_DEV_TOOLS_INSPECT, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_E},
+     {IDC_COPY_OR_INSPECT_SHORTCUT, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_C},
+     {IDC_NEW_SPLIT_TAB, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_N},
++    {IDC_HELIUM_COMMAND_LAUNCHER, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
++     ui::VKEY_K},
+     {IDC_TOGGLE_VERTICAL_TAB_STRIP_COLLAPSED,
+      ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_V},
+     {IDC_FIND, ui::EF_COMMAND_DOWN, ui::VKEY_F},
+--- a/chrome/browser/ui/webui/tab_search/tab_search.mojom
++++ b/chrome/browser/ui/webui/tab_search/tab_search.mojom
+@@ -46,6 +46,7 @@
+   [Default] kNone = 0,
+   kSearch = 1,
+   kOrganize = 2,
++  kCommand = 3,
+ };
+ 
+ //TODO(b/311697865) move this to a common location.
+@@ -197,6 +198,12 @@
+   int32 tab_id;
+ };
+ 
++struct LauncherCommand {
++  int32 command_id;
++  string title;
++  bool enabled;
++};
++
+ struct TabOrganization {
+   int32 organization_id;
+   array<Tab> tabs;
+@@ -281,6 +288,12 @@
+   // Get window and tab data for the current profile.
+   GetProfileData() => (ProfileData profile_data);
+ 
++  // Get command launcher actions available in the current browser context.
++  GetLauncherCommands() => (array<LauncherCommand> commands);
++
++  // Execute a command launcher action by command id.
++  ExecuteLauncherCommand(int32 command_id) => (bool executed);
++
+   // Get all tabs that are considered stale based on their last active time,
+   // and tabs that are duplicates of other tabs based on partial URL match
+   // (excludes fragments).
+--- a/chrome/browser/ui/webui/tab_search/tab_search_page_handler.h
++++ b/chrome/browser/ui/webui/tab_search/tab_search_page_handler.h
+@@ -108,6 +108,9 @@
+   void ExcludeFromStaleTabs(int32_t tab_id) override;
+   void ExcludeFromDuplicateTabs(const GURL& url) override;
+   void GetProfileData(GetProfileDataCallback callback) override;
++  void GetLauncherCommands(GetLauncherCommandsCallback callback) override;
++  void ExecuteLauncherCommand(int32_t command_id,
++                              ExecuteLauncherCommandCallback callback) override;
+   void GetUnusedTabs(GetUnusedTabsCallback callback) override;
+   void GetTabSearchSection(GetTabSearchSectionCallback callback) override;
+   void GetTabOrganizationFeature(
+--- a/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
++++ b/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
+@@ -15,6 +15,7 @@
+ #include <vector>
+ 
+ #include "base/base64.h"
++#include "base/containers/contains.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -23,6 +24,7 @@
+ #include "base/timer/timer.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/values.h"
++#include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/favicon/favicon_utils.h"
+ #include "chrome/browser/feedback/show_feedback_page.h"
+ #include "chrome/browser/optimization_guide/optimization_guide_keyed_service.h"
+@@ -33,6 +35,7 @@
+ #include "chrome/browser/signin/signin_error_controller_factory.h"
+ #include "chrome/browser/signin/signin_ui_util.h"
+ #include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_live_tab_context.h"
+ #include "chrome/browser/ui/browser_navigator.h"
+ #include "chrome/browser/ui/browser_window.h"
+@@ -77,6 +80,49 @@
+ 
+ namespace {
+ constexpr base::TimeDelta kTabsChangeDelay = base::Milliseconds(50);
++constexpr int kLauncherCommandIds[] = {
++    IDC_NEW_TAB,
++    IDC_NEW_WINDOW,
++    IDC_NEW_INCOGNITO_WINDOW,
++    IDC_RESTORE_TAB,
++    IDC_DUPLICATE_TAB,
++    IDC_BOOKMARK_THIS_TAB,
++    IDC_SHOW_HISTORY,
++    IDC_SHOW_DOWNLOADS,
++    IDC_OPTIONS,
++    IDC_TOGGLE_VERTICAL_TAB_STRIP_COLLAPSED,
++};
++
++bool IsSupportedLauncherCommand(int command_id) {
++  return base::Contains(kLauncherCommandIds, command_id);
++}
++
++std::string GetLauncherCommandTitle(int command_id) {
++  switch (command_id) {
++    case IDC_NEW_TAB:
++      return l10n_util::GetStringUTF8(IDS_NEW_TAB);
++    case IDC_NEW_WINDOW:
++      return l10n_util::GetStringUTF8(IDS_NEW_WINDOW);
++    case IDC_NEW_INCOGNITO_WINDOW:
++      return l10n_util::GetStringUTF8(IDS_NEW_INCOGNITO_WINDOW);
++    case IDC_RESTORE_TAB:
++      return l10n_util::GetStringUTF8(IDS_RESTORE_TAB);
++    case IDC_DUPLICATE_TAB:
++      return l10n_util::GetStringUTF8(IDS_TAB_CXMENU_DUPLICATE);
++    case IDC_BOOKMARK_THIS_TAB:
++      return l10n_util::GetStringUTF8(IDS_BOOKMARK_THIS_TAB);
++    case IDC_SHOW_HISTORY:
++      return l10n_util::GetStringUTF8(IDS_HISTORY_SHOW_HISTORY);
++    case IDC_SHOW_DOWNLOADS:
++      return l10n_util::GetStringUTF8(IDS_SHOW_DOWNLOADS);
++    case IDC_OPTIONS:
++      return l10n_util::GetStringUTF8(IDS_SETTINGS);
++    case IDC_TOGGLE_VERTICAL_TAB_STRIP_COLLAPSED:
++      return "Toggle Sidebar";
++    default:
++      return "";
++  }
++}
+ 
+ std::string GetLastActiveElapsedText(
+     const base::TimeTicks& last_active_time_ticks) {
+@@ -687,6 +733,37 @@
+   std::move(callback).Run(std::move(profile_tabs));
+ }
+ 
++void TabSearchPageHandler::GetLauncherCommands(
++    GetLauncherCommandsCallback callback) {
++  std::vector<tab_search::mojom::LauncherCommandPtr> commands;
++  if (!browser_) {
++    std::move(callback).Run(std::move(commands));
++    return;
++  }
++
++  for (const int command_id : kLauncherCommandIds) {
++    if (!chrome::SupportsCommand(browser_, command_id)) {
++      continue;
++    }
++    auto command = tab_search::mojom::LauncherCommand::New();
++    command->command_id = command_id;
++    command->title = GetLauncherCommandTitle(command_id);
++    command->enabled = chrome::IsCommandEnabled(browser_, command_id);
++    commands.push_back(std::move(command));
++  }
++
++  std::move(callback).Run(std::move(commands));
++}
++
++void TabSearchPageHandler::ExecuteLauncherCommand(
++    int32_t command_id,
++    ExecuteLauncherCommandCallback callback) {
++  const bool executed = browser_ && IsSupportedLauncherCommand(command_id) &&
++                        chrome::SupportsCommand(browser_, command_id) &&
++                        chrome::ExecuteCommand(browser_, command_id);
++  std::move(callback).Run(executed);
++}
++
+ void TabSearchPageHandler::GetUnusedTabs(GetUnusedTabsCallback callback) {
+   UpdateUnusedTabs();
+   std::move(callback).Run(GetMojoUnusedTabs());
+--- a/chrome/browser/ui/webui/tab_search/tab_search_ui.cc
++++ b/chrome/browser/ui/webui/tab_search/tab_search_ui.cc
+@@ -227,6 +227,15 @@
+   ui::Accelerator accelerator(ui::VKEY_A,
+                               ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR);
+   source->AddString("shortcutText", accelerator.GetShortcutText());
++  ui::Accelerator command_launcher_accelerator(
++      ui::VKEY_K, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR);
++  source->AddString("commandLauncherShortcutText",
++                    command_launcher_accelerator.GetShortcutText());
++  source->AddString("commandLauncherSearchPlaceholder",
++                    "Search commands and tabs");
++  source->AddString("commandLauncherCommandsTitle", "Commands");
++  source->AddString("commandLauncherTabsTitle", "Tabs");
++  source->AddString("commandLauncherActionSubtitle", "Action");
+   // TODO(b/362269642): Once the stale threshold duration is Finch-
+   // configurable, replace the hardcoded 7 below with the value of that
+   // parameter.
+--- a/chrome/browser/resources/tab_search/BUILD.gn
++++ b/chrome/browser/resources/tab_search/BUILD.gn
+@@ -45,6 +45,8 @@
+     "auto_tab_groups/auto_tab_groups_results.ts",
+     "auto_tab_groups/auto_tab_groups_results_actions.html.ts",
+     "auto_tab_groups/auto_tab_groups_results_actions.ts",
++    "command_launcher_page.html.ts",
++    "command_launcher_page.ts",
+     "declutter/declutter_page.html.ts",
+     "declutter/declutter_page.ts",
+     "lazy_list.ts",
+@@ -84,6 +86,7 @@
+     "auto_tab_groups/auto_tab_groups_results.css",
+     "auto_tab_groups/auto_tab_groups_results_actions.css",
+     "auto_tab_groups/auto_tab_groups_shared_style.css",
++    "command_launcher_page.css",
+     "declutter/declutter_page.css",
+     "lazy_list.css",
+     "selectable_lazy_list.css",
+--- a/chrome/browser/resources/tab_search/app.ts
++++ b/chrome/browser/resources/tab_search/app.ts
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ import './auto_tab_groups/auto_tab_groups_page.js';
++import './command_launcher_page.js';
+ import './declutter/declutter_page.js';
+ import './tab_organization_selector.js';
+ import './tab_search_page.js';
+@@ -113,9 +114,14 @@
+     this.tabOrganizationEnabled_ = enabled;
+   }
+ 
++  protected isCommandLauncherMode_(): boolean {
++    return this.selectedTabSection_ === TabSearchSection.kCommand;
++  }
++
+   protected sectionToIndex_(section: TabSearchSection): number {
+     switch (section) {
+       case TabSearchSection.kNone:
++      case TabSearchSection.kCommand:
+         return -1;
+       case TabSearchSection.kSearch:
+         return 0;
+--- a/chrome/browser/resources/tab_search/app.html.ts
++++ b/chrome/browser/resources/tab_search/app.html.ts
+@@ -9,7 +9,10 @@
+ export function getHtml(this: TabSearchAppElement) {
+   // clang-format off
+   return html`
+-${(this.tabOrganizationEnabled_ || this.declutterEnabled_) ? html`
++${this.isCommandLauncherMode_() ? html`
++  <command-launcher-page available-height="${this.availableHeight_}">
++  </command-launcher-page>
++` : (this.tabOrganizationEnabled_ || this.declutterEnabled_) ? html`
+   <cr-tabs
+       .tabNames="${this.tabNames_}"
+       .selected="${this.sectionToIndex_(this.selectedTabSection_)}"
+--- a/chrome/browser/resources/tab_search/tab_search_api_proxy.ts
++++ b/chrome/browser/resources/tab_search/tab_search_api_proxy.ts
+@@ -4,7 +4,7 @@
+ 
+ import type {Url} from 'chrome://resources/mojo/url/mojom/url.mojom-webui.js';
+ 
+-import type {ProfileData, SwitchToTabInfo, Tab, TabOrganizationFeature, TabOrganizationModelStrategy, TabOrganizationSession, TabSearchSection, UnusedTabInfo, UserFeedback} from './tab_search.mojom-webui.js';
++import type {LauncherCommand, ProfileData, SwitchToTabInfo, Tab, TabOrganizationFeature, TabOrganizationModelStrategy, TabOrganizationSession, TabSearchSection, UnusedTabInfo, UserFeedback} from './tab_search.mojom-webui.js';
+ import {PageCallbackRouter, PageHandlerFactory, PageHandlerRemote} from './tab_search.mojom-webui.js';
+ 
+ /**
+@@ -37,6 +37,10 @@
+ 
+   getProfileData(): Promise<{profileData: ProfileData}>;
+ 
++  getLauncherCommands(): Promise<{commands: LauncherCommand[]}>;
++
++  executeLauncherCommand(commandId: number): Promise<{executed: boolean}>;
++
+   getUnusedTabs(): Promise<{tabs: UnusedTabInfo}>;
+ 
+   getTabSearchSection(): Promise<{section: TabSearchSection}>;
+@@ -140,6 +144,14 @@
+     return this.handler.getProfileData();
+   }
+ 
++  getLauncherCommands() {
++    return this.handler.getLauncherCommands();
++  }
++
++  executeLauncherCommand(commandId: number) {
++    return this.handler.executeLauncherCommand(commandId);
++  }
++
+   getUnusedTabs() {
+     return this.handler.getUnusedTabs();
+   }
+--- a/chrome/browser/resources/tab_search/command_launcher_page.ts
++++ b/chrome/browser/resources/tab_search/command_launcher_page.ts
+@@ -0,0 +1,342 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import '/strings.m.js';
++import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
++
++import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {LauncherCommand, ProfileData, Tab} from './tab_search.mojom-webui.js';
++import type {TabSearchApiProxy} from './tab_search_api_proxy.js';
++import {TabSearchApiProxyImpl} from './tab_search_api_proxy.js';
++import {getCss} from './command_launcher_page.css.js';
++import {getHtml} from './command_launcher_page.html.js';
++
++type HeadingItem = {
++  kind: 'heading',
++  title: string,
++};
++
++type CommandItem = {
++  kind: 'command',
++  command: LauncherCommand,
++  score: number,
++};
++
++type TabItem = {
++  kind: 'tab',
++  tab: Tab,
++  inActiveWindow: boolean,
++  score: number,
++};
++
++type DisplayItem = HeadingItem|CommandItem|TabItem;
++
++type OpenTab = {
++  tab: Tab,
++  inActiveWindow: boolean,
++};
++
++function isSelectable(item: DisplayItem): item is CommandItem|TabItem {
++  return item.kind === 'command' || item.kind === 'tab';
++}
++
++function safeHost(url: string): string {
++  try {
++    return new URL(url).hostname;
++  } catch {
++    return '';
++  }
++}
++
++function scoreText(query: string, value: string): number {
++  if (!query) {
++    return 1;
++  }
++
++  const text = value.toLowerCase();
++  const idx = text.indexOf(query);
++  if (idx === -1) {
++    return 0;
++  }
++
++  if (idx === 0) {
++    return 300 - query.length;
++  }
++
++  const charBefore = text[idx - 1] || '';
++  const isBoundary = /[\s/_.:-]/.test(charBefore);
++  return (isBoundary ? 220 : 120) - idx;
++}
++
++function scoreCommand(query: string, command: LauncherCommand): number {
++  return scoreText(query, command.title);
++}
++
++function scoreTab(query: string, tab: Tab): number {
++  if (!query) {
++    return 1;
++  }
++
++  const titleScore = scoreText(query, tab.title) * 2;
++  const hostScore = scoreText(query, safeHost(tab.url.url));
++  return Math.max(titleScore, hostScore);
++}
++
++function compareTabsByActivity(a: Tab, b: Tab): number {
++  const aValue = Number(a.lastActiveTimeTicks.internalValue);
++  const bValue = Number(b.lastActiveTimeTicks.internalValue);
++  return bValue - aValue;
++}
++
++export class CommandLauncherPageElement extends CrLitElement {
++  static get is() {
++    return 'command-launcher-page';
++  }
++
++  static override get properties() {
++    return {
++      availableHeight: {type: Number},
++      query_: {type: String},
++      displayItems_: {type: Array},
++      selectedDisplayIndex_: {type: Number},
++      shortcut_: {type: String},
++    };
++  }
++
++  accessor availableHeight: number|undefined;
++  protected accessor query_: string = '';
++  protected accessor displayItems_: DisplayItem[] = [];
++  protected accessor selectedDisplayIndex_: number = -1;
++  protected accessor shortcut_: string =
++      loadTimeData.getString('commandLauncherShortcutText');
++
++  private apiProxy_: TabSearchApiProxy = TabSearchApiProxyImpl.getInstance();
++  private commands_: LauncherCommand[] = [];
++  private openTabs_: OpenTab[] = [];
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.refreshData_();
++  }
++
++  override updated(changedProperties: PropertyValues<this>) {
++    super.updated(changedProperties);
++
++    if (changedProperties.has('availableHeight')) {
++      this.requestUpdate();
++    }
++  }
++
++  protected getListMaxHeight_(): string {
++    const height = this.availableHeight ?? 440;
++    return `${Math.max(180, height - 78)}px`;
++  }
++
++  protected onQueryInput_(e: Event) {
++    const target = e.target as HTMLInputElement;
++    this.query_ = target.value;
++    this.rebuildDisplayItems_();
++  }
++
++  protected async onSearchKeyDown_(e: KeyboardEvent) {
++    if (e.key === 'ArrowDown') {
++      this.moveSelection_(1);
++      e.preventDefault();
++      return;
++    }
++
++    if (e.key === 'ArrowUp') {
++      this.moveSelection_(-1);
++      e.preventDefault();
++      return;
++    }
++
++    if (e.key === 'Enter') {
++      e.preventDefault();
++      await this.executeSelected_();
++      return;
++    }
++
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      window.close();
++    }
++  }
++
++  protected isSelected_(index: number): boolean {
++    return this.selectedDisplayIndex_ === index;
++  }
++
++  protected onRowMouseEnter_(e: Event) {
++    const target = e.currentTarget as HTMLElement;
++    this.selectedDisplayIndex_ = Number(target.dataset['index']);
++  }
++
++  protected async onRowClick_(e: Event) {
++    const target = e.currentTarget as HTMLElement;
++    const index = Number(target.dataset['index']);
++    this.selectedDisplayIndex_ = index;
++    await this.executeSelected_();
++  }
++
++  protected rowTitle_(item: CommandItem|TabItem): string {
++    return item.kind === 'command' ? item.command.title : item.tab.title;
++  }
++
++  protected rowSubtitle_(item: CommandItem|TabItem): string {
++    if (item.kind === 'command') {
++      return loadTimeData.getString('commandLauncherActionSubtitle');
++    }
++    const url = item.tab.url.url;
++    return safeHost(url) || url;
++  }
++
++  private async refreshData_() {
++    const [{commands}, {profileData}] = await Promise.all([
++      this.apiProxy_.getLauncherCommands(),
++      this.apiProxy_.getProfileData(),
++    ]);
++    this.commands_ = commands.filter(command => command.enabled);
++    this.openTabs_ = this.getOpenTabs_(profileData);
++    this.rebuildDisplayItems_();
++  }
++
++  private getOpenTabs_(profileData: ProfileData): OpenTab[] {
++    return profileData.windows.reduce((acc, window) => {
++      acc.push(...window.tabs.map(tab => ({tab, inActiveWindow: window.active})));
++      return acc;
++    }, [] as OpenTab[]);
++  }
++
++  private rebuildDisplayItems_() {
++    const query = this.query_.trim().toLowerCase();
++
++    const commandItems = this.commands_
++                             .map(command => ({
++                               kind: 'command' as const,
++                               command,
++                               score: scoreCommand(query, command),
++                             }))
++                             .filter(item => query ? item.score > 0 : true)
++                             .sort((a, b) => {
++                               if (b.score !== a.score) {
++                                 return b.score - a.score;
++                               }
++                               return a.command.title.localeCompare(b.command.title);
++                             })
++                             .slice(0, 8);
++
++    const tabItems = this.openTabs_
++                         .map(openTab => ({
++                           kind: 'tab' as const,
++                           tab: openTab.tab,
++                           inActiveWindow: openTab.inActiveWindow,
++                           score: scoreTab(query, openTab.tab),
++                         }))
++                         .filter(item => query ? item.score > 0 : true)
++                         .sort((a, b) => {
++                           if (b.score !== a.score) {
++                             return b.score - a.score;
++                           }
++                           return compareTabsByActivity(a.tab, b.tab);
++                         })
++                         .slice(0, 8);
++
++    const nextItems: DisplayItem[] = [];
++    if (commandItems.length > 0) {
++      nextItems.push({
++        kind: 'heading',
++        title: loadTimeData.getString('commandLauncherCommandsTitle'),
++      });
++      nextItems.push(...commandItems);
++    }
++    if (tabItems.length > 0) {
++      nextItems.push({
++        kind: 'heading',
++        title: loadTimeData.getString('commandLauncherTabsTitle'),
++      });
++      nextItems.push(...tabItems);
++    }
++
++    this.displayItems_ = nextItems;
++
++    if (!this.isSelectableIndex_(this.selectedDisplayIndex_)) {
++      this.selectedDisplayIndex_ = this.firstSelectableIndex_();
++    }
++  }
++
++  private isSelectableIndex_(index: number): boolean {
++    if (index < 0 || index >= this.displayItems_.length) {
++      return false;
++    }
++    return isSelectable(this.displayItems_[index]!);
++  }
++
++  private firstSelectableIndex_(): number {
++    return this.displayItems_.findIndex(item => isSelectable(item));
++  }
++
++  private moveSelection_(delta: number) {
++    const selectableIndices = this.displayItems_
++                                  .map((item, index) => ({item, index}))
++                                  .filter(({item}) => isSelectable(item))
++                                  .map(({index}) => index);
++    if (selectableIndices.length === 0) {
++      this.selectedDisplayIndex_ = -1;
++      return;
++    }
++
++    const currentPosition = selectableIndices.indexOf(this.selectedDisplayIndex_);
++    if (currentPosition === -1) {
++      this.selectedDisplayIndex_ = selectableIndices[0]!;
++      return;
++    }
++
++    const nextPosition =
++        (currentPosition + delta + selectableIndices.length) % selectableIndices.length;
++    this.selectedDisplayIndex_ = selectableIndices[nextPosition]!;
++  }
++
++  private async executeSelected_() {
++    if (!this.isSelectableIndex_(this.selectedDisplayIndex_)) {
++      return;
++    }
++
++    const selected = this.displayItems_[this.selectedDisplayIndex_]!;
++    if (!isSelectable(selected)) {
++      return;
++    }
++
++    if (selected.kind === 'command') {
++      const {executed} =
++          await this.apiProxy_.executeLauncherCommand(selected.command.commandId);
++      if (!executed) {
++        return;
++      }
++    } else {
++      this.apiProxy_.switchToTab({tabId: selected.tab.tabId});
++    }
++
++    window.close();
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'command-launcher-page': CommandLauncherPageElement;
++  }
++}
++
++customElements.define(CommandLauncherPageElement.is, CommandLauncherPageElement);
+--- a/chrome/browser/resources/tab_search/command_launcher_page.html.ts
++++ b/chrome/browser/resources/tab_search/command_launcher_page.html.ts
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {CommandLauncherPageElement} from './command_launcher_page.js';
++
++export function getHtml(this: CommandLauncherPageElement) {
++  // clang-format off
++  return html`<!--_html_template_start_-->
++<div id="commandLauncherPage">
++  <div id="searchField" @keydown="${this.onSearchKeyDown_}">
++    <cr-icon id="searchIcon" icon="tab-search:search"></cr-icon>
++    <div id="searchWrapper">
++      <label id="searchLabel" for="searchInput" aria-hidden="true">
++        <span>$i18n{commandLauncherSearchPlaceholder}</span>
++        <span>${this.shortcut_}</span>
++      </label>
++      <input id="searchInput" aria-labelledby="searchLabel"
++          autofocus autocomplete="off"
++          @input="${this.onQueryInput_}"
++          type="search" spellcheck="false">
++    </div>
++  </div>
++  <div id="divider"></div>
++  <div id="results" style="max-height:${this.getListMaxHeight_()}">
++    ${this.displayItems_.length === 0 ? html`
++      <div id="noResults">$i18n{noResultsFound}</div>
++    ` : this.displayItems_.map((item, index) => {
++      if (item.kind === 'heading') {
++        return html`<div class="section">${item.title}</div>`;
++      }
++      return html`
++        <button class="row ${this.isSelected_(index) ? 'selected' : ''}"
++            data-index="${index}"
++            @mouseenter="${this.onRowMouseEnter_}"
++            @click="${this.onRowClick_}">
++          <div class="title">${this.rowTitle_(item)}</div>
++          <div class="subtitle">${this.rowSubtitle_(item)}</div>
++        </button>`;
++    })}
++  </div>
++</div>
++<!--_html_template_end_-->`;
++  // clang-format on
++}
+--- a/chrome/browser/resources/tab_search/command_launcher_page.css
++++ b/chrome/browser/resources/tab_search/command_launcher_page.css
+@@ -0,0 +1,112 @@
++/* Copyright 2026 The Chromium Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  color: var(--cr-primary-text-color);
++  display: block;
++  width: 100%;
++}
++
++#commandLauncherPage {
++  box-sizing: border-box;
++  display: flex;
++  flex-direction: column;
++  width: 100%;
++}
++
++#searchField {
++  align-items: center;
++  display: flex;
++  min-height: 56px;
++  padding: 8px 16px;
++}
++
++#searchIcon {
++  --cr-icon-size: 18px;
++  color: var(--cr-secondary-text-color);
++  margin-inline-end: 10px;
++}
++
++#searchWrapper {
++  display: flex;
++  flex: 1;
++  flex-direction: column;
++  min-width: 0;
++}
++
++#searchLabel {
++  align-items: center;
++  color: var(--cr-secondary-text-color);
++  display: flex;
++  font-size: 12px;
++  justify-content: space-between;
++  line-height: 16px;
++}
++
++#searchInput {
++  background: transparent;
++  border: 0;
++  color: var(--cr-primary-text-color);
++  font-size: 15px;
++  line-height: 20px;
++  outline: none;
++  padding: 2px 0 0;
++  width: 100%;
++}
++
++#divider {
++  border-top: 1px solid var(--cr-separator-color);
++}
++
++#results {
++  overflow-y: auto;
++  padding: 8px;
++}
++
++#noResults {
++  color: var(--cr-secondary-text-color);
++  font-size: 12px;
++  padding: 20px 8px 12px;
++}
++
++.section {
++  color: var(--cr-secondary-text-color);
++  font-size: 11px;
++  font-weight: 600;
++  letter-spacing: 0.08em;
++  margin: 10px 8px 6px;
++  text-transform: uppercase;
++}
++
++.row {
++  align-items: flex-start;
++  background: transparent;
++  border: 0;
++  border-radius: 8px;
++  color: inherit;
++  cursor: pointer;
++  display: flex;
++  flex-direction: column;
++  margin: 0;
++  padding: 9px 10px;
++  text-align: left;
++  width: 100%;
++}
++
++.row:hover,
++.row.selected {
++  background: var(--cr-hover-background-color);
++}
++
++.title {
++  font-size: 13px;
++  line-height: 18px;
++}
++
++.subtitle {
++  color: var(--cr-secondary-text-color);
++  font-size: 11px;
++  line-height: 14px;
++  margin-top: 2px;
++}
