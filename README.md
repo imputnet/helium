@@ -43,6 +43,14 @@ Along with the main repo and platform packaging, these projects are also a part 
 - [Helium onboarding](https://github.com/imputnet/helium-onboarding) (the onboarding page seen in Helium at `helium://setup`)
 - [uBlock Origin packaging](https://github.com/imputnet/ublock-origin-crx)
 
+## Community Helium repos
+Community-maintained projects related to Helium:
+- [s6muel/helium-browser-bin](https://github.com/s6muel/helium-browser-bin)
+- [tolnayeu/helium-linux-manager](https://github.com/tolnayeu/helium-linux-manager)
+- [ni3rav/helium-installer](https://github.com/ni3rav/helium-installer)
+- [jqssun/android-helium-browser](https://github.com/jqssun/android-helium-browser)
+- [AUR helium-browser-bin](https://aur.archlinux.org/packages/helium-browser-bin)
+
 ## Credits
 ### ungoogled-chromium
 Helium is proudly based on [ungoogled-chromium](https://github.com/ungoogled-software/ungoogled-chromium).
