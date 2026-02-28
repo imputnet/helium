@@ -49,7 +49,6 @@ Community-maintained projects related to Helium:
 - [tolnayeu/helium-linux-manager](https://github.com/tolnayeu/helium-linux-manager)
 - [ni3rav/helium-installer](https://github.com/ni3rav/helium-installer)
 - [jqssun/android-helium-browser](https://github.com/jqssun/android-helium-browser)
-- [AUR helium-browser-bin](https://aur.archlinux.org/packages/helium-browser-bin)
 
 ## Credits
 ### ungoogled-chromium
