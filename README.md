@@ -2,50 +2,58 @@
     <br/>
     <p>
         <img src="resources/branding/app_icon/raw.png"
-            title="Helium" alt="Helium logo" width="120" />
-        <h1>Helium</h1>
+            title="Zephyr" alt="Zephyr logo" width="120" />
+        <h1>Zephyr</h1>
     </p>
     <p width="120">
-        The Chromium-based web browser made for people, with love.
+        Community-maintained fork of Helium focused on UI improvements.
         <br>
-        Best privacy by default, unbiased ad-blocking, no bloat and no noise.
+        Helium core compatibility is intentionally preserved where possible.
     </p>
-    <a href="https://helium.computer/">
-        helium.computer
+    <a href="https://github.com/quanticstudios/zephyr">
+        github.com/quanticstudios/zephyr
     </a>
     <br/>
 </div>
 
+## Fork status
+> [!IMPORTANT]
+> Zephyr is an unofficial fork built on top of [Helium](https://github.com/imputnet/helium).
+> This project keeps upstream attribution and licensing intact.
+> See [FORK_NOTICE.md](FORK_NOTICE.md) for details.
+
 ## Downloads
 > [!NOTE]
-> Helium is still in beta, so unexpected issues may occur. We are not responsible
+> Zephyr is in early development, so unexpected issues may occur. We are not responsible
 for any damage caused by usage of beta software.
 
-Best way to download Helium is to open [helium.computer](https://helium.computer/) on your computer.
-It'll pick the right build for your OS and architecture automatically.
+Zephyr release artifacts will be published in this repository:
+- [Zephyr releases](https://github.com/quanticstudios/zephyr/releases)
 
-If you wish to download builds "straight from the tap" with all options in one place,
-you can do it on GitHub in the Releases section in each platform's repo:
+Upstream Helium releases are still available here:
 - [macOS](https://github.com/imputnet/helium-macos/releases/latest)
 - [Linux](https://github.com/imputnet/helium-linux/releases/latest) (AppImage)
 - [Windows](https://github.com/imputnet/helium-windows/releases/latest) (no auto-updates yet)
 
-## Platform packaging
-Helium is available on all major desktop platforms, with entirety of source code
-for all of them published here:
+## Upstream platform packaging
+Helium upstream is available on all major desktop platforms:
 - [Helium for macOS](https://github.com/imputnet/helium-macos)
 - [Helium for Linux](https://github.com/imputnet/helium-linux)
 - [Helium for Windows](https://github.com/imputnet/helium-windows)
 
-## Other Helium repos
-Along with the main repo and platform packaging, these projects are also a part of Helium:
+## Upstream Helium repos
+Along with the main repo and platform packaging, these projects are part of Helium:
 - [Helium services](https://github.com/imputnet/helium-services)
 - [Helium onboarding](https://github.com/imputnet/helium-onboarding) (the onboarding page seen in Helium at `helium://setup`)
 - [uBlock Origin packaging](https://github.com/imputnet/ublock-origin-crx)
 
 ## Credits
+### Helium
+Zephyr is built on top of [Helium](https://github.com/imputnet/helium).
+We continue to credit upstream and intend to upstream applicable fixes where possible.
+
 ### ungoogled-chromium
-Helium is proudly based on [ungoogled-chromium](https://github.com/ungoogled-software/ungoogled-chromium).
+Helium (and therefore Zephyr) is proudly based on [ungoogled-chromium](https://github.com/ungoogled-software/ungoogled-chromium).
 It wouldn't be possible for us to get rid of Google's bloat and get a development+building pipeline this fast without it.
 Huge shout-out to everyone behind this amazing project!
 (and we intend to contribute even more stuff upstream in the future)
@@ -62,7 +70,7 @@ making it possible to exist in the first place.
 
 ## License
 All code, patches, modified portions of imported code or patches, and
-any other content that is unique to Helium and not imported from other
+any other content that is unique to this repository and not imported from other
 repositories is licensed under GPL-3.0. See [LICENSE](LICENSE).
 
 Any content imported from other projects retains its original license (for
