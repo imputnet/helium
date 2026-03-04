@@ -1,0 +1,296 @@
+Index: src/chrome/browser/ui/views/tabs/more_tabs_row_view.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/tabs/more_tabs_row_view.cc
+@@ -0,0 +1,218 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/more_tabs_row_view.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/themes/theme_properties.h"
++#include "chrome/browser/ui/tabs/tab_renderer_data.h"
++#include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/tabs/tab_close_button.h"
++#include "chrome/browser/ui/views/tabs/tab_icon.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/accessibility/ax_node_data.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/theme_provider.h"
++#include "ui/events/event.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/layout/flex_layout.h"
++#include "ui/views/layout/flex_layout_types.h"
++#include "ui/views/view_class_properties.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++constexpr int kRowHeight = 32;
++constexpr int kRowCornerRadius = 7;
++constexpr auto kRowInsets = gfx::Insets::VH(2, 6);
++
++std::u16string GetTabTitleForRow(const TabRendererData& tab_data) {
++  if (!tab_data.title.empty()) {
++    return tab_data.title;
++  }
++
++  if (tab_data.visible_url.is_valid()) {
++    return base::UTF8ToUTF16(tab_data.visible_url.spec());
++  }
++
++  return u"Untitled";
++}
++
++}  // namespace
++
++BEGIN_METADATA(MoreTabsRowView)
++END_METADATA
++
++MoreTabsRowView::MoreTabsRowView(const tabs::TabInterface* tab,
++                                 const TabRendererData& tab_data,
++                                 TabCallback on_select_tab,
++                                 TabCallback on_close_tab)
++    : tab_(tab),
++      on_select_tab_(std::move(on_select_tab)),
++      on_close_tab_(std::move(on_close_tab)) {
++  SetProperty(views::kElementIdentifierKey, kMoreTabsPopupRowElementId);
++  SetPreferredSize(gfx::Size(0, kRowHeight));
++  SetNotifyEnterExitOnChild(true);
++
++  SetFocusBehavior(FocusBehavior::ALWAYS);
++  views::FocusRing::Install(this);
++  views::HighlightPathGenerator::Install(
++      this, std::make_unique<views::RoundRectHighlightPathGenerator>(
++                kRowInsets, kRowCornerRadius));
++
++  const std::u16string tab_title = GetTabTitleForRow(tab_data);
++  SetTooltipText(tab_title);
++
++  GetViewAccessibility().SetRole(ax::mojom::Role::kListItem);
++  GetViewAccessibility().SetName(tab_title);
++
++  auto* layout = SetLayoutManager(std::make_unique<views::FlexLayout>());
++  layout->SetOrientation(views::LayoutOrientation::kHorizontal);
++  layout->SetCrossAxisAlignment(views::LayoutAlignment::kCenter);
++  layout->SetInteriorMargin(kRowInsets);
++
++  auto tab_icon = std::make_unique<TabIcon>();
++  tab_icon->SetCanProcessEventsWithinSubtree(false);
++  tab_icon->SetCanPaintToLayer(false);
++  tab_icon->SetData(tab_data);
++  tab_icon->SetActiveState(tab && tab->IsActivated());
++  tab_icon->SetProperty(views::kMarginsKey, gfx::Insets::TLBR(0, 0, 0, 8));
++  tab_icon_ = AddChildView(std::move(tab_icon));
++
++  auto title_label = std::make_unique<views::Label>(tab_title);
++  title_label->SetCanProcessEventsWithinSubtree(false);
++  title_label->SetHorizontalAlignment(gfx::ALIGN_TO_HEAD);
++  title_label->SetElideBehavior(gfx::FADE_TAIL);
++  title_label->SetAutoColorReadabilityEnabled(false);
++  title_label->SetProperty(
++      views::kFlexBehaviorKey,
++      views::FlexSpecification(views::LayoutOrientation::kHorizontal,
++                               views::MinimumFlexSizeRule::kScaleToZero,
++                               views::MaximumFlexSizeRule::kUnbounded)
++          .WithWeight(1));
++  title_label_ = AddChildView(std::move(title_label));
++
++  close_button_ = AddChildView(std::make_unique<TabCloseButton>(
++      base::BindRepeating(&MoreTabsRowView::HandleClosePressed,
++                          base::Unretained(this)),
++      base::DoNothingAs<void(views::View*, const ui::MouseEvent&)>()));
++  close_button_->SetProperty(views::kCrossAxisAlignmentKey,
++                             views::LayoutAlignment::kCenter);
++  close_button_->SetVisible(false);
++
++  UpdateColors();
++}
++
++MoreTabsRowView::~MoreTabsRowView() = default;
++
++bool MoreTabsRowView::OnMousePressed(const ui::MouseEvent& event) {
++  return event.IsOnlyLeftMouseButton();
++}
++
++void MoreTabsRowView::OnMouseReleased(const ui::MouseEvent& event) {
++  if (!event.IsOnlyLeftMouseButton() || !HitTestPoint(event.location())) {
++    return;
++  }
++
++  gfx::Point point_in_close_button = event.location();
++  ConvertPointToTarget(this, close_button_, &point_in_close_button);
++  if (close_button_->HitTestPoint(point_in_close_button)) {
++    return;
++  }
++
++  SelectTab();
++}
++
++bool MoreTabsRowView::OnKeyPressed(const ui::KeyEvent& event) {
++  if (event.key_code() == ui::VKEY_RETURN ||
++      event.key_code() == ui::VKEY_SPACE) {
++    SelectTab();
++    return true;
++  }
++
++  return views::View::OnKeyPressed(event);
++}
++
++void MoreTabsRowView::OnMouseEntered(const ui::MouseEvent& event) {
++  hovered_ = true;
++  UpdateColors();
++}
++
++void MoreTabsRowView::OnMouseExited(const ui::MouseEvent& event) {
++  hovered_ = false;
++  UpdateColors();
++}
++
++void MoreTabsRowView::OnFocus() {
++  views::View::OnFocus();
++  UpdateColors();
++}
++
++void MoreTabsRowView::OnBlur() {
++  views::View::OnBlur();
++  UpdateColors();
++}
++
++void MoreTabsRowView::OnThemeChanged() {
++  views::View::OnThemeChanged();
++  UpdateColors();
++}
++
++void MoreTabsRowView::SelectTab() {
++  if (tab_ && !on_select_tab_.is_null()) {
++    on_select_tab_.Run(tab_);
++  }
++}
++
++void MoreTabsRowView::HandleClosePressed(const ui::Event& event) {
++  if (tab_ && !on_close_tab_.is_null()) {
++    on_close_tab_.Run(tab_);
++  }
++}
++
++void MoreTabsRowView::UpdateColors() {
++  if (!GetColorProvider()) {
++    return;
++  }
++
++  const bool is_active_tab = tab_ && tab_->IsActivated();
++  const bool use_hover_style = hovered_ || HasFocus();
++  const bool frame_active = !GetWidget() || GetWidget()->ShouldPaintAsActive();
++  const TabStyle::TabSelectionState state =
++      is_active_tab ? TabStyle::TabSelectionState::kActive
++                    : TabStyle::TabSelectionState::kInactive;
++  const bool show_close_button = hovered_ || HasFocus();
++  const ui::ThemeProvider* theme_provider = GetThemeProvider();
++  const bool should_fill_inactive_tabs =
++      theme_provider &&
++      theme_provider->GetDisplayProperty(
++          ThemeProperties::SHOULD_FILL_BACKGROUND_TAB_COLOR);
++  const bool should_paint_background =
++      is_active_tab || use_hover_style || should_fill_inactive_tabs;
++
++  const TabStyle::TabColors colors = TabStyle::Get()->CalculateTargetColors(
++      state, /*apparently_active=*/is_active_tab, /*hovered=*/use_hover_style,
++      frame_active, GetColorProvider());
++
++  close_button_->SetVisible(show_close_button);
++  title_label_->SetEnabledColor(colors.foreground_color);
++  close_button_->SetColors(colors);
++  SetBackground(should_paint_background
++                    ? views::CreateRoundedRectBackground(colors.background_color,
++                                                         kRowCornerRadius)
++                    : nullptr);
++}
+Index: src/chrome/browser/ui/views/tabs/more_tabs_row_view.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/tabs/more_tabs_row_view.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_ROW_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_ROW_VIEW_H_
++
++#include "base/functional/callback_forward.h"
++#include "base/memory/raw_ptr.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++struct TabRendererData;
++class TabCloseButton;
++class TabIcon;
++
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
++namespace ui {
++class Event;
++class KeyEvent;
++class MouseEvent;
++}  // namespace ui
++
++namespace views {
++class Label;
++}  // namespace views
++
++class MoreTabsRowView : public views::View {
++  METADATA_HEADER(MoreTabsRowView, views::View)
++
++ public:
++  using TabCallback = base::RepeatingCallback<void(const tabs::TabInterface*)>;
++
++  MoreTabsRowView(const tabs::TabInterface* tab,
++                  const TabRendererData& tab_data,
++                  TabCallback on_select_tab,
++                  TabCallback on_close_tab);
++  MoreTabsRowView(const MoreTabsRowView&) = delete;
++  MoreTabsRowView& operator=(const MoreTabsRowView&) = delete;
++  ~MoreTabsRowView() override;
++
++ private:
++  bool OnMousePressed(const ui::MouseEvent& event) override;
++  void OnMouseReleased(const ui::MouseEvent& event) override;
++  bool OnKeyPressed(const ui::KeyEvent& event) override;
++  void OnMouseEntered(const ui::MouseEvent& event) override;
++  void OnMouseExited(const ui::MouseEvent& event) override;
++  void OnFocus() override;
++  void OnBlur() override;
++  void OnThemeChanged() override;
++
++  void SelectTab();
++  void HandleClosePressed(const ui::Event& event);
++  void UpdateColors();
++
++  raw_ptr<const tabs::TabInterface> tab_ = nullptr;
++  raw_ptr<TabIcon> tab_icon_ = nullptr;
++  raw_ptr<views::Label> title_label_ = nullptr;
++  raw_ptr<TabCloseButton> close_button_ = nullptr;
++  TabCallback on_select_tab_;
++  TabCallback on_close_tab_;
++  bool hovered_ = false;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_ROW_VIEW_H_
