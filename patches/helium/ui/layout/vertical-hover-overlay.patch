@@ -1,0 +1,227 @@
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
+@@ -7,6 +7,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/timer/timer.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/sessions/core/session_id.h"
+@@ -50,6 +51,8 @@
+ 
+   bool IsCollapsed() const;
+   void SetCollapsed(bool collapsed);
++  bool IsHoverExpanded() const;
++  void SetHovered(bool hovered);
+ 
+   int GetUncollapsedWidth() const;
+   void SetUncollapsedWidth(int width);
+@@ -71,12 +74,17 @@
+   // Update the Collapse Button's Action Item (kActionToggleCollapseVertical)
+   // based on the Vertical Tab Strip's Collapse State.
+   void UpdateCollapseActionItem();
++  void StartHoverExpandTimerIfNeeded();
++  void OnHoverExpandDelayElapsed();
+ 
+   const raw_ptr<PrefService> pref_service_;
+   PrefChangeRegistrar pref_change_registrar_;
+   raw_ptr<actions::ActionItem> root_action_item_;
+ 
+   VerticalTabStripState state_;
++  bool is_hovered_ = false;
++  bool held_by_hover_ = false;
++  base::OneShotTimer hover_expand_timer_;
+ 
+   base::RepeatingCallbackList<void(VerticalTabStripStateController*)>
+       on_state_changed_callback_list_;
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <optional>
+ 
++#include "base/functional/bind.h"
++#include "base/time/time.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser_actions.h"
+@@ -24,6 +26,10 @@
+ 
+ DEFINE_USER_DATA(VerticalTabStripStateController);
+ 
++namespace {
++constexpr base::TimeDelta kHoverExpandDelay = base::Milliseconds(400);
++}  // namespace
++
+ VerticalTabStripStateController::VerticalTabStripStateController(
+     BrowserWindowInterface* browser_window,
+     PrefService* pref_service,
+@@ -88,6 +94,35 @@ bool VerticalTabStripStateController::IsCollapsed() const {
+ void VerticalTabStripStateController::SetCollapsed(bool collapsed) {
+   if (state_.collapsed != collapsed) {
+     state_.collapsed = collapsed;
++    if (!state_.collapsed) {
++      held_by_hover_ = false;
++      hover_expand_timer_.Stop();
++    } else {
++      held_by_hover_ = false;
++      StartHoverExpandTimerIfNeeded();
++    }
++    NotifyStateChanged();
++  }
++}
++
++bool VerticalTabStripStateController::IsHoverExpanded() const {
++  return state_.collapsed && held_by_hover_;
++}
++
++void VerticalTabStripStateController::SetHovered(bool hovered) {
++  if (is_hovered_ == hovered) {
++    return;
++  }
++  is_hovered_ = hovered;
++
++  if (is_hovered_) {
++    StartHoverExpandTimerIfNeeded();
++    return;
++  }
++
++  hover_expand_timer_.Stop();
++  if (held_by_hover_) {
++    held_by_hover_ = false;
+     NotifyStateChanged();
+   }
+ }
+@@ -108,6 +143,13 @@ void VerticalTabStripStateController::SetState(
+   if (state_.collapsed != state.collapsed ||
+       state_.uncollapsed_width != state.uncollapsed_width) {
+     state_ = state;
++    if (!state_.collapsed) {
++      held_by_hover_ = false;
++      hover_expand_timer_.Stop();
++    } else {
++      held_by_hover_ = false;
++      StartHoverExpandTimerIfNeeded();
++    }
+     NotifyStateChanged();
+   }
+ }
+@@ -152,4 +194,24 @@ void VerticalTabStripStateController::UpdateCollapseActionItem() {
+   }
+ }
+ 
++void VerticalTabStripStateController::StartHoverExpandTimerIfNeeded() {
++  if (!state_.collapsed || !is_hovered_ || held_by_hover_ ||
++      hover_expand_timer_.IsRunning()) {
++    return;
++  }
++  hover_expand_timer_.Start(
++      FROM_HERE, kHoverExpandDelay,
++      base::BindOnce(
++          &VerticalTabStripStateController::OnHoverExpandDelayElapsed,
++          base::Unretained(this)));
++}
++
++void VerticalTabStripStateController::OnHoverExpandDelayElapsed() {
++  if (!state_.collapsed || !is_hovered_ || held_by_hover_) {
++    return;
++  }
++  held_by_hover_ = true;
++  NotifyStateChanged();
++}
++
+ }  // namespace tabs
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
+@@ -5,7 +5,11 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ 
+ #include <optional>
++#include <utility>
+ 
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/browser_window/test/mock_browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
+ #include "chrome/common/pref_names.h"
+@@ -30,8 +34,19 @@ class VerticalTabStripStateControllerTest : public testing::Test {
+ 
+   void SetUp() override {
+     testing::Test::SetUp();
++    pref_service_.registry()->RegisterIntegerPref(
++        prefs::kHeliumLayout,
++        std::to_underlying(HeliumLayoutType::kHorizontal),
++        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
++    pref_service_.registry()->RegisterBooleanPref(
++        prefs::kHeliumVerticalRightAligned, false,
++        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+     pref_service_.registry()->RegisterBooleanPref(
+-        prefs::kVerticalTabsEnabled, false,
++        prefs::kHeliumVerticalCollapsed, false,
++        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
++    pref_service_.registry()->RegisterIntegerPref(
++        prefs::kHeliumVerticalUncollapsedWidth,
++        kVerticalTabStripDefaultUncollapsedWidth,
+         user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+     SessionID test_session_id = SessionID::FromSerializedValue(kSessionIDValue);
+ 
+@@ -58,6 +73,8 @@ class VerticalTabStripStateControllerTest : public testing::Test {
+   }
+ 
+  private:
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
+   std::unique_ptr<VerticalTabStripStateController> controller_;
+   sync_preferences::TestingPrefServiceSyncable pref_service_;
+   ui::UnownedUserDataHost unowned_user_data_host_;
+@@ -74,11 +91,13 @@ TEST_F(VerticalTabStripStateControllerTest, Initial) {
+ TEST_F(VerticalTabStripStateControllerTest, VerticalTabsEnabled) {
+   controller()->SetVerticalTabsEnabled(true);
+   EXPECT_TRUE(controller()->ShouldDisplayVerticalTabs());
+-  EXPECT_TRUE(pref_service()->GetBoolean(prefs::kVerticalTabsEnabled));
++  EXPECT_EQ(std::to_underlying(HeliumLayoutType::kVertical),
++            pref_service()->GetInteger(prefs::kHeliumLayout));
+ 
+   controller()->SetVerticalTabsEnabled(false);
+   EXPECT_FALSE(controller()->ShouldDisplayVerticalTabs());
+-  EXPECT_FALSE(pref_service()->GetBoolean(prefs::kVerticalTabsEnabled));
++  EXPECT_EQ(std::to_underlying(HeliumLayoutType::kHorizontal),
++            pref_service()->GetInteger(prefs::kHeliumLayout));
+ }
+ 
+ TEST_F(VerticalTabStripStateControllerTest, Collapsed) {
+@@ -141,4 +160,32 @@ TEST_F(VerticalTabStripStateControllerTest, State) {
+   EXPECT_EQ(1, call_count);
+ }
+ 
++TEST_F(VerticalTabStripStateControllerTest, HoverExpanded) {
++  int call_count = 0;
++  auto subscription = controller()->RegisterOnStateChanged(base::BindRepeating(
++      [](int* call_count, VerticalTabStripStateController* controller) {
++        (*call_count)++;
++        if (*call_count == 2) {
++          EXPECT_TRUE(controller->IsHoverExpanded());
++        }
++      },
++      &call_count));
++
++  controller()->SetCollapsed(true);
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++
++  controller()->SetHovered(true);
++  task_environment_.FastForwardBy(base::Milliseconds(399));
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++  EXPECT_EQ(1, call_count);
++
++  task_environment_.FastForwardBy(base::Milliseconds(1));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++  EXPECT_EQ(2, call_count);
++
++  controller()->SetHovered(false);
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++  EXPECT_EQ(3, call_count);
++}
++
+ }  // namespace tabs
