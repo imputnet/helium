@@ -1,0 +1,190 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -1328,6 +1328,10 @@
+ inline constexpr char kHeliumVerticalUncollapsedWidth[] =
+     "helium.browser.vertical_uncollapsed_width";
+ 
++// A boolean pref set to true if collapsed vertical tabs expand on hover.
++inline constexpr char kHeliumVerticalHoverExpandEnabled[] =
++    "helium.browser.vertical_hover_expand_enabled";
++
+ // A boolean pref set to true if a Home button to open the Home pages should be
+ // visible on the toolbar.
+ inline constexpr char kShowHomeButton[] = "browser.show_home_button";
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+@@ -44,6 +44,8 @@
+   registry->RegisterIntegerPref(
+       prefs::kHeliumVerticalUncollapsedWidth,
+       kVerticalTabStripDefaultUncollapsedWidth);
++  registry->RegisterBooleanPref(prefs::kHeliumVerticalHoverExpandEnabled,
++                                true);
+ }
+ 
+ TabSearchPosition GetTabSearchPosition(const Profile* profile) {
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -185,6 +185,8 @@
+       settings_api::PrefType::kNumber;
+   (*s_allowlist)[::prefs::kHeliumVerticalRightAligned] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumVerticalHoverExpandEnabled] =
++      settings_api::PrefType::kBoolean;
+ 
+   // Miscellaneous
+   (*s_allowlist)[::embedder_support::kAlternateErrorPagesEnabled] =
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
+@@ -74,6 +74,8 @@
+   // Update the Collapse Button's Action Item (kActionToggleCollapseVertical)
+   // based on the Vertical Tab Strip's Collapse State.
+   void UpdateCollapseActionItem();
++  bool IsHoverExpandEnabled() const;
++  void OnHoverExpandEnabledPrefChanged();
+   void StartHoverExpandTimerIfNeeded();
+   void OnHoverExpandDelayElapsed();
+ 
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -48,6 +48,11 @@
+       {prefs::kHeliumLayout, prefs::kHeliumVerticalRightAligned},
+       base::BindRepeating(&VerticalTabStripStateController::NotifyStateChanged,
+                           base::Unretained(this)));
++  pref_change_registrar_.Add(
++      prefs::kHeliumVerticalHoverExpandEnabled,
++      base::BindRepeating(
++          &VerticalTabStripStateController::OnHoverExpandEnabledPrefChanged,
++          base::Unretained(this)));
+ 
+   state_.collapsed =
+       pref_service_->GetBoolean(prefs::kHeliumVerticalCollapsed);
+@@ -106,7 +111,7 @@
+ }
+ 
+ bool VerticalTabStripStateController::IsHoverExpanded() const {
+-  return state_.collapsed && held_by_hover_;
++  return state_.collapsed && held_by_hover_ && IsHoverExpandEnabled();
+ }
+ 
+ void VerticalTabStripStateController::SetHovered(bool hovered) {
+@@ -116,6 +121,9 @@
+   is_hovered_ = hovered;
+ 
+   if (is_hovered_) {
++    if (!IsHoverExpandEnabled()) {
++      return;
++    }
+     StartHoverExpandTimerIfNeeded();
+     return;
+   }
+@@ -194,8 +202,25 @@
+   }
+ }
+ 
++bool VerticalTabStripStateController::IsHoverExpandEnabled() const {
++  return pref_service_->GetBoolean(prefs::kHeliumVerticalHoverExpandEnabled);
++}
++
++void VerticalTabStripStateController::OnHoverExpandEnabledPrefChanged() {
++  if (!IsHoverExpandEnabled()) {
++    hover_expand_timer_.Stop();
++    if (held_by_hover_) {
++      held_by_hover_ = false;
++      NotifyStateChanged();
++    }
++    return;
++  }
++  StartHoverExpandTimerIfNeeded();
++}
++
+ void VerticalTabStripStateController::StartHoverExpandTimerIfNeeded() {
+-  if (!state_.collapsed || !is_hovered_ || held_by_hover_ ||
++  if (!IsHoverExpandEnabled() || !state_.collapsed || !is_hovered_ ||
++      held_by_hover_ ||
+       hover_expand_timer_.IsRunning()) {
+     return;
+   }
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
+@@ -48,6 +48,9 @@
+         prefs::kHeliumVerticalUncollapsedWidth,
+         kVerticalTabStripDefaultUncollapsedWidth,
+         user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
++    pref_service_.registry()->RegisterBooleanPref(
++        prefs::kHeliumVerticalHoverExpandEnabled, true,
++        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+     SessionID test_session_id = SessionID::FromSerializedValue(kSessionIDValue);
+ 
+     EXPECT_CALL(mock_browser_window_interface_, GetUnownedUserDataHost)
+@@ -188,4 +191,21 @@
+   EXPECT_EQ(3, call_count);
+ }
+ 
++TEST_F(VerticalTabStripStateControllerTest, HoverExpandedDisabledByPref) {
++  controller()->SetCollapsed(true);
++  controller()->SetHovered(true);
++  task_environment_.FastForwardBy(base::Milliseconds(500));
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++}
++
++TEST_F(VerticalTabStripStateControllerTest, DisablingPrefClearsHoverExpanded) {
++  controller()->SetCollapsed(true);
++  controller()->SetHovered(true);
++  task_environment_.FastForwardBy(base::Milliseconds(500));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  pref_service()->SetBoolean(prefs::kHeliumVerticalHoverExpandEnabled, false);
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++}
++
+ }  // namespace tabs
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -291,6 +291,9 @@
+   <message name="IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN" desc="Label for the toggle that displays vertical tabs on the right side of the browser window.">
+     Show vertical tabs on right side
+   </message>
++  <message name="IDS_SETTINGS_TAB_STRIP_HOVER_EXPAND" desc="Label for the toggle that expands collapsed vertical tabs on hover.">
++    Expand collapsed vertical tabs on hover
++  </message>
+   <message name="IDS_SETTINGS_SHOW_HOME_BUTTON" desc="Label for the checkbox which enables or disables showing the home button in the toolbar.">
+     Show home button
+   </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -530,6 +530,7 @@
+       {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
+       {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
+       {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
++      {"tabStripHoverExpand", IDS_SETTINGS_TAB_STRIP_HOVER_EXPAND},
+       {"showHomeButton", IDS_SETTINGS_SHOW_HOME_BUTTON},
+       {"showBookmarksBar", IDS_SETTINGS_SHOW_BOOKMARKS_BAR},
+       {"tabStripPosition", IDS_SETTINGS_TAB_STRIP_POSITION},
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.ts
+@@ -474,6 +474,10 @@
+     return this.showVerticalTabsEnabled_ && layout === BrowserLayout.VERTICAL;
+   }
+ 
++  private showVerticalHoverExpansionSetting_(layout: number|undefined): boolean {
++    return this.showVerticalTabsEnabled_ && layout === BrowserLayout.VERTICAL;
++  }
++
+   private themeChanged_(themeId: string) {
+     if (this.prefs === undefined || this.systemTheme_ === undefined) {
+       return;
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html
+@@ -114,6 +114,12 @@
+               pref="{{prefs.helium.browser.vertical_right_aligned}}"
+               label="$i18n{tabStripRightAlign}">
+           </settings-toggle-button>
++          <settings-toggle-button class="hr"
++              hidden="[[!showVerticalHoverExpansionSetting_(
++                  prefs.helium.browser.layout.value)]]"
++              pref="{{prefs.helium.browser.vertical_hover_expand_enabled}}"
++              label="$i18n{tabStripHoverExpand}">
++          </settings-toggle-button>
+         </div>
+ 
+         <div

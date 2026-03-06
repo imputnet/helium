@@ -1,0 +1,275 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
+@@ -32,6 +32,7 @@
+   virtual bool ShouldDrawVerticalTabStrip() const = 0;
+   virtual bool ShouldDrawToolbarTabStrip() const = 0;
+   virtual bool IsVerticalTabStripCollapsed() const = 0;
++  virtual bool IsVerticalTabStripHoverExpanded() const = 0;
+   virtual bool IsVerticalTabStripRightAligned() const = 0;
+   virtual bool ShouldDrawWebAppFrameToolbar() const = 0;
+   virtual bool GetBorderlessModeEnabled() const = 0;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+@@ -58,6 +58,12 @@
+   return browser_view_->IsVerticalTabStripCollapsed();
+ }
+ 
++bool BrowserViewLayoutDelegateImpl::IsVerticalTabStripHoverExpanded() const {
++  auto* controller =
++      tabs::VerticalTabStripStateController::From(browser_view_->browser());
++  return controller && controller->IsHoverExpanded();
++}
++
+ bool BrowserViewLayoutDelegateImpl::IsVerticalTabStripRightAligned() const {
+   auto* controller =
+       tabs::VerticalTabStripStateController::From(browser_view_->browser());
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
+@@ -25,6 +25,7 @@
+   bool ShouldDrawVerticalTabStrip() const override;
+   bool ShouldDrawToolbarTabStrip() const override;
+   bool IsVerticalTabStripCollapsed() const override;
++  bool IsVerticalTabStripHoverExpanded() const override;
+   bool IsVerticalTabStripRightAligned() const override;
+   bool ShouldDrawWebAppFrameToolbar() const override;
+   bool GetBorderlessModeEnabled() const override;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -252,6 +252,8 @@
+   BrowserLayoutParams params = browser_params;
+   bool needs_exclusion = true;
+   const TabStripType tab_strip_type = GetTabStripType();
++  const bool vertical_hover_expanded =
++      delegate().IsVerticalTabStripHoverExpanded();
+   const bool vertical_right_aligned =
+       delegate().IsVerticalTabStripRightAligned();
+ 
+@@ -310,12 +312,20 @@
+       int vertical_tab_strip_relative_top = 0;
+       int vertical_tab_strip_width =
+           views().vertical_tab_strip_region_view->GetPreferredSize().width();
++      int vertical_tab_strip_reserved_width = vertical_tab_strip_width;
+       if (delegate().IsVerticalTabStripCollapsed()) {
+         // Collapsed tabstrip sits underneath caption buttons when present.
++        vertical_tab_strip_reserved_width =
++            VerticalTabStripRegionView::kCollapsedWidth;
++        if (!vertical_hover_expanded) {
++          vertical_tab_strip_width = vertical_tab_strip_reserved_width;
++        }
+         vertical_tab_strip_relative_top =
+             GetCollapsedVerticalTabStripRelativeTop(params);
+         collapsed_vertical_tab_strip_adjustment =
+-            vertical_tab_strip_relative_top > 0 ? vertical_tab_strip_width : 0;
++            vertical_tab_strip_relative_top > 0
++                ? vertical_tab_strip_reserved_width
++                : 0;
+       } else {
+         // Un-collapsed tabstrip must be at least as wide as the caption
+         // buttons, if present.
+@@ -334,7 +344,7 @@
+           vertical_tab_strip_width, params.visual_client_area.height() -
+             vertical_tab_strip_relative_top);
+       params.InsetHorizontal(
+-          vertical_tab_strip_width,
++          vertical_tab_strip_reserved_width,
+           /*leading=*/!vertical_right_aligned);
+     }
+     layout.AddChild(views().vertical_tab_strip_region_view,
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -71,6 +71,8 @@
+   SetPaintToLayer();
+   // Because corners may be transparent, this must be set to false.
+   layer()->SetFillsBoundsOpaquely(false);
++  // Hover expansion should react when entering/leaving any descendant view.
++  SetNotifyEnterExitOnChild(true);
+ 
+   flex_layout_ = SetLayoutManager(std::make_unique<views::FlexLayout>());
+   flex_layout_->SetOrientation(views::LayoutOrientation::kVertical)
+@@ -102,10 +104,10 @@
+   resize_animation_.SetSlideDuration(
+       gfx::Animation::RichAnimationDuration(base::Milliseconds(250)));
+   resize_animation_.SetTweenType(gfx::Tween::Type::EASE_IN_OUT_EMPHASIZED);
+-  resize_animation_.Reset(!state_controller_->IsCollapsed());
+-
+   target_collapse_state_ = state_controller_->GetState();
+-  SetPreferredSize(gfx::Size(target_collapse_state_.collapsed
++  target_visually_collapsed_ = IsVisuallyCollapsed();
++  resize_animation_.Reset(!target_visually_collapsed_);
++  SetPreferredSize(gfx::Size(target_visually_collapsed_
+                                  ? kCollapsedWidth
+                                  : target_collapse_state_.uncollapsed_width,
+                              0));
+@@ -156,6 +158,16 @@
+                                         bounds().height()));
+ }
+ 
++void VerticalTabStripRegionView::OnMouseEntered(const ui::MouseEvent& event) {
++  TabStripRegionView::OnMouseEntered(event);
++  state_controller_->SetHovered(true);
++}
++
++void VerticalTabStripRegionView::OnMouseExited(const ui::MouseEvent& event) {
++  TabStripRegionView::OnMouseExited(event);
++  state_controller_->SetHovered(false);
++}
++
+ views::View* VerticalTabStripRegionView::GetDefaultFocusableChild() {
+   return top_button_container_;
+ }
+@@ -477,14 +489,14 @@
+ 
+ void VerticalTabStripRegionView::UpdateInteriorMargin() {
+   const int padding = GetLayoutConstant(
+-      state_controller_->IsCollapsed()
++      IsVisuallyCollapsed()
+           ? LayoutConstant::kVerticalTabStripCollapsedPadding
+           : LayoutConstant::kVerticalTabStripUncollapsedPadding);
+ 
+   // When collapsed and under the toolbar, the top padding has to be 0
+   // in order to align with webview.
+   int top_padding =
+-      state_controller_->IsCollapsed() && has_leading_exclusion_
++      IsVisuallyCollapsed() && has_leading_exclusion_
+           ? 0
+           : kRegionVerticalPadding;
+ 
+@@ -492,6 +504,11 @@
+       gfx::Insets::TLBR(top_padding, 0, padding, 0));
+ }
+ 
++bool VerticalTabStripRegionView::IsVisuallyCollapsed() const {
++  return state_controller_->IsCollapsed() &&
++         !state_controller_->IsHoverExpanded();
++}
++
+ void VerticalTabStripRegionView::OnCollapsedStateChanged(
+     tabs::VerticalTabStripStateController* state_controller) {
+   if (target_collapse_state_.collapsed != state_controller->IsCollapsed()) {
+@@ -503,8 +520,9 @@
+     UpdateCollapseState(state_controller_->GetState());
+   }
+ 
++  const bool is_visually_collapsed = IsVisuallyCollapsed();
+   const int padding = GetLayoutConstant(
+-      state_controller_->IsCollapsed()
++      is_visually_collapsed
+           ? LayoutConstant::kVerticalTabStripCollapsedPadding
+           : LayoutConstant::kVerticalTabStripUncollapsedPadding);
+ 
+@@ -518,7 +536,22 @@
+   UpdateInteriorMargin();
+ 
+   if (tab_strip_view_) {
+-    tab_strip_view_->SetCollapsedState(state_controller->IsCollapsed());
++    tab_strip_view_->SetCollapsedState(is_visually_collapsed);
++  }
++
++  if (target_visually_collapsed_ != is_visually_collapsed) {
++    target_visually_collapsed_ = is_visually_collapsed;
++    if (target_visually_collapsed_) {
++      resize_animation_.Hide();
++    } else {
++      resize_animation_.Show();
++    }
++  } else if (state_controller_->IsCollapsed() &&
++             !resize_animation_.is_animating()) {
++    const int expanded_width =
++        std::clamp(state_controller_->GetUncollapsedWidth(),
++                   kUncollapsedMinWidth, kUncollapsedMaxWidth);
++    ResizeToWidth(is_visually_collapsed ? kCollapsedWidth : expanded_width);
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -97,6 +97,8 @@
+   // views::View:
+   void AddedToWidget() override;
+   void Layout(PassKey) override;
++  void OnMouseEntered(const ui::MouseEvent& event) override;
++  void OnMouseExited(const ui::MouseEvent& event) override;
+   views::View* GetDefaultFocusableChild() override;
+ 
+   // TabStripRegionView
+@@ -143,6 +145,7 @@
+   void ClearTabStripView(views::View* view);
+ 
+   void UpdateInteriorMargin();
++  bool IsVisuallyCollapsed() const;
+ 
+   void OnCollapsedStateChanged(
+       tabs::VerticalTabStripStateController* state_controller);
+@@ -159,7 +162,6 @@
+   bool tab_strip_editable_for_testing_ = true;
+ 
+   raw_ptr<VerticalTabStripTopContainer> top_button_container_ = nullptr;
+-  raw_ptr<views::Separator> top_button_separator_ = nullptr;
+   raw_ptr<VerticalTabStripView> tab_strip_view_ = nullptr;
+   raw_ptr<VerticalTabStripBottomContainer> bottom_button_container_ = nullptr;
+   raw_ptr<views::View> gemini_button_ = nullptr;
+@@ -189,6 +191,7 @@
+   // Additionally, the collapsed value may differ from the state controller, in
+   // which case this is the source of truth only if we are in a drag operation.
+   tabs::VerticalTabStripState target_collapse_state_;
++  bool target_visually_collapsed_ = false;
+ 
+   // Animation for collapsing (GetCurrentValue() -> 0) and expanding
+   // (GetCurrentValue() -> 1).
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view_browsertest.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view_browsertest.cc
+@@ -393,6 +393,42 @@
+   WaitForBoundsToMatchPreferredWidth();
+ }
+ 
++IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
++                       HoverExpandedDoesNotResizeContents) {
++  state_controller()->SetCollapsed(true);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&]() { return !region_view()->is_animating_for_testing(); }));
++  WaitForBoundsToMatchPreferredWidth();
++
++  const auto initial_contents_bounds =
++      browser()->GetBrowserView().GetContentsContainerForTest()->bounds();
++
++  state_controller()->SetHovered(true);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&]() { return state_controller()->IsHoverExpanded(); }));
++  ASSERT_TRUE(base::test::RunUntil([&]() {
++    return region_view()->GetPreferredSize().width() >
++           VerticalTabStripRegionView::kCollapsedWidth;
++  }));
++  WaitForBoundsToMatchPreferredWidth();
++
++  EXPECT_TRUE(state_controller()->IsCollapsed());
++  EXPECT_EQ(initial_contents_bounds,
++            browser()->GetBrowserView().GetContentsContainerForTest()->bounds());
++
++  state_controller()->SetHovered(false);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&]() { return !state_controller()->IsHoverExpanded(); }));
++  ASSERT_TRUE(base::test::RunUntil([&]() {
++    return region_view()->GetPreferredSize().width() ==
++           VerticalTabStripRegionView::kCollapsedWidth;
++  }));
++  WaitForBoundsToMatchPreferredWidth();
++
++  EXPECT_EQ(initial_contents_bounds,
++            browser()->GetBrowserView().GetContentsContainerForTest()->bounds());
++}
++
+ // Verify that the pinned tabs container will never be larger than the unpinned
+ // tabs area.
+ IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
+@@ -220,7 +220,8 @@
+ bool VerticalTabStripController::IsCollapsed() const {
+   tabs::VerticalTabStripStateController* state_controller =
+       tabs::VerticalTabStripStateController::From(browser_view_->browser());
+-  return state_controller && state_controller->IsCollapsed();
++  return state_controller && state_controller->IsCollapsed() &&
++         !state_controller->IsHoverExpanded();
+ }
+ 
+ bool VerticalTabStripController::IsContextMenuCommandChecked(
