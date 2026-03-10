@@ -74,15 +74,14 @@
  // |locale|: The application locale used for lookups in Firefox's
  // locale-specific search engines feature (see firefox_importer.cc for
  // details).
-@@ -157,6 +203,8 @@ void DetectFirefoxProfiles(
-     firefox.locale = locale;
-     profiles->push_back(firefox);
-   }
-+
+@@ -100,6 +146,7 @@ void DetectFirefoxProfiles(
+     std::vector<user_data_importer::SourceProfile>* profiles) {
+   base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
+                                                 base::BlockingType::MAY_BLOCK);
 +  DetectZenProfiles(locale, profiles);
- }
- 
- std::vector<user_data_importer::SourceProfile> DetectSourceProfilesWorker(
+ #if BUILDFLAG(IS_WIN)
+   const std::string firefox_install_id =
+       shell_integration::GetFirefoxProgIdSuffix();
 --- a/chrome/common/importer/firefox_importer_utils_linux.cc
 +++ b/chrome/common/importer/firefox_importer_utils_linux.cc
 @@ -41,11 +41,16 @@ constexpr const base::FilePath::CharType
@@ -102,7 +101,7 @@
                                           kFlatpakFirefoxProfileStorageBasePath};
  
  // The subpath to the profiles.ini file relative to a profile storage base path.
-@@ -59,12 +64,17 @@ constexpr const base::FilePath::CharType
+@@ -59,12 +64,18 @@ constexpr const base::FilePath::CharType
  constexpr const base::FilePath::StringViewType kFirefoxProfilesXdgIniSubpath =
      kFirefoxProfilesIniSubpath + 1;
  
@@ -113,7 +112,8 @@
 +constexpr const base::FilePath::StringViewType kZenProfilesXdgIniSubpath =
 +    kZenProfilesIniSubpath + 1;
 +
-+base::FilePath GetXdgProfilesINIImpl(const base::FilePath::CharType* ini_subpath) {
++base::FilePath GetXdgProfilesINIImpl(
++  const base::FilePath::StringViewType ini_subpath) {
    auto env = base::Environment::Create();
    base::FilePath xdg_config_dir = base::nix::GetXDGDirectory(
        env.get(), base::nix::kXdgConfigHomeEnvVar, base::nix::kDotConfigDir);
@@ -123,7 +123,7 @@
    if (base::PathExists(ini_file)) {
      return ini_file;
    }
-@@ -72,11 +82,11 @@ base::FilePath GetXdgProfilesINI() {
+@@ -72,11 +83,11 @@ base::FilePath GetXdgProfilesINI() {
    return {};
  }
  
@@ -131,15 +131,15 @@
 -
 -base::FilePath GetProfilesINI() {
 +base::FilePath GetProfilesINIImpl(const base::FilePath::CharType* ini_subpath,
-+                               const base::FilePath::CharType* xdg_subpath) {
++                                  base::FilePath::StringViewType xdg_subpath) {
    // First, check the XDG-style (~/.config/mozilla/firefox) path.
 -  if (auto xdg_ini_file = GetXdgProfilesINI(); !xdg_ini_file.empty()) {
-+  if (auto xdg_ini_file = GetXdgProfilesINI(xdg_subpath);
++  if (auto xdg_ini_file = GetXdgProfilesINIImpl(xdg_subpath);
 +      !xdg_ini_file.empty()) {
      return xdg_ini_file;
    }
  
-@@ -93,8 +103,7 @@ base::FilePath GetProfilesINI() {
+@@ -93,8 +104,7 @@ base::FilePath GetProfilesINI() {
  
    for (const auto* profile_storage_base : kFirefoxProfileStorageBasePaths) {
      base::FilePath ini_file = home;
@@ -149,7 +149,7 @@
      if (base::PathExists(ini_file)) {
        return ini_file;
      }
-@@ -102,3 +111,14 @@ base::FilePath GetProfilesINI() {
+@@ -102,3 +112,14 @@ base::FilePath GetProfilesINI() {
  
    return base::FilePath();
  }
@@ -370,12 +370,8 @@
  
  #if BUILDFLAG(IS_POSIX)
    locale_ = source_profile.locale;
-@@ -378,10 +380,12 @@ void FirefoxImporter::ImportBookmarks()
-     }
-   }
+@@ -380,8 +382,8 @@ void FirefoxImporter::ImportBookmarks()
  
-+  ImportZenPins(db, bookmarks);
-+
    // Write into profile.
    if (!bookmarks.empty() && !cancelled()) {
 -    const std::u16string& first_folder_name =
@@ -385,89 +381,6 @@
      bridge_->AddBookmarks(bookmarks, first_folder_name);
    }
    if (!search_engines.empty() && !cancelled()) {
-@@ -402,6 +406,82 @@ void FirefoxImporter::ImportBookmarks()
-   }
- }
- 
-+constexpr char kZenPinQuery[] =
-+    "SELECT uuid, title, url, is_group, created_at,       "
-+    "       is_essential, folder_parent_uuid FROM zen_pins";
-+
-+using user_data_importer::ImportedBookmarkEntry;
-+void FirefoxImporter::ImportZenPins(
-+    sql::Database& db,
-+    std::vector<ImportedBookmarkEntry>& bookmarks_out) {
-+  sql::Statement s(db.GetUniqueStatement(kZenPinQuery));
-+
-+  if (!s.is_valid()) {
-+    return;
-+  }
-+
-+  std::map<std::string, std::string> parents;
-+  std::map<std::string, ImportedBookmarkEntry> entries;
-+
-+  // first, we need to pull out all pins from the DB
-+  while (s.Step() && !cancelled()) {
-+    bool is_folder = s.ColumnBool(3); /* is_group */
-+
-+    std::string uuid = s.ColumnString(0);   /* uuid */
-+    std::string parent = s.ColumnString(6); /* folder_parent_uuid */
-+
-+    if (!parent.empty()) {
-+      parents[uuid] = std::move(parent);
-+    }
-+
-+    ImportedBookmarkEntry entry;
-+    entry.creation_time =
-+        base::Time::FromTimeT(s.ColumnInt64(4) / 1000); /* created_at */
-+
-+    entry.title = s.ColumnString16(1); /* title */
-+    if (entry.title.ends_with(u'/')) {
-+      entry.title = u"";
-+    }
-+
-+    entry.url = GURL(s.ColumnStringView(2)); /* url */
-+    entry.path = {};
-+    entry.in_toolbar = s.ColumnBool(5); /* is_essential */
-+    entry.is_folder = is_folder;
-+
-+    entries[uuid] = std::move(entry);
-+  }
-+
-+  // compute the folder hierarchy
-+  for (auto& [uuid, entry] : entries) {
-+    std::vector<std::u16string> path;
-+    std::string current = uuid;
-+
-+    while (true) {
-+      auto query = parents.find(current);
-+
-+      if (query == parents.end()) {
-+        break;
-+      }
-+
-+      current = query->second;
-+      path.insert(path.begin(), entries.find(current)->second.title);
-+    }
-+
-+    entry.path = std::move(path);
-+
-+    // Folders are ad-hoc constructed based on the .path
-+    // attribute that we defined just before this.
-+    // `is_folder` makes empty folders, which we don't
-+    // really care about when importing pins.
-+    // If you use empty folders for something, sorry I guess?
-+    if (entry.is_folder) {
-+      continue;
-+    }
-+
-+    bookmarks_out.push_back(std::move(entry));
-+  }
-+}
-+
- #if !BUILDFLAG(IS_MAC)
- void FirefoxImporter::ImportPasswords() {
-   // Initializes NSS3.
 --- a/chrome/utility/importer/firefox_importer.h
 +++ b/chrome/utility/importer/firefox_importer.h
 @@ -63,6 +63,9 @@ class FirefoxImporter : public Importer
