@@ -1,23 +1,177 @@
 --- a/chrome/browser/ui/views/side_panel/side_panel.cc
 +++ b/chrome/browser/ui/views/side_panel/side_panel.cc
-@@ -60,12 +60,12 @@ namespace {
- // This thickness includes the solid-color background and the inner round-rect
- // border-color stroke. It does not include the outer-color separator.
- int GetBorderThickness() {
+@@ -57,25 +57,17 @@
+ 
+ namespace {
+ 
+-// This thickness includes the solid-color background and the inner round-rect
+-// border-color stroke. It does not include the outer-color separator.
+-int GetBorderThickness() {
 -  return 8 + views::Separator::kThickness;
-+  return 6;
+-}
+-
+-// This is how many units of the toolbar are essentially expected to be
+-// background.
+-constexpr int kOverlapFromToolbar = 4;
+-
+-// We want the border to visually look like GetBorderThickness() units on all
+-// sides except the top. On the top side, background is drawn on top of the
+-// top-content separator and some units of background inside the toolbar (or
+-// bookmarks bar) itself. Subtract both of those to not get visually-excessive
+-// padding.
+-gfx::Insets GetBorderInsets() {
+-  int border_thickness = GetBorderThickness();
+-  return gfx::Insets::TLBR(-kOverlapFromToolbar, border_thickness,
+-                           border_thickness, border_thickness);
++constexpr int kResizeAreaWidth = 6;
++
++gfx::Insets GetBorderInsetsForAlignment(
++    SidePanel::HorizontalAlignment alignment) {
++  const bool is_right_aligned =
++      alignment == SidePanel::HorizontalAlignment::kRight;
++  const bool inset_on_left =
++      base::i18n::IsRTL() ? !is_right_aligned : is_right_aligned;
++  const int left = inset_on_left ? kResizeAreaWidth : 0;
++  const int right = inset_on_left ? 0 : kResizeAreaWidth;
++  return gfx::Insets::TLBR(0, left, 0, right);
  }
  
- // This is how many units of the toolbar are essentially expected to be
- // background.
--constexpr int kOverlapFromToolbar = 4;
-+constexpr int kOverlapFromToolbar = 3;
+ SidePanel::HorizontalAlignment GetHorizontalAlignment(
+@@ -196,14 +188,16 @@ class SidePanelBorder : public views::Bo
+   }
  
- // We want the border to visually look like GetBorderThickness() units on all
- // sides except the top. On the top side, background is drawn on top of the
+   gfx::Insets GetInsets() const override {
++    const gfx::Insets border_insets = GetBorderInsetsForAlignment(
++        SidePanel::HorizontalAlignment::kRight);
+     // This additional inset matches the growth inside BorderView::Layout()
+     // below to let us paint on top of the toolbar separator. This additional
+     // inset is outside the SidePanel itself, but not outside the BorderView. If
+     // there is a header we want to increase the top inset to give room for the
+     // header to paint on top of the border area.
+     int top_inset =
+-        views::Separator::kThickness + header_height_ - GetBorderInsets().top();
+-    return GetBorderInsets() + gfx::Insets::TLBR(top_inset, 0, 0, 0);
++        views::Separator::kThickness + header_height_ - border_insets.top();
++    return border_insets + gfx::Insets::TLBR(top_inset, 0, 0, 0);
+   }
+   gfx::Size GetMinimumSize() const override {
+     return gfx::Size(GetInsets().width(), GetInsets().height());
+@@ -443,16 +437,9 @@ SidePanel::SidePanel(BrowserView* browse
+   // parent view. content_parent_view_ is added first so it exists behind
+   // border_view_ and resize_area_.
+   content_parent_view_ = AddChildView(std::make_unique<ContentParentView>(
+-      browser_view, /*should_round_corners=*/!has_border, type));
++      browser_view, /*should_round_corners=*/false, type));
+   content_parent_view_->SetVisible(false);
+ 
+-  if (has_border) {
+-    std::unique_ptr<BorderView> border_view =
+-        std::make_unique<BorderView>(browser_view);
+-    border_view_ = border_view.get();
+-    AddChildView(std::move(border_view));
+-  }
+-
+   std::unique_ptr<views::SidePanelResizeArea> resize_area =
+       std::make_unique<views::SidePanelResizeArea>(this);
+   resize_area_ = resize_area.get();
+@@ -482,15 +469,12 @@ SidePanel::SidePanel(BrowserView* browse
+ 
+   SetVisible(false);
+   SetLayoutManager(std::make_unique<views::FillLayout>());
++  UpdateBorderInsets();
+ 
+   // Set the panel width from the preference or use the minimum size as the
+   // default.
+   SetPanelWidth(GetMinimumSize().width());
+ 
+-  if (has_border) {
+-    SetBorder(views::CreateEmptyBorder(GetBorderInsets()));
+-  }
+-
+   SetProperty(views::kElementIdentifierKey, kSidePanelElementId);
+ }
+ 
+@@ -575,6 +559,22 @@ bool SidePanel::IsRightAligned() const {
+   return horizontal_alignment() == HorizontalAlignment::kRight;
+ }
+ 
++gfx::Insets SidePanel::GetBorderInsets() const {
++  return GetBorderInsetsForAlignment(horizontal_alignment_);
++}
++
++void SidePanel::UpdateBorderInsets() {
++  if (header_view_ && header_view_->GetVisible()) {
++    const gfx::Insets border_insets = GetBorderInsets();
++    const int top_inset = header_view_->height() - border_insets.top();
++    SetBorder(views::CreateEmptyBorder(border_insets +
++                                       gfx::Insets::TLBR(top_inset, 0, 0, 0)));
++    return;
++  }
++
++  SetBorder(views::CreateEmptyBorder(GetBorderInsets().set_top(0)));
++}
++
+ gfx::Size SidePanel::GetMinimumSize() const {
+   const int min_height = 0;
+   return gfx::Size(
+@@ -620,29 +620,10 @@ gfx::Rect SidePanel::GetContentAnimation
+   return animating_bounds;
+ }
+ 
+-void SidePanel::AddHeaderView(std::unique_ptr<views::View> view) {
+-  // If a header view already exists make sure we remove it so that it is
+-  // replaced.
+-  if (header_view_) {
+-    auto header_view = RemoveChildViewT(header_view_);
+-    header_view_ = nullptr;
+-  }
+-  header_view_ = view.get();
+-  AddChildView(std::move(view));
+-  header_view_->InsertAfterInFocusList(resize_area_);
+-  header_view_->DeprecatedLayoutImmediately();
+-  if (border_view_) {
+-    border_view_->HeaderViewChanged(header_view_);
+-  }
+-  // Update the border so that the insets include space for the header to be
+-  // placed on top of the border area.
+-  int top_inset = header_view_->height() - GetBorderInsets().top();
+-  SetBorder(views::CreateEmptyBorder(GetBorderInsets() +
+-                                     gfx::Insets::TLBR(top_inset, 0, 0, 0)));
+-}
++void SidePanel::AddHeaderView(std::unique_ptr<views::View> view) {}
+ 
+ void SidePanel::RemoveHeaderView() {
+-  SetBorder(views::CreateEmptyBorder(GetBorderInsets().set_top(0)));
++  UpdateBorderInsets();
+   if (border_view_) {
+     border_view_->HeaderViewChanged(nullptr);
+   }
+@@ -860,9 +841,7 @@ void SidePanel::UpdateVisibility(bool sh
+       border_view_->layer()->SetFillsBoundsOpaquely(false);
+       if (header_view_ && header_view_->GetVisible()) {
+         border_view_->HeaderViewChanged(header_view_);
+-        int top_inset = header_view_->height() - GetBorderInsets().top();
+-        SetBorder(views::CreateEmptyBorder(
+-            GetBorderInsets() + gfx::Insets::TLBR(top_inset, 0, 0, 0)));
++        UpdateBorderInsets();
+       }
+     } else {
+       border_view_->DestroyLayer();
+@@ -957,6 +936,11 @@ void SidePanel::UpdateHorizontalAlignmen
+       GetHorizontalAlignment(browser_view_->GetProfile()->GetPrefs(), type_,
+                              use_default_horizontal_alignment_);
+ 
++  UpdateBorderInsets();
++  if (border_view_) {
++    border_view_->SchedulePaint();
++  }
++
+   InvalidateLayout();
+ }
+ 
 --- a/chrome/browser/ui/views/side_panel/side_panel_resize_area.cc
 +++ b/chrome/browser/ui/views/side_panel/side_panel_resize_area.cc
-@@ -29,11 +29,11 @@ SidePanelResizeHandle::SidePanelResizeHa
+@@ -29,7 +29,7 @@ SidePanelResizeHandle::SidePanelResizeHa
      : side_panel_(side_panel) {
    SetProperty(views::kElementIdentifierKey, kSidePanelResizeHandleElementId);
    SetVisible(false);
@@ -26,8 +180,22 @@
    SetPreferredSize(preferred_size);
    SetCanProcessEventsWithinSubtree(false);
  
--  const int resize_handle_left_margin = 2;
-+  const int resize_handle_left_margin = 1;
-   SetProperty(views::kMarginsKey,
-               gfx::Insets().set_left(resize_handle_left_margin));
- }
+--- a/chrome/browser/ui/views/side_panel/side_panel.h
++++ b/chrome/browser/ui/views/side_panel/side_panel.h
+@@ -15,6 +15,7 @@
+ #include "components/prefs/pref_change_registrar.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/gfx/animation/slide_animation.h"
++#include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/geometry/rounded_corners_f.h"
+ #include "ui/views/accessible_pane_view.h"
+ #include "ui/views/animation/animation_delegate_views.h"
+@@ -136,6 +137,8 @@ class SidePanel : public views::Accessib
+   bool ShouldShowAnimation() const;
+   void AnnounceResize();
+ 
++  gfx::Insets GetBorderInsets() const;
++  void UpdateBorderInsets();
+   void UpdateHorizontalAlignment();
+ 
+   // views::View:
