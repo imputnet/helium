@@ -18,7 +18,7 @@ def scale_image(input_file, size, output_path):
     """
     Scales the square image to provided size and saves it
     """
-    img = Image.open(input_file)
+    img = Image.open(input_file).convert("RGBA")
 
     if size is not None:
         img.thumbnail((size, size))
