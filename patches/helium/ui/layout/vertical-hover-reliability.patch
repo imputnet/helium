@@ -1,0 +1,285 @@
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
+@@ -74,10 +74,15 @@
+   // Update the Collapse Button's Action Item (kActionToggleCollapseVertical)
+   // based on the Vertical Tab Strip's Collapse State.
+   void UpdateCollapseActionItem();
++  void OnLayoutOrAlignmentPrefChanged();
+   bool IsHoverExpandEnabled() const;
+   void OnHoverExpandEnabledPrefChanged();
++  bool ShouldHoldExpandedForHover() const;
++  void ClearHoverHoldState(bool notify);
+   void StartHoverExpandTimerIfNeeded();
+   void OnHoverExpandDelayElapsed();
++  void StartHoverCollapseTimerIfNeeded();
++  void OnHoverCollapseDelayElapsed();
+ 
+   const raw_ptr<PrefService> pref_service_;
+   PrefChangeRegistrar pref_change_registrar_;
+@@ -87,6 +92,7 @@
+   bool is_hovered_ = false;
+   bool held_by_hover_ = false;
+   base::OneShotTimer hover_expand_timer_;
++  base::OneShotTimer hover_collapse_timer_;
+ 
+   base::RepeatingCallbackList<void(VerticalTabStripStateController*)>
+       on_state_changed_callback_list_;
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -27,7 +27,8 @@
+ DEFINE_USER_DATA(VerticalTabStripStateController);
+ 
+ namespace {
+-constexpr base::TimeDelta kHoverExpandDelay = base::Milliseconds(400);
++constexpr base::TimeDelta kHoverExpandDelay = base::Milliseconds(300);
++constexpr base::TimeDelta kHoverCollapseDelay = base::Milliseconds(120);
+ }  // namespace
+ 
+ VerticalTabStripStateController::VerticalTabStripStateController(
+@@ -46,8 +47,9 @@
+ 
+   pref_change_registrar_.AddMultiple(
+       {prefs::kHeliumLayout, prefs::kHeliumVerticalRightAligned},
+-      base::BindRepeating(&VerticalTabStripStateController::NotifyStateChanged,
+-                          base::Unretained(this)));
++      base::BindRepeating(
++          &VerticalTabStripStateController::OnLayoutOrAlignmentPrefChanged,
++          base::Unretained(this)));
+   pref_change_registrar_.Add(
+       prefs::kHeliumVerticalHoverExpandEnabled,
+       base::BindRepeating(
+@@ -97,21 +99,21 @@
+ }
+ 
+ void VerticalTabStripStateController::SetCollapsed(bool collapsed) {
+-  if (state_.collapsed != collapsed) {
+-    state_.collapsed = collapsed;
+-    if (!state_.collapsed) {
+-      held_by_hover_ = false;
+-      hover_expand_timer_.Stop();
+-    } else {
+-      held_by_hover_ = false;
+-      StartHoverExpandTimerIfNeeded();
+-    }
+-    NotifyStateChanged();
++  if (state_.collapsed == collapsed) {
++    return;
+   }
++
++  state_.collapsed = collapsed;
++  ClearHoverHoldState(/*notify=*/false);
++  if (state_.collapsed) {
++    StartHoverExpandTimerIfNeeded();
++  }
++  NotifyStateChanged();
+ }
+ 
+ bool VerticalTabStripStateController::IsHoverExpanded() const {
+-  return state_.collapsed && held_by_hover_ && IsHoverExpandEnabled();
++  return state_.collapsed && held_by_hover_ && IsHoverExpandEnabled() &&
++         ShouldDisplayVerticalTabs();
+ }
+ 
+ void VerticalTabStripStateController::SetHovered(bool hovered) {
+@@ -121,7 +123,8 @@
+   is_hovered_ = hovered;
+ 
+   if (is_hovered_) {
+-    if (!IsHoverExpandEnabled()) {
++    hover_collapse_timer_.Stop();
++    if (!ShouldHoldExpandedForHover()) {
+       return;
+     }
+     StartHoverExpandTimerIfNeeded();
+@@ -129,10 +132,7 @@
+   }
+ 
+   hover_expand_timer_.Stop();
+-  if (held_by_hover_) {
+-    held_by_hover_ = false;
+-    NotifyStateChanged();
+-  }
++  StartHoverCollapseTimerIfNeeded();
+ }
+ 
+ int VerticalTabStripStateController::GetUncollapsedWidth() const {
+@@ -151,11 +151,8 @@
+   if (state_.collapsed != state.collapsed ||
+       state_.uncollapsed_width != state.uncollapsed_width) {
+     state_ = state;
+-    if (!state_.collapsed) {
+-      held_by_hover_ = false;
+-      hover_expand_timer_.Stop();
+-    } else {
+-      held_by_hover_ = false;
++    ClearHoverHoldState(/*notify=*/false);
++    if (state_.collapsed) {
+       StartHoverExpandTimerIfNeeded();
+     }
+     NotifyStateChanged();
+@@ -206,24 +203,46 @@
+   return pref_service_->GetBoolean(prefs::kHeliumVerticalHoverExpandEnabled);
+ }
+ 
++void VerticalTabStripStateController::OnLayoutOrAlignmentPrefChanged() {
++  if (!ShouldDisplayVerticalTabs()) {
++    ClearHoverHoldState(/*notify=*/false);
++  } else if (state_.collapsed && is_hovered_) {
++    StartHoverExpandTimerIfNeeded();
++  }
++  NotifyStateChanged();
++}
++
+ void VerticalTabStripStateController::OnHoverExpandEnabledPrefChanged() {
+   if (!IsHoverExpandEnabled()) {
+-    hover_expand_timer_.Stop();
+-    if (held_by_hover_) {
+-      held_by_hover_ = false;
+-      NotifyStateChanged();
+-    }
++    ClearHoverHoldState(/*notify=*/true);
+     return;
+   }
+   StartHoverExpandTimerIfNeeded();
+ }
+ 
++bool VerticalTabStripStateController::ShouldHoldExpandedForHover() const {
++  return IsHoverExpandEnabled() && ShouldDisplayVerticalTabs() &&
++         state_.collapsed;
++}
++
++void VerticalTabStripStateController::ClearHoverHoldState(bool notify) {
++  hover_expand_timer_.Stop();
++  hover_collapse_timer_.Stop();
++  if (!held_by_hover_) {
++    return;
++  }
++  held_by_hover_ = false;
++  if (notify) {
++    NotifyStateChanged();
++  }
++}
++
+ void VerticalTabStripStateController::StartHoverExpandTimerIfNeeded() {
+-  if (!IsHoverExpandEnabled() || !state_.collapsed || !is_hovered_ ||
+-      held_by_hover_ ||
++  if (!ShouldHoldExpandedForHover() || !is_hovered_ || held_by_hover_ ||
+       hover_expand_timer_.IsRunning()) {
+     return;
+   }
++  hover_collapse_timer_.Stop();
+   hover_expand_timer_.Start(
+       FROM_HERE, kHoverExpandDelay,
+       base::BindOnce(
+@@ -232,11 +251,31 @@
+ }
+ 
+ void VerticalTabStripStateController::OnHoverExpandDelayElapsed() {
+-  if (!state_.collapsed || !is_hovered_ || held_by_hover_) {
++  if (!ShouldHoldExpandedForHover() || !is_hovered_ || held_by_hover_) {
+     return;
+   }
+   held_by_hover_ = true;
+   NotifyStateChanged();
+ }
+ 
++void VerticalTabStripStateController::StartHoverCollapseTimerIfNeeded() {
++  if (!held_by_hover_ || is_hovered_ || !state_.collapsed ||
++      hover_collapse_timer_.IsRunning()) {
++    return;
++  }
++  hover_collapse_timer_.Start(
++      FROM_HERE, kHoverCollapseDelay,
++      base::BindOnce(
++          &VerticalTabStripStateController::OnHoverCollapseDelayElapsed,
++          base::Unretained(this)));
++}
++
++void VerticalTabStripStateController::OnHoverCollapseDelayElapsed() {
++  if (!held_by_hover_ || is_hovered_ || !state_.collapsed) {
++    return;
++  }
++  held_by_hover_ = false;
++  NotifyStateChanged();
++}
++
+ }  // namespace tabs
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
+@@ -174,11 +174,13 @@
+       },
+       &call_count));
+ 
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
+   controller()->SetCollapsed(true);
+   EXPECT_FALSE(controller()->IsHoverExpanded());
+ 
+   controller()->SetHovered(true);
+-  task_environment_.FastForwardBy(base::Milliseconds(399));
++  task_environment_.FastForwardBy(base::Milliseconds(299));
+   EXPECT_FALSE(controller()->IsHoverExpanded());
+   EXPECT_EQ(1, call_count);
+ 
+@@ -187,11 +189,52 @@
+   EXPECT_EQ(2, call_count);
+ 
+   controller()->SetHovered(false);
++  task_environment_.FastForwardBy(base::Milliseconds(119));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++  EXPECT_EQ(2, call_count);
++
++  task_environment_.FastForwardBy(base::Milliseconds(1));
+   EXPECT_FALSE(controller()->IsHoverExpanded());
+   EXPECT_EQ(3, call_count);
+ }
+ 
++TEST_F(VerticalTabStripStateControllerTest, HoverCollapseCancelledOnReenter) {
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
++  controller()->SetCollapsed(true);
++
++  controller()->SetHovered(true);
++  task_environment_.FastForwardBy(base::Milliseconds(300));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  controller()->SetHovered(false);
++  task_environment_.FastForwardBy(base::Milliseconds(80));
++  controller()->SetHovered(true);
++  task_environment_.FastForwardBy(base::Milliseconds(1000));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++}
++
++TEST_F(VerticalTabStripStateControllerTest,
++       SwitchingAwayFromVerticalClearsHoverExpanded) {
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
++  controller()->SetCollapsed(true);
++  controller()->SetHovered(true);
++  task_environment_.FastForwardBy(base::Milliseconds(300));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kHorizontal));
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++
++  controller()->SetHovered(false);
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++}
++
+ TEST_F(VerticalTabStripStateControllerTest, HoverExpandedDisabledByPref) {
++  pref_service()->SetBoolean(prefs::kHeliumVerticalHoverExpandEnabled, false);
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
+   controller()->SetCollapsed(true);
+   controller()->SetHovered(true);
+   task_environment_.FastForwardBy(base::Milliseconds(500));
+@@ -199,6 +242,8 @@
+ }
+ 
+ TEST_F(VerticalTabStripStateControllerTest, DisablingPrefClearsHoverExpanded) {
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
+   controller()->SetCollapsed(true);
+   controller()->SetHovered(true);
+   task_environment_.FastForwardBy(base::Milliseconds(500));
