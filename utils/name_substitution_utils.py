@@ -78,6 +78,15 @@ def replace_text(text):
     return text, had_match
 
 
+def should_skip_tail(elem):
+    """
+    Whether the `tail` text should be left as-is on
+    a particular element.
+    """
+    return elem.get('name') == 'BEGIN_LINK_CHROMIUM' \
+        and elem.tail == 'Chromium'
+
+
 def replace_grit_message(msg):
     """
     Replaces instances of Chrom(e | ium) with Helium
@@ -90,7 +99,7 @@ def replace_grit_message(msg):
         msg.text = text
         had_any_match |= match
 
-    if msg.tail:
+    if msg.tail and not should_skip_tail(msg):
         tail, match = replace_text(msg.tail)
         msg.tail = tail
         had_any_match |= match
