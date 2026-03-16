@@ -49,6 +49,10 @@ can be applied there too.
 
 [> See development docs in macOS repo](https://github.com/imputnet/helium-macos/blob/main/docs/building.md#development-build-and-environment)
 
+## Contributing
+Before contributing to Helium, please read the guidelines in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Credits
 
 ### The Chromium project
