@@ -52,13 +52,15 @@
  #include "components/prefs/pref_service.h"
  #include "components/reading_list/core/reading_list_model.h"
  #include "components/split_tabs/split_tab_id.h"
-@@ -164,6 +168,53 @@ bool ShouldForgetOpenersForTransition(ui
+@@ -164,6 +168,54 @@ bool ShouldForgetOpenersForTransition(ui
                                        ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
  }
  
 +using DiscardEligibilityPolicy =
 +    performance_manager::policies::DiscardEligibilityPolicy;
 +using CanDiscardResult = performance_manager::policies::CanDiscardResult;
++constexpr auto kHibernateDiscardReason =
++    ::mojom::LifecycleUnitDiscardReason::EXTERNAL;
 +
 +DiscardEligibilityPolicy* GetDiscardEligibilityPolicy() {
 +  if (!performance_manager::PerformanceManager::IsAvailable()) {
@@ -93,8 +95,7 @@
 +  }
 +
 +  CanDiscardResult can_discard_result = eligibility_policy->CanDiscard(
-+      page_node.get(), ::mojom::LifecycleUnitDiscardReason::PROACTIVE,
-+      base::TimeDelta());
++      page_node.get(), kHibernateDiscardReason, base::TimeDelta());
 +
 +  if (can_discard_result != CanDiscardResult::kEligible) {
 +    return nullptr;
@@ -106,7 +107,7 @@
  }  // namespace
  
  TabGroupModelFactory::TabGroupModelFactory() {
-@@ -2485,6 +2536,21 @@ bool TabStripModel::IsContextMenuCommand
+@@ -2485,6 +2537,21 @@ bool TabStripModel::IsContextMenuCommand
      case CommandReload:
        return delegate_->CanReload();
  
@@ -128,7 +129,7 @@
      case CommandCloseOtherTabs:
      case CommandCloseTabsToRight: {
        return !GetIndicesClosedByCommand(context_index, command_id).empty();
-@@ -2651,6 +2717,27 @@ void TabStripModel::ExecuteContextMenuCo
+@@ -2651,6 +2718,27 @@ void TabStripModel::ExecuteContextMenuCo
        }
        break;
      }
@@ -148,7 +149,7 @@
 +        }
 +
 +        performance_manager::user_tuning::DiscardPage(
-+            page_node.get(), ::mojom::LifecycleUnitDiscardReason::PROACTIVE,
++            page_node.get(), kHibernateDiscardReason,
 +            /*ignore_minimum_time_in_background=*/true);
 +      }
 +      break;
@@ -168,3 +169,51 @@
    AddItemWithStringId(TabStripModel::CommandCloseTab, IDS_TAB_CXMENU_CLOSETAB);
    AddItemWithStringId(TabStripModel::CommandCloseOtherTabs,
                        IDS_TAB_CXMENU_CLOSEOTHERTABS);
+--- a/chrome/browser/ui/performance_controls/memory_saver_chip_tab_helper.cc
++++ b/chrome/browser/ui/performance_controls/memory_saver_chip_tab_helper.cc
+@@ -125,8 +125,9 @@ bool MemorySaverChipTabHelper::ComputeSh
+ 
+ void MemorySaverChipTabHelper::ComputeChipState(
+     content::NavigationHandle* navigation_handle) {
+-  // This memory saver chip only appears for eligible sites that have been
+-  // proactively discarded.
++  // This chip only appears for eligible sites that have been discarded by
++  // Memory Saver, by the performance detection manager, or explicitly by the
++  // user via Hibernate.
+   bool const was_discarded = navigation_handle->ExistingDocumentWasDiscarded();
+   std::optional<mojom::LifecycleUnitDiscardReason> const discard_reason =
+       memory_saver::GetDiscardReason(navigation_handle->GetWebContents());
+@@ -135,7 +136,8 @@ void MemorySaverChipTabHelper::ComputeCh
+ 
+   if (!(is_memory_saver_mode_enabled_ && was_discarded &&
+         (discard_reason == mojom::LifecycleUnitDiscardReason::PROACTIVE ||
+-         discard_reason == mojom::LifecycleUnitDiscardReason::SUGGESTED) &&
++         discard_reason == mojom::LifecycleUnitDiscardReason::SUGGESTED ||
++         discard_reason == mojom::LifecycleUnitDiscardReason::EXTERNAL) &&
+         is_site_supported)) {
+     chip_state_ = memory_saver::ChipState::HIDDEN;
+   } else if (ComputeShouldEducateAboutMemorySavings()) {
+--- a/chrome/browser/ui/tabs/tab_renderer_data.cc
++++ b/chrome/browser/ui/tabs/tab_renderer_data.cc
+@@ -154,15 +154,16 @@ TabRendererData TabRendererData::FromTab
+   std::optional<mojom::LifecycleUnitDiscardReason> discard_reason =
+       memory_saver::GetDiscardReason(contents);
+ 
+-  // Only show discard status for tabs that were proactively discarded or
+-  // suggested by the PerformanceDetectionManager to prevent confusion to users
+-  // on why a tab was discarded. Also, the favicon discard animation may use
+-  // resources so the animation should be limited to prevent performance issues.
++  // Show discard status for tabs discarded by Memory Saver, by the performance
++  // detection manager, or explicitly by the user via Hibernate. The favicon
++  // discard animation may use resources so the animation should be limited to
++  // discard reasons that intentionally surface this state to the user.
+   data.should_show_discard_status =
+       memory_saver::IsURLSupported(contents->GetURL()) &&
+       contents->WasDiscarded() && discard_reason.has_value() &&
+       (discard_reason.value() == mojom::LifecycleUnitDiscardReason::PROACTIVE ||
+-       discard_reason.value() == mojom::LifecycleUnitDiscardReason::SUGGESTED);
++       discard_reason.value() == mojom::LifecycleUnitDiscardReason::SUGGESTED ||
++       discard_reason.value() == mojom::LifecycleUnitDiscardReason::EXTERNAL);
+ 
+   if (contents->WasDiscarded()) {
+     data.discarded_memory_savings =
