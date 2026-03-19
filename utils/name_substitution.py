@@ -168,6 +168,8 @@ def maybe_make_tarball(tar_path, modified_files):
 
 def do_substitution(tree, tarpath, workers, dry_run):
     """Performs name substitutions on all candidate files"""
+    util.add_grit_to_path(tree)
+
     files = list(get_substitutable_files(tree, ['grd', 'grdp']))
     save_original = tarpath is not None
     print(f"Found {len(files)} .grd files to process")
@@ -196,8 +198,6 @@ def main():
 
     if not (args.t / "OWNERS").exists():
         raise ValueError("wrong src directory")
-
-    util.add_grit_to_path(args.t)
 
     if args.sub:
         if args.backup_path is not None and args.backup_path.exists():
