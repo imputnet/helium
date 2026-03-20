@@ -1,0 +1,510 @@
+--- a/chrome/browser/profiles/profile_avatar_icon_util.cc
++++ b/chrome/browser/profiles/profile_avatar_icon_util.cc
+@@ -451,6 +451,8 @@ constexpr std::string_view kDefaultUrlPr
+     "chrome://theme/IDR_PROFILE_AVATAR_";
+ constexpr base::FilePath::CharType kGAIAPictureFileName[] =
+     FILE_PATH_LITERAL("Google Profile Picture.png");
++constexpr base::FilePath::CharType kCustomAvatarPictureFileName[] =
++    FILE_PATH_LITERAL("Custom Avatar Picture.png");
+ constexpr base::FilePath::CharType kHighResAvatarFolderName[] =
+     FILE_PATH_LITERAL("Avatars");
+ 
+@@ -811,19 +813,17 @@ gfx::Image GetPlaceholderAvatarIconWithC
+     SkColor fill_color,
+     SkColor stroke_color,
+     int size,
+-    const PlaceholderAvatarIconParams& icon_params) {
++    const PlaceholderAvatarIconParams& icon_params,
++    const gfx::VectorIcon& icon) {
+   // If the icon should be an outline icon visible against the background, use
+   // `GetPlaceholderAvatarIconVisibleAgainstBackground()` instead.
+   CHECK(!icon_params.visibility_against_background.has_value());
+ 
+-  const gfx::VectorIcon& person_icon =
+-      vector_icons::kAccountCircleChromeRefreshIcon;
+-
+   const gfx::ImageSkia avatar_icon_without_background =
+       icon_params.has_padding
+-          ? CreatePaddedIcon(person_icon, size, stroke_color, 0.5f)
++          ? CreatePaddedIcon(icon, size, stroke_color, 0.5f)
+           : gfx::CreateVectorIcon(
+-                gfx::IconDescription(person_icon, size, stroke_color));
++                gfx::IconDescription(icon, size, stroke_color));
+ 
+   if (icon_params.has_background) {
+     return gfx::Image(
+@@ -891,13 +891,17 @@ base::DictValue GetAvatarIconAndLabelDic
+                                           const std::u16string& label,
+                                           size_t index,
+                                           bool selected,
+-                                          bool is_gaia_avatar) {
++                                          bool is_gaia_avatar,
++                                          bool is_custom_avatar,
++                                          bool is_placeholder) {
+   base::DictValue avatar_info;
+   avatar_info.Set("url", url);
+   avatar_info.Set("label", label);
+   avatar_info.Set("index", static_cast<int>(index));
+   avatar_info.Set("selected", selected);
+   avatar_info.Set("isGaiaAvatar", is_gaia_avatar);
++  avatar_info.Set("isCustomAvatar", is_custom_avatar);
++  avatar_info.Set("isPlaceholder", is_placeholder);
+   return avatar_info;
+ }
+ 
+@@ -905,13 +909,32 @@ base::DictValue GetDefaultProfileAvatarI
+                                                     SkColor stroke_color,
+                                                     bool selected) {
+   gfx::Image icon = profiles::GetPlaceholderAvatarIconWithColors(
+-      fill_color, stroke_color, kAvatarIconSize);
++      fill_color,
++      stroke_color,
++      kAvatarIconSize);
+   size_t index = profiles::GetPlaceholderAvatarIndex();
+   return GetAvatarIconAndLabelDict(
+       webui::GetBitmapDataUrl(icon.AsBitmap()),
+       l10n_util::GetStringUTF16(
+           profiles::GetDefaultAvatarLabelResourceIDAtIndex(index)),
+-      index, selected, /*is_gaia_avatar=*/false);
++      index, selected, /*is_gaia_avatar=*/false, /*is_custom_avatar=*/false,
++      /*is_placeholder=*/false);
++}
++
++base::DictValue GetPlaceholderCustomAvatarIconAndLabel(int index,
++                                                       SkColor fill_color,
++                                                       SkColor stroke_color) {
++  gfx::Image icon = profiles::GetPlaceholderAvatarIconWithColors(
++      fill_color,
++      stroke_color,
++      kAvatarIconSize,
++      /*icon_params=*/{},
++      kSavePageIcon);
++  return GetAvatarIconAndLabelDict(
++      webui::GetBitmapDataUrl(icon.AsBitmap()),
++      l10n_util::GetStringUTF16(IDS_SETTINGS_CHOOSE_CUSTOM_AVATAR_FILE), index,
++      false, /*is_gaia_avatar=*/false, /*is_custom_avatar=*/true,
++      /*is_placeholder=*/true);
+ }
+ 
+ base::ListValue GetCustomProfileAvatarIconsAndLabels(
+@@ -924,7 +947,8 @@ base::ListValue GetCustomProfileAvatarIc
+         profiles::GetDefaultAvatarIconUrl(i),
+         l10n_util::GetStringUTF16(
+             profiles::GetDefaultAvatarLabelResourceIDAtIndex(i)),
+-        i, i == selected_avatar_idx, /*is_gaia_avatar=*/false));
++        i, i == selected_avatar_idx, /*is_gaia_avatar=*/false,
++        /*is_custom_avatar=*/false, /*is_placeholder=*/false));
+   }
+   return avatars;
+ }
+@@ -957,13 +981,33 @@ base::ListValue GetIconsAndLabelsForProf
+   DCHECK(entry);
+ 
+   bool using_gaia = entry->IsUsingGAIAPicture();
+-  size_t selected_avatar_idx =
+-      using_gaia ? SIZE_MAX : entry->GetAvatarIconIndex();
++  bool using_custom_avatar = entry->IsUsingCustomAvatar();
++  size_t selected_avatar_idx = using_gaia || using_custom_avatar
++                                   ? SIZE_MAX
++                                   : entry->GetAvatarIconIndex();
+ 
+   // Obtain a list of the modern avatar icons.
+   base::ListValue avatars(
+       GetCustomProfileAvatarIconsAndLabels(selected_avatar_idx));
+ 
++  if (const auto* custom_icon = entry->GetCustomAvatarPicture()) {
++    gfx::Image avatar_icon = GetAvatarIconForWebUI(*custom_icon);
++    auto custom_avatar_info = GetAvatarIconAndLabelDict(
++        /*url=*/webui::GetBitmapDataUrl(avatar_icon.AsBitmap()),
++        /*label=*/
++        l10n_util::GetStringUTF16(IDS_SETTINGS_CUSTOM_AVATAR_LABEL),
++        /*index=*/0, using_custom_avatar, /*is_gaia_avatar=*/false,
++        /*is_custom_avatar=*/true, /*is_placeholder =*/false);
++    avatars.Insert(avatars.begin(), base::Value(std::move(custom_avatar_info)));
++  } else {
++    ProfileThemeColors colors = entry->GetProfileThemeColors();
++    auto generic_avatar_info = GetPlaceholderCustomAvatarIconAndLabel(
++        /*index=*/1, colors.default_avatar_fill_color,
++        colors.default_avatar_stroke_color);
++    avatars.Insert(avatars.begin(),
++                   base::Value(std::move(generic_avatar_info)));
++  }
++
+   if (entry->GetSigninState() == SigninState::kNotSignedIn) {
+     ProfileThemeColors colors = entry->GetProfileThemeColors();
+     auto generic_avatar_info = GetDefaultProfileAvatarIconAndLabel(
+@@ -982,7 +1026,8 @@ base::ListValue GetIconsAndLabelsForProf
+         /*url=*/webui::GetBitmapDataUrl(avatar_icon.AsBitmap()),
+         /*label=*/
+         l10n_util::GetStringUTF16(IDS_SETTINGS_CHANGE_PICTURE_PROFILE_PHOTO),
+-        /*index=*/0, using_gaia, /*is_gaia_avatar=*/true);
++        /*index=*/0, using_gaia, /*is_gaia_avatar=*/true,
++        /*is_custom_avatar=*/false, /*is_placeholder=*/false);
+     avatars.Insert(avatars.begin(), base::Value(std::move(gaia_picture_info)));
+   }
+ 
+@@ -998,6 +1043,7 @@ void SetDefaultProfileAvatarIndex(Profil
+   pref_service->SetBoolean(prefs::kProfileUsingDefaultAvatar,
+                            avatar_icon_index == GetPlaceholderAvatarIndex());
+   pref_service->SetBoolean(prefs::kProfileUsingGAIAAvatar, false);
++  pref_service->SetBoolean(prefs::kProfileUsingCustomAvatar, false);
+ 
+   ProfileMetrics::LogProfileAvatarSelection(avatar_icon_index);
+ }
+--- a/chrome/browser/profiles/profile_attributes_entry.cc
++++ b/chrome/browser/profiles/profile_attributes_entry.cc
+@@ -69,6 +69,8 @@ const char kUserAcceptedAccountManagemen
+ const char kLastDownloadedGAIAPictureUrlWithSizeKey[] =
+     "last_downloaded_gaia_picture_url_with_size";
+ const char kGAIAPictureFileNameKey[] = "gaia_picture_file_name";
++const char kCustomAvatarPictureFileNameKey[] =
++    "custom_avatar_picture_file_name";
+ 
+ // Profile colors info.
+ const char kProfileHighlightColorKey[] = "profile_highlight_color";
+@@ -117,6 +119,8 @@ const char ProfileAttributesEntry::kIsUs
+     "is_using_default_name";
+ const char ProfileAttributesEntry::kIsUsingDefaultAvatarKey[] =
+     "is_using_default_avatar";
++const char ProfileAttributesEntry::kIsUsingCustomAvatarKey[] =
++    "is_using_custom_avatar";
+ const char ProfileAttributesEntry::kUseGAIAPictureKey[] = "use_gaia_picture";
+ const char ProfileAttributesEntry::kAccountIdKey[] = "account_id_key";
+ const char ProfileAttributesEntry::kIsGlicEligible[] = "is_glic_eligible";
+@@ -282,7 +286,7 @@ bool ProfileAttributesEntry::ShouldUpdat
+     // Updating from an empty image to a null image is a no-op and it is
+     // important to avoid firing |OnProfileAvatarChanged| in this case.
+     // See http://crbug.com/41423540
+-    DCHECK(!IsGAIAPictureLoaded());
++    // DCHECK(!IsGAIAPictureLoaded());
+     return false;
+   }
+ 
+@@ -302,6 +306,26 @@ bool ProfileAttributesEntry::ShouldUpdat
+   return IsUsingDefaultAvatar() || IsUsingGAIAPicture();
+ }
+ 
++bool ProfileAttributesEntry::ShouldUpdateCustomAvatarPicture(
++    bool image_is_empty) const {
++  std::string old_file_name = GetString(kCustomAvatarPictureFileNameKey);
++
++  if (old_file_name.empty() && image_is_empty) {
++    // On Windows, Taskbar and Desktop icons are refreshed every time
++    // |OnProfileAvatarChanged| notification is fired.
++    // Updating from an empty image to a null image is a no-op and it is
++    // important to avoid firing |OnProfileAvatarChanged| in this case.
++    // See http://crbug.com/900374
++    return false;
++  }
++
++  if (old_file_name.empty() || image_is_empty) {
++    return true;
++  }
++
++  return IsUsingDefaultAvatar() || IsUsingCustomAvatar();
++}
++
+ std::u16string ProfileAttributesEntry::GetLastNameToDisplay() const {
+   return last_name_to_display_;
+ }
+@@ -369,7 +393,12 @@ ProfileAttributesEntry::GetAvatarIconWit
+     int size_for_placeholder_avatar,
+     bool use_high_res_file,
+     const PlaceholderAvatarIconParams& icon_params) const {
+-  if (IsUsingGAIAPicture()) {
++
++  if (IsUsingCustomAvatar()) {
++    if (const gfx::Image* image = GetCustomAvatarPicture()) {
++      return {*image, AvatarIconType::kNonPlaceholder};
++    }
++  } else if (IsUsingGAIAPicture()) {
+     // The picture may be null if it has not finished downloading yet; in that
+     // case fall through to return the avatar-index-based icon below.
+     if (const gfx::Image* image = GetGAIAPicture()) {
+@@ -444,6 +473,19 @@ const gfx::Image* ProfileAttributesEntry
+       profile_path_, storage_key_, image_path);
+ }
+ 
++const gfx::Image* ProfileAttributesEntry::GetCustomAvatarPicture() const {
++  std::string file_name = GetString(kCustomAvatarPictureFileNameKey);
++
++  // If the picture is not on disk then return nullptr.
++  if (file_name.empty()) {
++    return nullptr;
++  }
++
++  base::FilePath image_path = profile_path_.AppendASCII(file_name);
++  return profile_attributes_storage_->LoadAvatarPictureFromPath(
++      profile_path_, storage_key_, image_path);
++}
++
+ bool ProfileAttributesEntry::IsUsingGAIAPicture() const {
+   bool result = GetBool(kUseGAIAPictureKey);
+   if (!result) {
+@@ -516,6 +558,10 @@ bool ProfileAttributesEntry::IsUsingDefa
+   return GetBool(kIsUsingDefaultAvatarKey);
+ }
+ 
++bool ProfileAttributesEntry::IsUsingCustomAvatar() const {
++  return GetBool(kIsUsingCustomAvatarKey);
++}
++
+ bool ProfileAttributesEntry::IsSignedInWithCredentialProvider() const {
+   return false;
+ }
+@@ -740,6 +786,39 @@ void ProfileAttributesEntry::SetIsUsingG
+   }
+ }
+ 
++void ProfileAttributesEntry::SetCustomAvatarPicture(gfx::Image image) {
++  std::string old_file_name = GetString(kCustomAvatarPictureFileNameKey);
++  std::string new_file_name;
++
++  if (!ShouldUpdateCustomAvatarPicture(image.IsEmpty())) {
++    return;
++  }
++
++  DCHECK(!image.IsEmpty() || !old_file_name.empty())
++      << "Trying to set an empty custom avatar picture when there is no "
++         "existing custom avatar picture.";
++
++  if (!image.IsEmpty()) {
++    // Save the new bitmap to disk.
++    new_file_name = old_file_name.empty()
++                        ? base::FilePath(profiles::kCustomAvatarPictureFileName)
++                              .MaybeAsASCII()
++                        : old_file_name;
++    base::FilePath image_path = profile_path_.AppendASCII(new_file_name);
++    profile_attributes_storage_->SaveCustomAvatarImageAtPath(
++        profile_path_, storage_key_, image, image_path);
++  }
++
++  SetString(kCustomAvatarPictureFileNameKey, new_file_name);
++  profile_attributes_storage_->NotifyOnProfileAvatarChanged(profile_path_);
++}
++
++void ProfileAttributesEntry::SetIsUsingCustomAvatar(bool value) {
++  if (SetBool(kIsUsingCustomAvatarKey, value)) {
++    profile_attributes_storage_->NotifyOnProfileAvatarChanged(profile_path_);
++  }
++}
++
+ void ProfileAttributesEntry::SetLastDownloadedGAIAPictureUrlWithSize(
+     const std::string& image_url_with_size) {
+   SetString(kLastDownloadedGAIAPictureUrlWithSizeKey, image_url_with_size);
+@@ -897,6 +976,21 @@ void ProfileAttributesEntry::SetAuthInfo
+   profile_attributes_storage_->NotifyProfileAuthInfoChanged(profile_path_);
+ }
+ 
++void ProfileAttributesEntry::ClearCustomAvatar() {
++  std::string file_name = GetString(kCustomAvatarPictureFileNameKey);
++
++  if (!file_name.empty()) {
++    // Delete the old bitmap from disk.
++    base::FilePath image_path = profile_path_.AppendASCII(file_name);
++    profile_attributes_storage_->DeleteCustomAvatarImageAtPath(
++        profile_path_, storage_key_, image_path);
++  }
++
++  ClearValue(kCustomAvatarPictureFileNameKey);
++  SetBool(kIsUsingCustomAvatarKey, false);
++  profile_attributes_storage_->NotifyOnProfileAvatarChanged(profile_path_);
++}
++
+ const gfx::Image* ProfileAttributesEntry::GetHighResAvatar() const {
+   const size_t avatar_index = GetAvatarIconIndex();
+ 
+--- a/chrome/browser/profiles/profile_attributes_entry.h
++++ b/chrome/browser/profiles/profile_attributes_entry.h
+@@ -160,6 +160,9 @@ class ProfileAttributesEntry {
+   // if the profile does not have a GAIA picture or if the picture must be
+   // loaded from disk.
+   const gfx::Image* GetGAIAPicture() const;
++  // Return the custom avatar picture for the given profile. This may return
++  // NULL if the profile does not have a custom avatar picture
++  const gfx::Image* GetCustomAvatarPicture() const;
+   // Returns true if the profile displays a GAIA picture instead of one of the
+   // locally bundled icons.
+   bool IsUsingGAIAPicture() const;
+@@ -193,6 +196,9 @@ class ProfileAttributesEntry {
+   // Returns true if the Profile is using the default avatar, which is one of
+   // the profile icons selectable at profile creation.
+   bool IsUsingDefaultAvatar() const;
++  // Returns true if the Profile is using a custom avatar, which is an avatar
++  // that the user has selected from the file system.
++  bool IsUsingCustomAvatar() const;
+   // Indicates that profile was signed in through native OS credential provider.
+   bool IsSignedInWithCredentialProvider() const;
+   // Returns true if the profile is managed by a third party identity that is
+@@ -252,6 +258,7 @@ class ProfileAttributesEntry {
+   void SetGAIAName(const std::u16string& name);
+   void SetGAIAGivenName(const std::u16string& name);
+   void SetGAIAPicture(const std::string& image_url_with_size, gfx::Image image);
++  void SetCustomAvatarPicture(gfx::Image image);
+   void SetIsUsingGAIAPicture(bool value);
+   void SetLastDownloadedGAIAPictureUrlWithSize(
+       const std::string& image_url_with_size);
+@@ -264,6 +271,7 @@ class ProfileAttributesEntry {
+   void SetUserAcceptedAccountManagement(bool value);
+   bool UserAcceptedAccountManagement() const;
+   void SetIsUsingDefaultAvatar(bool value);
++  void SetIsUsingCustomAvatar(bool value);
+   void SetAvatarIconIndex(size_t icon_index);
+   // std::nullopt resets colors to default.
+   void SetProfileThemeColors(const std::optional<ProfileThemeColors>& colors);
+@@ -285,6 +293,9 @@ class ProfileAttributesEntry {
+ 
+   void SetIsGlicEligible(bool value);
+ 
++  // Clears the custom avatar of the profile, if it exists.
++  void ClearCustomAvatar();
++
+   // Lock/Unlock the profile, should be called only if force-sign-in is enabled.
+   void LockForceSigninProfile(bool is_lock);
+ 
+@@ -299,6 +310,7 @@ class ProfileAttributesEntry {
+   static const char kEnterpriseLabelKey[];
+   static const char kIsUsingDefaultNameKey[];
+   static const char kIsUsingDefaultAvatarKey[];
++  static const char kIsUsingCustomAvatarKey[];
+   static const char kUseGAIAPictureKey[];
+   static const char kAccountIdKey[];
+   static const char kIsGlicEligible[];
+@@ -338,6 +350,11 @@ class ProfileAttributesEntry {
+   bool ShouldUpdateGAIAPicture(const std::string& image_url_with_size,
+                                bool image_is_empty) const;
+ 
++  // Returns true if the current custom avatar picture should be updated
++  // with an image having provided parameters. `image_is_empty` is true
++  // when attempting to clear the current custom avatar picture.
++  bool ShouldUpdateCustomAvatarPicture(bool image_is_empty) const;
++
+   // Loads or uses an already loaded high resolution image of the generic
+   // profile avatar.
+   const gfx::Image* GetHighResAvatar() const;
+--- a/chrome/browser/profiles/profile_avatar_icon_util.h
++++ b/chrome/browser/profiles/profile_avatar_icon_util.h
+@@ -14,6 +14,7 @@
+ #include "base/files/file_path.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
++#include "components/vector_icons/vector_icons.h"
+ #include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/models/image_model.h"
+@@ -70,6 +71,7 @@ inline constexpr int kProfileAvatarBadge
+ // Avatar access.
+ extern const base::FilePath::CharType kGAIAPictureFileName[];
+ extern const base::FilePath::CharType kHighResAvatarFolderName[];
++extern const base::FilePath::CharType kCustomAvatarPictureFileName[];
+ 
+ // Avatar formatting.
+ extern const int kAvatarIconSize;
+@@ -169,7 +171,8 @@ gfx::Image GetPlaceholderAvatarIconWithC
+     SkColor fill_color,
+     SkColor stroke_color,
+     int size,
+-    const PlaceholderAvatarIconParams& icon_params = {});
++    const PlaceholderAvatarIconParams& icon_params = {},
++    const gfx::VectorIcon& icon = vector_icons::kAccountCircleChromeRefreshIcon);
+ 
+ // Gets the resource ID of the default avatar icon at |index|.
+ int GetDefaultAvatarIconResourceIDAtIndex(size_t index);
+@@ -205,7 +208,9 @@ base::DictValue GetAvatarIconAndLabelDic
+                                           const std::u16string& label,
+                                           size_t index,
+                                           bool selected,
+-                                          bool is_gaia_avatar);
++                                          bool is_gaia_avatar,
++                                          bool is_custom_avatar,
++                                          bool is_placeholder);
+ 
+ // Returns dictionary containing the default generic avatar icon, label, index
+ // and selected state.
+--- a/chrome/browser/profiles/profile_attributes_storage.cc
++++ b/chrome/browser/profiles/profile_attributes_storage.cc
+@@ -784,6 +784,24 @@ void ProfileAttributesStorage::DeleteGAI
+   entry->SetLastDownloadedGAIAPictureUrlWithSize(std::string());
+ }
+ 
++void ProfileAttributesStorage::SaveCustomAvatarImageAtPath(
++    const base::FilePath& profile_path,
++    const std::string& key,
++    gfx::Image image,
++    const base::FilePath& image_path) {
++  cached_avatar_images_.erase(key);
++  SaveAvatarImageAtPathNoCallback(profile_path, image, key, image_path);
++}
++
++void ProfileAttributesStorage::DeleteCustomAvatarImageAtPath(
++    const base::FilePath& profile_path,
++    const std::string& key,
++    const base::FilePath& image_path) {
++  cached_avatar_images_.erase(key);
++  file_task_runner_->PostTask(FROM_HERE,
++                              base::BindOnce(&DeleteBitmap, image_path));
++}
++
+ void ProfileAttributesStorage::AddObserver(Observer* obs) {
+   observer_list_.AddObserver(obs);
+ }
+--- a/chrome/browser/profiles/profile_attributes_storage.h
++++ b/chrome/browser/profiles/profile_attributes_storage.h
+@@ -163,6 +163,16 @@ class ProfileAttributesStorage {
+                              const std::string& key,
+                              const base::FilePath& image_path);
+ 
++  // Saves the CustomAvatar `image` at `image_path`.
++  void SaveCustomAvatarImageAtPath(const base::FilePath& profile_path,
++                                   const std::string& key,
++                                   gfx::Image image,
++                                   const base::FilePath& image_path);
++  // Deletes a CustomAvatar picture at `image_path`.
++  void DeleteCustomAvatarImageAtPath(const base::FilePath& profile_path,
++                                     const std::string& key,
++                                     const base::FilePath& image_path);
++
+   // Checks whether the high res avatar at index |icon_index| exists, and if it
+   // does not, calls |DownloadHighResAvatar|.
+   void DownloadHighResAvatarIfNeeded(size_t icon_index,
+--- a/chrome/browser/profiles/profile_impl.cc
++++ b/chrome/browser/profiles/profile_impl.cc
+@@ -389,6 +389,7 @@ void ProfileImpl::RegisterProfilePrefs(
+   // (i.e. was assigned by default by legacy profile creation).
+   registry->RegisterBooleanPref(prefs::kProfileUsingDefaultAvatar, true);
+   registry->RegisterBooleanPref(prefs::kProfileUsingGAIAAvatar, false);
++  registry->RegisterBooleanPref(prefs::kProfileUsingCustomAvatar, false);
+   // Whether a profile is using a default avatar name (eg. Pickles or Person 1).
+   registry->RegisterBooleanPref(prefs::kProfileUsingDefaultName, true);
+   registry->RegisterStringPref(prefs::kProfileName, std::string());
+@@ -701,6 +702,10 @@ void ProfileImpl::DoFinalInit(CreateMode
+       prefs::kProfileUsingGAIAAvatar,
+       base::BindRepeating(&ProfileImpl::UpdateAvatarInStorage,
+                           base::Unretained(this)));
++  pref_change_registrar_.Add(
++      prefs::kProfileUsingCustomAvatar,
++      base::BindRepeating(&ProfileImpl::UpdateAvatarInStorage,
++                          base::Unretained(this)));
+ 
+   // Changes in the profile name.
+   pref_change_registrar_.Add(
+@@ -1625,6 +1630,8 @@ void ProfileImpl::UpdateAvatarInStorage(
+         GetPrefs()->GetBoolean(prefs::kProfileUsingDefaultAvatar));
+     entry->SetIsUsingGAIAPicture(
+         GetPrefs()->GetBoolean(prefs::kProfileUsingGAIAAvatar));
++    entry->SetIsUsingCustomAvatar(
++        GetPrefs()->GetBoolean(prefs::kProfileUsingCustomAvatar));
+   }
+ }
+ 
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -1556,6 +1556,8 @@ inline constexpr char kProfileUsingDefau
+ inline constexpr char kProfileUsingDefaultAvatar[] =
+     "profile.using_default_avatar";
+ inline constexpr char kProfileUsingGAIAAvatar[] = "profile.using_gaia_avatar";
++inline constexpr char kProfileUsingCustomAvatar[] =
++    "profile.using_custom_avatar";
+ 
+ // Indicates if we've already shown a notification that high contrast
+ // mode is on, recommending high-contrast extensions and themes.
