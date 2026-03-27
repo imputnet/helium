@@ -1,1 +1,1 @@
-C:/Users/PC/Desktop/heal/helium/AGENTS.md
+AGENTS.md
