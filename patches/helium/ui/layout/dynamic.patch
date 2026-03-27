@@ -1,0 +1,179 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/check.h"
+ #include "base/i18n/rtl.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/trace_event/common/trace_event_common.h"
+@@ -16,6 +17,7 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/bookmarks/bookmark_bar_view.h"
+ #include "chrome/browser/ui/views/frame/custom_corners_background.h"
+ #include "chrome/browser/ui/views/frame/custom_floating_corner.h"
+@@ -138,6 +140,9 @@ BrowserViewTabbedLayoutImpl::GetMinimumT
+     const BrowserLayoutParams& params) const {
+   switch (GetTabStripType()) {
+     case TabStripType::kHorizontal: {
++      if (!ShowDynamicTabStrip(TabStripType::kHorizontal)) {
++        return std::make_pair(gfx::Size(), gfx::Size());
++      }
+       auto result = views().horizontal_tab_strip_region_view->GetMinimumSize();
+       result.Enlarge(GetExclusionWidth(params), 0);
+       return std::make_pair(gfx::Size(), result);
+@@ -181,6 +186,9 @@ BrowserViewTabbedLayoutImpl::CalculateHo
+   // Start with some preliminary values.
+   layout.force_top_container_to_top =
+       tab_strip_type != TabStripType::kHorizontal;
++  if (IsDynamicTabStrip(tab_strip_type)) {
++    layout.force_top_container_to_top = true;
++  }
+   layout.min_content_width = kContentsContainerMinimumWidth;
+ 
+   // Get information about the vertical tabstrip, if present.
+@@ -423,6 +431,25 @@ HeliumLayoutType BrowserViewTabbedLayout
+          controller->GetBrowserLayout() : HeliumLayoutType::kClassic;
+ }
+ 
++bool BrowserViewTabbedLayoutImpl::IsDynamicTabStrip(
++  TabStripType tab_strip_type) const {
++  return GetHeliumLayout() == HeliumLayoutType::kDynamic &&
++         tab_strip_type == TabStripType::kHorizontal &&
++         IsParentedTo(views().top_container, views().browser_view) &&
++         IsParentedTo(views().horizontal_tab_strip_region_view,
++                      views().browser_view);
++}
++
++bool BrowserViewTabbedLayoutImpl::ShowDynamicTabStrip(
++    TabStripType tab_strip_type) const {
++  if (!IsDynamicTabStrip(tab_strip_type)) {
++    return true;
++  }
++
++  return !browser() || !browser()->tab_strip_model() ||
++         browser()->tab_strip_model()->count() > 1;
++}
++
+ bool BrowserViewTabbedLayoutImpl::ShadowOverlayVisible() const {
+   if (!views().toolbar_height_side_panel) {
+     return false;
+@@ -535,6 +562,9 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+   BrowserLayoutParams params = browser_params;
+   bool needs_exclusion = true;
+   const TabStripType tab_strip_type = GetTabStripType();
++  const bool dynamic_tab_strip = IsDynamicTabStrip(tab_strip_type);
++  const bool show_dynamic_tab_strip = ShowDynamicTabStrip(tab_strip_type);
++  std::optional<int> dynamic_tab_strip_top;
+   HorizontalLayout horizontal_layout = CalculateHorizontalLayout(params);
+ 
+   if (tab_strip_type == TabStripType::kWebUi) {
+@@ -560,7 +590,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+   }
+ 
+   // Lay out horizontal tab strip region if present.
+-  if (IsParentedTo(views().horizontal_tab_strip_region_view,
++  if (!dynamic_tab_strip &&
++      IsParentedTo(views().horizontal_tab_strip_region_view,
+                    views().browser_view)) {
+     gfx::Rect tabstrip_bounds;
+     if (tab_strip_type == TabStripType::kHorizontal) {
+@@ -572,8 +603,10 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+       tabstrip_bounds = GetBoundsWithExclusion(
+           params, views().horizontal_tab_strip_region_view,
+           TabStyle::Get()->GetBottomCornerRadius());
++      const int default_tabstrip_toolbar_overlap =
++          GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
+       params.SetTop(tabstrip_bounds.bottom() -
+-                    GetLayoutConstant(LayoutConstant::kTabstripToolbarOverlap));
++                    default_tabstrip_toolbar_overlap);
+       needs_exclusion = false;
+     }
+     layout.AddChild(views().horizontal_tab_strip_region_view, tabstrip_bounds,
+@@ -684,6 +717,21 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+         top_container_layout, top_container_params, needs_exclusion);
+     top_container_layout.bounds =
+         GetTopContainerBoundsInParent(top_container_local_bounds, params);
++
++    if (dynamic_tab_strip && tab_strip_type == TabStripType::kHorizontal) {
++      const int toolbar_tabstrip_overlap =
++          GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
++      if (const auto* toolbar_layout =
++              top_container_layout.GetLayoutFor(views().toolbar);
++          toolbar_layout && !toolbar_layout->bounds.IsEmpty()) {
++        dynamic_tab_strip_top =
++            top_container_layout.bounds.y() + toolbar_layout->bounds.bottom() -
++            toolbar_tabstrip_overlap;
++      } else {
++        dynamic_tab_strip_top = top_container_layout.bounds.y();
++      }
++    }
++
+     params.SetTop(top_container_layout.bounds.bottom());
+ 
+     // Possibly bump the leading margin of the top container out to cover the
+@@ -701,6 +749,22 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+     }
+   }
+ 
++  if (dynamic_tab_strip) {
++    DCHECK_EQ(tab_strip_type, TabStripType::kHorizontal);
++
++    const int tabstrip_height =
++        views().horizontal_tab_strip_region_view->GetPreferredSize().height();
++    const int tabstrip_top = show_dynamic_tab_strip
++                                 ? dynamic_tab_strip_top.value_or(
++                                       params.visual_client_area.y())
++                                 : -tabstrip_height;
++    const gfx::Rect tabstrip_bounds(params.visual_client_area.x(), tabstrip_top,
++                                    params.visual_client_area.width(),
++                                    tabstrip_height);
++    layout.AddChild(views().horizontal_tab_strip_region_view, tabstrip_bounds,
++                    show_dynamic_tab_strip);
++  }
++
+   // Lay out the main area background.
+   if (IsParentedTo(views().main_background_region, views().browser_view)) {
+     layout.AddChild(views().main_background_region, params.visual_client_area,
+@@ -946,6 +1010,8 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+   const int original_top = params.visual_client_area.y();
+ 
+   const TabStripType tab_strip_type = GetTabStripType();
++  const bool dynamic_tab_strip = IsDynamicTabStrip(tab_strip_type);
++  const bool show_dynamic_tab_strip = ShowDynamicTabStrip(tab_strip_type);
+ 
+   // If the WebUI tabstrip is in the top container (which can happen in
+   // immersive mode), ensure it is laid out here.
+@@ -1007,6 +1073,17 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+     layout.AddChild(views().toolbar, toolbar_bounds, toolbar_visible);
+   }
+ 
++  // Clamp the margins visually by overlapping toolbar and the tab strip
++  if (dynamic_tab_strip && show_dynamic_tab_strip) {
++    const int toolbar_tabstrip_overlap =
++        toolbar_visible ? GetLayoutConstant(LayoutConstant::kHeliumBasePadding)
++                        : 0;
++    params.SetTop(params.visual_client_area.y() +
++                  views().horizontal_tab_strip_region_view->GetPreferredSize()
++                          .height() -
++                  toolbar_tabstrip_overlap);
++  }
++
+   // Lay out the bookmarks bar if one is present.
+   const bool bookmarks_visible = delegate().IsBookmarkBarVisible();
+   if (IsParentedTo(views().bookmark_bar, views().top_container)) {
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.h
+@@ -110,6 +110,8 @@ class BrowserViewTabbedLayoutImpl : publ
+   // Returns the type of tabstrip present.
+   enum class TabStripType { kNone, kWebUi, kVertical, kHorizontal };
+   HeliumLayoutType GetHeliumLayout() const;
++  bool IsDynamicTabStrip(TabStripType tab_strip_type) const;
++  bool ShowDynamicTabStrip(TabStripType tab_strip_type) const;
+   TabStripType GetTabStripType() const;
+ 
+   // Returns whether the shadow overlay (with its attendant margin) around the
