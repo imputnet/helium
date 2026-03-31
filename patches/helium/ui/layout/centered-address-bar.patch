@@ -5,26 +5,27 @@
      "helium.browser.vertical_uncollapsed_width";
  
 +// A boolean pref set to true if the address bar should be centered.
-+// When false (default), the address bar uses its full width.
-+inline constexpr char kLocationBarIsCentered[] =
-+    "helium.browser.use_centered_location_bar";
++// When false, the address bar uses the full available width.
++inline constexpr char kHeliumCenteredLocationBar[] =
++    "helium.browser.centered_location_bar";
 +
  // A boolean pref set to true if a Home button to open the Home pages should be
  // visible on the toolbar.
  inline constexpr char kShowHomeButton[] = "browser.show_home_button";
---- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
-+++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
-@@ -43,6 +43,7 @@ void RegisterProfilePrefs(user_prefs::Pr
-   registry->RegisterIntegerPref(
-       prefs::kHeliumVerticalUncollapsedWidth,
-       kVerticalTabStripDefaultUncollapsedWidth);
-+  registry->RegisterBooleanPref(prefs::kLocationBarIsCentered, false);
- }
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -117,6 +117,8 @@ void RegisterBrowserUserPrefs(user_prefs
  
- TabSearchPosition GetTabSearchPosition(const Profile* profile) {
+   registry->RegisterBooleanPref(prefs::kTabCyclingMRU, false);
+ 
++  registry->RegisterBooleanPref(prefs::kHeliumCenteredLocationBar, false);
++
+   registry->RegisterBooleanPref(prefs::kHomePageIsNewTabPage, true,
+                                 pref_registration_flags);
+   registry->RegisterBooleanPref(prefs::kShowHomeButton, false,
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.h
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
-@@ -306,6 +306,10 @@ class ToolbarView : public views::Access
+@@ -297,6 +297,10 @@ class ToolbarView : public views::Access
  
    void OnShowMediaButtonChanged();
  
@@ -35,7 +36,7 @@
    void OnTouchUiChanged();
  
    void NewTabButtonPressed(const ui::Event& event);
-@@ -380,6 +384,8 @@ class ToolbarView : public views::Access
+@@ -370,6 +374,8 @@ class ToolbarView : public views::Access
  
    BooleanPrefMember show_media_button_;
  
@@ -46,45 +47,48 @@
    // The display mode used when laying out the toolbar.
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
-@@ -191,6 +191,25 @@ auto& GetViewCommandMap() {
- 
+@@ -184,6 +184,28 @@ auto& GetViewCommandMap() {
  constexpr int kBrowserAppMenuRefreshExpandedMargin = 5;
  constexpr int kBrowserAppMenuRefreshCollapsedMargin = 2;
-+constexpr int kCenteredLocationBarMaxWidth = 900;
-+constexpr int kCenteredLocationBarMinToolbarWidth = 700;
-+constexpr int kCenteredLocationBarMediumMarginToolbarWidth = 850;
-+constexpr int kCenteredLocationBarLargeMarginToolbarWidth = 1000;
-+constexpr int kCenteredLocationBarSmallMarginPercent = 5;
-+constexpr int kCenteredLocationBarMediumMarginPercent = 9;
-+constexpr int kCenteredLocationBarLargeMarginPercent = 12;
-+
-+int GetCenteredLocationBarMarginPercent(int toolbar_width) {
-+  // Wider toolbars reserve more side space so the centered location bar keeps
-+  // balanced whitespace before the max-width cap becomes the dominant limit.
-+  if (toolbar_width >= kCenteredLocationBarLargeMarginToolbarWidth) {
-+    return kCenteredLocationBarLargeMarginPercent;
-+  }
-+  if (toolbar_width >= kCenteredLocationBarMediumMarginToolbarWidth) {
-+    return kCenteredLocationBarMediumMarginPercent;
-+  }
-+  return kCenteredLocationBarSmallMarginPercent;
-+}
  
++constexpr int kCenteredLocationBarMaxWidth = 800;
++
++struct CenteredLocationBarStep {
++  int min_toolbar_width;
++  int toolbar_width_reduction_percent;
++};
++
++constexpr CenteredLocationBarStep kCenteredLocationBarSteps[] = {
++    {1000, 12},
++    {800, 10},
++    {600, 5},
++};
++
++int CenteredLocationBarWidthReduction(int toolbar_width) {
++  for (const auto& step : kCenteredLocationBarSteps) {
++    if (toolbar_width >= step.min_toolbar_width) {
++      return toolbar_width * step.toolbar_width_reduction_percent / 100;
++    }
++  }
++  return 0;
++}
++
  bool IsMigratedClickToCallBubble(
      IntentPickerBubbleView::BubbleType bubble_type) {
-@@ -577,6 +596,11 @@ void ToolbarView::Init() {
+   return bubble_type == IntentPickerBubbleView::BubbleType::kClickToCall &&
+@@ -569,6 +591,11 @@ void ToolbarView::Init() {
      OnShowMediaButtonChanged();
    }
  
 +  location_bar_is_centered_.Init(
-+      prefs::kLocationBarIsCentered, prefs,
++      prefs::kHeliumCenteredLocationBar, prefs,
 +      base::BindRepeating(&ToolbarView::OnLocationBarCenteredChanged,
 +                          base::Unretained(this)));
 +
    InitLayout();
  
-   auto flex_preferred = views::FlexSpecification(
-@@ -1105,6 +1129,7 @@ void ToolbarView::Layout(PassKey) {
+   for (auto* button : std::array<views::Button*, 5>{back_, forward_, reload_,
+@@ -1076,6 +1103,7 @@ void ToolbarView::Layout(PassKey) {
    // Call super implementation to ensure layout manager and child layouts
    // happen.
    LayoutSuperclass<AccessiblePaneView>(this);
@@ -92,7 +96,7 @@
  }
  
  void ToolbarView::OnThemeChanged() {
-@@ -1598,6 +1623,59 @@ void ToolbarView::OnShowMediaButtonChang
+@@ -1491,6 +1519,48 @@ void ToolbarView::OnShowMediaButtonChang
    InvalidateLayout();
  }
  
@@ -101,50 +105,39 @@
 +}
 +
 +void ToolbarView::MaybeCenterLocationBar() {
-+  if (ShouldDisplayToolbarTabStrip()) {
-+    return;
-+  }
-+
-+  if (!location_bar_is_centered_.GetValue()) {
-+    return;
-+  }
-+
-+  if (display_mode_ != DisplayMode::kNormal) {
-+    return;
-+  }
-+
-+  if (!location_bar_view_ || !location_bar_view_->GetVisible()) {
++  if (ShouldDisplayToolbarTabStrip() || display_mode_ != DisplayMode::kNormal ||
++      !location_bar_is_centered_.GetValue()) {
 +    return;
 +  }
 +
 +  const int toolbar_width = width();
-+  if (toolbar_width < kCenteredLocationBarMinToolbarWidth) {
++  const int width_reduction = CenteredLocationBarWidthReduction(toolbar_width);
++  if (width_reduction == 0) {
 +    return;
 +  }
 +
-+  const int location_bar_margin_percent =
-+      GetCenteredLocationBarMarginPercent(toolbar_width);
-+
 +  gfx::Rect bounds = location_bar_view_->bounds();
-+  const int total_margin =
-+      toolbar_width * location_bar_margin_percent / 100;
++  const int centered_width = std::clamp(
++      bounds.width() - width_reduction,
++      location_bar_view_->GetMinimumSize().width(),
++      kCenteredLocationBarMaxWidth);
 +
-+  int new_width =
-+      std::min(bounds.width() - total_margin, kCenteredLocationBarMaxWidth);
-+  new_width = std::max(new_width, location_bar_view_->GetMinimumSize().width());
-+
-+  int desired_x = (toolbar_width - new_width) / 2;
-+  // Allow more slack on the left so the location bar remains centered relative
-+  // to the toolbar width when side items have different widths.
-+  int left_limit = bounds.x() + total_margin / 3;
-+  int right_limit = bounds.x() + bounds.width() - new_width - total_margin / 2;
-+  if (left_limit <= right_limit) {
-+    desired_x = std::clamp(desired_x, left_limit, right_limit);
-+  } else {
-+    desired_x = bounds.x() + (bounds.width() - new_width) / 2;
++  // Keep the location bar centered within the full toolbar when that position
++  // still fits. If surrounding controls push it out, center the location bar
++  // within the available slot instead to avoid a one-sided gap.
++  int centered_x = bounds.x() + (bounds.width() - centered_width) / 2;
++  if (centered_width <= bounds.width()) {
++    const int ideal_centered_x = (toolbar_width - centered_width) / 2;
++    const int min_centered_x = bounds.x();
++    const int max_centered_x = bounds.right() - centered_width;
++    if (ideal_centered_x >= min_centered_x &&
++        ideal_centered_x <= max_centered_x) {
++      centered_x = ideal_centered_x;
++    }
 +  }
-+  bounds.set_x(desired_x);
-+  bounds.set_width(new_width);
++
++  bounds.set_x(centered_x);
++  bounds.set_width(centered_width);
 +
 +  location_bar_view_->SetBoundsRect(bounds);
 +}
@@ -158,8 +151,8 @@
    <message name="IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN" desc="Label for the toggle that displays vertical tabs on the right side of the browser window.">
      Show vertical tabs on right side
    </message>
-+  <message name="IDS_SETTINGS_USE_CENTERED_ADDRESS_BAR" desc="Label for the toggle to use a centered address bar.">
-+    Use centered address bar
++  <message name="IDS_SETTINGS_CENTERED_LOCATION_BAR" desc="Label for the toggle to use a centered address bar.">
++    Center the address bar
 +  </message>
    <message name="IDS_SETTINGS_SHOW_HOME_BUTTON" desc="Label for the checkbox which enables or disables showing the home button in the toolbar.">
      Show home button
@@ -170,7 +163,7 @@
        {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
        {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
        {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
-+      {"useCenteredAddressBar", IDS_SETTINGS_USE_CENTERED_ADDRESS_BAR},
++      {"centeredLocationBar", IDS_SETTINGS_CENTERED_LOCATION_BAR},
        {"verticalCollapseShortcut", IDS_SETTINGS_VERTICAL_COLLAPSE_SHORTCUT},
        {"showHomeButton", IDS_SETTINGS_SHOW_HOME_BUTTON},
        {"showBookmarksBar", IDS_SETTINGS_SHOW_BOOKMARKS_BAR},
@@ -180,7 +173,7 @@
        settings_api::PrefType::kNumber;
    (*s_allowlist)[::prefs::kHeliumVerticalRightAligned] =
        settings_api::PrefType::kBoolean;
-+  (*s_allowlist)[::prefs::kLocationBarIsCentered] =
++  (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
 +      settings_api::PrefType::kBoolean;
  
    // Miscellaneous
@@ -191,7 +184,7 @@
      return this.showVerticalTabsEnabled_ && layout === BrowserLayout.VERTICAL;
    }
  
-+  private showCenteredAddressBarSetting_(layout: number|undefined): boolean {
++  private showCenteredLocationBarSetting_(layout: number|undefined): boolean {
 +    return layout !== BrowserLayout.COMPACT;
 +  }
 +
@@ -205,10 +198,10 @@
                label="$i18n{tabStripRightAlign}">
            </settings-toggle-button>
 +          <settings-toggle-button
-+              hidden="[[!showCenteredAddressBarSetting_(
++              hidden="[[!showCenteredLocationBarSetting_(
 +                  prefs.helium.browser.layout.value)]]"
-+              pref="{{prefs.helium.browser.use_centered_location_bar}}"
-+              label="$i18n{useCenteredAddressBar}">
++              pref="{{prefs.helium.browser.centered_location_bar}}"
++              label="$i18n{centeredLocationBar}">
 +          </settings-toggle-button>
          </div>
  
