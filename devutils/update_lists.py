@@ -105,6 +105,7 @@ PRUNING_EXCLUDE_PATTERNS = [
     '*.json',
     '*.txt',
     '*.binarypb',
+    '*.hyb',
     '*.xtb'
 ]
 
