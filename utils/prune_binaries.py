@@ -137,6 +137,10 @@ CONTINGENT_PATHS = (
     'third_party/rust-src/',
     'third_party/rust-toolchain/',
     'third_party/webgl/',
+    # Helium onboarding
+    'components/helium_onboarding/node_modules/@esbuild/',
+    'components/helium_onboarding/node_modules/@rollup/',
+    'components/helium_onboarding/node_modules/fsevents/',
 )
 
 # Files that should be excluded when pruning contingent paths.
