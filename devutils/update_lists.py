@@ -71,6 +71,12 @@ PRUNING_EXCLUDE_PATTERNS = [
     'third_party/perfetto/src/trace_processor/importers/proto/atoms.descriptor',
     # Exclusion for zoneinfo64
     'third_party/rust/chromium_crates_io/vendor/zoneinfo64-v0_2/src/data/zoneinfo64.res',
+    # Exclusions for uBlock Origin
+    'third_party/ublock/js/wasm/biditrie.wasm',
+    'third_party/ublock/js/wasm/hntrie.wasm',
+    'third_party/ublock/lib/lz4/lz4-block-codec.wasm',
+    'third_party/ublock/lib/publicsuffixlist/wasm/publicsuffixlist.wasm',
+    'third_party/ublock/web_accessible_resources/noop-1s.mp4',
     # Exclusions for safe file extensions
     '*.avif',
     '*.ttf',
@@ -129,6 +135,9 @@ DOMAIN_EXCLUDE_PREFIXES = [
     'chrome/common/extensions/api/_api_features.json',
     'extensions/common/extension_urls.cc',
     'extensions/browser/updater/safe_manifest_parser.cc',
+    # Helium components
+    'third_party/ublock/',
+    'components/helium_onboarding/',
 ]
 
 # pylint: enable=line-too-long
