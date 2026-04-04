@@ -1,0 +1,264 @@
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
+@@ -53,6 +53,7 @@
+   void SetCollapsed(bool collapsed);
+   bool IsHoverExpanded() const;
+   void SetHovered(bool hovered);
++  void SetHoverExpansionLock(bool locked);
+ 
+   int GetUncollapsedWidth() const;
+   void SetUncollapsedWidth(int width);
+@@ -78,6 +79,7 @@
+   bool IsHoverExpandEnabled() const;
+   void OnHoverExpandEnabledPrefChanged();
+   bool ShouldHoldExpandedForHover() const;
++  bool IsHoverExpansionLocked() const;
+   void ClearHoverHoldState(bool notify);
+   void StartHoverExpandTimerIfNeeded();
+   void OnHoverExpandDelayElapsed();
+@@ -91,6 +93,7 @@
+   VerticalTabStripState state_;
+   bool is_hovered_ = false;
+   bool held_by_hover_ = false;
++  int hover_expansion_lock_count_ = 0;
+   base::OneShotTimer hover_expand_timer_;
+   base::OneShotTimer hover_collapse_timer_;
+ 
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -135,6 +135,23 @@
+   StartHoverCollapseTimerIfNeeded();
+ }
+ 
++void VerticalTabStripStateController::SetHoverExpansionLock(bool locked) {
++  if (locked) {
++    ++hover_expansion_lock_count_;
++    hover_collapse_timer_.Stop();
++    return;
++  }
++
++  if (hover_expansion_lock_count_ == 0) {
++    return;
++  }
++
++  --hover_expansion_lock_count_;
++  if (!IsHoverExpansionLocked()) {
++    StartHoverCollapseTimerIfNeeded();
++  }
++}
++
+ int VerticalTabStripStateController::GetUncollapsedWidth() const {
+   return state_.uncollapsed_width;
+ }
+@@ -225,6 +242,10 @@
+          state_.collapsed;
+ }
+ 
++bool VerticalTabStripStateController::IsHoverExpansionLocked() const {
++  return hover_expansion_lock_count_ > 0;
++}
++
+ void VerticalTabStripStateController::ClearHoverHoldState(bool notify) {
+   hover_expand_timer_.Stop();
+   hover_collapse_timer_.Stop();
+@@ -260,6 +281,7 @@
+ 
+ void VerticalTabStripStateController::StartHoverCollapseTimerIfNeeded() {
+   if (!held_by_hover_ || is_hovered_ || !state_.collapsed ||
++      IsHoverExpansionLocked() ||
+       hover_collapse_timer_.IsRunning()) {
+     return;
+   }
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
+@@ -231,6 +231,50 @@
+   EXPECT_FALSE(controller()->IsHoverExpanded());
+ }
+ 
++TEST_F(VerticalTabStripStateControllerTest,
++       HoverExpansionLockSuppressesCollapse) {
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
++  controller()->SetCollapsed(true);
++  controller()->SetHovered(true);
++  task_environment_.FastForwardBy(base::Milliseconds(300));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  controller()->SetHoverExpansionLock(true);
++  controller()->SetHovered(false);
++  task_environment_.FastForwardBy(base::Milliseconds(500));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  controller()->SetHoverExpansionLock(false);
++  task_environment_.FastForwardBy(base::Milliseconds(119));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++  task_environment_.FastForwardBy(base::Milliseconds(1));
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++}
++
++TEST_F(VerticalTabStripStateControllerTest, HoverExpansionLockRefCounted) {
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
++  controller()->SetCollapsed(true);
++  controller()->SetHovered(true);
++  task_environment_.FastForwardBy(base::Milliseconds(300));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  controller()->SetHoverExpansionLock(true);
++  controller()->SetHoverExpansionLock(true);
++  controller()->SetHovered(false);
++  task_environment_.FastForwardBy(base::Milliseconds(1000));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  controller()->SetHoverExpansionLock(false);
++  task_environment_.FastForwardBy(base::Milliseconds(1000));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  controller()->SetHoverExpansionLock(false);
++  task_environment_.FastForwardBy(base::Milliseconds(120));
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++}
++
+ TEST_F(VerticalTabStripStateControllerTest, HoverExpandedDisabledByPref) {
+   pref_service()->SetBoolean(prefs::kHeliumVerticalHoverExpandEnabled, false);
+   pref_service()->SetInteger(prefs::kHeliumLayout,
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_GROUP_HEADER_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_GROUP_HEADER_VIEW_H_
+ 
++#include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+ #include "chrome/browser/ui/views/tabs/tab_group_editor_bubble_tracker.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_types.h"
+@@ -64,6 +65,11 @@
+   void OnDataChanged(
+       const tab_groups::TabGroupVisualData* tab_group_visual_data);
+ 
++  base::CallbackListSubscription RegisterOnEditorBubbleOpened(
++      base::RepeatingClosure callback);
++  base::CallbackListSubscription RegisterOnEditorBubbleClosed(
++      base::RepeatingClosure callback);
++
+   views::ImageView* collapse_icon_for_testing() { return collapse_icon_; }
+ 
+  private:
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.h"
+ 
+ #include <numeric>
++#include <utility>
+ 
+ #include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+@@ -187,5 +188,17 @@
+   }
+ }
+ 
++base::CallbackListSubscription
++VerticalTabGroupHeaderView::RegisterOnEditorBubbleOpened(
++    base::RepeatingClosure callback) {
++  return editor_bubble_tracker_.RegisterOnBubbleOpened(std::move(callback));
++}
++
++base::CallbackListSubscription
++VerticalTabGroupHeaderView::RegisterOnEditorBubbleClosed(
++    base::RepeatingClosure callback) {
++  return editor_bubble_tracker_.RegisterOnBubbleClosed(std::move(callback));
++}
++
+ BEGIN_METADATA(VerticalTabGroupHeaderView)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -74,12 +74,15 @@
+ 
+   void ResetCollectionNode();
+   void OnDataChanged();
++  void SetHoverExpansionLock(bool locked);
+   void UpdateChildVisibilityForCollapseState(bool collapsed);
+ 
+   raw_ptr<TabCollectionNode> collection_node_ = nullptr;
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
+   base::CallbackListSubscription data_changed_subscription_;
++  base::CallbackListSubscription editor_bubble_opened_subscription_;
++  base::CallbackListSubscription editor_bubble_closed_subscription_;
+ 
+   tab_groups::TabGroupVisualData tab_group_visual_data_;
+   const raw_ptr<VerticalTabGroupHeaderView> group_header_ = nullptr;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <numeric>
+ 
++#include "base/functional/bind.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/layout_constants.h"
+@@ -23,6 +24,7 @@
+ #include "components/tabs/public/tab_collection_storage.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/gfx/color_utils.h"
+@@ -83,6 +85,14 @@
+   data_changed_subscription_ =
+       collection_node_->RegisterDataChangedCallback(base::BindRepeating(
+           &VerticalTabGroupView::OnDataChanged, base::Unretained(this)));
++  editor_bubble_opened_subscription_ =
++      group_header_->RegisterOnEditorBubbleOpened(base::BindRepeating(
++          &VerticalTabGroupView::SetHoverExpansionLock,
++          base::Unretained(this), true));
++  editor_bubble_closed_subscription_ =
++      group_header_->RegisterOnEditorBubbleClosed(base::BindRepeating(
++          &VerticalTabGroupView::SetHoverExpansionLock,
++          base::Unretained(this), false));
+   OnDataChanged();
+ }
+ 
+@@ -205,9 +215,38 @@
+ void VerticalTabGroupView::ResetCollectionNode() {
+   node_destroyed_subscription_ = {};
+   data_changed_subscription_ = {};
++  editor_bubble_opened_subscription_ = {};
++  editor_bubble_closed_subscription_ = {};
+   collection_node_ = nullptr;
+ }
+ 
++void VerticalTabGroupView::SetHoverExpansionLock(bool locked) {
++  if (!collection_node_) {
++    return;
++  }
++
++  const TabGroup* group = GetTabGroupFromNode(collection_node_);
++  if (!group) {
++    return;
++  }
++  tabs::TabInterface* first_tab = group->GetFirstTab();
++  if (!first_tab) {
++    return;
++  }
++
++  BrowserWindowInterface* browser_window = first_tab->GetBrowserWindowInterface();
++  if (!browser_window) {
++    return;
++  }
++
++  tabs::VerticalTabStripStateController* state_controller =
++      tabs::VerticalTabStripStateController::From(browser_window);
++  if (!state_controller) {
++    return;
++  }
++  state_controller->SetHoverExpansionLock(locked);
++}
++
+ void VerticalTabGroupView::OnDataChanged() {
+   // If the group is in the process of being closed, then ignore updates.
+   if (!collection_node_) {
