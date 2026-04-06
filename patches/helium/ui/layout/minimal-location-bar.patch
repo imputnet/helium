@@ -1,0 +1,290 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -1333,6 +1333,10 @@ inline constexpr char kHeliumVerticalUnc
+ inline constexpr char kHeliumCenteredLocationBar[] =
+     "helium.browser.centered_location_bar";
+ 
++// A boolean pref set to true if the minimal location bar should be used.
++inline constexpr char kHeliumMinimalLocationBar[] =
++    "helium.browser.minimal_location_bar";
++
+ // A boolean pref set to true if a Home button to open the Home pages should be
+ // visible on the toolbar.
+ inline constexpr char kShowHomeButton[] = "browser.show_home_button";
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -119,6 +119,8 @@ void RegisterBrowserUserPrefs(user_prefs
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumCenteredLocationBar, false);
+ 
++  registry->RegisterBooleanPref(prefs::kHeliumMinimalLocationBar, false);
++
+   registry->RegisterBooleanPref(prefs::kHomePageIsNewTabPage, true,
+                                 pref_registration_flags);
+   registry->RegisterBooleanPref(prefs::kShowHomeButton, false,
+--- a/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
++++ b/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
+@@ -69,6 +69,7 @@
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/omnibox/chrome_omnibox_navigation_observer.h"
+ #include "chrome/browser/ui/omnibox/omnibox_next_features.h"
++#include "chrome/browser/ui/omnibox/omnibox_controller.h"
+ #include "chrome/browser/ui/omnibox/omnibox_tab_helper.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+@@ -167,6 +168,15 @@ ChromeOmniboxClient::~ChromeOmniboxClien
+   }
+ }
+ 
++bool ChromeOmniboxClient::ShouldUseMinimalLocationBar() const {
++  OmniboxController* omnibox_controller = location_bar_->GetOmniboxController();
++  OmniboxEditModel* edit_model =
++      omnibox_controller ? omnibox_controller->edit_model() : nullptr;
++  return edit_model &&
++         edit_model->focus_state() == OMNIBOX_FOCUS_NONE &&
++         GetPrefs()->GetBoolean(prefs::kHeliumMinimalLocationBar);
++}
++
+ std::unique_ptr<AutocompleteProviderClient>
+ ChromeOmniboxClient::CreateAutocompleteProviderClient() {
+   // base::Unretained(location_bar_) is safe because `location_bar_` outlives
+@@ -329,6 +339,15 @@ std::u16string ChromeOmniboxClient::GetF
+ }
+ 
+ std::u16string ChromeOmniboxClient::GetURLForDisplay() const {
++  OmniboxController* omnibox_controller = location_bar_->GetOmniboxController();
++  OmniboxEditModel* edit_model =
++      omnibox_controller ? omnibox_controller->edit_model() : nullptr;
++  bool in_progress = edit_model && edit_model->user_input_in_progress();
++
++  if (ShouldUseMinimalLocationBar() && !in_progress) {
++    return location_bar_->GetLocationBarModel()->GetURLForDisplay(
++        /*trim_after_host_name=*/true);
++  }
+   return location_bar_->GetLocationBarModel()->GetURLForDisplay();
+ }
+ 
+@@ -405,6 +424,9 @@ void ChromeOmniboxClient::OnFocusChanged
+   if (!location_bar_->GetWebContents()) {
+     return;
+   }
++  if (GetPrefs()->GetBoolean(prefs::kHeliumMinimalLocationBar)) {
++    location_bar_->UpdateWithoutTabRestore();
++  }
+   if (auto* helper =
+           OmniboxTabHelper::FromWebContents(location_bar_->GetWebContents())) {
+     helper->OnFocusChanged(state, reason);
+@@ -856,7 +878,9 @@ void ChromeOmniboxClient::OnAutocomplete
+ }
+ 
+ void ChromeOmniboxClient::OnInputInProgress(bool in_progress) {
+-  location_bar_->UpdateWithoutTabRestore();
++  if (!ShouldUseMinimalLocationBar() || !in_progress) {
++    location_bar_->UpdateWithoutTabRestore();
++  }
+   content::WebContents* const web_contents = location_bar_->GetWebContents();
+   if (web_contents) {
+     auto* const helper =
+--- a/chrome/browser/ui/omnibox/chrome_omnibox_client.h
++++ b/chrome/browser/ui/omnibox/chrome_omnibox_client.h
+@@ -144,6 +144,8 @@ class ChromeOmniboxClient final : public
+                                      const AutocompleteMatch& match);
+ 
+  private:
++  bool ShouldUseMinimalLocationBar() const;
++
+   // Performs prerendering for |match|.
+   void DoPrerender(const AutocompleteMatch& match);
+ 
+--- a/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
+@@ -64,6 +64,7 @@
+ #include "chrome/browser/ui/views/page_action/page_action_icon_controller.h"
+ #include "chrome/browser/ui/views/page_action/page_action_view.h"
+ #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_controller.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "chrome/grit/branded_strings.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -276,6 +277,9 @@ OmniboxViewViews::OmniboxViewViews(bool
+     pref_change_registrar_.Init(
+         location_bar_view_->browser()->profile()->GetPrefs());
+     pref_change_registrar_.Add(
++        prefs::kHeliumMinimalLocationBar,
++        base::BindRepeating(&OmniboxViewViews::Update, base::Unretained(this)));
++    pref_change_registrar_.Add(
+         omnibox::kPreventUrlElisionsInOmnibox,
+         base::BindRepeating(&OmniboxViewViews::Update, base::Unretained(this)));
+   }
+@@ -341,6 +345,7 @@ void OmniboxViewViews::Init() {
+   ash::input_method::InputMethodManager::Get()->AddCandidateWindowObserver(
+       this);
+ #endif
++  UpdateSteadyStateTextAlignment();
+   UpdateAccessibleTextSelection();
+ }
+ 
+@@ -375,6 +380,7 @@ void OmniboxViewViews::OnTabChanged(cons
+       web_contents->GetUserData(OmniboxTabHelper::kOmniboxStateKey));
+   controller()->edit_model()->RestoreState(state ? &state->model_state
+                                                  : nullptr);
++  UpdateSteadyStateTextAlignment();
+   if (state) {
+     // This assumes that the omnibox has already been focused or blurred as
+     // appropriate; otherwise, a subsequent OnFocus() or OnBlur() call could
+@@ -478,6 +484,8 @@ void OmniboxViewViews::Update() {
+     // security state may be different from before the Update.
+     EmphasizeURLComponents();
+   }
++
++  UpdateSteadyStateTextAlignment();
+ }
+ 
+ std::u16string OmniboxViewViews::GetText() const {
+@@ -890,6 +898,20 @@ void OmniboxViewViews::UpdateAccessibleT
+                                        friendly_suggestion_text_prefix_length_);
+ }
+ 
++void OmniboxViewViews::UpdateSteadyStateTextAlignment() {
++  bool center_text = false;
++  if (controller()->edit_model()->focus_state() == OMNIBOX_FOCUS_NONE &&
++      !controller()->edit_model()->user_input_in_progress() &&
++      location_bar_view_ && location_bar_view_->profile()) {
++    center_text = location_bar_view_->profile()->GetPrefs()->GetBoolean(
++        prefs::kHeliumMinimalLocationBar);
++  }
++
++  SetHorizontalAlignment(center_text ? gfx::ALIGN_CENTER : gfx::ALIGN_LEFT);
++  set_placeholder_text_draw_flags(center_text ? gfx::Canvas::TEXT_ALIGN_CENTER
++                                              : gfx::Canvas::TEXT_ALIGN_LEFT);
++}
++
+ void OmniboxViewViews::OnOmniboxPaste() {
+   const std::u16string text(GetClipboardText(/*notify_if_restricted=*/true));
+ 
+@@ -1026,6 +1048,7 @@ void OmniboxViewViews::ApplyCaretVisibil
+       location_bar_view_->OnOmniboxFocused();
+     }
+   }
++  UpdateSteadyStateTextAlignment();
+   InstallPlaceholderText();
+ }
+ 
+@@ -1670,6 +1693,7 @@ void OmniboxViewViews::OnFocus() {
+ 
+   // TODO(oshima): Get control key state.
+   controller()->edit_model()->OnSetFocus(false);
++  UpdateSteadyStateTextAlignment();
+   // Don't call WebLocationBar::OnSetFocus(), this view has already acquired
+   // focus.
+ 
+@@ -1742,6 +1766,7 @@ void OmniboxViewViews::OnBlur() {
+ 
+   // Tell the model to reset itself.
+   controller()->edit_model()->OnKillFocus();
++  UpdateSteadyStateTextAlignment();
+ 
+   // Deselect the text. Ensures the cursor is an I-beam.
+   SetSelectedRange(gfx::Range(GetCursorPosition()));
+--- a/chrome/browser/ui/views/omnibox/omnibox_view_views.h
++++ b/chrome/browser/ui/views/omnibox/omnibox_view_views.h
+@@ -211,6 +211,7 @@ class OmniboxViewViews
+   // Returns the selected text.
+   std::u16string_view GetSelectedText() const;
+   void UpdateAccessibleTextSelection() override;
++  void UpdateSteadyStateTextAlignment();
+ 
+   // Paste text from the clipboard into the omnibox.
+   // Textfields implementation of Paste() pastes the contents of the clipboard
+--- a/components/omnibox/browser/location_bar_model.h
++++ b/components/omnibox/browser/location_bar_model.h
+@@ -38,6 +38,10 @@ class LocationBarModel {
+   // The returned string is not suitable for editing, and is for display only.
+   virtual std::u16string GetURLForDisplay() const = 0;
+ 
++  // Returns a simplified URL for display, optionally trimming everything after
++  // the hostname.
++  virtual std::u16string GetURLForDisplay(bool trim_after_host_name) const = 0;
++
+   // Returns the URL of the current navigation entry.
+   virtual GURL GetURL() const = 0;
+ 
+--- a/components/omnibox/browser/location_bar_model_impl.cc
++++ b/components/omnibox/browser/location_bar_model_impl.cc
+@@ -53,6 +53,11 @@ std::u16string LocationBarModelImpl::Get
+ }
+ 
+ std::u16string LocationBarModelImpl::GetURLForDisplay() const {
++  return GetURLForDisplay(delegate_->ShouldTrimDisplayUrlAfterHostName());
++}
++
++std::u16string LocationBarModelImpl::GetURLForDisplay(
++    bool trim_after_host_name) const {
+   // For the contextual tasks page, apply "origin-swapping" logic in order to
+   // display the proper URL in the Omnibox.
+   const auto inner_frame_url = delegate_->GetContextualTasksInnerFrameURL();
+@@ -77,7 +82,7 @@ std::u16string LocationBarModelImpl::Get
+ 
+   url_formatter::FormatUrlTypes format_types =
+       url_formatter::kFormatUrlOmitDefaults;
+-  if (delegate_->ShouldTrimDisplayUrlAfterHostName()) {
++  if (delegate_->ShouldTrimDisplayUrlAfterHostName() || trim_after_host_name) {
+     format_types |= url_formatter::kFormatUrlTrimAfterHost;
+   }
+ 
+--- a/components/omnibox/browser/location_bar_model_impl.h
++++ b/components/omnibox/browser/location_bar_model_impl.h
+@@ -35,6 +35,7 @@ class LocationBarModelImpl : public Loca
+   // LocationBarModel:
+   std::u16string GetFormattedFullURL() const override;
+   std::u16string GetURLForDisplay() const override;
++  std::u16string GetURLForDisplay(bool trim_after_host_name) const override;
+   GURL GetURL() const override;
+   bool IsContextualTasksPage() const override;
+   GURL GetContextualTasksInnerFrameURL() const override;
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -307,6 +307,9 @@
+   <message name="IDS_SETTINGS_CENTERED_LOCATION_BAR" desc="Label for the toggle to use a centered address bar.">
+     Center the address bar
+   </message>
++  <message name="IDS_SETTINGS_MINIMAL_LOCATION_BAR" desc="Label for the toggle that enables the minimal address bar.">
++    Minimal address bar
++  </message>
+   <message name="IDS_SETTINGS_SHOW_HOME_BUTTON" desc="Label for the checkbox which enables or disables showing the home button in the toolbar.">
+     Show home button
+   </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -514,6 +514,7 @@ void AddAppearanceStrings(content::WebUI
+       {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
+       {"centeredLocationBar", IDS_SETTINGS_CENTERED_LOCATION_BAR},
+       {"verticalCollapseShortcut", IDS_SETTINGS_VERTICAL_COLLAPSE_SHORTCUT},
++      {"minimalLocationBar", IDS_SETTINGS_MINIMAL_LOCATION_BAR},
+       {"showHomeButton", IDS_SETTINGS_SHOW_HOME_BUTTON},
+       {"showBookmarksBar", IDS_SETTINGS_SHOW_BOOKMARKS_BAR},
+       {"tabStripPosition", IDS_SETTINGS_TAB_STRIP_POSITION},
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -205,6 +205,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumMinimalLocationBar] =
++      settings_api::PrefType::kBoolean;
+ 
+   // Miscellaneous
+   (*s_allowlist)[::embedder_support::kAlternateErrorPagesEnabled] =
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html
+@@ -120,6 +120,10 @@
+               pref="{{prefs.helium.browser.centered_location_bar}}"
+               label="$i18n{centeredLocationBar}">
+           </settings-toggle-button>
++          <settings-toggle-button
++              pref="{{prefs.helium.browser.minimal_location_bar}}"
++              label="$i18n{minimalLocationBar}">
++          </settings-toggle-button>
+         </div>
+ 
+         <div
