@@ -1,17 +1,17 @@
 --- a/chrome/browser/ui/tabs/features.cc
 +++ b/chrome/browser/ui/tabs/features.cc
-@@ -11,7 +11,7 @@ namespace tabs {
- 
- BASE_FEATURE(kTabGroupHome, base::FEATURE_DISABLED_BY_DEFAULT);
+@@ -14,7 +14,7 @@ BASE_FEATURE(kTabGroupHome, base::FEATUR
+ BASE_FEATURE(kSessionRestoreShowThrobberOnVisible,
+              base::FEATURE_DISABLED_BY_DEFAULT);
  
 -BASE_FEATURE(kVerticalTabs, base::FEATURE_DISABLED_BY_DEFAULT);
 +BASE_FEATURE(kVerticalTabs, base::FEATURE_ENABLED_BY_DEFAULT);
  
- BASE_FEATURE(kVerticalTabsPreviewBadge, base::FEATURE_DISABLED_BY_DEFAULT);
+ BASE_FEATURE(kVerticalTabsLaunch, base::FEATURE_DISABLED_BY_DEFAULT);
  
 --- a/chrome/browser/sync/prefs/chrome_syncable_prefs_database.cc
 +++ b/chrome/browser/sync/prefs/chrome_syncable_prefs_database.cc
-@@ -394,7 +394,6 @@ enum {
+@@ -391,7 +391,6 @@ enum {
    kPinSplitTabButton = 100327,
    kGlicRolloutEligibility = 100328,
    kShelfNotebookLmAppPinRolls = 100329,
@@ -27,9 +27,9 @@
  #include "chrome/browser/profiles/profile_manager.h"
 +#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
  #include "chrome/browser/ui/tabs/features.h"
- #include "chrome/common/pref_names.h"
- #include "components/prefs/pref_service.h"
-@@ -27,7 +28,8 @@ VerticalTabsState TabMetricsProvider::Ge
+ #include "chrome/browser/user_education/user_education_service.h"
+ #include "chrome/browser/user_education/user_education_service_factory.h"
+@@ -37,7 +38,8 @@ VerticalTabsState TabMetricsProvider::Ge
    size_t vertical_tab_profiles = 0;
    for (Profile* profile : profiles) {
      if (profile->GetPrefs() &&
@@ -39,24 +39,39 @@
        vertical_tab_profiles++;
      }
    }
+@@ -83,9 +85,4 @@ void TabMetricsProvider::OnProfileAdded(
+                               base::Unretained(this), profile)));
+ }
+ 
+-void TabMetricsProvider::OnUserEducationSessionStart(Profile* profile) {
+-  base::UmaHistogramBoolean(
+-      "Tabs.VerticalTabs.EnabledAtSessionStart",
+-      profile->GetPrefs() &&
+-          profile->GetPrefs()->GetBoolean(prefs::kVerticalTabsEnabled));
+-}
++void TabMetricsProvider::OnUserEducationSessionStart(Profile* profile) {}
 --- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
-@@ -5,8 +5,10 @@
+@@ -5,10 +5,12 @@
  #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
  
  #include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser.h"
  #include "chrome/browser/ui/tab_search_feature.h"
  #include "chrome/browser/ui/tabs/features.h"
 +#include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
- #include "chrome/common/chrome_features.h"
- #include "chrome/common/pref_names.h"
- #include "components/pref_registry/pref_registry_syncable.h"
-@@ -31,12 +33,18 @@ bool GetDefaultTabSearchRightAligned() {
- void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
-   registry->RegisterBooleanPref(prefs::kTabSearchRightAligned,
-                                 GetDefaultTabSearchRightAligned());
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/toolbar/toolbar_pref_names.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -42,8 +44,13 @@ void RegisterProfilePrefs(user_prefs::Pr
+       prefs::kTabSearchPinnedToTabstripMigrationComplete, false);
+   registry->RegisterBooleanPref(prefs::kProjectsPanelPinnedToTabstrip, true);
+   registry->RegisterBooleanPref(prefs::kEverythingMenuPinnedToTabstrip, true);
 -  registry->RegisterBooleanPref(prefs::kVerticalTabsEnabled, false);
+-  registry->RegisterBooleanPref(prefs::kVerticalTabsEnabledFirstTime, false);
++
 +  registry->RegisterIntegerPref(prefs::kHeliumLayout,
 +                                std::to_underlying(HeliumLayoutType::kClassic));
 +  registry->RegisterBooleanPref(prefs::kHeliumVerticalRightAligned, false);
@@ -65,20 +80,13 @@
 +                                kVerticalTabStripDefaultUncollapsedWidth);
  }
  
- TabSearchPosition GetTabSearchPosition(const Profile* profile) {
-   if (tabs::IsVerticalTabsFeatureEnabled() &&
--      profile->GetPrefs()->GetBoolean(prefs::kVerticalTabsEnabled)) {
-+      profile->GetPrefs()->GetInteger(prefs::kHeliumLayout) ==
-+          std::to_underlying(HeliumLayoutType::kVertical)) {
-     return TabSearchPosition::kVerticalTabstrip;
-   }
- 
+ void MigrateTabSearchPref(PrefService* profile_prefs) {
 --- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
 +++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
-@@ -7,10 +7,6 @@
- 
+@@ -8,10 +8,6 @@
  #include "base/callback_list.h"
  #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
 -#include "base/scoped_observation.h"
 -#include "chrome/browser/sessions/session_service_base_observer.h"
 -#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
@@ -86,7 +94,7 @@
  #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
  #include "components/prefs/pref_change_registrar.h"
  #include "components/sessions/core/session_id.h"
-@@ -26,8 +22,7 @@ class ActionItem;
+@@ -27,8 +23,7 @@ class ActionItem;
  
  namespace tabs {
  
@@ -96,7 +104,7 @@
   public:
    DECLARE_USER_DATA(VerticalTabStripStateController);
  
-@@ -43,7 +38,7 @@ class VerticalTabStripStateController :
+@@ -56,7 +51,7 @@ class VerticalTabStripStateController :
        delete;
    VerticalTabStripStateController& operator=(
        const VerticalTabStripStateController&) = delete;
@@ -105,16 +113,16 @@
  
    static const VerticalTabStripStateController* From(
        const BrowserWindowInterface* browser_window);
-@@ -52,6 +47,8 @@ class VerticalTabStripStateController :
+@@ -65,6 +60,8 @@ class VerticalTabStripStateController :
  
    bool ShouldDisplayVerticalTabs() const;
    void SetVerticalTabsEnabled(bool enabled);
 +  bool IsTabStripRightAligned() const;
 +  void SetTabStripRightAligned(bool right_aligned);
  
-   bool IsCollapsed() const;
-   void SetCollapsed(bool collapsed);
-@@ -71,35 +68,21 @@ class VerticalTabStripStateController :
+   std::unique_ptr<ScopedEnableStateLock> GetEnableStateLock();
+ 
+@@ -86,10 +83,6 @@ class VerticalTabStripStateController :
    base::CallbackListSubscription RegisterOnModeChanged(
        StateChangedCallback callback);
  
@@ -125,7 +133,9 @@
   private:
    void NotifyCollapseChanged();
    void NotifyModeWillChange();
-   void NotifyModeChanged();
+@@ -97,28 +90,19 @@ class VerticalTabStripStateController :
+ 
+   void OnModeChanged();
  
 -  // Updates the SessionService with the current state (collapsed status and
 -  // uncollapsed width) for the associated session ID.
@@ -143,16 +153,18 @@
 -  // BrowserCollectionObserver:
 -  void OnBrowserCreated(BrowserWindowInterface* browser) override;
 -
+   void OnLockCreated();
+   void OnLockDestroyed();
+ 
    const raw_ptr<PrefService> pref_service_;
    PrefChangeRegistrar pref_change_registrar_;
    raw_ptr<actions::ActionItem> root_action_item_;
 -  raw_ptr<SessionService> session_service_;
 -  const SessionID session_id_;
--  raw_ptr<BrowserWindowInterface> browser_window_;
+   raw_ptr<BrowserWindowInterface> browser_window_;
  
    VerticalTabStripState state_;
- 
-@@ -109,8 +92,6 @@ class VerticalTabStripStateController :
+@@ -129,13 +113,12 @@ class VerticalTabStripStateController :
        on_mode_will_change_callback_list_;
    base::RepeatingCallbackList<void(VerticalTabStripStateController*)>
        on_mode_changed_callback_list_;
@@ -160,24 +172,33 @@
 -      browser_collection_observation_{this};
    ui::ScopedUnownedUserData<VerticalTabStripStateController>
        scoped_unowned_user_data_;
+ 
+   bool is_vertical_tabs_enabled_ = false;
+   int enable_state_lock_count_ = 0;
++  bool mode_changed_while_locked_ = false;
+ 
+   base::WeakPtrFactory<VerticalTabStripStateController> weak_ptr_factory_{this};
  };
 --- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
 +++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
-@@ -7,21 +7,16 @@
- #include <optional>
- 
+@@ -9,24 +9,18 @@
  #include "base/i18n/rtl.h"
+ #include "base/metrics/user_metrics.h"
+ #include "base/metrics/user_metrics_action.h"
 -#include "base/strings/string_number_conversions.h"
 -#include "base/strings/to_string.h"
  #include "chrome/app/vector_icons/vector_icons.h"
- #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/profiles/profile.h"
 -#include "chrome/browser/sessions/session_service.h"
 -#include "chrome/browser/sessions/session_service_factory.h"
  #include "chrome/browser/ui/actions/chrome_action_id.h"
  #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 -#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
 +#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/views/interaction/browser_elements_views.h"
  #include "chrome/common/pref_names.h"
  #include "chrome/grit/generated_resources.h"
  #include "components/prefs/pref_notifier_impl.h"
@@ -186,7 +207,7 @@
  #include "ui/actions/actions.h"
  #include "ui/base/l10n/l10n_util.h"
  #include "ui/views/vector_icons.h"
-@@ -34,58 +29,29 @@ VerticalTabStripStateController::Vertica
+@@ -39,61 +33,33 @@ VerticalTabStripStateController::Vertica
      BrowserWindowInterface* browser_window,
      PrefService* pref_service,
      actions::ActionItem* root_action_item,
@@ -202,16 +223,19 @@
        root_action_item_(root_action_item),
 -      session_service_(session_service),
 -      session_id_(session_id),
--      browser_window_(browser_window),
+       browser_window_(browser_window),
        scoped_unowned_user_data_(browser_window->GetUnownedUserDataHost(),
                                  *this) {
+-  is_vertical_tabs_enabled_ =
+-      pref_service_->GetBoolean(prefs::kVerticalTabsEnabled);
+-
    pref_change_registrar_.Init(pref_service_);
  
 -  pref_change_registrar_.Add(
 -      prefs::kVerticalTabsEnabled,
 +  pref_change_registrar_.AddMultiple(
 +      {prefs::kHeliumLayout, prefs::kHeliumVerticalRightAligned},
-       base::BindRepeating(&VerticalTabStripStateController::NotifyModeChanged,
+       base::BindRepeating(&VerticalTabStripStateController::OnModeChanged,
                            base::Unretained(this)));
  
 -  if (restored_state_collapsed.has_value()) {
@@ -223,6 +247,9 @@
 +  state_.collapsed = pref_service_->GetBoolean(prefs::kHeliumVerticalCollapsed);
 +  state_.uncollapsed_width =
 +      pref_service_->GetInteger(prefs::kHeliumVerticalUncollapsedWidth);
++  is_vertical_tabs_enabled_ =
++      pref_service_->GetInteger(prefs::kHeliumLayout) ==
++      std::to_underlying(HeliumLayoutType::kVertical);
  
    UpdateCollapseActionItem();
 -
@@ -253,16 +280,9 @@
 -}
 +VerticalTabStripStateController::~VerticalTabStripStateController() = default;
  
- // static
- const VerticalTabStripStateController* VerticalTabStripStateController::From(
-@@ -102,12 +68,24 @@ VerticalTabStripStateController* Vertica
- }
- 
- bool VerticalTabStripStateController::ShouldDisplayVerticalTabs() const {
--  return pref_service_->GetBoolean(prefs::kVerticalTabsEnabled);
-+  return pref_service_->GetInteger(prefs::kHeliumLayout) ==
-+         std::to_underlying(HeliumLayoutType::kVertical);
- }
+ VerticalTabStripStateController::ScopedEnableStateLock::ScopedEnableStateLock(
+     base::WeakPtr<VerticalTabStripStateController> controller)
+@@ -136,7 +102,18 @@ bool VerticalTabStripStateController::Sh
  
  void VerticalTabStripStateController::SetVerticalTabsEnabled(bool enabled) {
    NotifyModeWillChange();
@@ -282,7 +302,7 @@
  }
  
  bool VerticalTabStripStateController::IsCollapsed() const {
-@@ -160,7 +138,7 @@ VerticalTabStripStateController::Registe
+@@ -195,7 +172,7 @@ VerticalTabStripStateController::Registe
  }
  
  void VerticalTabStripStateController::NotifyCollapseChanged() {
@@ -291,12 +311,51 @@
    UpdateCollapseActionItem();
    on_collapse_changed_callback_list_.Notify(this);
  }
-@@ -170,21 +148,20 @@ void VerticalTabStripStateController::No
+@@ -205,23 +182,19 @@ void VerticalTabStripStateController::No
  }
  
  void VerticalTabStripStateController::NotifyModeChanged() {
 +  UpdateCollapseActionItem();
    on_mode_changed_callback_list_.Notify(this);
+ }
+ 
+ void VerticalTabStripStateController::OnModeChanged() {
+-  if (pref_service_->GetBoolean(prefs::kVerticalTabsEnabled) &&
+-      !pref_service_->GetBoolean(prefs::kVerticalTabsEnabledFirstTime)) {
+-    base::RecordAction(
+-        base::UserMetricsAction("VerticalTabs_EnabledFirstTime"));
+-    pref_service_->SetBoolean(prefs::kVerticalTabsEnabledFirstTime, true);
+-  }
+-
+   if (enable_state_lock_count_ > 0) {
++    mode_changed_while_locked_ = true;
+     return;
+   }
+ 
+   is_vertical_tabs_enabled_ =
+-      pref_service_->GetBoolean(prefs::kVerticalTabsEnabled);
++      pref_service_->GetInteger(prefs::kHeliumLayout) ==
++      std::to_underlying(HeliumLayoutType::kVertical);
+ 
+   NotifyModeChanged();
+ }
+@@ -234,27 +207,25 @@ void VerticalTabStripStateController::On
+   CHECK_GT(enable_state_lock_count_, 0);
+   enable_state_lock_count_--;
+ 
+-  if (enable_state_lock_count_ == 0) {
+-    bool new_state = pref_service_->GetBoolean(prefs::kVerticalTabsEnabled);
+-    if (new_state != is_vertical_tabs_enabled_) {
+-      is_vertical_tabs_enabled_ = new_state;
+-      NotifyModeChanged();
+-    }
++  if (enable_state_lock_count_ == 0 && mode_changed_while_locked_) {
++    mode_changed_while_locked_ = false;
++    is_vertical_tabs_enabled_ =
++        pref_service_->GetInteger(prefs::kHeliumLayout) ==
++        std::to_underlying(HeliumLayoutType::kVertical);
++    NotifyModeChanged();
+   }
  }
  
 -void VerticalTabStripStateController::UpdateSessionService() {
@@ -321,7 +380,7 @@
                                      ? views::kMenuOpenIcon
                                      : views::kMenuCloseIcon;
  
-@@ -204,20 +181,4 @@ void VerticalTabStripStateController::Up
+@@ -274,20 +245,4 @@ void VerticalTabStripStateController::Up
    }
  }
  
@@ -344,7 +403,7 @@
  }  // namespace tabs
 --- a/chrome/common/pref_names.h
 +++ b/chrome/common/pref_names.h
-@@ -1314,6 +1314,21 @@ inline constexpr char kNewTabNextToActiv
+@@ -1235,6 +1235,21 @@ inline constexpr char kNewTabNextToActiv
  // when cycling through tabs with Ctrl+Tab.
  inline constexpr char kTabCyclingMRU[] = "helium.browser.mru_tab_cycling";
  
@@ -366,21 +425,26 @@
  // A boolean pref set to true if a Home button to open the Home pages should be
  // visible on the toolbar.
  inline constexpr char kShowHomeButton[] = "browser.show_home_button";
-@@ -2003,9 +2018,6 @@ inline constexpr char kGoogleSearchSideP
- // True when the tab search button is on the right side of the tab strip even in
- // RTL.
- inline constexpr char kTabSearchRightAligned[] = "tab_search.is_right_aligned";
+@@ -1875,14 +1890,6 @@ inline constexpr char kProjectsPanelPinn
+ // strip.
+ inline constexpr char kEverythingMenuPinnedToTabstrip[] =
+     "everything_menu.pinned_to_tabstrip";
 -
 -// Boolean determining whether vertical tabs are enabled.
 -inline constexpr char kVerticalTabsEnabled[] = "vertical_tabs.enabled";
+-
+-// Records whether the user has enabled vertical tabs for the first time. Only
+-// used for metrics reporting purposes.
+-inline constexpr char kVerticalTabsEnabledFirstTime[] =
+-    "vertical_tabs.enabled_first_time";
  #endif  // !BUILDFLAG(IS_ANDROID)
  
  #if BUILDFLAG(ENABLE_COMPOSE)
 --- a/chrome/browser/ui/BUILD.gn
 +++ b/chrome/browser/ui/BUILD.gn
-@@ -60,6 +60,8 @@ static_library("ui") {
+@@ -59,6 +59,8 @@ static_library("ui") {
+     "confirm_bubble.h",
      "crypto_module_password_dialog.h",
-     "cryptuiapi_shim.h",
      "enterprise_startup_dialog.h",
 +    "helium/helium_layout_state_controller.cc",
 +    "helium/helium_layout_state_controller.h",
@@ -537,7 +601,7 @@
 +}
 --- a/chrome/browser/ui/browser_window/public/browser_window_features.h
 +++ b/chrome/browser/ui/browser_window/public/browser_window_features.h
-@@ -61,6 +61,7 @@ class ExclusiveAccessManager;
+@@ -59,6 +59,7 @@ class ExclusiveAccessManager;
  class FindBarController;
  class FindBarOwner;
  class FullscreenControlHost;
@@ -545,9 +609,9 @@
  class HistoryClustersSidePanelCoordinator;
  class HistorySidePanelCoordinator;
  class IncognitoClearBrowsingDataDialogCoordinator;
-@@ -577,6 +578,8 @@ class BrowserWindowFeatures {
- 
-   std::unique_ptr<tabs::TabDeclutterController> tab_declutter_controller_;
+@@ -569,6 +570,8 @@ class BrowserWindowFeatures {
+   std::unique_ptr<extensions::Mv2DisabledDialogController>
+       mv2_disabled_dialog_controller_;
  
 +  std::unique_ptr<HeliumLayoutStateController> helium_layout_state_controller_;
 +
@@ -556,7 +620,7 @@
  
 --- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
 +++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
-@@ -53,6 +53,7 @@
+@@ -62,6 +62,7 @@
  #include "chrome/browser/ui/extensions/mv2_disabled_dialog_controller.h"
  #include "chrome/browser/ui/find_bar/find_bar.h"
  #include "chrome/browser/ui/find_bar/find_bar_controller.h"
@@ -564,9 +628,9 @@
  #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
  #include "chrome/browser/ui/omnibox/ai_mode_page_action_controller.h"
  #include "chrome/browser/ui/performance_controls/memory_saver_bubble_controller.h"
-@@ -299,6 +300,10 @@ void BrowserWindowFeatures::Init(Browser
+@@ -306,6 +307,10 @@ void BrowserWindowFeatures::Init(Browser
+           std::make_unique<tabs::GlicNudgeController>(browser);
      }
- #endif  // BUILDFLAG(ENABLE_GLIC)
  
 +    helium_layout_state_controller_ =
 +        GetUserDataFactory().CreateInstance<HeliumLayoutStateController>(
@@ -587,7 +651,7 @@
    virtual BrowserLayoutParams GetBrowserLayoutParams(
 --- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
 +++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
-@@ -54,6 +54,12 @@ bool BrowserViewLayoutDelegateImpl::IsVe
+@@ -55,6 +55,12 @@ bool BrowserViewLayoutDelegateImpl::IsVe
    return browser_view_->IsVerticalTabStripCollapsed();
  }
  
@@ -621,20 +685,19 @@
  #include "base/token.h"
  #include "base/uuid.h"
  #include "base/values.h"
-@@ -30,12 +28,10 @@
+@@ -31,11 +29,9 @@
  #include "chrome/browser/ui/browser_window.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 -#include "chrome/browser/ui/tabs/features.h"
  #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
- #include "chrome/browser/ui/tabs/saved_tab_groups/tab_group_action_context_desktop.h"
  #include "chrome/browser/ui/tabs/tab_group_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
 -#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
- #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/web_applications/web_app_helpers.h"
  #include "components/saved_tab_groups/public/features.h"
-@@ -170,18 +166,7 @@ std::map<std::string, std::string> Brows
+ #include "components/saved_tab_groups/public/saved_tab_group.h"
+@@ -163,18 +159,7 @@ std::map<std::string, std::string> Brows
  
  std::map<std::string, std::string>
  BrowserLiveTabContext::GetExtraDataForWindow() const {
@@ -654,7 +717,7 @@
  }
  
  std::optional<tab_groups::TabGroupId> BrowserLiveTabContext::GetTabGroupForTab(
-@@ -388,7 +373,7 @@ sessions::LiveTabContext* BrowserLiveTab
+@@ -380,7 +365,7 @@ sessions::LiveTabContext* BrowserLiveTab
      ui::mojom::WindowShowState show_state,
      const std::string& workspace,
      const std::string& user_title,
@@ -663,7 +726,7 @@
    std::unique_ptr<Browser::CreateParams> create_params;
    if (ShouldCreateAppWindowForAppName(profile, app_name)) {
      // Only trusted app popup windows should ever be restored.
-@@ -413,26 +398,6 @@ sessions::LiveTabContext* BrowserLiveTab
+@@ -405,26 +390,6 @@ sessions::LiveTabContext* BrowserLiveTab
    create_params->initial_workspace = workspace;
    create_params->user_title = user_title;
  
@@ -692,7 +755,7 @@
    return browser->GetFeatures().live_tab_context();
 --- a/chrome/browser/sessions/session_restore.cc
 +++ b/chrome/browser/sessions/session_restore.cc
-@@ -67,12 +67,10 @@
+@@ -68,12 +68,10 @@
  #include "chrome/browser/ui/startup/startup_browser_creator.h"
  #include "chrome/browser/ui/startup/startup_tab.h"
  #include "chrome/browser/ui/startup/startup_types.h"
@@ -705,7 +768,7 @@
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/waap/initial_webui_window_metrics_manager.h"
  #include "chrome/browser/ui/webui/whats_new/whats_new_util.h"
-@@ -1144,7 +1142,7 @@ class SessionRestoreImpl : public Browse
+@@ -1145,7 +1143,7 @@ class SessionRestoreImpl : public Browse
        ui::mojom::WindowShowState show_state,
        const std::string& app_name,
        const std::string& user_title,
@@ -714,7 +777,7 @@
        int32_t restore_id) {
      Browser::CreateParams params(type, profile_, false);
      params.initial_bounds = bounds;
-@@ -1170,26 +1168,6 @@ class SessionRestoreImpl : public Browse
+@@ -1171,26 +1169,6 @@ class SessionRestoreImpl : public Browse
      params.initial_visible_on_all_workspaces_state = visible_on_all_workspaces;
      params.creation_source = Browser::CreationSource::kSessionRestore;
  
@@ -751,18 +814,68 @@
  #include "chrome/browser/ui/tabs/features.h"
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/common/buildflags.h"
-@@ -105,9 +106,11 @@ void UmaHistogramCounts10000WithTabStrip
-     return;
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -240,8 +240,6 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kSidePanelHorizontalAlignment] =
+       settings_api::PrefType::kBoolean;
+-  (*s_allowlist)[::prefs::kVerticalTabsEnabled] =
+-      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kTabSearchRightAligned] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kTabSearchPinnedToTabstrip] =
+--- a/chrome/browser/ui/tabs/vertical_tab_iph_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_iph_controller.cc
+@@ -34,11 +34,6 @@ VerticalTabIphController::VerticalTabIph
+     BrowserWindowInterface* interface)
+     : browser_window_interface_(interface),
+       scoped_data_(interface->GetUnownedUserDataHost(), *this) {
+-  auto* tab_strip_model = browser_window_interface_->GetTabStripModel();
+-  auto* profile = Profile::FromBrowserContext(tab_strip_model->profile());
+-  if (!profile->GetPrefs()->GetBoolean(prefs::kVerticalTabsEnabledFirstTime)) {
+-    browser_window_interface_->GetTabStripModel()->AddObserver(this);
+-  }
+ }
+ 
+ VerticalTabIphController::~VerticalTabIphController() = default;
+@@ -54,38 +49,7 @@ void VerticalTabIphController::OnTabStri
    }
+ }
  
--  const char* suffix = tabs::IsVerticalTabsFeatureEnabled() &&
--                               tab_strip.GetProfile()->GetPrefs()->GetBoolean(
--                                   prefs::kVerticalTabsEnabled)
-+  const bool vertical_enabled =
-+      tab_strip.GetProfile()->GetPrefs()->GetInteger(prefs::kHeliumLayout) ==
-+      std::to_underlying(HeliumLayoutType::kVertical);
-+
-+  const char* suffix = tabs::IsVerticalTabsFeatureEnabled() && vertical_enabled
-                            ? ".VerticalTabStrip"
-                            : ".HorizontalTabStrip";
+-void VerticalTabIphController::MaybeShowPromo() {
+-  auto* tab_strip_model = browser_window_interface_->GetTabStripModel();
+-  if (tab_strip_model->count() <= kMinTabsForVerticalTabPromo) {
+-    return;
+-  }
+-
+-  auto* profile = Profile::FromBrowserContext(tab_strip_model->profile());
+-  if (profile->GetPrefs()->GetBoolean(prefs::kVerticalTabsEnabledFirstTime)) {
+-    return;
+-  }
+-
+-  BrowserView* browser_view =
+-      BrowserView::GetBrowserViewForBrowser(browser_window_interface_);
+-  if (!browser_view || !browser_view->tab_strip_view()) {
+-    return;
+-  }
+-
+-  int first_unpinned_index = tab_strip_model->IndexOfFirstNonPinnedTab();
+-  if (first_unpinned_index == tab_strip_model->count()) {
+-    return;
+-  }
+-
+-  // If the unpinned tab is shrunk significantly compared to its standard
+-  // width show the IPH.
+-  views::View* tab =
+-      browser_view->tab_strip_view()->GetTabAnchorViewAt(first_unpinned_index);
+-  if (IsTabShrunk(tab)) {
+-    BrowserUserEducationInterface::From(browser_window_interface_)
+-        ->MaybeShowFeaturePromo(
+-            feature_engagement::kIPHVerticalTabstripTutorialFeature);
+-  }
+-}
++void VerticalTabIphController::MaybeShowPromo() {}
  
+ bool VerticalTabIphController::IsTabShrunk(views::View* tab) {
+   if (!tab) {
