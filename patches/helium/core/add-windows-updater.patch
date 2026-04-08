@@ -1,3 +1,117 @@
+--- a/chrome/browser/ui/webui/settings/about_handler.cc
++++ b/chrome/browser/ui/webui/settings/about_handler.cc
+@@ -14,6 +14,11 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/strings/utf_string_conversions.h"
++#if BUILDFLAG(IS_WIN)
++#include "base/json/json_reader.h"
++#include "base/version.h"
++#include "chrome/browser/ui/browser_navigator.h"
++#include "chrome/browser/ui/browser_navigator_params.h"
++#endif
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -58,6 +63,79 @@
+ 
+ }  // namespace
+ 
++#if BUILDFLAG(IS_WIN)
++class HeliumVersionUpdaterWin : public VersionUpdater {
++ public:
++  explicit HeliumVersionUpdaterWin(content::WebContents* web_contents)
++      : web_contents_(web_contents) {}
++
++  void CheckForUpdates(StatusCallback callback, PromoteCallback) override {
++    callback_ = callback;
++    callback_.Run(Status::kChecking, 0, false, false, "", 0, u"");
++
++    auto* profile = Profile::FromBrowserContext(web_contents_->GetBrowserContext());
++    GURL url = helium::GetBrowserUpdateURL(*profile->GetPrefs());
++
++    if (url == helium::GetDummyURL()) {
++      callback_.Run(Status::kDisabledByAdmin, 0, false, false, "", 0, u"");
++      return;
++    }
++
++    static const net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++        net::DefineNetworkTrafficAnnotation("helium_win_update_check", R"(
++          semantics {
++            sender: "Helium"
++            description: "Fetches the latest release metadata from GitHub to check if an update is available."
++            trigger: "Opening the About Helium settings page."
++            data: "None."
++            destination: OTHER
++            destination_other: "api.github.com"
++          }
++          policy {
++            cookies_allowed: NO
++            setting: "Disabled when 'Allow automatic browser and component updates' is turned off in Helium services settings."
++            policy_exception_justification: "Not applicable."
++          })");
++
++    auto req = std::make_unique<network::ResourceRequest>();
++    req->url = url;
++    req->credentials_mode = network::mojom::CredentialsMode::kOmit;
++    req->headers.SetHeader("User-Agent", "Helium-Browser");
++
++    loader_ = network::SimpleURLLoader::Create(std::move(req), kTrafficAnnotation);
++    loader_->DownloadToString(
++        profile->GetURLLoaderFactory().get(),
++        base::BindOnce(&HeliumVersionUpdaterWin::OnResponse, base::Unretained(this)),
++        65536);
++  }
++
++  void RelaunchBrowser() override {
++    NavigateParams p(ProfileManager::GetLastUsedProfile(),
++        GURL("https://github.com/imputnet/helium-windows/releases/latest"),
++        ui::PAGE_TRANSITION_LINK);
++    p.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++    Navigate(&p);
++  }
++
++ private:
++  void OnResponse(std::unique_ptr<std::string> body) {
++    if (!body || body->empty()) {
++      callback_.Run(Status::kUpdateError, 0, false, false, "", 0, u"");
++      return;
++    }
++
++    auto parsed = base::JSONReader::Read(*body);
++    const std::string* tag = parsed && parsed->is_dict()
++        ? parsed->GetDict().FindString("tag_name") : nullptr;
++
++    if (!tag || tag->empty()) {
++      callback_.Run(Status::kUpdateError, 0, false, false, "", 0, u"");
++      return;
++    }
++
++    std::string v = tag->front() == 'v' ? tag->substr(1) : *tag;
++    bool has_update = base::Version(v) > base::Version(version_info::GetHeliumVersionNumber());
++    callback_.Run(has_update ? Status::kNearlyUpdated : Status::kUpToDate,
++        0, false, false, "", 0, u"");
++  }
++
++  raw_ptr<content::WebContents> web_contents_;
++  StatusCallback callback_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++};
++#endif
++
++std::unique_ptr<VersionUpdater> VersionUpdater::Create(
++    content::WebContents* web_contents) {
++#if BUILDFLAG(IS_CHROMEOS_ASH)
++  return std::make_unique<VersionUpdaterChromeOS>(web_contents);
++#elif BUILDFLAG(IS_MAC)
++  return std::make_unique<VersionUpdaterMac>(web_contents);
++#elif BUILDFLAG(IS_WIN)
++  return std::make_unique<HeliumVersionUpdaterWin>(web_contents);
++#else
++  return std::make_unique<VersionUpdaterBasic>(web_contents);
++#endif
++}
++
 --- a/components/helium_services/helium_services_helpers.cc
 +++ b/components/helium_services/helium_services_helpers.cc
 @@ -109,6 +109,8 @@ GURL GetSpellcheckURL(const PrefService&
@@ -37,94 +151,3 @@
        Helium will automatically download and install browser and component updates as they become available. We recommend keeping this setting enabled to ensure you get the latest features and security updates. Automatic core browser updates are not available on this platform yet, but component updates are. Please use external software to keep Helium up to date.
      </message>
    </if>
---- a/chrome/browser/ui/webui/settings/about_handler.cc
-+++ b/chrome/browser/ui/webui/settings/about_handler.cc
-@@ -58,6 +58,111 @@
- 
- }  // namespace
- 
-+#if BUILDFLAG(IS_WIN)
-+#include "base/json/json_reader.h"
-+#include "chrome/browser/lifetime/application_lifetime.h"
-+
-+class HeliumVersionUpdaterWin : public VersionUpdater {
-+ public:
-+  explicit HeliumVersionUpdaterWin(content::WebContents* web_contents)
-+      : web_contents_(web_contents) {}
-+
-+  void CheckForUpdates(StatusCallback callback, PromoteCallback promote_callback) override {
-+    callback_ = std::move(callback);
-+
-+    auto* profile = Profile::FromBrowserContext(web_contents_->GetBrowserContext());
-+    GURL url = helium::GetBrowserUpdateURL(*profile->GetPrefs());
-+
-+    if (url.is_empty() || url.spec().find("dummy") != std::string::npos) {
-+      std::move(callback_).Run(Status::kDisabledByAdmin, 0, false, false, "", 0, u"");
-+      return;
-+    }
-+
-+    auto req = std::make_unique<network::ResourceRequest>();
-+    req->url = url;
-+    req->credentials_mode = network::mojom::CredentialsMode::kOmit;
-+    req->headers.SetHeader("User-Agent", "Helium-Browser");
-+
-+    loader_ = network::SimpleURLLoader::Create(std::move(req), MISSING_TRAFFIC_ANNOTATION);
-+    loader_->DownloadToStringOfUnboundedSizeUntilCrashAndDie(
-+        profile->GetURLLoaderFactory().get(),
-+        base::BindOnce(&HeliumVersionUpdaterWin::OnUpdateCheckDone, base::Unretained(this)));
-+
-+    std::move(callback_).Run(Status::kChecking, 0, false, false, "", 0, u"");
-+  }
-+
-+  void RelaunchBrowser() override {
-+    chrome::AttemptRestart();
-+  }
-+
-+ private:
-+  void OnUpdateCheckDone(std::unique_ptr<std::string> body) {
-+    if (!body || body->empty()) {
-+      std::move(callback_).Run(Status::kUpdateError, 0, false, false, "", 0, u"");
-+      return;
-+    }
-+
-+    auto root = base::JSONReader::Read(*body);
-+    if (!root || !root->is_dict()) {
-+      std::move(callback_).Run(Status::kUpdateError, 0, false, false, "", 0, u"");
-+      return;
-+    }
-+
-+    const std::string* tag = root->GetDict().FindString("tag_name");
-+    if (!tag) {
-+      std::move(callback_).Run(Status::kUpdateError, 0, false, false, "", 0, u"");
-+      return;
-+    }
-+
-+    std::string v = *tag;
-+    if (v[0] == 'v') v = v.substr(1);
-+
-+    if (base::Version(v) > base::Version(version_info::GetHeliumVersionNumber())) {
-+      std::move(callback_).Run(Status::kNearlyUpdated, 0, false, false, "", 0, u"");
-+    } else {
-+      std::move(callback_).Run(Status::kUpToDate, 0, false, false, "", 0, u"");
-+    }
-+  }
-+
-+  raw_ptr<content::WebContents> web_contents_;
-+  StatusCallback callback_;
-+  std::unique_ptr<network::SimpleURLLoader> loader_;
-+};
-+#endif
-+
-+std::unique_ptr<VersionUpdater> VersionUpdater::Create(
-+    content::WebContents* web_contents) {
-+#if BUILDFLAG(IS_CHROMEOS_ASH)
-+  return std::make_unique<VersionUpdaterChromeOS>(web_contents);
-+#elif BUILDFLAG(IS_MAC)
-+  return std::make_unique<VersionUpdaterMac>(web_contents);
-+#elif BUILDFLAG(IS_WIN)
-+  return std::make_unique<HeliumVersionUpdaterWin>(web_contents);
-+#else
-+  return std::make_unique<VersionUpdaterBasic>(web_contents);
-+#endif
-+}
-+
