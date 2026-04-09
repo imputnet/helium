@@ -1,0 +1,208 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -1329,6 +1329,11 @@ inline constexpr char kHeliumVerticalCol
+ inline constexpr char kHeliumVerticalUncollapsedWidth[] =
+     "helium.browser.vertical_uncollapsed_width";
+ 
++// A boolean pref set to true if the address bar should be centered.
++// When false, the address bar uses the full available width.
++inline constexpr char kHeliumCenteredLocationBar[] =
++    "helium.browser.centered_location_bar";
++
+ // A boolean pref set to true if a Home button to open the Home pages should be
+ // visible on the toolbar.
+ inline constexpr char kShowHomeButton[] = "browser.show_home_button";
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -117,6 +117,8 @@ void RegisterBrowserUserPrefs(user_prefs
+ 
+   registry->RegisterBooleanPref(prefs::kTabCyclingMRU, false);
+ 
++  registry->RegisterBooleanPref(prefs::kHeliumCenteredLocationBar, false);
++
+   registry->RegisterBooleanPref(prefs::kHomePageIsNewTabPage, true,
+                                 pref_registration_flags);
+   registry->RegisterBooleanPref(prefs::kShowHomeButton, false,
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -297,6 +297,10 @@ class ToolbarView : public views::Access
+ 
+   void OnShowMediaButtonChanged();
+ 
++  void OnLocationBarCenteredChanged();
++
++  void MaybeCenterLocationBar();
++
+   void OnTouchUiChanged();
+ 
+   void NewTabButtonPressed(const ui::Event& event);
+@@ -370,6 +374,8 @@ class ToolbarView : public views::Access
+ 
+   BooleanPrefMember show_media_button_;
+ 
++  BooleanPrefMember location_bar_is_centered_;
++
+   BooleanPrefMember show_chrome_labs_button_;
+ 
+   // The display mode used when laying out the toolbar.
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -184,6 +184,28 @@ auto& GetViewCommandMap() {
+ constexpr int kBrowserAppMenuRefreshExpandedMargin = 5;
+ constexpr int kBrowserAppMenuRefreshCollapsedMargin = 2;
+ 
++constexpr int kCenteredLocationBarMaxWidth = 700;
++
++struct CenteredLocationBarStep {
++  int min_toolbar_width;
++  int toolbar_width_reduction_percent;
++};
++
++constexpr CenteredLocationBarStep kCenteredLocationBarSteps[] = {
++    {1000, 12},
++    {800, 10},
++    {600, 5},
++};
++
++int CenteredLocationBarWidthReduction(int toolbar_width) {
++  for (const auto& step : kCenteredLocationBarSteps) {
++    if (toolbar_width >= step.min_toolbar_width) {
++      return toolbar_width * step.toolbar_width_reduction_percent / 100;
++    }
++  }
++  return 0;
++}
++
+ bool IsMigratedClickToCallBubble(
+     IntentPickerBubbleView::BubbleType bubble_type) {
+   return bubble_type == IntentPickerBubbleView::BubbleType::kClickToCall &&
+@@ -569,6 +591,11 @@ void ToolbarView::Init() {
+     OnShowMediaButtonChanged();
+   }
+ 
++  location_bar_is_centered_.Init(
++      prefs::kHeliumCenteredLocationBar, prefs,
++      base::BindRepeating(&ToolbarView::OnLocationBarCenteredChanged,
++                          base::Unretained(this)));
++
+   InitLayout();
+ 
+   for (auto* button : std::array<views::Button*, 5>{back_, forward_, reload_,
+@@ -1076,6 +1103,7 @@ void ToolbarView::Layout(PassKey) {
+   // Call super implementation to ensure layout manager and child layouts
+   // happen.
+   LayoutSuperclass<AccessiblePaneView>(this);
++  MaybeCenterLocationBar();
+ }
+ 
+ void ToolbarView::OnThemeChanged() {
+@@ -1488,6 +1516,48 @@ void ToolbarView::OnShowMediaButtonChang
+   InvalidateLayout();
+ }
+ 
++void ToolbarView::OnLocationBarCenteredChanged() {
++  InvalidateLayout();
++}
++
++void ToolbarView::MaybeCenterLocationBar() {
++  if (display_mode_ != DisplayMode::kNormal ||
++      !location_bar_is_centered_.GetValue()) {
++    return;
++  }
++
++  const int toolbar_width = width();
++  const int width_reduction = CenteredLocationBarWidthReduction(toolbar_width);
++  if (width_reduction == 0) {
++    return;
++  }
++
++  gfx::Rect bounds = location_bar_view_->bounds();
++  const int centered_width =
++      std::clamp(bounds.width() - width_reduction,
++                 location_bar_view_->GetMinimumSize().width(),
++                 kCenteredLocationBarMaxWidth);
++
++  // Center against the full width of the toolbar's parent. If that position
++  // does not fit in the slot assigned by layout, fall back to centering within
++  // the slot instead.
++  int centered_x = bounds.x() + (bounds.width() - centered_width) / 2;
++  if (parent() && centered_width <= bounds.width()) {
++    const int ideal_centered_x = (parent()->width() - centered_width) / 2 - x();
++    const int min_centered_x = bounds.x();
++    const int max_centered_x = bounds.right() - centered_width;
++    if (ideal_centered_x >= min_centered_x &&
++        ideal_centered_x <= max_centered_x) {
++      centered_x = ideal_centered_x;
++    }
++  }
++
++  bounds.set_x(centered_x);
++  bounds.set_width(centered_width);
++
++  location_bar_view_->SetBoundsRect(bounds);
++}
++
+ void ToolbarView::OnTouchUiChanged() {
+   if (display_mode_ == DisplayMode::kNormal) {
+     // Update the internal margins for touch layout.
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -304,6 +304,9 @@
+   <message name="IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN" desc="Label for the toggle that displays vertical tabs on the right side of the browser window.">
+     Show vertical tabs on right side
+   </message>
++  <message name="IDS_SETTINGS_CENTERED_LOCATION_BAR" desc="Label for the toggle to use a centered address bar.">
++    Center the address bar
++  </message>
+   <message name="IDS_SETTINGS_SHOW_HOME_BUTTON" desc="Label for the checkbox which enables or disables showing the home button in the toolbar.">
+     Show home button
+   </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -512,6 +512,7 @@ void AddAppearanceStrings(content::WebUI
+       {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
+       {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
+       {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
++      {"centeredLocationBar", IDS_SETTINGS_CENTERED_LOCATION_BAR},
+       {"verticalCollapseShortcut", IDS_SETTINGS_VERTICAL_COLLAPSE_SHORTCUT},
+       {"showHomeButton", IDS_SETTINGS_SHOW_HOME_BUTTON},
+       {"showBookmarksBar", IDS_SETTINGS_SHOW_BOOKMARKS_BAR},
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -202,6 +202,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+   (*s_allowlist)[::prefs::kHeliumLayout] = settings_api::PrefType::kNumber;
+   (*s_allowlist)[::prefs::kHeliumVerticalRightAligned] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
++      settings_api::PrefType::kBoolean;
+ 
+   // Miscellaneous
+   (*s_allowlist)[::embedder_support::kAlternateErrorPagesEnabled] =
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.ts
+@@ -479,6 +479,10 @@ export class SettingsAppearancePageEleme
+     return this.showVerticalTabsEnabled_ && layout === BrowserLayout.VERTICAL;
+   }
+ 
++  private showCenteredLocationBarSetting_(layout: number|undefined): boolean {
++    return layout !== BrowserLayout.COMPACT;
++  }
++
+   private themeChanged_(themeId: string) {
+     if (this.prefs === undefined || this.systemTheme_ === undefined) {
+       return;
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html
+@@ -114,6 +114,12 @@
+               pref="{{prefs.helium.browser.vertical_right_aligned}}"
+               label="$i18n{tabStripRightAlign}">
+           </settings-toggle-button>
++          <settings-toggle-button
++              hidden="[[!showCenteredLocationBarSetting_(
++                  prefs.helium.browser.layout.value)]]"
++              pref="{{prefs.helium.browser.centered_location_bar}}"
++              label="$i18n{centeredLocationBar}">
++          </settings-toggle-button>
+         </div>
+ 
+         <div
