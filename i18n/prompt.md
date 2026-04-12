@@ -35,7 +35,17 @@ Respond with only a JSON array in the same order as the input. Each element shou
 - `feminine`: feminine form of the translation, if the target language has grammatical gender and this string would differ when addressing a female user. Omit this field if it would be identical to `message`.
 - `masculine`: masculine form, same rules as above. Omit if identical to `message`.
 
-For most strings (buttons, labels, technical descriptions), there will be no gendered variants. Only include `feminine`/`masculine` when the translation genuinely differs, such as strings that use past participles or adjectives that agree with the gender of the person being addressed (e.g. French "connecté" vs "connectée").
+For most strings (buttons, labels, technical descriptions), there will be no gendered variants. Only include `feminine`/`masculine` when the translation genuinely differs, such as strings that use past participles or adjectives that agree with the gender of the person being addressed. For example, translating "Imported from X" into French:
+
+```json
+{
+  "name": "...",
+  "message": "Importé depuis X",
+  "feminine": "Importée depuis X"
+}
+```
+
+Here `message` is the default (masculine) form and `feminine` differs only in the participle. If a string like "Add search engine" has no gendered forms, omit both fields.
 
 **Important**: any double quotes (`"`) inside translated strings must be escaped as `\"` in the JSON output, or replaced with the locale-appropriate quotation marks (e.g. `«»`, `„"`, `「」`). Unescaped double quotes will break the JSON.
 

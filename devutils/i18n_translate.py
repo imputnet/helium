@@ -83,6 +83,10 @@ def build_payload(source, untranslated, existing, context_window=2):
     Build the JSON array to send to the model.
     Includes untranslated strings plus nearby neighbors as context.
     Context-only strings are marked with "translate": false.
+
+    Deduplicates untranslated entries with identical name + message,
+    returning a dedup_map that maps each payload index to all source
+    indices sharing that name + message.
     """
     needed = set(untranslated)
     all_indices = set()
@@ -92,19 +96,42 @@ def build_payload(source, untranslated, existing, context_window=2):
             if 0 <= idx < len(source):
                 all_indices.add(idx)
 
+    # group untranslated indices by (name, message) for dedup
+    seen = {}
+    for i in untranslated:
+        key = (source[i]['name'], source[i]['message'])
+        seen.setdefault(key, []).append(i)
+
     payload = []
+    dedup_map = []
+    added_keys = set()
     for i in sorted(all_indices):
+        if i not in needed:
+            entry = {
+                'name': source[i]['name'],
+                'context': source[i]['context'],
+                'message': source[i]['message'],
+                'translate': False,
+                'translation': existing[i]['message'],
+            }
+            payload.append(entry)
+            dedup_map.append([i])
+            continue
+
+        key = (source[i]['name'], source[i]['message'])
+        if key in added_keys:
+            continue
+        added_keys.add(key)
+
         entry = {
             'name': source[i]['name'],
             'context': source[i]['context'],
             'message': source[i]['message'],
         }
-        if i not in needed:
-            entry['translate'] = False
-            entry['translation'] = existing[i]['message']
         payload.append(entry)
+        dedup_map.append(seen[key])
 
-    return payload
+    return payload, dedup_map
 
 
 def fill_prompt(template, language_name, language_code):
@@ -186,28 +213,28 @@ def parse_response(raw, expected_names):
     return results
 
 
-def save_translations(lang_code, source, existing, response, untranslated):
+def save_translations(lang_code, source, existing, response, dedup_map):
     """Merge model response into existing translations and save."""
     # pad existing to match source length if needed
     while len(existing) < len(source):
         existing.append(None)
 
-    for entry, src_idx in zip(response, untranslated):
-        expected_name = source[src_idx]['name']
+    for entry, indices in zip(response, dedup_map):
+        expected_name = source[indices[0]]['name']
         if entry['name'] != expected_name:
-            raise ValueError(
-                f'response order mismatch at index {src_idx}: '
-                f'expected {expected_name}, got {entry["name"]}')
-        result = {
-            'name': expected_name,
-            'source': source[src_idx]['message'],
-            'message': entry['message'],
-        }
-        if 'feminine' in entry:
-            result['feminine'] = entry['feminine']
-        if 'masculine' in entry:
-            result['masculine'] = entry['masculine']
-        existing[src_idx] = result
+            raise ValueError(f'response order mismatch at index {indices[0]}: '
+                             f'expected {expected_name}, got {entry["name"]}')
+        for src_idx in indices:
+            result = {
+                'name': source[src_idx]['name'],
+                'source': source[src_idx]['message'],
+                'message': entry['message'],
+            }
+            if 'feminine' in entry:
+                result['feminine'] = entry['feminine']
+            if 'masculine' in entry:
+                result['masculine'] = entry['masculine']
+            existing[src_idx] = result
 
     path = TRANSLATIONS_DIR / f'{lang_code}.json'
     with open(path, 'w', encoding='utf-8') as f:
@@ -226,7 +253,7 @@ def translate_language(lang_code, lang_name, source, prompt_template):
 
     print(f'{lang_code}: {len(untranslated)} strings to translate')
 
-    payload = build_payload(source, untranslated, existing)
+    payload, dedup_map = build_payload(source, untranslated, existing)
     prompt = fill_prompt(prompt_template, lang_name, lang_code)
     data = json.dumps(payload, ensure_ascii=False)
 
@@ -235,7 +262,7 @@ def translate_language(lang_code, lang_name, source, prompt_template):
     raw = llm_chat(prompt, data)
     response = parse_response(raw, expected_names)
 
-    save_translations(lang_code, source, existing, response, untranslated)
+    save_translations(lang_code, source, existing, response, dedup_map)
     print(f'{lang_code}: done')
 
 
