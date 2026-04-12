@@ -117,7 +117,6 @@ def extract_strings(repo_root, platforms_dir):
 def run(args, repo_root):
     """Generate the base source strings JSON from patches."""
     prep_platform_repos(args.platforms_dir)
-    namesub.add_grit_to_path(args.tree)
 
     with open(args.output, 'w', encoding='utf-8') as out:
         data = json.dumps(

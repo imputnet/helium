@@ -23,7 +23,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description='i18n tooling for Helium')
     subparsers = parser.add_subparsers(dest='command', required=True)
     base = subparsers.add_parser('generate', help='Extract translatable strings from patches')
-    base.add_argument('-t', '--tree', type=Path, required=True, help='Path to Chromium source tree')
     base.add_argument('-p',
                       '--platforms-dir',
                       type=Path,
