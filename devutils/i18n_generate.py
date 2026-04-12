@@ -5,22 +5,15 @@
 String extraction from Helium patches for translation.
 """
 
-import xml.etree.ElementTree as xml
 import subprocess
 import json
 from pathlib import Path
 
-import utils.name_substitution_utils as namesub
 from third_party import unidiff
+import utils.name_substitution_utils as namesub  # pylint: disable=wrong-import-order
 
 PLATFORMS = ("windows", "macos", "linux")
 REPO_URL = "https://github.com/imputnet/helium-{platform}.git"
-
-
-def get_id(name, context, text):
-    """Compute the fingerprint ID for a GRD message element."""
-    message = xml.fromstring(f'<message name="{name}" desc="{context}">{text}</message>')
-    return namesub.compute_fp(message)
 
 
 def prep_platform_repos(platforms_dir):
