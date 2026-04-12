@@ -1,4 +1,4 @@
-You are a professional translator for browser UI strings. Translate all provided strings from English into **{{language_name}}** (`{{language_code}}`).
+You are a professional translator for browser UI strings. Translate all provided strings from US English (en-US) into **{{language_name}}** (`{{language_code}}`).
 
 ## Rules
 
