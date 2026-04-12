@@ -5,6 +5,7 @@ Translation of Helium strings using a completions API.
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -53,26 +54,25 @@ def llm_chat(prompt, data):
     return body['choices'][0]['message']['content']
 
 
-def load_existing(lang_code):
-    """Load existing translations for a language, or empty dict."""
+def load_existing(lang_code, source_len):
+    """Load existing translations for a language, or empty list."""
     path = TRANSLATIONS_DIR / f'{lang_code}.json'
     if path.exists():
         with open(path, encoding='utf-8') as f:
             return json.load(f)
-    return {}
+    return [None] * source_len
 
 
 def find_untranslated(source, existing):
     """
     Return indices into source for strings that need (re)translation.
     A string needs translation if:
-    - it has no entry in existing translations, or
+    - it has no existing translation, or
     - the source message has changed since it was last translated
     """
     indices = []
     for i, entry in enumerate(source):
-        name = entry['name']
-        prev = existing.get(name)
+        prev = existing[i] if i < len(existing) else None
         if not prev or prev.get('source') != entry['message']:
             indices.append(i)
     return indices
@@ -84,7 +84,6 @@ def build_payload(source, untranslated, existing, context_window=2):
     Includes untranslated strings plus nearby neighbors as context.
     Context-only strings are marked with "translate": false.
     """
-
     needed = set(untranslated)
     all_indices = set()
     for i in untranslated:
@@ -101,9 +100,8 @@ def build_payload(source, untranslated, existing, context_window=2):
             'message': source[i]['message'],
         }
         if i not in needed:
-            prev = existing[source[i]['name']]
             entry['translate'] = False
-            entry['translation'] = prev['message']
+            entry['translation'] = existing[i]['message']
         payload.append(entry)
 
     return payload
@@ -116,17 +114,48 @@ def fill_prompt(template, language_name, language_code):
     return template
 
 
-def parse_response(raw, expected_names):
-    """Parse and validate the model's response.
-
-    Strips markdown code fences, parses JSON, validates the shape,
-    and filters to only the names we asked to translate.
-    """
+def fixup_json(raw):
+    """Strips markdown code fences and fixes unescaped double quotes."""
     raw = raw.strip()
     raw = re.sub(r'^```(?:json)?\s*\n?', '', raw)
     raw = re.sub(r'\n?```\s*$', '', raw)
 
-    response = json.loads(raw)
+    result = []
+    in_string = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '\\' and in_string:
+            # skip escaped character
+            result.append(raw[i:i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            if not in_string:
+                in_string = True
+                result.append(ch)
+            elif i + 1 < len(raw) and raw[i + 1] not in (',', '}', ']', ':', '\n', '\r'):
+                # quote not followed by a structural character — escape it
+                result.append('\\"')
+            else:
+                in_string = False
+                result.append(ch)
+        else:
+            result.append(ch)
+        i += 1
+    return ''.join(result)
+
+
+def parse_response(raw, expected_names):
+    """Parse and validate the model's response."""
+    raw = fixup_json(raw)
+
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f'failed to parse model response: {exc}', file=sys.stderr)
+        print(f'raw response:\n{raw}', file=sys.stderr)
+        raise
 
     if not isinstance(response, list):
         raise ValueError('expected a JSON array from the model')
@@ -157,21 +186,22 @@ def parse_response(raw, expected_names):
     return results
 
 
-def save_translations(lang_code, source, existing, response):
+def save_translations(lang_code, source, existing, response, untranslated):
     """Merge model response into existing translations and save."""
-    source_by_name = {s['name']: s['message'] for s in source}
+    # pad existing to match source length if needed
+    while len(existing) < len(source):
+        existing.append(None)
 
-    for entry in response:
-        name = entry['name']
+    for entry, src_idx in zip(response, untranslated):
         result = {
-            'source': source_by_name[name],
+            'source': source[src_idx]['message'],
             'message': entry['message'],
         }
         if 'feminine' in entry:
             result['feminine'] = entry['feminine']
         if 'masculine' in entry:
             result['masculine'] = entry['masculine']
-        existing[name] = result
+        existing[src_idx] = result
 
     path = TRANSLATIONS_DIR / f'{lang_code}.json'
     with open(path, 'w', encoding='utf-8') as f:
@@ -181,7 +211,7 @@ def save_translations(lang_code, source, existing, response):
 
 def translate_language(lang_code, lang_name, source, prompt_template):
     """Run translation for a single language."""
-    existing = load_existing(lang_code)
+    existing = load_existing(lang_code, len(source))
     untranslated = find_untranslated(source, existing)
 
     if not untranslated:
@@ -199,7 +229,7 @@ def translate_language(lang_code, lang_name, source, prompt_template):
     raw = llm_chat(prompt, data)
     response = parse_response(raw, expected_names)
 
-    save_translations(lang_code, source, existing, response)
+    save_translations(lang_code, source, existing, response, untranslated)
     print(f'{lang_code}: done')
 
 

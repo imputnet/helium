@@ -37,4 +37,6 @@ Respond with only a JSON array in the same order as the input. Each element shou
 
 For most strings (buttons, labels, technical descriptions), there will be no gendered variants. Only include `feminine`/`masculine` when the translation genuinely differs, such as strings that use past participles or adjectives that agree with the gender of the person being addressed (e.g. French "connecté" vs "connectée").
 
+**Important**: any double quotes (`"`) inside translated strings must be escaped as `\"` in the JSON output, or replaced with the locale-appropriate quotation marks (e.g. `«»`, `„"`, `「」`). Unescaped double quotes will break the JSON.
+
 Do not include any other text, explanation, or markdown formatting. Output raw JSON only.
