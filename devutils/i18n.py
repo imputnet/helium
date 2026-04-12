@@ -125,30 +125,8 @@ def extract_strings():
                 }
 
 
-def parse_args():
-    """CLI arg parsing"""
-    parser = argparse.ArgumentParser(description='Extract i18n strings from Helium patches')
-    parser.add_argument('-t',
-                        '--tree',
-                        type=Path,
-                        required=True,
-                        help='Path to Chromium source tree')
-    parser.add_argument('-p',
-                        '--platforms-dir',
-                        type=Path,
-                        default=PLATFORMS_DIR,
-                        help='Path where platform repos will be cloned')
-    parser.add_argument('-o',
-                        '--output',
-                        type=Path,
-                        default=OUT_PATH,
-                        help='Output path where base JSON file will be saved')
-    return parser.parse_args()
-
-
-def main():
-    """CLI entrypoint"""
-    args = parse_args()
+def cmd_generate_base(args):
+    """Generate the base source strings JSON from patches."""
     prep_platform_repos(args.platforms_dir)
     namesub.add_grit_to_path(args.tree)
 
@@ -156,7 +134,53 @@ def main():
         out.write(json.dumps(list(extract_strings()), indent=2, ensure_ascii=False))
         out.write('\n')
 
-    return 0
+
+def cmd_translate(args):
+    """Translate source strings into target languages."""
+    raise NotImplementedError("translate is not yet implemented")
+
+
+def parse_args():
+    """CLI arg parsing"""
+    parser = argparse.ArgumentParser(description='i18n tooling for Helium')
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    base = subparsers.add_parser('generate',
+                                 help='Extract translatable strings from patches')
+    base.add_argument('-t',
+                      '--tree',
+                      type=Path,
+                      required=True,
+                      help='Path to Chromium source tree')
+    base.add_argument('-p',
+                      '--platforms-dir',
+                      type=Path,
+                      default=PLATFORMS_DIR,
+                      help='Path where platform repos will be cloned')
+    base.add_argument('-o',
+                      '--output',
+                      type=Path,
+                      default=OUT_PATH,
+                      help='Output path where base JSON file will be saved')
+
+    translate = subparsers.add_parser('translate',
+                                      help='Translate source strings into target languages')
+    translate.add_argument('-l',
+                           '--language',
+                           type=str,
+                           help='Target language code (e.g. "fr"). '
+                                'If omitted, translates all languages.')
+
+    return parser.parse_args()
+
+
+def main():
+    """CLI entrypoint"""
+    args = parse_args()
+    commands = {
+        'generate': cmd_generate_base,
+        'translate': cmd_translate,
+    }
+    return commands[args.command](args)
 
 
 if __name__ == '__main__':
