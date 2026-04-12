@@ -78,7 +78,10 @@ def extract_strings_from_hunk(hunk):
     for line in str(hunk).split('\n'):
         is_additive = line.startswith('+')
         is_subtractive = line.startswith('-')
-        line = line.lstrip('+-').strip()
+        line = line.lstrip('+').strip()
+
+        if is_subtractive:
+            continue
 
         if line.startswith('<message') or meta_acc:
             meta_acc += line
@@ -87,7 +90,7 @@ def extract_strings_from_hunk(hunk):
                 yield name, desc, message
             name, message, desc = None, '', None
             had_any_additive = False
-        elif name and not is_subtractive:
+        elif name:
             message += line
 
         if meta_acc and line.endswith('>'):
