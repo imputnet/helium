@@ -118,7 +118,6 @@ def build_payload(source, untranslated, existing, context_window=2):
                 'translation': existing[i]['message'],
             }
             payload.append(entry)
-            dedup_map.append([i])
             continue
 
         key = (source[i]['name'], source[i]['message'])
@@ -164,7 +163,7 @@ def fixup_json(raw):
             if not in_string:
                 in_string = True
                 result.append(char)
-            elif i + 1 < len(raw) and raw[i + 1] not in (',', '}', ']', ':', '\n', '\r'):
+            elif i + 1 < len(raw) and raw[i + 1] not in (',', '}', ']', ':', '\n', '\r', ' ', '\t'):
                 # quote not followed by a structural character — escape it
                 result.append('\\"')
             else:
@@ -200,12 +199,12 @@ def parse_response(raw, expected_names):
         if 'name' not in entry or 'message' not in entry:
             raise ValueError(f'entry missing required fields: {entry}')
 
+        if entry['name'] not in expected_names:
+            continue
+
         extra = set(entry.keys()) - allowed_keys
         if extra:
             raise ValueError(f'unexpected fields in entry {entry["name"]}: {extra}')
-
-        if entry['name'] not in expected_names:
-            continue
 
         results.append(entry)
 
