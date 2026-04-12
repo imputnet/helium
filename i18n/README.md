@@ -23,8 +23,8 @@ to open a pull request to resolve it.
 ## Translation owners
 If you are a native speaker of a particular language and would be willing to
 review any changes made to its translations, you may ask to be added for the
-particular language file in [CODEOWNERS](../CODEOWNERS), if there are no or
-few translators for that file. This would be preferrably done in a PR related to
+particular language file in [owners.yml](owners.yml), if there are no or few
+translators for that file. This would be preferrably done in a PR related to
 the file itself.
 
 ## Development
