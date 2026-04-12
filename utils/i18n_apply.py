@@ -6,11 +6,12 @@
 Apply translated strings into Chromium XTB files.
 """
 
+import xml.etree.ElementTree as xml
 import argparse
 import json
 import re
 import sys
-import xml.etree.ElementTree as xml
+
 from collections import defaultdict
 from multiprocessing import Pool
 from pathlib import Path
@@ -159,8 +160,8 @@ def apply_language(task):
         print(f'{lang_code}: no translations found, skipping', file=sys.stderr)
         return
 
-    with open(trans_path, encoding='utf-8') as f:
-        translations = json.load(f)
+    with open(trans_path, encoding='utf-8') as file:
+        translations = json.load(file)
 
     trans_by_key = {}
     for trans in translations:
@@ -193,10 +194,10 @@ def main():
                         help='Path to Chromium source tree')
     args = parser.parse_args()
 
-    with open(SOURCE_PATH, encoding='utf-8') as f:
-        source = json.load(f)
-    with open(I18N_DIR / 'languages.json', encoding='utf-8') as f:
-        languages = json.load(f)
+    with open(SOURCE_PATH, encoding='utf-8') as file:
+        source = json.load(file)
+    with open(I18N_DIR / 'languages.json', encoding='utf-8') as file:
+        languages = json.load(file)
 
     namesub.add_grit_to_path(args.tree)
     xtb_index = build_xtb_index(source, args.tree)

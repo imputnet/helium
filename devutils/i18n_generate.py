@@ -10,7 +10,8 @@ import json
 from pathlib import Path
 
 from third_party import unidiff
-import utils.name_substitution_utils as namesub  # pylint: disable=wrong-import-order
+
+import utils.name_substitution_utils as namesub # pylint: disable=wrong-import-order
 
 PLATFORMS = ("windows", "macos", "linux")
 REPO_URL = "https://github.com/imputnet/helium-{platform}.git"
