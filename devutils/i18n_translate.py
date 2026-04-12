@@ -57,13 +57,18 @@ def llm_chat(prompt, data):
     return body['choices'][0]['message']['content']
 
 
-def load_existing(lang_code, source_len):
-    """Load existing translations for a language, or empty list."""
+def load_existing(lang_code):
+    """Load existing translations as a dict keyed by (name, source)."""
     path = TRANSLATIONS_DIR / f'{lang_code}.json'
-    if path.exists():
-        with open(path, encoding='utf-8') as file:
-            return json.load(file)
-    return [None] * source_len
+    if not path.exists():
+        return {}
+    with open(path, encoding='utf-8') as file:
+        entries = json.load(file)
+    result = {}
+    for entry in entries:
+        if entry:
+            result[(entry['name'], entry['source'])] = entry
+    return result
 
 
 def find_untranslated(source, existing):
@@ -75,8 +80,8 @@ def find_untranslated(source, existing):
     """
     indices = []
     for i, entry in enumerate(source):
-        prev = existing[i] if i < len(existing) else None
-        if not prev or prev.get('source') != entry['message']:
+        key = (entry['name'], entry['message'])
+        if key not in existing:
             indices.append(i)
     return indices
 
@@ -110,12 +115,13 @@ def build_payload(source, untranslated, existing, context_window=2):
     added_keys = set()
     for i in sorted(all_indices):
         if i not in needed:
+            key = (source[i]['name'], source[i]['message'])
             entry = {
                 'name': source[i]['name'],
                 'context': source[i]['context'],
                 'message': source[i]['message'],
                 'translate': False,
-                'translation': existing[i]['message'],
+                'translation': existing[key]['message'],
             }
             payload.append(entry)
             continue
@@ -217,16 +223,13 @@ def parse_response(raw, expected_names):
 
 def save_translations(lang_code, source, existing, response, dedup_map):
     """Merge model response into existing translations and save."""
-    # pad existing to match source length if needed
-    while len(existing) < len(source):
-        existing.append(None)
-
     for entry, indices in zip(response, dedup_map):
         expected_name = source[indices[0]]['name']
         if entry['name'] != expected_name:
             raise ValueError(f'response order mismatch at index {indices[0]}: '
                              f'expected {expected_name}, got {entry["name"]}')
         for src_idx in indices:
+            key = (source[src_idx]['name'], source[src_idx]['message'])
             result = {
                 'name': source[src_idx]['name'],
                 'source': source[src_idx]['message'],
@@ -236,17 +239,17 @@ def save_translations(lang_code, source, existing, response, dedup_map):
                 result['feminine'] = entry['feminine']
             if 'masculine' in entry:
                 result['masculine'] = entry['masculine']
-            existing[src_idx] = result
+            existing[key] = result
 
     path = TRANSLATIONS_DIR / f'{lang_code}.json'
     with open(path, 'w', encoding='utf-8') as file:
-        json.dump(existing, file, indent=2, ensure_ascii=False)
+        json.dump(list(existing.values()), file, indent=2, ensure_ascii=False)
         file.write('\n')
 
 
 def translate_language(lang_code, lang_name, source, prompt_template, from_file=None):
     """Run translation for a single language."""
-    existing = load_existing(lang_code, len(source))
+    existing = load_existing(lang_code)
     untranslated = find_untranslated(source, existing)
 
     if not untranslated:
