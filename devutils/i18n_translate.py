@@ -193,7 +193,13 @@ def save_translations(lang_code, source, existing, response, untranslated):
         existing.append(None)
 
     for entry, src_idx in zip(response, untranslated):
+        expected_name = source[src_idx]['name']
+        if entry['name'] != expected_name:
+            raise ValueError(
+                f'response order mismatch at index {src_idx}: '
+                f'expected {expected_name}, got {entry["name"]}')
         result = {
+            'name': expected_name,
             'source': source[src_idx]['message'],
             'message': entry['message'],
         }
