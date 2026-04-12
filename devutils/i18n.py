@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 The Helium Authors
+# You can use, redistribute, and/or modify this source code under
+# the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """
 Utility file for generating files for translation and
 importing them into the codebase.
@@ -40,6 +43,11 @@ def parse_args():
                            nargs='+',
                            help='Target language code(s) (e.g. "fr" "de"). '
                            'If omitted, translates all languages.')
+    translate.add_argument('-f',
+                           '--from-file',
+                           type=Path,
+                           help='Import translations from a JSON file '
+                           'instead of calling the LLM.')
 
     return parser.parse_args()
 

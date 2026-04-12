@@ -1,3 +1,6 @@
+# Copyright 2026 The Helium Authors
+# You can use, redistribute, and/or modify this source code under
+# the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """
 Translation of Helium strings using a completions API.
 """
@@ -242,7 +245,7 @@ def save_translations(lang_code, source, existing, response, dedup_map):
         file.write('\n')
 
 
-def translate_language(lang_code, lang_name, source, prompt_template):
+def translate_language(lang_code, lang_name, source, prompt_template, from_file=None):
     """Run translation for a single language."""
     existing = load_existing(lang_code, len(source))
     untranslated = find_untranslated(source, existing)
@@ -254,12 +257,18 @@ def translate_language(lang_code, lang_name, source, prompt_template):
     print(f'{lang_code}: {len(untranslated)} strings to translate')
 
     payload, dedup_map = build_payload(source, untranslated, existing)
-    prompt = fill_prompt(prompt_template, lang_name, lang_code)
-    data = json.dumps(payload, ensure_ascii=False)
-
     expected_names = {source[i]['name'] for i in untranslated}
 
-    raw = llm_chat(prompt, data)
+    if from_file:
+        if str(from_file) == '-':
+            raw = sys.stdin.read()
+        else:
+            raw = from_file.read_text(encoding='utf-8')
+    else:
+        prompt = fill_prompt(prompt_template, lang_name, lang_code)
+        data = json.dumps(payload, ensure_ascii=False)
+        raw = llm_chat(prompt, data)
+
     response = parse_response(raw, expected_names)
 
     save_translations(lang_code, source, existing, response, dedup_map)
@@ -276,11 +285,15 @@ def run(args):
     prompt_template = (I18N_DIR / 'prompt.md').read_text(encoding='utf-8')
     TRANSLATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+    from_file = getattr(args, 'from_file', None)
+
     if args.language:
         for code in args.language:
             if code not in languages:
                 raise ValueError(f'unknown language code: {code}')
-            translate_language(code, languages[code], source, prompt_template)
+            translate_language(code, languages[code], source, prompt_template, from_file)
     else:
+        if from_file:
+            raise ValueError('--from-file requires --language')
         for code, name in languages.items():
             translate_language(code, name, source, prompt_template)
