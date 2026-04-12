@@ -4,6 +4,7 @@ Translation of Helium strings using a completions API.
 
 import json
 import os
+import re
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -109,6 +110,47 @@ def fill_prompt(template, language_name, language_code):
             .replace('{{language_code}}', language_code))
 
 
+def parse_response(raw, expected_names):
+    """Parse and validate the model's response.
+
+    Strips markdown code fences, parses JSON, validates the shape,
+    and filters to only the names we asked to translate.
+    """
+    raw = raw.strip()
+    raw = re.sub(r'^```(?:json)?\s*\n?', '', raw)
+    raw = re.sub(r'\n?```\s*$', '', raw)
+
+    response = json.loads(raw)
+
+    if not isinstance(response, list):
+        raise ValueError('expected a JSON array from the model')
+
+    ALLOWED_KEYS = {'name', 'message', 'feminine', 'masculine'}
+
+    results = []
+    for entry in response:
+        if not isinstance(entry, dict):
+            raise ValueError(f'expected object in array, got {type(entry).__name__}')
+
+        if 'name' not in entry or 'message' not in entry:
+            raise ValueError(f'entry missing required fields: {entry}')
+
+        extra = set(entry.keys()) - ALLOWED_KEYS
+        if extra:
+            raise ValueError(f'unexpected fields in entry {entry["name"]}: {extra}')
+
+        if entry['name'] not in expected_names:
+            continue
+
+        results.append(entry)
+
+    missing = expected_names - {e['name'] for e in results}
+    if missing:
+        raise ValueError(f'model did not translate: {missing}')
+
+    return results
+
+
 def save_translations(lang_code, source, existing, response):
     """Merge model response into existing translations and save."""
     source_by_name = {s['name']: s['message'] for s in source}
@@ -146,8 +188,10 @@ def translate_language(lang_code, lang_name, source, prompt_template):
     prompt = fill_prompt(prompt_template, lang_name, lang_code)
     data = json.dumps(payload, ensure_ascii=False)
 
+    expected_names = {source[i]['name'] for i in untranslated}
+
     raw = llm_chat(prompt, data)
-    response = json.loads(raw)
+    response = parse_response(raw, expected_names)
 
     save_translations(lang_code, source, existing, response)
     print(f'{lang_code}: done')
