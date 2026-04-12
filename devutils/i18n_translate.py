@@ -31,8 +31,14 @@ def llm_chat(prompt, data):
         data=json.dumps({
             'model': model,
             'messages': [
-                {'role': 'system', 'content': prompt},
-                {'role': 'user', 'content': data},
+                {
+                    'role': 'system',
+                    'content': prompt
+                },
+                {
+                    'role': 'user',
+                    'content': data
+                },
             ],
         }).encode(),
         headers={
@@ -105,9 +111,9 @@ def build_payload(source, untranslated, existing, context_window=2):
 
 def fill_prompt(template, language_name, language_code):
     """Fill in the language placeholders in a prompt template."""
-    return (template
-            .replace('{{language_name}}', language_name)
-            .replace('{{language_code}}', language_code))
+    template = template.replace('{{language_name}}', language_name)
+    template = template.replace('{{language_code}}', language_code)
+    return template
 
 
 def parse_response(raw, expected_names):
@@ -125,7 +131,7 @@ def parse_response(raw, expected_names):
     if not isinstance(response, list):
         raise ValueError('expected a JSON array from the model')
 
-    ALLOWED_KEYS = {'name', 'message', 'feminine', 'masculine'}
+    allowed_keys = {'name', 'message', 'feminine', 'masculine'}
 
     results = []
     for entry in response:
@@ -135,7 +141,7 @@ def parse_response(raw, expected_names):
         if 'name' not in entry or 'message' not in entry:
             raise ValueError(f'entry missing required fields: {entry}')
 
-        extra = set(entry.keys()) - ALLOWED_KEYS
+        extra = set(entry.keys()) - allowed_keys
         if extra:
             raise ValueError(f'unexpected fields in entry {entry["name"]}: {extra}')
 

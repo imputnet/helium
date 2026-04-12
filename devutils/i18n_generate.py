@@ -7,8 +7,8 @@ import subprocess
 import json
 from pathlib import Path
 
-import utils.name_substitution_utils as namesub
 from third_party import unidiff
+import utils.name_substitution_utils as namesub
 
 PLATFORMS = ("windows", "macos", "linux")
 REPO_URL = "https://github.com/imputnet/helium-{platform}.git"
@@ -123,8 +123,9 @@ def run(args, repo_root):
     namesub.add_grit_to_path(args.tree)
 
     with open(args.output, 'w', encoding='utf-8') as out:
-        out.write(json.dumps(
+        data = json.dumps(
             list(extract_strings(repo_root, args.platforms_dir)),
-            indent=2, ensure_ascii=False,
-        ))
-        out.write('\n')
+            indent=2,
+            ensure_ascii=False,
+        )
+        out.write(data + '\n')

@@ -19,13 +19,8 @@ def parse_args():
     """CLI arg parsing"""
     parser = argparse.ArgumentParser(description='i18n tooling for Helium')
     subparsers = parser.add_subparsers(dest='command', required=True)
-    base = subparsers.add_parser('generate',
-                                 help='Extract translatable strings from patches')
-    base.add_argument('-t',
-                      '--tree',
-                      type=Path,
-                      required=True,
-                      help='Path to Chromium source tree')
+    base = subparsers.add_parser('generate', help='Extract translatable strings from patches')
+    base.add_argument('-t', '--tree', type=Path, required=True, help='Path to Chromium source tree')
     base.add_argument('-p',
                       '--platforms-dir',
                       type=Path,
@@ -43,7 +38,7 @@ def parse_args():
                            '--language',
                            type=str,
                            help='Target language code (e.g. "fr"). '
-                                'If omitted, translates all languages.')
+                           'If omitted, translates all languages.')
 
     return parser.parse_args()
 
@@ -53,11 +48,14 @@ def main():
     args = parse_args()
 
     if args.command == 'generate':
-        import i18n_generate
+        import i18n_generate # pylint: disable=import-outside-toplevel
         return i18n_generate.run(args, REPO_ROOT)
-    elif args.command == 'translate':
-        import i18n_translate
+
+    if args.command == 'translate':
+        import i18n_translate # pylint: disable=import-outside-toplevel
         return i18n_translate.run(args)
+
+    raise ValueError(f'unknown command: {args.command}')
 
 
 if __name__ == '__main__':
