@@ -58,8 +58,8 @@ def load_existing(lang_code, source_len):
     """Load existing translations for a language, or empty list."""
     path = TRANSLATIONS_DIR / f'{lang_code}.json'
     if path.exists():
-        with open(path, encoding='utf-8') as f:
-            return json.load(f)
+        with open(path, encoding='utf-8') as file:
+            return json.load(file)
     return [None] * source_len
 
 
@@ -151,24 +151,24 @@ def fixup_json(raw):
     in_string = False
     i = 0
     while i < len(raw):
-        ch = raw[i]
-        if ch == '\\' and in_string:
+        char = raw[i]
+        if char == '\\' and in_string:
             # skip escaped character
             result.append(raw[i:i + 2])
             i += 2
             continue
-        if ch == '"':
+        if char == '"':
             if not in_string:
                 in_string = True
-                result.append(ch)
+                result.append(char)
             elif i + 1 < len(raw) and raw[i + 1] not in (',', '}', ']', ':', '\n', '\r'):
                 # quote not followed by a structural character — escape it
                 result.append('\\"')
             else:
                 in_string = False
-                result.append(ch)
+                result.append(char)
         else:
-            result.append(ch)
+            result.append(char)
         i += 1
     return ''.join(result)
 
@@ -237,9 +237,9 @@ def save_translations(lang_code, source, existing, response, dedup_map):
             existing[src_idx] = result
 
     path = TRANSLATIONS_DIR / f'{lang_code}.json'
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(existing, f, indent=2, ensure_ascii=False)
-        f.write('\n')
+    with open(path, 'w', encoding='utf-8') as file:
+        json.dump(existing, file, indent=2, ensure_ascii=False)
+        file.write('\n')
 
 
 def translate_language(lang_code, lang_name, source, prompt_template):
@@ -268,10 +268,10 @@ def translate_language(lang_code, lang_name, source, prompt_template):
 
 def run(args):
     """Translate source strings into target languages."""
-    with open(SOURCE_PATH, encoding='utf-8') as f:
-        source = json.load(f)
-    with open(I18N_DIR / 'languages.json', encoding='utf-8') as f:
-        languages = json.load(f)
+    with open(SOURCE_PATH, encoding='utf-8') as file:
+        source = json.load(file)
+    with open(I18N_DIR / 'languages.json', encoding='utf-8') as file:
+        languages = json.load(file)
 
     prompt_template = (I18N_DIR / 'prompt.md').read_text(encoding='utf-8')
     TRANSLATIONS_DIR.mkdir(parents=True, exist_ok=True)
