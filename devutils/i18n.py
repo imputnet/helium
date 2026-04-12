@@ -49,13 +49,6 @@ def parse_args():
                            help='Import translations from a JSON file '
                            'instead of calling the LLM.')
 
-    merge = subparsers.add_parser('merge', help='Merge translations into XTB files')
-    merge.add_argument('-t',
-                       '--tree',
-                       type=Path,
-                       required=True,
-                       help='Path to Chromium source tree')
-
     return parser.parse_args()
 
 
@@ -70,10 +63,6 @@ def main():
     if args.command == 'translate':
         import i18n_translate # pylint: disable=import-outside-toplevel
         return i18n_translate.run(args)
-
-    if args.command == 'merge':
-        import i18n_merge # pylint: disable=import-outside-toplevel
-        return i18n_merge.run(args)
 
     raise ValueError(f'unknown command: {args.command}')
 

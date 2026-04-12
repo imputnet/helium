@@ -1,10 +1,12 @@
+#!/usr/bin/env python3
 # Copyright 2026 The Helium Authors
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """
-Merge translated strings into Chromium XTB files.
+Apply translated strings into Chromium XTB files.
 """
 
+import argparse
 import json
 import re
 import sys
@@ -13,9 +15,10 @@ from collections import defaultdict
 from multiprocessing import Pool
 from pathlib import Path
 
-import utils.name_substitution_utils as namesub
+import name_substitution_utils as namesub
 
-I18N_DIR = Path(__file__).resolve().parent.parent / 'i18n'
+REPO_ROOT = Path(__file__).resolve().parent.parent
+I18N_DIR = REPO_ROOT / 'i18n'
 SOURCE_PATH = I18N_DIR / 'source.gen.json'
 TRANSLATIONS_DIR = I18N_DIR / 'translations'
 
@@ -148,8 +151,8 @@ def merge_into_xtb(xtb_path, source_entries, trans_by_key):
     return len(entries)
 
 
-def merge_language(task):
-    """Merge translations for a single language into XTB files."""
+def apply_language(task):
+    """Apply translations for a single language into XTB files."""
     lang_code, source, xtb_index = task
     trans_path = TRANSLATIONS_DIR / f'{lang_code}.json'
     if not trans_path.exists():
@@ -177,20 +180,31 @@ def merge_language(task):
     for xtb_path, source_entries in by_xtb.items():
         total += merge_into_xtb(xtb_path, source_entries, trans_by_key)
 
-    print(f'{lang_code}: merged {total} translations into {len(by_xtb)} XTB files')
+    print(f'{lang_code}: applied {total} translations to {len(by_xtb)} XTB files')
 
 
-def run(args):
-    """Merge translations into XTB files."""
+def main():
+    """CLI entrypoint"""
+    parser = argparse.ArgumentParser(description='Apply i18n translations to Chromium XTB files')
+    parser.add_argument('-t',
+                        '--tree',
+                        type=Path,
+                        required=True,
+                        help='Path to Chromium source tree')
+    args = parser.parse_args()
+
     with open(SOURCE_PATH, encoding='utf-8') as f:
         source = json.load(f)
     with open(I18N_DIR / 'languages.json', encoding='utf-8') as f:
         languages = json.load(f)
 
-    tree = args.tree
-    namesub.add_grit_to_path(tree)
-    xtb_index = build_xtb_index(source, tree)
+    namesub.add_grit_to_path(args.tree)
+    xtb_index = build_xtb_index(source, args.tree)
 
     tasks = [(code, source, xtb_index) for code in languages]
     with Pool() as pool:
-        pool.map(merge_language, tasks)
+        pool.map(apply_language, tasks)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
