@@ -244,9 +244,10 @@ def run(args):
     TRANSLATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.language:
-        if args.language not in languages:
-            raise ValueError(f'unknown language code: {args.language}')
-        translate_language(args.language, languages[args.language], source, prompt_template)
+        for code in args.language:
+            if code not in languages:
+                raise ValueError(f'unknown language code: {code}')
+            translate_language(code, languages[code], source, prompt_template)
     else:
         for code, name in languages.items():
             translate_language(code, name, source, prompt_template)

@@ -37,7 +37,8 @@ def parse_args():
     translate.add_argument('-l',
                            '--language',
                            type=str,
-                           help='Target language code (e.g. "fr"). '
+                           nargs='+',
+                           help='Target language code(s) (e.g. "fr" "de"). '
                            'If omitted, translates all languages.')
 
     return parser.parse_args()
