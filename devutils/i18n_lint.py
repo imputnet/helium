@@ -16,6 +16,10 @@ def main():
     """Validate all translation files."""
     errors = 0
 
+    with open(I18N_DIR / 'source.gen.json', encoding='utf-8') as file:
+        source = json.load(file)
+    source_keys = {(s['name'], s['message']) for s in source}
+
     for path in sorted((I18N_DIR / 'translations').glob('*.json')):
         with open(path, encoding='utf-8') as file:
             entries = json.load(file)
@@ -26,7 +30,15 @@ def main():
             try:
                 xml.fromstring(f'<t>{entry["message"]}</t>')
             except xml.ParseError as exc:
-                print(f'{path.name}[{i}] ({entry["name"]}): {exc}', file=sys.stderr)
+                print(f'{path.name}[{i}] ({entry["name"]}): invalid xml: {exc}', file=sys.stderr)
+                errors += 1
+                continue
+
+            key = (entry['name'], entry['source'])
+            if key not in source_keys:
+                print(f'{path.name}[{i}] ({entry["name"]}): '
+                      f'no matching source string',
+                      file=sys.stderr)
                 errors += 1
 
     if errors:
