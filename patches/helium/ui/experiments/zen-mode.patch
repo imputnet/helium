@@ -8,7 +8,16 @@
  #include "ui/gfx/animation/animation_runner.h"
  #include "ui/gfx/canvas.h"
  #include "ui/gfx/color_utils.h"
-@@ -410,6 +411,10 @@ namespace {
+@@ -330,6 +331,8 @@
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/accessibility/view_accessibility_utils.h"
+ #include "ui/views/animation/compositor_animation_runner.h"
++#include "ui/views/animation/ink_drop.h"
++#include "ui/views/animation/ink_drop_state.h"
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
+ #include "ui/views/controls/button/menu_button.h"
+ #include "ui/views/controls/textfield/textfield.h"
+@@ -410,6 +413,14 @@ namespace {
  // The visible height of the shadow above the tabs. Clicks in this area are
  // treated as clicks to the frame, rather than clicks to the tab.
  const int kTabShadowSize = 2;
@@ -16,10 +25,14 @@
 +constexpr int kZenModeChromeHoverLeeway = 8;
 +constexpr base::TimeDelta kZenModeRevealAnimationDuration =
 +    base::Milliseconds(100);
++constexpr base::TimeDelta kZenModeCursorExitGracePeriod =
++    base::Milliseconds(1000);
++constexpr base::TimeDelta kZenModeHoverExitGracePeriod =
++    base::Milliseconds(250);
  
  #if BUILDFLAG(IS_CHROMEOS)
  // UMA histograms that record animation smoothness for tab loading animation.
-@@ -955,7 +960,9 @@ BrowserView::BrowserView(Browser* browse
+@@ -955,7 +966,9 @@ BrowserView::BrowserView(Browser* browse
            std::make_unique<ExclusiveAccessContextImpl>(*this)),
        browser_(browser),
        accessibility_mode_observer_(
@@ -30,20 +43,22 @@
    if (auto* manager = InitialWebUIWindowMetricsManager::From(browser_.get())) {
      manager->OnBrowserWindowCreated();
    }
-@@ -983,6 +990,12 @@ BrowserView::BrowserView(Browser* browse
+@@ -983,6 +996,14 @@ BrowserView::BrowserView(Browser* browse
    }
  
    SetProperty(views::kElementIdentifierKey, kBrowserViewElementId);
 +  zen_top_chrome_animation_.SetSlideDuration(
 +      gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
++  zen_top_chrome_animation_.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN_3);
 +  zen_top_chrome_animation_.Reset(1);
 +  zen_side_chrome_animation_.SetSlideDuration(
 +      gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
++  zen_side_chrome_animation_.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN_3);
 +  zen_side_chrome_animation_.Reset(1);
  
    // Add any legal notices required for the user to the queue.
    QueueLegalAndPrivacyNotices(browser_->GetProfile());
-@@ -1174,6 +1187,7 @@ BrowserView::~BrowserView() {
+@@ -1174,6 +1195,7 @@ BrowserView::~BrowserView() {
    // Stop the animation timer explicitly here to avoid running it in a nested
    // message loop, which may run by Browser destructor.
    loading_animation_timer_.Stop();
@@ -51,7 +66,7 @@
  
    // Reset autofill bubble handler to make sure it does not out-live toolbar,
    // since it is responsible for showing autofill related bubbles from toolbar's
-@@ -1392,6 +1406,13 @@ bool BrowserView::GetTabStripVisible() c
+@@ -1392,6 +1414,13 @@ bool BrowserView::GetTabStripVisible() c
      return false;
    }
  
@@ -65,7 +80,7 @@
    // In non-fullscreen the tabstrip should always be visible.
    auto* const immersive_mode_controller =
        ImmersiveModeController::From(browser());
-@@ -1578,6 +1599,52 @@ float BrowserView::GetTopControlsSlideBe
+@@ -1578,6 +1607,52 @@ float BrowserView::GetTopControlsSlideBe
    return 1.f;
  }
  
@@ -118,7 +133,7 @@
  views::Widget* BrowserView::GetWidgetForAnchoring() {
  #if BUILDFLAG(IS_MAC)
    if (UsesImmersiveFullscreenMode()) {
-@@ -1602,6 +1669,7 @@ void BrowserView::OnVerticalTabStripMode
+@@ -1602,6 +1677,7 @@ void BrowserView::OnVerticalTabStripMode
    const bool should_be_vertical = controller->ShouldDisplayVerticalTabs();
    if (vertical_initialized == should_be_vertical) {
      // Mode is unchanged; just re-layout so alignment-dependent views update.
@@ -126,7 +141,7 @@
      InvalidateLayout();
      return;
    }
-@@ -1641,10 +1709,208 @@ void BrowserView::OnToolbarTabStripState
+@@ -1641,10 +1717,263 @@ void BrowserView::OnToolbarTabStripState
      toolbar_->UpdateToolbarLayout();
    }
  
@@ -205,9 +220,18 @@
 +  }
 +
 +  gfx::Point cursor;
++  // When the cursor leaves the window, start a timer before collapsing.
++  // Brief cursor excursions outside the window shouldn't collapse
++  // the chrome.
 +  if (!GetCursorLocationInBrowserView(&cursor) ||
 +      !GetLocalBounds().Contains(cursor)) {
-+    UpdateZenModeReveal(/*reveal_top=*/false, /*reveal_side=*/false);
++    if (!zen_cursor_exit_timer_.IsRunning()) {
++      zen_cursor_exit_timer_.Start(
++          FROM_HERE, kZenModeCursorExitGracePeriod,
++          base::BindOnce(&BrowserView::UpdateZenModeReveal,
++                         base::Unretained(this), /*reveal_top=*/false,
++                         /*reveal_side=*/false));
++    }
 +    return;
 +  }
 +
@@ -221,6 +245,20 @@
 +  const bool in_side_chrome = IsPointInZenSideChromeBounds(cursor);
 +  bool reveal_side = !reveal_top && (in_side_trigger || in_side_chrome);
 +
++  // Defer the collapse briefly so quick excursions don't cause the
++  // chrome to snap closed.
++  if (!reveal_top && !reveal_side) {
++    if (!zen_cursor_exit_timer_.IsRunning()) {
++      zen_cursor_exit_timer_.Start(
++          FROM_HERE, kZenModeHoverExitGracePeriod,
++          base::BindOnce(&BrowserView::UpdateZenModeReveal,
++                         base::Unretained(this), /*reveal_top=*/false,
++                         /*reveal_side=*/false));
++    }
++    return;
++  }
++
++  zen_cursor_exit_timer_.Stop();
 +  UpdateZenModeReveal(reveal_top, reveal_side);
 +}
 +
@@ -242,6 +280,12 @@
 +  const bool omnibox_focused = toolbar_ && toolbar_->location_bar_view() &&
 +                               toolbar_->location_bar_view()->HasFocus();
 +  if (omnibox_focused) {
++    reveal_top = true;
++  }
++
++  // Keep the top chrome visible while a bubble/popup anchored inside
++  // the top container is open (e.g. extensions menu, page info bubble).
++  if (HasOpenBubbleAnchoredInTopContainer()) {
 +    reveal_top = true;
 +  }
 +
@@ -293,6 +337,32 @@
 +  return point.x() < kZenModeRevealTriggerThickness;
 +}
 +
++namespace {
++
++bool HasActivatedInkDropInSubtree(views::View* view) {
++  if (auto* host = views::InkDrop::Get(view)) {
++    auto* ink_drop = host->GetInkDrop();
++    if (ink_drop &&
++        ink_drop->GetTargetInkDropState() == views::InkDropState::ACTIVATED) {
++      return true;
++    }
++  }
++
++  for (views::View* child : view->children()) {
++    if (HasActivatedInkDropInSubtree(child)) {
++      return true;
++    }
++  }
++
++  return false;
++}
++
++}  // namespace
++
++bool BrowserView::HasOpenBubbleAnchoredInTopContainer() const {
++  return top_container_ && HasActivatedInkDropInSubtree(top_container_);
++}
++
 +bool BrowserView::IsPointInZenTopChromeBounds(const gfx::Point& point) const {
 +  if (!top_container_ || !top_container_->parent()) {
 +    return false;
@@ -335,7 +405,7 @@
  void BrowserView::OnProjectsPanelStateChanged(
      ProjectsPanelStateController* controller) {
    projects_panel_container_->OnProjectsPanelStateChanged(controller);
-@@ -2397,6 +2663,8 @@ void BrowserView::FullscreenStateChanged
+@@ -2397,6 +2726,8 @@ void BrowserView::FullscreenStateChanged
        ShowSplitView(GetActiveContentsWebView()->HasFocus());
      }
    }
@@ -344,7 +414,7 @@
  }
  
  void BrowserView::SetToolbarButtonProvider(ToolbarButtonProvider* provider) {
-@@ -2449,6 +2717,17 @@ void BrowserView::SetFocusToLocationBar(
+@@ -2449,6 +2780,17 @@ void BrowserView::SetFocusToLocationBar(
      return;
    }
  
@@ -362,7 +432,7 @@
    LocationBar* location_bar = GetLocationBar();
    location_bar->FocusLocation(is_user_initiated,
                                /*clear_focus_if_failed=*/true);
-@@ -3203,7 +3482,7 @@ bool BrowserView::IsToolbarVisible() con
+@@ -3203,7 +3545,7 @@ bool BrowserView::IsToolbarVisible() con
  }
  
  bool BrowserView::IsToolbarShowing() const {
@@ -371,7 +441,19 @@
  }
  
  bool BrowserView::IsLocationBarVisible() const {
-@@ -5239,6 +5518,8 @@ void BrowserView::AddedToWidget() {
+@@ -4400,6 +4742,11 @@ void BrowserView::OnWidgetActivationChan
+     }
+   }
+ 
++  // Collapse zen mode chrome when the window is deactivated.
++  if (!active && zen_mode_enabled_) {
++    UpdateZenModeReveal(/*reveal_top=*/false, /*reveal_side=*/false);
++  }
++
+   browser_->GetFeatures()
+       .extension_keybinding_registry()
+       ->OnHostActivationChanged(active);
+@@ -5239,6 +5586,8 @@ void BrowserView::AddedToWidget() {
              base::BindRepeating(&BrowserView::OnToolbarTabStripStateChanged,
                                  base::Unretained(this)));
      OnToolbarTabStripStateChanged(helium_layout_controller);
@@ -380,7 +462,7 @@
    }
  
    UpdateTabSearchBubbleHost();
-@@ -5388,6 +5669,7 @@ void BrowserView::AddedToWidget() {
+@@ -5388,6 +5737,7 @@ void BrowserView::AddedToWidget() {
  }
  
  void BrowserView::RemovedFromWidget() {
@@ -388,7 +470,7 @@
    CHECK(GetFocusManager());
    focus_manager_observation_.Reset();
  }
-@@ -5416,6 +5698,14 @@ void BrowserView::OnThemeChanged() {
+@@ -5416,6 +5766,14 @@ void BrowserView::OnThemeChanged() {
    }
  
    FrameColorsChanged();
@@ -403,7 +485,7 @@
  }
  
  bool BrowserView::GetDropFormats(
-@@ -5746,6 +6036,9 @@ void BrowserView::UpdateFastResizeForCon
+@@ -5746,6 +6104,9 @@ void BrowserView::UpdateFastResizeForCon
  }
  
  int BrowserView::GetClientAreaTop() {
@@ -413,7 +495,7 @@
    views::View* top_view = toolbar_;
  #if BUILDFLAG(ENABLE_WEBUI_TAB_STRIP)
    // If webui_tab_strip is displayed, the client area starts at its top,
-@@ -6300,6 +6593,42 @@ void BrowserView::OnWillChangeFocus(View
+@@ -6300,6 +6661,42 @@ void BrowserView::OnWillChangeFocus(View
  }
  void BrowserView::OnDidChangeFocus(View* focused_before, View* focused_now) {
    UpdateAccessibleNameForRootView();
@@ -523,7 +605,7 @@
    // Testing interface:
    views::View* GetContentsContainerForTest() { return contents_container_; }
    BrowserViewLayout* GetBrowserViewLayoutForTesting() {
-@@ -953,6 +978,19 @@ class BrowserView : public BrowserWindow
+@@ -953,6 +978,20 @@ class BrowserView : public BrowserWindow
  
    void OnProjectsPanelStateChanged(ProjectsPanelStateController* controller);
  
@@ -538,12 +620,13 @@
 +  bool IsPointInZenSideTrigger(const gfx::Point& point) const;
 +  bool IsPointInZenTopChromeBounds(const gfx::Point& point) const;
 +  bool IsPointInZenSideChromeBounds(const gfx::Point& point) const;
++  bool HasOpenBubbleAnchoredInTopContainer() const;
 +  bool GetCursorLocationInBrowserView(gfx::Point* cursor_location) const;
 +
    // Make sure the WebUI tab strip exists if it should.
    void MaybeInitializeWebUITabStrip();
  
-@@ -1468,6 +1506,12 @@ class BrowserView : public BrowserWindow
+@@ -1468,6 +1507,13 @@ class BrowserView : public BrowserWindow
  
    std::unique_ptr<TabCyclingEventHandler> tab_cycling_event_handler_;
  
@@ -551,6 +634,7 @@
 +  std::unique_ptr<views::EventMonitor> zen_mode_event_monitor_;
 +  gfx::SlideAnimation zen_top_chrome_animation_;
 +  gfx::SlideAnimation zen_side_chrome_animation_;
++  base::OneShotTimer zen_cursor_exit_timer_;
 +  bool zen_mode_enabled_ = false;
 +
    mutable base::WeakPtrFactory<BrowserView> weak_ptr_factory_{this};
@@ -655,7 +739,7 @@
  
 --- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
 +++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
-@@ -34,10 +34,12 @@
+@@ -34,9 +34,11 @@
  #include "chrome/browser/ui/views/tabs/projects/layout_constants.h"
  #include "chrome/browser/ui/views/tabs/projects/projects_panel_utils.h"
  #include "chrome/browser/ui/views/tabs/projects/projects_panel_view.h"
@@ -663,11 +747,10 @@
  #include "ui/gfx/geometry/outsets.h"
  #include "ui/gfx/geometry/size.h"
  #include "ui/views/controls/separator.h"
- #include "ui/views/view_class_properties.h"
 +#include "ui/views/layout/layout_provider.h"
+ #include "ui/views/view_class_properties.h"
  #include "ui/views/view_utils.h"
  
- #if BUILDFLAG(IS_MAC)
 @@ -59,6 +61,28 @@ constexpr int kVerticalTabsGrabHandleSiz
  // against the frame controls when it is the top-most row.
  constexpr int kTopToolbarExclusion = 10;
