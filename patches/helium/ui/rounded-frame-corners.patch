@@ -1,0 +1,330 @@
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -35,6 +35,8 @@ namespace helium {
+       "helium-noise-hw-concurrency";
+ 
+   constexpr const char kMiddleClickAutoscrollCommandLine[] = "middle-click-autoscroll";
++  constexpr const char kHeliumRoundedFrameCommandLine[] =
++      "helium-rounded-frame";
+ 
+ }  // namespace helium
+ 
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -37,4 +37,8 @@
+      "Middle Click Autoscroll",
+      "Enables autoscroll on middle click. Helium flag, Chromium feature.",
+      kOsDesktop, FEATURE_VALUE_TYPE(blink::features::kHeliumMiddleClickAutoscroll)},
++    {helium::kHeliumRoundedFrameCommandLine,
++     "Rounded webview frame",
++     "Adds rounded corners and outer padding around webview. Helium flag.",
++     kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumRoundedFrame)},
+ #endif  /* CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_ */
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -18,6 +18,14 @@
+ 
+ namespace features {
+ 
++// Adds rounded corners and outer padding around the webview.
++BASE_FEATURE(kHeliumRoundedFrame,
++             base::FEATURE_ENABLED_BY_DEFAULT);
++
++bool HeliumUseRoundedFrame() {
++  return base::FeatureList::IsEnabled(kHeliumRoundedFrame);
++}
++
+ // Enables the use of WGC for the Eye Dropper screen capture.
+ BASE_FEATURE(kAllowEyeDropperWGCScreenCapture,
+ #if BUILDFLAG(IS_WIN)
+--- a/chrome/browser/ui/ui_features.h
++++ b/chrome/browser/ui/ui_features.h
+@@ -19,6 +19,9 @@ namespace features {
+ // All features in alphabetical order. The features should be documented
+ // alongside the definition of their values in the .cc file.
+ 
++BASE_DECLARE_FEATURE(kHeliumRoundedFrame);
++bool HeliumUseRoundedFrame();
++
+ BASE_DECLARE_FEATURE(kAllowEyeDropperWGCScreenCapture);
+ 
+ BASE_DECLARE_FEATURE(kBrowserWidgetCacheThemeService);
+--- a/chrome/browser/ui/views/frame/contents_container_view.cc
++++ b/chrome/browser/ui/views/frame/contents_container_view.cc
+@@ -62,8 +62,6 @@ constexpr float kContentBottomCornerRadi
+     kContentCornerRadius;
+ #endif
+ constexpr int kSplitViewContentPadding = 2;
+-constexpr float kContentInnerCornerRadius =
+-    kContentCornerRadius - kSplitViewContentPadding;
+ 
+ constexpr int kNewTabFooterSeparatorHeight = 1;
+ constexpr int kNewTabFooterHeight = 56;
+@@ -181,20 +179,24 @@ std::vector<views::View*> ContentsContai
+ }
+ 
+ void ContentsContainerView::UpdateBorderAndOverlay(bool is_in_split,
++                                                   bool should_round_contents,
+                                                    bool is_active,
+                                                    bool is_highlighted,
+                                                    bool round_bottom_left,
+                                                    bool round_bottom_right) {
+   const bool split_changed = is_in_split != is_in_split_;
++  const bool rounded_contents_changed =
++      should_round_contents != should_round_contents_;
+   const bool bottom_corner_state_changed =
+       round_bottom_left_window_corner_ != round_bottom_left ||
+       round_bottom_right_window_corner_ != round_bottom_right;
+   is_in_split_ = is_in_split;
++  should_round_contents_ = should_round_contents;
+   round_bottom_left_window_corner_ = round_bottom_left;
+   round_bottom_right_window_corner_ = round_bottom_right;
+ 
+-  if (!is_in_split) {
+-    if (split_changed) {
++  if (!should_round_contents) {
++    if (split_changed || rounded_contents_changed) {
+       SetBorder(nullptr);
+       ClearBorderRoundedCorners();
+ 
+@@ -206,15 +208,24 @@ void ContentsContainerView::UpdateBorder
+       }
+     }
+   } else {
+-    if (split_changed) {
+-      SetBorder(views::CreateEmptyBorder(gfx::Insets(
+-          kSplitViewContentPadding + ContentsContainerOutline::kThickness)));
++    if (split_changed || rounded_contents_changed) {
++      if (is_in_split) {
++        SetBorder(views::CreateEmptyBorder(gfx::Insets(
++            kSplitViewContentPadding + ContentsContainerOutline::kThickness)));
++      } else {
++        SetBorder(nullptr);
++      }
+     }
+-    if (split_changed || bottom_corner_state_changed) {
++    if (split_changed || rounded_contents_changed ||
++        bottom_corner_state_changed) {
+       UpdateBorderRoundedCorners();
+     }
+ 
+-    container_outline_->UpdateState(is_active, is_highlighted);
++    if (is_in_split) {
++      container_outline_->UpdateState(is_active, is_highlighted);
++    } else {
++      container_outline_->SetVisible(false);
++    }
+     if (capture_contents_border_widget_) {
+       static_cast<ContentsCaptureBorderView*>(
+           capture_contents_border_widget_->GetContentsView())
+@@ -223,7 +234,7 @@ void ContentsContainerView::UpdateBorder
+   }
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+-  if (split_changed) {
++  if ((split_changed || rounded_contents_changed) && GetWidget()) {
+     // Ensures correct window rounded corners after updating contents rounded
+     // corners in UpdateBorderRoundedCorners()/ClearBorderRoundedCorners().
+     GetWidget()->non_client_view()->frame_view()->UpdateWindowRoundedCorners();
+@@ -232,6 +243,8 @@ void ContentsContainerView::UpdateBorder
+ }
+ 
+ void ContentsContainerView::UpdateBorderRoundedCorners() {
++  const int content_padding = is_in_split_ ? kSplitViewContentPadding : 0;
++  const float content_corner_radius = kContentCornerRadius - content_padding;
+   const float lower_left_radius = round_bottom_left_window_corner_
+                                       ? kContentBottomCornerRadius
+                                       : kContentCornerRadius;
+@@ -242,12 +255,12 @@ void ContentsContainerView::UpdateBorder
+       kContentCornerRadius, kContentCornerRadius, lower_right_radius,
+       lower_left_radius);
+   const float inner_lower_left_radius =
+-      lower_left_radius - kSplitViewContentPadding;
++      lower_left_radius - content_padding;
+   const float inner_lower_right_radius =
+-      lower_right_radius - kSplitViewContentPadding;
++      lower_right_radius - content_padding;
+   const gfx::RoundedCornersF inner_rounded_corners(
+-      kContentInnerCornerRadius, kContentInnerCornerRadius,
+-      inner_lower_right_radius, inner_lower_left_radius);
++      content_corner_radius, content_corner_radius, inner_lower_right_radius,
++      inner_lower_left_radius);
+ 
+   container_outline_->SetCornerRadii(container_rounded_corners);
+   if (capture_contents_border_widget_) {
+@@ -277,9 +290,9 @@ void ContentsContainerView::UpdateBorder
+        current_devtools_docked_placement_ == DevToolsDockedPlacement::kRight);
+ 
+   const gfx::RoundedCornersF content_upper_rounded_corners =
+-      gfx::RoundedCornersF{
+-          devtools_in_upper_left ? 0 : kContentInnerCornerRadius,
+-          devtools_in_upper_right ? 0 : kContentInnerCornerRadius, 0, 0};
++      gfx::RoundedCornersF{devtools_in_upper_left ? 0 : content_corner_radius,
++                           devtools_in_upper_right ? 0 : content_corner_radius,
++                           0, 0};
+   const gfx::RoundedCornersF content_lower_rounded_corners =
+       gfx::RoundedCornersF{0, 0,
+                            devtools_in_lower_right ? 0
+@@ -288,8 +301,8 @@ void ContentsContainerView::UpdateBorder
+                                                   : inner_lower_left_radius};
+   const gfx::RoundedCornersF content_rounded_corners =
+       gfx::RoundedCornersF{
+-          devtools_in_upper_left ? 0 : kContentInnerCornerRadius,
+-          devtools_in_upper_right ? 0 : kContentInnerCornerRadius,
++          devtools_in_upper_left ? 0 : content_corner_radius,
++          devtools_in_upper_right ? 0 : content_corner_radius,
+           devtools_in_lower_right ? 0 : inner_lower_right_radius,
+           devtools_in_lower_left ? 0 : inner_lower_left_radius};
+ 
+@@ -351,7 +364,7 @@ void ContentsContainerView::ClearBorderR
+ 
+ void ContentsContainerView::ChildVisibilityChanged(View* child) {
+   if ((child == new_tab_footer_view_ || child == devtools_web_view_) &&
+-      is_in_split_) {
++      should_round_contents_) {
+     UpdateBorderRoundedCorners();
+   }
+ }
+@@ -369,7 +382,7 @@ void ContentsContainerView::Layout(PassK
+ void ContentsContainerView::OnViewBoundsChanged(View* observed_view) {
+   if (observed_view == contents_view_) {
+     UpdateDevToolsDockedPlacement();
+-    if (is_in_split_) {
++    if (should_round_contents_) {
+       UpdateBorderRoundedCorners();
+     }
+   }
+@@ -495,10 +508,15 @@ void ContentsContainerView::CreateCaptur
+   capture_contents_border_widget_->Init(std::move(params));
+   auto contents_capture_border_view =
+       std::make_unique<ContentsCaptureBorderView>(nullptr);
++  auto* contents_capture_border_view_ptr = contents_capture_border_view.get();
+   capture_contents_border_widget_->SetContentsView(
+       std::move(contents_capture_border_view));
+   capture_contents_border_widget_->SetVisibilityChangedAnimationsEnabled(false);
+   capture_contents_border_widget_->SetOpacity(0.50f);
++  contents_capture_border_view_ptr->SetIsInSplit(should_round_contents_);
++  if (should_round_contents_) {
++    UpdateBorderRoundedCorners();
++  }
+ }
+ 
+ void ContentsContainerView::UpdateCaptureContentsBorderLocation() {
+--- a/chrome/browser/ui/views/frame/contents_container_view.h
++++ b/chrome/browser/ui/views/frame/contents_container_view.h
+@@ -112,6 +112,7 @@ class ContentsContainerView : public vie
+                               int font_size);
+ 
+   void UpdateBorderAndOverlay(bool is_in_split,
++                              bool should_round_contents,
+                               bool is_active,
+                               bool is_highlighted,
+                               bool round_bottom_left_window_corner,
+@@ -158,6 +159,7 @@ class ContentsContainerView : public vie
+       const views::SizeBounds& size_bounds) const override;
+ 
+   bool is_in_split_ = false;
++  bool should_round_contents_ = false;
+   bool round_bottom_left_window_corner_ = false;
+   bool round_bottom_right_window_corner_ = false;
+ 
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -167,6 +167,8 @@ MultiContentsView::MultiContentsView(
+       prefs::kSplitViewDragAndDropEnabled,
+       base::BindRepeating(&MultiContentsView::OnDragAndDropPrefStateChange,
+                           base::Unretained(this)));
++
++  UpdateContentsBorderAndOverlay();
+ }
+ 
+ MultiContentsView::~MultiContentsView() {
+@@ -476,7 +478,8 @@ views::ProposedLayout MultiContentsView:
+   gfx::Rect available_space = gfx::Rect(width, height);
+ 
+   const bool show_background =
+-      drop_target_view_->GetVisible() || IsInSplitView();
++      drop_target_view_->GetVisible() || IsInSplitView() ||
++      features::HeliumUseRoundedFrame();
+   layouts.child_layouts.emplace_back(background_view_.get(), show_background,
+                                      available_space);
+ 
+@@ -501,6 +504,15 @@ views::ProposedLayout MultiContentsView:
+   if (IsInSplitView()) {
+     start_rect.Inset(start_contents_view_inset_);
+     end_rect.Inset(end_contents_view_inset_);
++  } else if (features::HeliumUseRoundedFrame()) {
++    gfx::Insets single_contents_view_inset(kSplitViewContentInset);
++    single_contents_view_inset.set_top(
++        contents_separators_.should_show_top ? 0 : kSplitViewContentInset);
++    single_contents_view_inset.set_left(
++        contents_separators_.should_show_leading ? 0 : kSplitViewContentInset);
++    single_contents_view_inset.set_right(
++        contents_separators_.should_show_trailing ? 0 : kSplitViewContentInset);
++    start_rect.Inset(single_contents_view_inset);
+   }
+ 
+   layouts.child_layouts.emplace_back(contents_container_views_[0],
+@@ -611,7 +623,7 @@ gfx::Rect MultiContentsView::CalculateDr
+ gfx::Rect MultiContentsView::CalculateSeparatorLayouts(
+     const gfx::Rect& available_space,
+     std::vector<views::ChildLayout>& child_layouts) const {
+-  if (IsInSplitView()) {
++  if (IsInSplitView() || features::HeliumUseRoundedFrame()) {
+     child_layouts.emplace_back(contents_separators_.top_separator.get(), false,
+                                gfx::Rect());
+     child_layouts.emplace_back(contents_separators_.leading_separator.get(),
+@@ -745,20 +757,32 @@ int MultiContentsView::GetMinViewWidth(g
+ }
+ 
+ void MultiContentsView::UpdateContentsBorderAndOverlay() {
++  const bool is_in_split = IsInSplitView();
++  const bool should_round_single_contents =
++      !is_in_split && features::HeliumUseRoundedFrame();
+   const bool use_window_bottom_left_corner_radius =
+-      IsInSplitView() && !contents_separators_.should_show_leading;
++      (is_in_split || should_round_single_contents) &&
++      !contents_separators_.should_show_leading;
+   const bool use_window_bottom_right_corner_radius =
+-      IsInSplitView() && !contents_separators_.should_show_trailing;
++      (is_in_split || should_round_single_contents) &&
++      !contents_separators_.should_show_trailing;
+ 
+   for (auto* contents_container_view : contents_container_views_) {
+     const bool is_active =
+         contents_container_view->contents_view() == GetActiveContentsView();
++    const bool is_single_contents_view =
++        !is_in_split && contents_container_view->GetVisible();
+     const bool is_first_view =
++        !is_in_split ||
+         contents_container_view == contents_container_views_.front();
+     const bool is_last_view =
++        !is_in_split ||
+         contents_container_view == contents_container_views_.back();
++    const bool should_round_contents =
++        is_in_split ||
++        (is_single_contents_view && should_round_single_contents);
+     contents_container_view->UpdateBorderAndOverlay(
+-        IsInSplitView(), is_active,
++        is_in_split, should_round_contents, is_active,
+         is_active && active_contents_view_highlighted_,
+         use_window_bottom_left_corner_radius && is_first_view,
+         use_window_bottom_right_corner_radius && is_last_view);
+@@ -821,7 +845,7 @@ void MultiContentsView::SetShouldShowLea
+   contents_separators_.should_show_leading = should_show;
+   start_contents_view_inset_.set_left(
+       should_show ? 0 : MultiContentsView::kSplitViewContentInset);
+-  if (IsInSplitView()) {
++  if (IsInSplitView() || features::HeliumUseRoundedFrame()) {
+     UpdateContentsBorderAndOverlay();
+   }
+ 
+@@ -837,7 +861,7 @@ void MultiContentsView::SetShouldShowTra
+   contents_separators_.should_show_trailing = should_show;
+   end_contents_view_inset_.set_right(
+       should_show ? 0 : MultiContentsView::kSplitViewContentInset);
+-  if (IsInSplitView()) {
++  if (IsInSplitView() || features::HeliumUseRoundedFrame()) {
+     UpdateContentsBorderAndOverlay();
+   }
+ 
