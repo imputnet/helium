@@ -184,6 +184,21 @@ def apply_language(task):
     print(f'{lang_code}: applied {total} translations to {len(by_xtb)} XTB files')
 
 
+def apply_translations(tree):
+    """Applies all translations to all relevant .xtb files"""
+    with open(SOURCE_PATH, encoding='utf-8') as file:
+        source = json.load(file)
+    with open(I18N_DIR / 'languages.json', encoding='utf-8') as file:
+        languages = json.load(file)
+
+    namesub.add_grit_to_path(tree)
+    xtb_index = build_xtb_index(source, tree)
+
+    tasks = [(code, source, xtb_index) for code in languages]
+    with Pool() as pool:
+        pool.map(apply_language, tasks)
+
+
 def main():
     """CLI entrypoint"""
     parser = argparse.ArgumentParser(description='Apply i18n translations to Chromium XTB files')
@@ -193,18 +208,7 @@ def main():
                         required=True,
                         help='Path to Chromium source tree')
     args = parser.parse_args()
-
-    with open(SOURCE_PATH, encoding='utf-8') as file:
-        source = json.load(file)
-    with open(I18N_DIR / 'languages.json', encoding='utf-8') as file:
-        languages = json.load(file)
-
-    namesub.add_grit_to_path(args.tree)
-    xtb_index = build_xtb_index(source, args.tree)
-
-    tasks = [(code, source, xtb_index) for code in languages]
-    with Pool() as pool:
-        pool.map(apply_language, tasks)
+    apply_translations(args.tree)
 
 
 if __name__ == '__main__':
