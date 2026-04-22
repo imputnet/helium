@@ -30,7 +30,16 @@
  
    MultiContentsView(BrowserView* browser_view,
                      std::unique_ptr<MultiContentsViewDelegate> delegate);
-@@ -186,10 +185,6 @@ class MultiContentsView : public views::
+@@ -157,6 +156,8 @@ class MultiContentsView : public views::
+   // views::View:
+   void OnThemeChanged() override;
+ 
++  void OnFullscreenStateChanged();
++
+   const std::vector<ContentsContainerView*>& contents_container_views() const {
+     return contents_container_views_;
+   }
+@@ -186,10 +187,6 @@ class MultiContentsView : public views::
      return contents_container_views_[1]->contents_view();
    }
  
@@ -41,7 +50,7 @@
    MultiContentsBackgroundView* background_view_for_testing() const {
      return background_view_;
    }
-@@ -307,7 +302,7 @@ class MultiContentsView : public views::
+@@ -307,7 +304,7 @@ class MultiContentsView : public views::
    // Nullopt if not currently resizing.
    std::optional<double> initial_start_width_on_resize_;
  
@@ -60,14 +69,31 @@
  #include "chrome/browser/ui/views/frame/scrim_view.h"
  #include "chrome/browser/ui/views/frame/themed_background.h"
  #include "chrome/browser/ui/views/new_tab_footer/footer_web_view.h"
-@@ -746,12 +745,23 @@ int MultiContentsView::GetMinViewWidth(g
+@@ -410,6 +409,10 @@ void MultiContentsView::OnThemeChanged()
+   UpdateContentsBorderAndOverlay();
+ }
+ 
++void MultiContentsView::OnFullscreenStateChanged() {
++  UpdateContentsBorderAndOverlay();
++}
++
+ int MultiContentsView::GetInactiveIndex() const {
+   return active_index_ == 0 ? 1 : 0;
+ }
+@@ -746,12 +749,29 @@ int MultiContentsView::GetMinViewWidth(g
  }
  
  void MultiContentsView::UpdateContentsBorderAndOverlay() {
-+  const bool use_window_bottom_left_corner_radius =
-+      IsInSplitView() && !contents_separators_.should_show_leading;
-+  const bool use_window_bottom_right_corner_radius =
-+      IsInSplitView() && !contents_separators_.should_show_trailing;
++  const views::Widget* widget = browser_view_->GetWidget();
++  const bool is_fullscreen = widget && widget->IsFullscreen();
++  const bool is_in_split = IsInSplitView();
++
++  const bool use_system_bottom_left_radius =
++      is_in_split && !is_fullscreen &&
++      !contents_separators_.should_show_leading;
++  const bool use_system_bottom_right_radius =
++      is_in_split && !is_fullscreen &&
++      !contents_separators_.should_show_trailing;
 +
    for (auto* contents_container_view : contents_container_views_) {
      const bool is_active =
@@ -77,15 +103,16 @@
 +    const bool is_last_view =
 +        contents_container_view == contents_container_views_.back();
      contents_container_view->UpdateBorderAndOverlay(
-         IsInSplitView(), is_active,
+-        IsInSplitView(), is_active,
 -        is_active && active_contents_view_highlighted_);
++        is_in_split, is_active,
 +        is_active && active_contents_view_highlighted_,
-+        use_window_bottom_left_corner_radius && is_first_view,
-+        use_window_bottom_right_corner_radius && is_last_view);
++        use_system_bottom_left_radius && is_first_view,
++        use_system_bottom_right_radius && is_last_view);
    }
  }
  
-@@ -811,6 +821,9 @@ void MultiContentsView::SetShouldShowLea
+@@ -811,6 +831,9 @@ void MultiContentsView::SetShouldShowLea
    contents_separators_.should_show_leading = should_show;
    start_contents_view_inset_.set_left(
        should_show ? 0 : MultiContentsView::kSplitViewContentInset);
@@ -95,7 +122,7 @@
  
    // This can be called during BrowserView layout, so protect against creating a
    // layout loop.
-@@ -824,6 +837,9 @@ void MultiContentsView::SetShouldShowTra
+@@ -824,6 +847,9 @@ void MultiContentsView::SetShouldShowTra
    contents_separators_.should_show_trailing = should_show;
    end_contents_view_inset_.set_right(
        should_show ? 0 : MultiContentsView::kSplitViewContentInset);
@@ -107,7 +134,7 @@
    // layout loop.
 --- a/chrome/browser/ui/views/frame/contents_container_view.cc
 +++ b/chrome/browser/ui/views/frame/contents_container_view.cc
-@@ -24,7 +24,6 @@
+@@ -24,10 +24,10 @@
  #include "chrome/browser/ui/views/frame/contents_container_outline.h"
  #include "chrome/browser/ui/views/frame/contents_separator.h"
  #include "chrome/browser/ui/views/frame/contents_web_view.h"
@@ -115,7 +142,11 @@
  #include "chrome/browser/ui/views/frame/scrim_view.h"
  #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
  #include "chrome/browser/ui/views/frame/top_container_view.h"
-@@ -38,6 +37,7 @@
++#include "chrome/browser/ui/views/helium/frame_corner_radius.h"
+ #include "chrome/browser/ui/views/new_tab_footer/footer_web_view.h"
+ #include "chrome/common/chrome_features.h"
+ #include "components/search/ntp_features.h"
+@@ -38,6 +38,7 @@
  #include "ui/compositor/layer.h"
  #include "ui/gfx/geometry/insets.h"
  #include "ui/gfx/geometry/rect.h"
@@ -123,29 +154,18 @@
  #include "ui/views/border.h"
  #include "ui/views/layout/delegating_layout_manager.h"
  #include "ui/views/layout/fill_layout.h"
-@@ -52,9 +52,18 @@
+@@ -52,9 +53,7 @@
  #endif
  
  namespace {
 -constexpr float kContentCornerRadius = 6;
 -constexpr gfx::RoundedCornersF kContentRoundedCorners{kContentCornerRadius};
 -constexpr int kSplitViewContentPadding = 4;
-+constexpr float kContentCornerRadius = 8;
-+constexpr float kContentBottomCornerRadius =
-+#if BUILDFLAG(IS_MAC)
-+    // window_radius - padding = bottom_corner_radius
-+    // 17 - 3 = 14
-+    14;
-+#else
-+    kContentCornerRadius;
-+#endif
 +constexpr int kSplitViewContentPadding = 2;
-+constexpr float kContentInnerCornerRadius =
-+    kContentCornerRadius - kSplitViewContentPadding;
  
  constexpr int kNewTabFooterSeparatorHeight = 1;
  constexpr int kNewTabFooterHeight = 56;
-@@ -69,7 +78,7 @@ ContentsContainerView::ContentsContainer
+@@ -69,7 +68,7 @@ ContentsContainerView::ContentsContainer
    // The default z-order is the order in which children were added to the
    // parent view. So first added devtools and the devtools scrim view (as it
    // exists behind the content view), then the content view and new tab page
@@ -154,7 +174,7 @@
  
    auto devtools_web_view =
        std::make_unique<views::WebView>(browser_view->GetProfile());
-@@ -141,11 +150,8 @@ ContentsContainerView::ContentsContainer
+@@ -141,11 +140,8 @@ ContentsContainerView::ContentsContainer
              .Build());
    }
  
@@ -167,7 +187,7 @@
  
    view_bounds_observer_.Observe(contents_view_);
  }
-@@ -176,16 +182,22 @@ std::vector<views::View*> ContentsContai
+@@ -176,16 +172,22 @@ std::vector<views::View*> ContentsContai
  
  void ContentsContainerView::UpdateBorderAndOverlay(bool is_in_split,
                                                     bool is_active,
@@ -192,7 +212,7 @@
        container_outline_->SetVisible(false);
        if (capture_contents_border_widget_) {
          static_cast<ContentsCaptureBorderView*>(
-@@ -197,13 +209,12 @@ void ContentsContainerView::UpdateBorder
+@@ -197,13 +199,12 @@ void ContentsContainerView::UpdateBorder
      if (split_changed) {
        SetBorder(views::CreateEmptyBorder(gfx::Insets(
            kSplitViewContentPadding + ContentsContainerOutline::kThickness)));
@@ -208,25 +228,31 @@
      if (capture_contents_border_widget_) {
        static_cast<ContentsCaptureBorderView*>(
            capture_contents_border_widget_->GetContentsView())
-@@ -221,10 +232,34 @@ void ContentsContainerView::UpdateBorder
+@@ -221,10 +222,40 @@ void ContentsContainerView::UpdateBorder
  }
  
  void ContentsContainerView::UpdateBorderRoundedCorners() {
-+  const float lower_left_radius = round_bottom_left_window_corner_
-+                                      ? kContentBottomCornerRadius
-+                                      : kContentCornerRadius;
-+  const float lower_right_radius = round_bottom_right_window_corner_
-+                                       ? kContentBottomCornerRadius
-+                                       : kContentCornerRadius;
++  const int frame_radius = GetPaddedFrameRadius();
++  const int generic_radius = GetGenericFrameRadius();
++
++  const int lower_left_radius = round_bottom_left_window_corner_
++                                      ? frame_radius
++                                      : generic_radius;
++  const int lower_right_radius = round_bottom_right_window_corner_
++                                       ? frame_radius
++                                       : generic_radius;
++
 +  const gfx::RoundedCornersF container_rounded_corners(
-+      kContentCornerRadius, kContentCornerRadius, lower_right_radius,
-+      lower_left_radius);
++      generic_radius, generic_radius, lower_right_radius, lower_left_radius);
++
++  const float inner_generic_radius = generic_radius - kSplitViewContentPadding;
 +  const float inner_lower_left_radius =
 +      lower_left_radius - kSplitViewContentPadding;
 +  const float inner_lower_right_radius =
 +      lower_right_radius - kSplitViewContentPadding;
++
 +  const gfx::RoundedCornersF inner_rounded_corners(
-+      kContentInnerCornerRadius, kContentInnerCornerRadius,
++      inner_generic_radius, inner_generic_radius,
 +      inner_lower_right_radius, inner_lower_left_radius);
 +
 +  container_outline_->SetCornerRadii(container_rounded_corners);
@@ -245,7 +271,7 @@
  
    const bool devtools_in_upper_left =
        devtools_web_view_->GetVisible() &&
-@@ -242,18 +277,21 @@ void ContentsContainerView::UpdateBorder
+@@ -242,18 +273,21 @@ void ContentsContainerView::UpdateBorder
         current_devtools_docked_placement_ == DevToolsDockedPlacement::kRight);
  
    const gfx::RoundedCornersF content_upper_rounded_corners =
@@ -253,8 +279,8 @@
 -                           devtools_in_upper_right ? 0 : kContentCornerRadius,
 -                           0, 0};
 +      gfx::RoundedCornersF{
-+          devtools_in_upper_left ? 0 : kContentInnerCornerRadius,
-+          devtools_in_upper_right ? 0 : kContentInnerCornerRadius, 0, 0};
++          devtools_in_upper_left ? 0 : inner_generic_radius,
++          devtools_in_upper_right ? 0 : inner_generic_radius, 0, 0};
    const gfx::RoundedCornersF content_lower_rounded_corners =
        gfx::RoundedCornersF{0, 0,
 -                           devtools_in_lower_right ? 0 : kContentCornerRadius,
@@ -269,14 +295,14 @@
 -                           devtools_in_lower_right ? 0 : kContentCornerRadius,
 -                           devtools_in_lower_left ? 0 : kContentCornerRadius};
 +      gfx::RoundedCornersF{
-+          devtools_in_upper_left ? 0 : kContentInnerCornerRadius,
-+          devtools_in_upper_right ? 0 : kContentInnerCornerRadius,
++          devtools_in_upper_left ? 0 : inner_generic_radius,
++          devtools_in_upper_right ? 0 : inner_generic_radius,
 +          devtools_in_lower_right ? 0 : inner_lower_right_radius,
 +          devtools_in_lower_left ? 0 : inner_lower_left_radius};
  
    auto radii = new_tab_footer_view_ && new_tab_footer_view_->GetVisible()
                     ? content_upper_rounded_corners
-@@ -261,7 +299,7 @@ void ContentsContainerView::UpdateBorder
+@@ -261,7 +295,7 @@ void ContentsContainerView::UpdateBorder
  
    contents_view_->SetBackgroundRadii(radii);
    contents_view_->holder()->SetCornerRadii(radii);
@@ -285,7 +311,7 @@
  
    if (new_tab_footer_view_) {
      new_tab_footer_view_->holder()->SetCornerRadii(
-@@ -456,7 +494,7 @@ void ContentsContainerView::CreateCaptur
+@@ -456,7 +490,7 @@ void ContentsContainerView::CreateCaptur
  
    capture_contents_border_widget_->Init(std::move(params));
    auto contents_capture_border_view =
@@ -294,7 +320,7 @@
    capture_contents_border_widget_->SetContentsView(
        std::move(contents_capture_border_view));
    capture_contents_border_widget_->SetVisibilityChangedAnimationsEnabled(false);
-@@ -634,24 +672,6 @@ views::ProposedLayout ContentsContainerV
+@@ -634,24 +668,6 @@ views::ProposedLayout ContentsContainerV
          non_devtools_contents_bounds, size_bounds);
    }
  
@@ -418,7 +444,15 @@
  #include "chrome/browser/ui/views/frame/scrim_view.h"
  #include "chrome/browser/ui/views/frame/shadow_overlay_view.h"
  #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
-@@ -2446,10 +2445,6 @@ void BrowserView::UpdateToolbar(content:
+@@ -2361,6 +2360,7 @@ void BrowserView::FullscreenStateChanged
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+   browser_->WindowFullscreenStateChanged();
++  multi_contents_view_->OnFullscreenStateChanged();
+ 
+   exclusive_access_context_->GetExclusiveAccessManager()
+       ->fullscreen_controller()
+@@ -2446,10 +2446,6 @@ void BrowserView::UpdateToolbar(content:
    if (toolbar_) {
      toolbar_->Update(contents);
    }
