@@ -24,7 +24,7 @@
 +constexpr int kZenModeRevealTriggerThickness = 10;
 +constexpr int kZenModeChromeHoverLeeway = 8;
 +constexpr base::TimeDelta kZenModeRevealAnimationDuration =
-+    base::Milliseconds(100);
++    base::Milliseconds(200);
 +constexpr base::TimeDelta kZenModeCursorExitGracePeriod =
 +    base::Milliseconds(1000);
 +constexpr base::TimeDelta kZenModeHoverExitGracePeriod =
@@ -197,7 +197,7 @@
 +  }
 +
 +  if (multi_contents_view_) {
-+    multi_contents_view_->UpdateContentsBorderAndOverlay();
++    multi_contents_view_->MaybeUpdateContentsBorderAndOverlay();
 +  }
 +}
 +
@@ -533,7 +533,7 @@
 +  AnimationProgressed(animation);
 +  // Update content corner fills now that the animation has settled.
 +  if (multi_contents_view_) {
-+    multi_contents_view_->UpdateContentsBorderAndOverlay();
++    multi_contents_view_->MaybeUpdateContentsBorderAndOverlay();
 +  }
  }
  
@@ -739,19 +739,7 @@
  
 --- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
 +++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
-@@ -34,9 +34,11 @@
- #include "chrome/browser/ui/views/tabs/projects/layout_constants.h"
- #include "chrome/browser/ui/views/tabs/projects/projects_panel_utils.h"
- #include "chrome/browser/ui/views/tabs/projects/projects_panel_view.h"
-+#include "ui/compositor/layer.h"
- #include "ui/gfx/geometry/outsets.h"
- #include "ui/gfx/geometry/size.h"
- #include "ui/views/controls/separator.h"
-+#include "ui/views/layout/layout_provider.h"
- #include "ui/views/view_class_properties.h"
- #include "ui/views/view_utils.h"
- 
-@@ -59,6 +61,28 @@ constexpr int kVerticalTabsGrabHandleSiz
+@@ -59,6 +59,42 @@ constexpr int kVerticalTabsGrabHandleSiz
  // against the frame controls when it is the top-most row.
  constexpr int kTopToolbarExclusion = 10;
  
@@ -759,10 +747,24 @@
 +  return base::ClampRound(std::max(0, extent) * ratio);
 +}
 +
-+gfx::Rect ScaleHeightFromTop(const gfx::Rect& bounds, float ratio) {
-+  gfx::Rect scaled(bounds);
-+  scaled.set_height(ScaleExtent(bounds.height(), ratio));
-+  return scaled;
++gfx::Rect SlideBoundsFromTop(const gfx::Rect& bounds, float ratio) {
++  gfx::Rect slid(bounds);
++  // Slide from fully above the parent's top edge to the view's shown bounds.
++  slid.Offset(0, ScaleExtent(bounds.bottom(), ratio) - bounds.bottom());
++  return slid;
++}
++
++int GetDynamicTabStripToolbarBottom(const views::View& toolbar,
++                                    const gfx::Rect& toolbar_bounds,
++                                    bool zen_mode,
++                                    float top_chrome_ratio) {
++  // The toolbar bounds may already be slid upward during zen reveal. Use the
++  // stable shown height for the dynamic tab strip target instead of deriving a
++  // target from animated bounds.
++  if (zen_mode && top_chrome_ratio < 1.0f) {
++    return toolbar.GetPreferredSize().height();
++  }
++  return toolbar_bounds.bottom();
 +}
 +
 +gfx::Rect ScaleWidthOnEdge(const gfx::Rect& bounds,
@@ -780,7 +782,7 @@
  // Maximum portion of the window a "size-restricted" contents-height side panel
  // can take up. This is not the only limit on side panel size.
  constexpr float kMaxContentsHeightSidePanelFraction = 2.f / 3.f;
-@@ -581,6 +605,13 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -581,6 +617,13 @@ BrowserViewTabbedLayoutImpl::CalculatePr
  
    const bool vertical_right_aligned =
        delegate().IsVerticalTabStripRightAligned();
@@ -794,7 +796,7 @@
  
    if (tab_strip_type == TabStripType::kWebUi) {
      // When the WebUI tab strip is present, it does not paint over the caption
-@@ -613,14 +644,19 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -613,14 +656,19 @@ BrowserViewTabbedLayoutImpl::CalculatePr
        const int leading_margin = GetHorizontalTabStripLeadingMargin(params);
        tabstrip_bounds = GetBoundsWithExclusion(
            params, views().horizontal_tab_strip_region_view, leading_margin);
@@ -802,7 +804,7 @@
 -          GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
 -      params.SetTop(tabstrip_bounds.bottom() -
 -                    default_tabstrip_toolbar_overlap);
-+      tabstrip_bounds = ScaleHeightFromTop(tabstrip_bounds, top_chrome_ratio);
++      tabstrip_bounds = SlideBoundsFromTop(tabstrip_bounds, top_chrome_ratio);
 +      if (tabstrip_bounds.height() > 0) {
 +        const int default_tabstrip_toolbar_overlap =
 +            ScaleExtent(GetLayoutConstant(LayoutConstant::kHeliumBasePadding),
@@ -815,11 +817,11 @@
      layout.AddChild(views().horizontal_tab_strip_region_view, tabstrip_bounds,
 -                    tab_strip_type == TabStripType::kHorizontal);
 +                    tab_strip_type == TabStripType::kHorizontal &&
-+                        top_chrome_visible && tabstrip_bounds.height() > 0);
++                        tabstrip_bounds.height() > 0);
    }
  
    // This will be the area next to the vertical tab strip (if present) that will
-@@ -636,20 +672,29 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -636,20 +684,29 @@ BrowserViewTabbedLayoutImpl::CalculatePr
      gfx::Rect vertical_tab_strip_bounds;
      if (tab_strip_type == TabStripType::kVertical) {
        vertical_tab_strip_animation = CalculateVerticalTabStripAnimation(params);
@@ -860,7 +862,7 @@
  
        // Let the vertical tab strip animate out over the content.
        if (views().vertical_tab_strip_region_view->is_animating()) {
-@@ -663,7 +708,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -663,7 +720,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
      }
      layout.AddChild(views().vertical_tab_strip_region_view,
                      vertical_tab_strip_bounds,
@@ -870,7 +872,7 @@
    }
  
    // TODO(crbug.com/469425263): Ensure correct layout calculations for the
-@@ -718,7 +764,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -718,7 +776,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
  
      // Inset the bookmark bar horizontally by the vertical tab strip width so
      // it doesn't overlap.
@@ -880,7 +882,20 @@
        auto& top_container_children = top_container_layout.children;
        auto bookmarks_child = top_container_children.find(views().bookmark_bar);
        if (bookmarks_child != top_container_children.end() &&
-@@ -748,6 +795,29 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -739,15 +798,40 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+       if (const auto* toolbar_layout =
+               top_container_layout.GetLayoutFor(views().toolbar);
+           toolbar_layout && !toolbar_layout->bounds.IsEmpty()) {
++        const int toolbar_bottom = GetDynamicTabStripToolbarBottom(
++            *views().toolbar, toolbar_layout->bounds, zen_mode,
++            top_chrome_ratio);
+         dynamic_tab_strip_top = top_container_layout.bounds.y() +
+-                                toolbar_layout->bounds.bottom() -
+-                                toolbar_tabstrip_overlap;
++                                toolbar_bottom - toolbar_tabstrip_overlap;
+       } else {
+         dynamic_tab_strip_top = top_container_layout.bounds.y();
+       }
      }
  
      params.SetTop(top_container_layout.bounds.bottom());
@@ -910,16 +925,36 @@
    }
  
    if (dynamic_tab_strip) {
-@@ -763,7 +833,7 @@ BrowserViewTabbedLayoutImpl::CalculatePr
-                                     params.visual_client_area.width(),
-                                     tabstrip_height);
+@@ -755,15 +839,20 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+ 
+     const int tabstrip_height =
+         views().horizontal_tab_strip_region_view->GetPreferredSize().height();
+-    const int tabstrip_top =
+-        show_dynamic_tab_strip
+-            ? dynamic_tab_strip_top.value_or(params.visual_client_area.y())
+-            : -tabstrip_height;
+-    const gfx::Rect tabstrip_bounds(params.visual_client_area.x(), tabstrip_top,
+-                                    params.visual_client_area.width(),
+-                                    tabstrip_height);
++    gfx::Rect tabstrip_bounds;
++    if (show_dynamic_tab_strip) {
++      tabstrip_bounds = gfx::Rect(
++          params.visual_client_area.x(),
++          dynamic_tab_strip_top.value_or(params.visual_client_area.y()),
++          params.visual_client_area.width(), tabstrip_height);
++      tabstrip_bounds = SlideBoundsFromTop(tabstrip_bounds, top_chrome_ratio);
++    } else {
++      tabstrip_bounds = gfx::Rect(params.visual_client_area.x(), -tabstrip_height,
++                                  params.visual_client_area.width(),
++                                  tabstrip_height);
++    }
      layout.AddChild(views().horizontal_tab_strip_region_view, tabstrip_bounds,
 -                    show_dynamic_tab_strip);
-+                    show_dynamic_tab_strip && top_chrome_visible);
++                    show_dynamic_tab_strip && tabstrip_bounds.height() > 0);
    }
  
    // Lay out the main area background.
-@@ -868,6 +938,11 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -868,6 +957,11 @@ BrowserViewTabbedLayoutImpl::CalculatePr
      top_container_layout.bounds =
          GetTopContainerBoundsInParent(top_container_local_bounds, params);
      params.SetTop(top_container_layout.bounds.bottom());
@@ -931,34 +966,51 @@
    }
  
    // Lay out infobar container.
-@@ -895,6 +970,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -895,6 +989,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
    // Lay out contents-height side panel.
    bool show_leading_separator = false;
    bool show_trailing_separator = false;
-+  bool leading_side_panel_visible = false;
-+  bool trailing_side_panel_visible = false;
++  bool leading_side_chrome_attached = false;
++  bool trailing_side_chrome_attached = false;
    bool contents_height_side_panel_leading = false;
  
    // The contents-height side panel is adjusted for the presence of a top
-@@ -917,6 +994,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -917,6 +1013,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
      if (horizontal_layout.has_content_height_side_panel()) {
        show_leading_separator = contents_height_side_panel_leading;
        show_trailing_separator = !contents_height_side_panel_leading;
-+      leading_side_panel_visible = show_leading_separator;
-+      trailing_side_panel_visible = show_trailing_separator;
++      leading_side_chrome_attached = show_leading_separator;
++      trailing_side_chrome_attached = show_trailing_separator;
        if (animation_value < 1.0) {
          clip_content_for_animation = true;
        }
-@@ -949,6 +1028,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -942,13 +1040,17 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+     // panels, so rounded content drops its padding and bottom radius there.
+     if (vertical_right_aligned) {
+       show_trailing_separator = true;
++      trailing_side_chrome_attached = !float_vertical_tab_strip;
+     } else {
+       show_leading_separator = true;
++      leading_side_chrome_attached = !float_vertical_tab_strip;
+     }
+   }
  
    // Show separators in multi-contents view. Note that the multi-contents
    // view is inside the main container so doesn't need to be laid out.
-+  views().multi_contents_view->SetSidePanelVisibility(
-+      leading_side_panel_visible, trailing_side_panel_visible);
++  views().multi_contents_view->SetAttachedSideChromeVisibility(
++      leading_side_chrome_attached, trailing_side_chrome_attached);
    views().multi_contents_view->SetShouldShowLeadingSeparator(
        show_leading_separator);
    views().multi_contents_view->SetShouldShowTrailingSeparator(
-@@ -1091,15 +1172,19 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+@@ -963,6 +1065,7 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+   const auto top_separator_type = GetTopSeparatorType();
+   views().multi_contents_view->SetShouldShowTopSeparator(
+       !suppress_top_separator &&
++      (!zen_mode || top_chrome_ratio > 0.0f) &&
+       top_separator_type == TopSeparatorType::kMultiContents);
+ 
+   // Lay out contents container. The contents container contains the multi-
+@@ -1091,15 +1194,19 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
    const TabStripType tab_strip_type = GetTabStripType();
    const bool dynamic_tab_strip = IsDynamicTabStrip(tab_strip_type);
    const bool show_dynamic_tab_strip = ShowDynamicTabStrip(tab_strip_type);
@@ -982,13 +1034,13 @@
      layout.AddChild(views().webui_tab_strip,
                      gfx::Rect(params.visual_client_area.origin(),
                                gfx::Size(width, height)));
-@@ -1113,12 +1198,18 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+@@ -1113,12 +1220,18 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
        const int leading_margin = GetHorizontalTabStripLeadingMargin(params);
        tabstrip_bounds = GetBoundsWithExclusion(
            params, views().horizontal_tab_strip_region_view, leading_margin);
 -      params.SetTop(tabstrip_bounds.bottom() -
 -                    GetLayoutConstant(LayoutConstant::kTabstripToolbarOverlap));
-+      tabstrip_bounds = ScaleHeightFromTop(tabstrip_bounds, top_chrome_ratio);
++      tabstrip_bounds = SlideBoundsFromTop(tabstrip_bounds, top_chrome_ratio);
 +      if (tabstrip_bounds.height() > 0) {
 +        params.SetTop(tabstrip_bounds.bottom() -
 +                      ScaleExtent(GetLayoutConstant(
@@ -1000,31 +1052,22 @@
      layout.AddChild(views().horizontal_tab_strip_region_view, tabstrip_bounds,
 -                    tab_strip_type == TabStripType::kHorizontal);
 +                    tab_strip_type == TabStripType::kHorizontal &&
-+                        top_chrome_visible && tabstrip_bounds.height() > 0);
++                        tabstrip_bounds.height() > 0);
    }
  
    // Lay out toolbar. If toolbar is in the top-most row, it will go into the
-@@ -1126,7 +1217,7 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
-   const bool toolbar_visible = delegate().IsToolbarVisible();
-   if (IsParentedTo(views().toolbar, views().top_container)) {
-     gfx::Rect toolbar_bounds;
--    if (toolbar_visible) {
-+    if (toolbar_visible && top_chrome_visible) {
-       // Toolbar is in the top row in all layouts except Classic.
-       const bool is_not_classic =
-           GetHeliumLayout() != HeliumLayoutType::kClassic;
-@@ -1139,14 +1230,17 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+@@ -1139,21 +1252,26 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
                            params.visual_client_area.y(),
                            params.visual_client_area.width(),
                            views().toolbar->GetPreferredSize().height());
-+      toolbar_bounds = ScaleHeightFromTop(toolbar_bounds, top_chrome_ratio);
++      toolbar_bounds = SlideBoundsFromTop(toolbar_bounds, top_chrome_ratio);
        params.SetTop(toolbar_bounds.bottom());
        needs_exclusion = false;
      }
 -    layout.AddChild(views().toolbar, toolbar_bounds, toolbar_visible);
 +    layout.AddChild(
 +        views().toolbar, toolbar_bounds,
-+        toolbar_visible && top_chrome_visible && toolbar_bounds.height() > 0);
++        toolbar_visible && toolbar_bounds.height() > 0);
    }
  
    // Clamp the margins visually by overlapping toolbar and the tab strip
@@ -1033,7 +1076,18 @@
      const int toolbar_tabstrip_overlap =
          toolbar_visible ? GetLayoutConstant(LayoutConstant::kHeliumBasePadding)
                          : 0;
-@@ -1162,9 +1256,13 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+     params.SetTop(
+         params.visual_client_area.y() +
+-        views().horizontal_tab_strip_region_view->GetPreferredSize().height() -
+-        toolbar_tabstrip_overlap);
++        ScaleExtent(views().horizontal_tab_strip_region_view->GetPreferredSize()
++                        .height() -
++                    toolbar_tabstrip_overlap,
++                    top_chrome_ratio));
+   }
+ 
+   // Lay out the bookmarks bar if one is present.
+@@ -1162,9 +1280,13 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
      const gfx::Rect bookmarks_bounds(
          params.visual_client_area.x(), params.visual_client_area.y(),
          params.visual_client_area.width(),
@@ -1050,7 +1104,7 @@
      params.SetTop(bookmarks_bounds.bottom());
    }
  
-@@ -1174,29 +1272,37 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+@@ -1174,29 +1296,37 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
    // Lay out the loading bar when present.
    if (IsParentedTo(views().loading_bar, views().top_container)) {
      gfx::Rect loading_bar_bounds;
@@ -1095,7 +1149,7 @@
    }
  
    return gfx::Rect(params.visual_client_area.x(), original_top,
-@@ -1204,6 +1310,26 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+@@ -1204,6 +1334,26 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
                     params.visual_client_area.y() - original_top);
  }
  
@@ -1122,7 +1176,7 @@
  void BrowserViewTabbedLayoutImpl::ConfigureTopContainerBackground(
      const BrowserLayoutParams& params,
      CustomCornersBackground* background) {
-@@ -1217,9 +1343,107 @@ void BrowserViewTabbedLayoutImpl::Config
+@@ -1217,9 +1367,98 @@ void BrowserViewTabbedLayoutImpl::Config
  
    // The top container always draws an opaque background when in vertical
    // tabstrip mode.
@@ -1194,7 +1248,13 @@
 +  // corners to round.
 +  auto clip_upper_corners = [radius](views::View* view, bool round_leading,
 +                                     bool round_trailing) {
-+    if (!view || view->width() <= 0 || view->height() <= 0) {
++    if (!view) {
++      return;
++    }
++    if (view->width() <= 0 || view->height() <= 0) {
++      if (!view->clip_path().isEmpty()) {
++        view->SetClipPath(SkPath());
++      }
 +      return;
 +    }
 +    if (radius > 0 && (round_leading || round_trailing)) {
@@ -1216,21 +1276,6 @@
 +  views::View* top_container = views().top_container;
 +  if (top_container->bounds().y() == 0) {
 +    clip_upper_corners(top_container, true, true);
-+  }
-+
-+  // The new tab button has its own layer (SetPaintToLayer) so it escapes
-+  // clip paths.  Hide it during zen mode animation to prevent it from
-+  // floating outside the scaled tab strip.
-+  if (views().horizontal_tab_strip_region_view) {
-+    auto* region = views::AsViewClass<HorizontalTabStripRegionView>(
-+        views().horizontal_tab_strip_region_view.get());
-+    if (region && region->new_tab_button()) {
-+      auto* ntb = region->new_tab_button();
-+      if (ntb->layer()) {
-+        ntb->layer()->SetOpacity(
-+            delegate().GetTopChromeRevealRatio() < 1.0f ? 0.0f : 1.0f);
-+      }
-+    }
 +  }
 +}
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
@@ -1309,21 +1354,21 @@
          auto* controller =
 --- a/chrome/browser/ui/views/frame/multi_contents_view.h
 +++ b/chrome/browser/ui/views/frame/multi_contents_view.h
-@@ -80,6 +80,9 @@ class MultiContentsView : public views::
+@@ -80,6 +80,8 @@ class MultiContentsView : public views::
    const gfx::RoundedCornersF& background_radii() const;
    void SetBackgroundRadii(const gfx::RoundedCornersF& radii);
  
-+  // Updates the border and corner overlay for all content containers.
-+  void UpdateContentsBorderAndOverlay();
++  void MaybeUpdateContentsBorderAndOverlay();
 +
    // Returns true if more than one WebContents is displayed.
    bool IsInSplitView() const;
  
-@@ -171,6 +174,7 @@ class MultiContentsView : public views::
+@@ -171,6 +173,8 @@ class MultiContentsView : public views::
    void SetShouldShowTopSeparator(bool should_show);
    void SetShouldShowLeadingSeparator(bool should_show);
    void SetShouldShowTrailingSeparator(bool should_show);
-+  void SetSidePanelVisibility(bool leading_visible, bool trailing_visible);
++  void SetAttachedSideChromeVisibility(bool leading_attached,
++                                       bool trailing_attached);
  
    void set_min_contents_width_for_testing(int width) {
      min_contents_width_for_testing_ = std::make_optional(width);
@@ -1331,29 +1376,20 @@
      bool should_show_top = false;
      bool should_show_leading = false;
      bool should_show_trailing = false;
-+    bool leading_side_panel_visible = false;
-+    bool trailing_side_panel_visible = false;
++    bool leading_side_chrome_attached = false;
++    bool trailing_side_chrome_attached = false;
    };
  
    static constexpr int kMinWebContentsWidth = 200;
-@@ -241,6 +247,7 @@ class MultiContentsView : public views::
-       std::vector<views::ChildLayout>& child_layouts) const;
- 
-   int GetInactiveIndex() const;
-+  void MaybeUpdateContentsBorderAndOverlay();
- 
-   void OnWebContentsFocused(views::WebView*);
-   void OnNtpFooterFocused(views::WebView*);
-@@ -262,8 +269,6 @@ class MultiContentsView : public views::
+@@ -262,6 +268,7 @@ class MultiContentsView : public views::
  
    bool ShouldUseRoundedFrame() const;
  
--  void UpdateContentsBorderAndOverlay();
--
-   double CalculateRatioWithSnapPoints(double end_width,
-                                       double total_width) const;
++  // Updates the border and corner overlay for all content containers.
+   void UpdateContentsBorderAndOverlay();
  
-@@ -308,10 +313,6 @@ class MultiContentsView : public views::
+   double CalculateRatioWithSnapPoints(double end_width,
+@@ -308,10 +315,6 @@ class MultiContentsView : public views::
    // Nullopt if not currently resizing.
    std::optional<double> initial_start_width_on_resize_;
  
@@ -1376,22 +1412,12 @@
 +                                    BrowserLayoutParams& params,
 +                                    float top_chrome_ratio) const;
 +
-+  // Post-layout adjustments specific to zen mode (clip paths, new tab button).
++  // Post-layout adjustments specific to zen mode.
 +  void DoZenModeVisualAdjustments();
 +
    // Gets the amount of padding to place between
    int GetMinimumGrabHandlePadding() const;
  
---- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h
-+++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h
-@@ -61,6 +61,7 @@ class HorizontalTabStripRegionView final
-   // view. |point| is in the local coordinate space of |this|.
-   bool IsPositionInWindowCaption(const gfx::Point& point);
- 
-+  views::Button* new_tab_button() { return new_tab_button_; }
-   views::Button* new_tab_button_for_testing() { return new_tab_button_; }
- 
-   views::View* reserved_grab_handle_space_for_testing() {
 --- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 @@ -680,7 +680,15 @@ void VerticalTabStripRegionView::UpdateI
@@ -1543,7 +1569,32 @@
  
 --- a/chrome/browser/ui/views/frame/multi_contents_view.cc
 +++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
-@@ -69,11 +69,7 @@ MultiContentsView::MultiContentsView(
+@@ -55,8 +55,24 @@
+ 
+ namespace {
+ constexpr int kSnapDistance = 15;
++constexpr float kZenTopChromeAttachedThreshold = 0.5f;
++
++bool IsTopChromeAttached(const BrowserView& browser_view,
++                         bool should_show_top_separator) {
++  return should_show_top_separator &&
++         (!browser_view.IsZenModeEnabledForLayout() ||
++          browser_view.GetTopChromeRevealRatio() >=
++              kZenTopChromeAttachedThreshold);
++}
++
++bool IsSideChromeAttached(bool zen_mode,
++                          bool side_chrome_attached,
++                          bool should_show_separator) {
++  return side_chrome_attached || (!zen_mode && should_show_separator);
+ }
+ 
++}  // namespace
++
+ void MultiContentsView::ContentsSeparators::Reset() {
+   top_separator = nullptr;
+   leading_separator = nullptr;
+@@ -69,11 +85,7 @@ MultiContentsView::MultiContentsView(
      BrowserView* browser_view,
      std::unique_ptr<MultiContentsViewDelegate> delegate)
      : browser_view_(browser_view),
@@ -1556,7 +1607,7 @@
    SetLayoutManager(std::make_unique<views::DelegatingLayoutManager>(this));
    SetProperty(views::kElementIdentifierKey, kMultiContentsViewElementId);
  
-@@ -431,6 +427,12 @@ int MultiContentsView::GetInactiveIndex(
+@@ -431,6 +443,12 @@ int MultiContentsView::GetInactiveIndex(
    return active_index_ == 0 ? 1 : 0;
  }
  
@@ -1569,7 +1620,7 @@
  void MultiContentsView::OnWebContentsFocused(views::WebView* web_view) {
    if (IsInSplitView()) {
      // Check whether the widget is visible as otherwise during browser hide,
-@@ -493,9 +495,11 @@ views::ProposedLayout MultiContentsView:
+@@ -493,9 +511,11 @@ views::ProposedLayout MultiContentsView:
  
    gfx::Rect available_space = gfx::Rect(width, height);
  
@@ -1582,7 +1633,7 @@
        should_use_rounded_frame;
    layouts.child_layouts.emplace_back(background_view_.get(), show_background,
                                       available_space);
-@@ -518,18 +522,31 @@ views::ProposedLayout MultiContentsView:
+@@ -518,18 +538,28 @@ views::ProposedLayout MultiContentsView:
    gfx::Rect end_rect(resize_rect.top_right(),
                       gfx::Size(widths.end_width, available_space.height()));
  
@@ -1599,17 +1650,14 @@
 -        contents_separators_.should_show_trailing ? 0 : kSplitViewContentInset);
 -    start_rect.Inset(single_inset);
 +  if (is_in_split || should_use_rounded_frame) {
-+    constexpr float kZenTopChromeAttachedThreshold = 0.5f;
-+    const bool top_chrome_attached =
-+        contents_separators_.should_show_top &&
-+        (!zen_mode || browser_view_->GetTopChromeRevealRatio() >=
-+                          kZenTopChromeAttachedThreshold);
-+    const bool leading_edge_attached =
-+        contents_separators_.leading_side_panel_visible ||
-+        (!zen_mode && contents_separators_.should_show_leading);
-+    const bool trailing_edge_attached =
-+        contents_separators_.trailing_side_panel_visible ||
-+        (!zen_mode && contents_separators_.should_show_trailing);
++    const bool top_chrome_attached = IsTopChromeAttached(
++        *browser_view_, contents_separators_.should_show_top);
++    const bool leading_edge_attached = IsSideChromeAttached(
++        zen_mode, contents_separators_.leading_side_chrome_attached,
++        contents_separators_.should_show_leading);
++    const bool trailing_edge_attached = IsSideChromeAttached(
++        zen_mode, contents_separators_.trailing_side_chrome_attached,
++        contents_separators_.should_show_trailing);
 +    const int top_inset = top_chrome_attached ? 0 : kSplitViewContentInset;
 +    const int leading_inset =
 +        leading_edge_attached ? 0 : kSplitViewContentInset;
@@ -1626,7 +1674,7 @@
    }
  
    layouts.child_layouts.emplace_back(contents_container_views_[0],
-@@ -692,10 +709,14 @@ gfx::Rect MultiContentsView::CalculateSe
+@@ -692,10 +722,14 @@ gfx::Rect MultiContentsView::CalculateSe
        gfx::Rect(available_space.right() - trailing_separator_width,
                  available_space.y(), trailing_separator_width, height));
  
@@ -1642,7 +1690,7 @@
                              (should_show_leading || should_show_trailing));
    if (corner_layout.visible) {
      if (should_show_leading) {
-@@ -718,8 +739,8 @@ gfx::Rect MultiContentsView::CalculateSe
+@@ -718,8 +752,8 @@ gfx::Rect MultiContentsView::CalculateSe
        contents_separators_.trailing_corner_separator.get();
    views::ChildLayout trailing_corner_layout(
        trailing_corner_separator,
@@ -1653,7 +1701,7 @@
    if (trailing_corner_layout.visible) {
      trailing_corner_layout.bounds = gfx::Rect(
          gfx::Point(available_space.right() - corner_preferred_size.width(),
-@@ -802,12 +823,28 @@ void MultiContentsView::UpdateContentsBo
+@@ -802,12 +836,30 @@ void MultiContentsView::UpdateContentsBo
    const bool should_round_single_contents =
        !is_in_split && ShouldUseRoundedFrame();
  
@@ -1661,13 +1709,15 @@
 +  const bool can_use_system_corners =
 +      (is_in_split || should_round_single_contents) && !is_fullscreen;
 +  const bool top_edge_is_window_edge =
-+      zen_mode || !contents_separators_.should_show_top;
++      !IsTopChromeAttached(*browser_view_, contents_separators_.should_show_top);
 +  const bool leading_edge_is_window_edge =
-+      zen_mode ? !contents_separators_.leading_side_panel_visible
-+               : !contents_separators_.should_show_leading;
++      !IsSideChromeAttached(zen_mode,
++                            contents_separators_.leading_side_chrome_attached,
++                            contents_separators_.should_show_leading);
 +  const bool trailing_edge_is_window_edge =
-+      zen_mode ? !contents_separators_.trailing_side_panel_visible
-+               : !contents_separators_.should_show_trailing;
++      !IsSideChromeAttached(zen_mode,
++                            contents_separators_.trailing_side_chrome_attached,
++                            contents_separators_.should_show_trailing);
 +
 +  const bool use_system_top_left_radius =
 +      can_use_system_corners && top_edge_is_window_edge &&
@@ -1686,7 +1736,7 @@
  
    for (auto* contents_container_view : contents_container_views_) {
      const bool is_active =
-@@ -826,6 +863,8 @@ void MultiContentsView::UpdateContentsBo
+@@ -826,6 +878,8 @@ void MultiContentsView::UpdateContentsBo
      contents_container_view->UpdateBorderAndOverlay(
          is_in_split, should_round_contents, is_active,
          is_active && active_contents_view_highlighted_,
@@ -1695,7 +1745,7 @@
          use_system_bottom_left_radius && is_first_view,
          use_system_bottom_right_radius && is_last_view);
    }
-@@ -878,10 +917,7 @@ void MultiContentsView::SetShouldShowTop
+@@ -878,10 +932,7 @@ void MultiContentsView::SetShouldShowTop
      return;
    }
    contents_separators_.should_show_top = should_show;
@@ -1707,7 +1757,7 @@
  
    // This can be called during BrowserView layout, so protect against creating a
    // layout loop.
-@@ -893,11 +929,7 @@ void MultiContentsView::SetShouldShowLea
+@@ -893,11 +944,7 @@ void MultiContentsView::SetShouldShowLea
      return;
    }
    contents_separators_.should_show_leading = should_show;
@@ -1720,7 +1770,7 @@
  
    // This can be called during BrowserView layout, so protect against creating a
    // layout loop.
-@@ -909,16 +941,24 @@ void MultiContentsView::SetShouldShowTra
+@@ -909,16 +956,25 @@ void MultiContentsView::SetShouldShowTra
      return;
    }
    contents_separators_.should_show_trailing = should_show;
@@ -1736,14 +1786,15 @@
    InvalidateLayout(/*avoid_propagate_during_layout=*/true);
  }
  
-+void MultiContentsView::SetSidePanelVisibility(bool leading_visible,
-+                                               bool trailing_visible) {
-+  if (contents_separators_.leading_side_panel_visible == leading_visible &&
-+      contents_separators_.trailing_side_panel_visible == trailing_visible) {
++void MultiContentsView::SetAttachedSideChromeVisibility(
++    bool leading_attached,
++    bool trailing_attached) {
++  if (contents_separators_.leading_side_chrome_attached == leading_attached &&
++      contents_separators_.trailing_side_chrome_attached == trailing_attached) {
 +    return;
 +  }
-+  contents_separators_.leading_side_panel_visible = leading_visible;
-+  contents_separators_.trailing_side_panel_visible = trailing_visible;
++  contents_separators_.leading_side_chrome_attached = leading_attached;
++  contents_separators_.trailing_side_chrome_attached = trailing_attached;
 +  MaybeUpdateContentsBorderAndOverlay();
 +  InvalidateLayout(/*avoid_propagate_during_layout=*/true);
 +}
