@@ -1,0 +1,229 @@
+--- /dev/null
++++ b/chrome/browser/ui/tabs/tab_custom_titles.h
+@@ -0,0 +1,36 @@
++// Copyright 2025 The Helium Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_UI_TABS_TAB_CUSTOM_TITLES_H_
++#define CHROME_BROWSER_UI_TABS_TAB_CUSTOM_TITLES_H_
++
++#include <string>
++
++#include "base/containers/flat_map.h"
++#include "base/no_destructor.h"
++#include "content/public/browser/web_contents.h"
++
++// Stores user-defined custom tab titles keyed by WebContents*.
++// Valid for the lifetime of each tab's WebContents.
++namespace tab_custom_titles {
++
++inline base::flat_map<content::WebContents*, std::u16string>& GetMap() {
++  static base::NoDestructor<
++      base::flat_map<content::WebContents*, std::u16string>>
++      map;
++  return *map;
++}
++
++inline const std::u16string* GetTitle(content::WebContents* wc) {
++  const auto& map = GetMap();
++  const auto it = map.find(wc);
++  return (it != map.end() && !it->second.empty()) ? &it->second : nullptr;
++}
++
++inline void SetTitle(content::WebContents* wc, const std::u16string& title) {
++  if (title.empty())
++    GetMap().erase(wc);
++  else
++    GetMap()[wc] = title;
++}
++
++}  // namespace tab_custom_titles
++
++#endif  // CHROME_BROWSER_UI_TABS_TAB_CUSTOM_TITLES_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/tab_rename_dialog.h
+@@ -0,0 +1,70 @@
++// Copyright 2025 The Helium Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_TAB_RENAME_DIALOG_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_TAB_RENAME_DIALOG_H_
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/tabs/tab_custom_titles.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "content/public/browser/invalidate_type.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/controls/textfield/textfield.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/window/dialog_delegate.h"
++
++// A simple modal dialog that lets the user rename the active tab.
++// Shows the current custom title (or page title) as the initial value.
++// On Accept, stores the title in tab_custom_titles and applies it to the
++// current NavigationEntry so the tab strip reflects it immediately.
++class TabRenameView : public views::DialogDelegateView {
++ public:
++  static void Show(Browser* browser, int tab_index) {
++    auto* dialog = new TabRenameView(browser, tab_index);
++    views::Widget::CreateWindowWithContext(
++        dialog, browser->window()->GetNativeWindow())
++        ->Show();
++  }
++
++  TabRenameView(Browser* browser, int tab_index)
++      : browser_(browser), tab_index_(tab_index) {
++    SetTitle(u"Rename Tab");
++    SetModalType(ui::mojom::ModalType::kWindow);
++    SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kVertical, gfx::Insets(12), 8));
++
++    textfield_ = AddChildView(std::make_unique<views::Textfield>());
++    textfield_->SetPreferredSize(gfx::Size(320, 32));
++    textfield_->SetPlaceholderText(u"Tab name");
++
++    content::WebContents* wc =
++        browser->tab_strip_model()->GetWebContentsAt(tab_index);
++    if (wc) {
++      const std::u16string* custom = tab_custom_titles::GetTitle(wc);
++      textfield_->SetText(custom ? *custom : wc->GetTitle());
++      textfield_->SelectAll(true);
++    }
++  }
++
++  bool Accept() override {
++    content::WebContents* wc =
++        browser_->tab_strip_model()->GetWebContentsAt(tab_index_);
++    if (!wc)
++      return true;
++    const std::u16string title = textfield_->GetText();
++    tab_custom_titles::SetTitle(wc, title);
++    if (!title.empty()) {
++      if (auto* entry = wc->GetController().GetVisibleEntry())
++        entry->SetTitle(title);
++    }
++    wc->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TITLE);
++    return true;
++  }
++
++ private:
++  raw_ptr<Browser> browser_;
++  int tab_index_;
++  raw_ptr<views::Textfield> textfield_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_TAB_RENAME_DIALOG_H_
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -12064,6 +12064,9 @@
+         <message name="IDS_TAB_CXMENU_HIBERNATE" desc="The label of the 'Hibernate' Tab context menu item.">
+           Hibernate
+         </message>
++        <message name="IDS_TAB_CXMENU_RENAME_TAB" desc="The label of the 'Rename Tab' context menu item.">
++          Rename Tab
++        </message>
+         <message name="IDS_TAB_CXMENU_CLOSETAB" desc="The label of the tab context menu item for closing one or more tabs.">
+           Close
+         </message>
+@@ -12186,6 +12189,9 @@
+         <message name="IDS_TAB_CXMENU_HIBERNATE" desc="In Title Case: The label of the 'Hibernate' Tab context menu item.">
+           Hibernate
+         </message>
++        <message name="IDS_TAB_CXMENU_RENAME_TAB" desc="In Title Case: The label of the 'Rename Tab' context menu item.">
++          Rename Tab
++        </message>
+         <message name="IDS_TAB_CXMENU_CLOSETAB" desc="In Title Case: The label of the tab context menu item for closing one or more tabs.">
+           Close
+         </message>
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -783,6 +783,7 @@ class TabStripModel {
+     CommandGlicCreateNewChat,
+     CommandGlicSwitchToRecentConversation,
+     CommandGlicUnshare,
++    CommandRenameTab,
+     CommandDiscard,
+     CommandLast
+   };
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2462,6 +2462,10 @@ bool TabStripModel::IsContextMenuCommand
+       return false;
+     }
+
++    case CommandRenameTab:
++      return GetIndicesForCommand(context_index).size() == 1;
++
+     case CommandCloseOtherTabs:
+     case CommandCloseTabsToRight: {
+       return !GetIndicesClosedByCommand(context_index, command_id).empty();
+@@ -2644,6 +2648,11 @@ void TabStripModel::ExecuteContextMenuCo
+       break;
+     }
+
++    case CommandRenameTab:
++      delegate_->ShowTabRenameDialog(context_index);
++      break;
++
+     case CommandCloseTab: {
+       base::UmaHistogramCounts1000("Tab.ContextMenu.CloseTab.SelectedTabsCount",
+--- a/chrome/browser/ui/tabs/tab_strip_model_delegate.h
++++ b/chrome/browser/ui/tabs/tab_strip_model_delegate.h
+@@ -109,6 +109,9 @@ class TabStripModelDelegate {
+   // Returns true if the associated tab strip supports read-later functionality.
+   virtual bool SupportsReadLater();
+
++  // Shows a dialog allowing the user to rename the tab at |index|.
++  virtual void ShowTabRenameDialog(int index) {}
++
+  protected:
+   virtual ~TabStripModelDelegate() {}
+ };
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.h
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.h
+@@ -57,6 +57,7 @@ class BrowserTabStripModelDelegate : pub
+   void MoveTabsToNewWindow(std::vector<int> indices) override;
+   bool CanReloadContents(content::WebContents* web_contents) const override;
+   bool CanSaveContents(content::WebContents* web_contents) const override;
++  void ShowTabRenameDialog(int index) override;
+
+  private:
+   Browser* const browser_;
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -1,6 +1,8 @@
+ // Copyright 2012 The Chromium Authors
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/tab_rename_dialog.h"
+
+ #include "chrome/browser/ui/browser_tab_strip_model_delegate.h"
+@@ -299,3 +301,10 @@ bool BrowserTabStripModelDelegate::Suppo
+ bool BrowserTabStripModelDelegate::SupportsReadLater() {
+   return false;
+ }
++
++void BrowserTabStripModelDelegate::ShowTabRenameDialog(int index) {
++  content::WebContents* web_contents =
++      browser_->tab_strip_model()->GetWebContentsAt(index);
++  if (web_contents)
++    TabRenameView::Show(browser_, index);
++}
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -321,6 +321,7 @@ void TabMenuModel::Build(TabStripModel*
+   }
+
+   AddSeparator(ui::NORMAL_SEPARATOR);
++  AddItemWithStringId(TabStripModel::CommandRenameTab, IDS_TAB_CXMENU_RENAME_TAB);
+
+   AddItemWithStringId(TabStripModel::CommandDiscard, IDS_TAB_CXMENU_HIBERNATE);
+
