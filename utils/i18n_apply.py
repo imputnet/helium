@@ -10,6 +10,7 @@ import xml.etree.ElementTree as xml
 import argparse
 import json
 import re
+import os
 import sys
 
 from collections import defaultdict
@@ -195,7 +196,7 @@ def apply_translations(tree):
     xtb_index = build_xtb_index(source, tree)
 
     tasks = [(code, source, xtb_index) for code in languages]
-    with Pool() as pool:
+    with Pool(min(32, os.cpu_count() or 1)) as pool:
         pool.map(apply_language, tasks)
 
 
