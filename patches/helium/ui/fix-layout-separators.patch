@@ -1,0 +1,200 @@
+--- a/chrome/browser/ui/views/frame/custom_floating_corner.cc
++++ b/chrome/browser/ui/views/frame/custom_floating_corner.cc
+@@ -8,15 +8,14 @@
+ #include <variant>
+ 
+ #include "base/i18n/rtl.h"
+-#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/helium/frame_corner_radius.h"
+ #include "third_party/skia/include/core/SkPathBuilder.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_id.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/gfx/scoped_canvas.h"
+ #include "ui/views/controls/separator.h"
+-#include "ui/views/layout/layout_provider.h"
+ 
+ namespace {
+ 
+@@ -45,13 +44,11 @@ CustomFloatingCorner::CornerOrientation
+ CustomFloatingCorner::CustomFloatingCorner(
+     BrowserView& browser_view,
+     CornerOrientation orientation,
+-    views::ShapeContextTokens corner_radius_token,
+     ColorChoice color,
+     std::optional<ui::ColorId> stroke_color,
+     bool is_vertical_window_edge)
+     : CustomCorners(browser_view),
+       orientation_(orientation),
+-      corner_radius_token_(corner_radius_token),
+       color_(color),
+       stroke_color_(stroke_color),
+       is_vertical_window_edge_(is_vertical_window_edge) {
+@@ -79,16 +76,6 @@ void CustomFloatingCorner::SetOrientatio
+   SchedulePaint();
+ }
+ 
+-void CustomFloatingCorner::SetCornerRadius(
+-    views::ShapeContextTokens corner_radius_token) {
+-  if (corner_radius_token == corner_radius_token_) {
+-    return;
+-  }
+-
+-  corner_radius_token_ = corner_radius_token;
+-  PreferredSizeChanged();
+-}
+-
+ void CustomFloatingCorner::SetStroke(std::optional<ui::ColorId> stroke_color,
+                                      bool is_vertical_window_edge) {
+   if (stroke_color_ == stroke_color &&
+@@ -111,19 +98,8 @@ void CustomFloatingCorner::SetStroke(std
+ 
+ gfx::Size CustomFloatingCorner::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
+-  // This can return nullptr when there is no Widget (for context, see
+-  // http://crbug.com/40178332). The nullptr dereference does not always
+-  // crash due to compiler optimizations, so CHECKing here ensures we crash.
+-  CHECK(GetLayoutProvider());
+-  const float corner_radius =
+-      GetLayoutProvider()->GetCornerRadiusMetric(corner_radius_token_);
+-  const float horizontal_size =
+-      corner_radius + (stroke_color_ ? views::Separator::kThickness : 0);
+-  const float vertical_size =
+-      corner_radius + (stroke_color_ && !is_vertical_window_edge_
+-                           ? views::Separator::kThickness
+-                           : 0);
+-  return gfx::Size(horizontal_size, vertical_size);
++  const int corner_radius = GetGenericFrameRadius();
++  return gfx::Size(corner_radius, corner_radius);
+ }
+ 
+ void CustomFloatingCorner::OnPaint(gfx::Canvas* canvas) {
+@@ -133,9 +109,8 @@ void CustomFloatingCorner::OnPaint(gfx::
+   gfx::ScopedCanvas scoped(canvas);
+ 
+   // This assumes that the view has gotten its preferred size, however, it will
+-  // scale gracefully if it is not that size. The view should be the preferred
+-  // corner radius in each dimension, plus the stroke thickness if there is a
+-  // stroke.
++  // scale gracefully if it is not that size. The view is the outer corner
++  // radius; the stroked arc is inset by the separator thickness.
+   const bool has_stroke = stroke_color_.has_value();
+   const bool extend_vertical = has_stroke && !is_vertical_window_edge_;
+   const SkVector corner_radius(
+--- a/chrome/browser/ui/views/frame/custom_floating_corner.h
++++ b/chrome/browser/ui/views/frame/custom_floating_corner.h
+@@ -16,7 +16,6 @@
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/color/color_id.h"
+ #include "ui/views/background.h"
+-#include "ui/views/layout/layout_provider.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/view.h"
+ 
+@@ -39,7 +38,6 @@ class CustomFloatingCorner : public view
+ 
+   CustomFloatingCorner(BrowserView& browser_view,
+                        CornerOrientation orientation,
+-                       views::ShapeContextTokens corner_radius_token,
+                        ColorChoice color,
+                        std::optional<ui::ColorId> stroke_color = std::nullopt,
+                        bool is_vertical_window_edge = false);
+@@ -51,9 +49,6 @@ class CustomFloatingCorner : public view
+   // Sets the corner orientation.
+   void SetOrientation(CornerOrientation orientation);
+ 
+-  // Set the corner radius.
+-  void SetCornerRadius(views::ShapeContextTokens corner_radius_token);
+-
+   // Sets a stroke, or no stroke (std::nullopt). If `is_vertical_window_edge` is
+   // true, the stroke ends outside the vertical bounds of the corner.
+   void SetStroke(std::optional<ui::ColorId> stroke_color,
+@@ -74,7 +69,6 @@ class CustomFloatingCorner : public view
+   void SchedulePaintHost() override;
+ 
+   CornerOrientation orientation_;
+-  views::ShapeContextTokens corner_radius_token_;
+   ColorChoice color_;
+   std::optional<ui::ColorId> stroke_color_;
+   bool is_vertical_window_edge_ = false;
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -62,6 +62,7 @@ void MultiContentsView::ContentsSeparato
+   leading_separator = nullptr;
+   trailing_separator = nullptr;
+   corner_separator = nullptr;
++  trailing_corner_separator = nullptr;
+ }
+ 
+ MultiContentsView::MultiContentsView(
+@@ -116,12 +117,17 @@ MultiContentsView::MultiContentsView(
+   contents_separators_.corner_separator =
+       AddChildView(std::make_unique<CustomFloatingCorner>(
+           *browser_view_, CustomFloatingCorner::CornerOrientation::kTopLeading,
+-          views::ShapeContextTokens::kContentSeparatorRadius,
+           CustomFloatingCorner::ToolbarTheme(),
+           kColorToolbarContentAreaSeparator));
+   contents_separators_.corner_separator->SetProperty(
+       views::kElementIdentifierKey, kContentsSeparatorTopCornerElementId);
+ 
++  contents_separators_.trailing_corner_separator =
++      AddChildView(std::make_unique<CustomFloatingCorner>(
++          *browser_view_, CustomFloatingCorner::CornerOrientation::kTopTrailing,
++          CustomFloatingCorner::ToolbarTheme(),
++          kColorToolbarContentAreaSeparator));
++
+   for (auto* contents_container_view : contents_container_views_) {
+     auto& view_map = container_focusable_map_[contents_container_view];
+ 
+@@ -643,6 +649,9 @@ gfx::Rect MultiContentsView::CalculateSe
+                                false, gfx::Rect());
+     child_layouts.emplace_back(contents_separators_.corner_separator.get(),
+                                false, gfx::Rect());
++    child_layouts.emplace_back(
++        contents_separators_.trailing_corner_separator.get(), false,
++        gfx::Rect());
+     return available_space;
+   }
+ 
+@@ -683,7 +692,6 @@ gfx::Rect MultiContentsView::CalculateSe
+       gfx::Rect(available_space.right() - trailing_separator_width,
+                 available_space.y(), trailing_separator_width, height));
+ 
+-  // Place the corner separator and set its orientation.
+   auto* const corner_separator = contents_separators_.corner_separator.get();
+   const auto corner_preferred_size = corner_separator->GetPreferredSize();
+   views::ChildLayout corner_layout(
+@@ -706,6 +714,22 @@ gfx::Rect MultiContentsView::CalculateSe
+   }
+   child_layouts.push_back(corner_layout);
+ 
++  auto* const trailing_corner_separator =
++      contents_separators_.trailing_corner_separator.get();
++  views::ChildLayout trailing_corner_layout(
++      trailing_corner_separator,
++      contents_separators_.should_show_top && should_show_leading &&
++          should_show_trailing);
++  if (trailing_corner_layout.visible) {
++    trailing_corner_layout.bounds = gfx::Rect(
++        gfx::Point(available_space.right() - corner_preferred_size.width(),
++                   available_space.y()),
++        corner_preferred_size);
++    trailing_corner_separator->SetOrientation(
++        CustomFloatingCorner::CornerOrientation::kTopTrailing);
++  }
++  child_layouts.push_back(trailing_corner_layout);
++
+   return gfx::Rect(available_space.x() + leading_separator_width,
+                    available_space.y() + separator_height,
+                    width - trailing_separator_width - leading_separator_width,
+--- a/chrome/browser/ui/views/frame/multi_contents_view.h
++++ b/chrome/browser/ui/views/frame/multi_contents_view.h
+@@ -212,6 +212,7 @@ class MultiContentsView : public views::
+     raw_ptr<views::View> leading_separator = nullptr;
+     raw_ptr<views::View> trailing_separator = nullptr;
+     raw_ptr<CustomFloatingCorner> corner_separator = nullptr;
++    raw_ptr<CustomFloatingCorner> trailing_corner_separator = nullptr;
+ 
+     bool should_show_top = false;
+     bool should_show_leading = false;

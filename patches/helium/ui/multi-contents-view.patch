@@ -1,0 +1,475 @@
+--- a/chrome/browser/ui/views/frame/multi_contents_view.h
++++ b/chrome/browser/ui/views/frame/multi_contents_view.h
+@@ -58,7 +58,7 @@ class MultiContentsView : public views::
+     double end_width = 0;
+   };
+ 
+-  static constexpr int kSplitViewContentInset = 8;
++  static constexpr int kSplitViewContentInset = 3;
+ 
+   MultiContentsView(BrowserView* browser_view,
+                     std::unique_ptr<MultiContentsViewDelegate> delegate);
+@@ -156,6 +156,8 @@ class MultiContentsView : public views::
+   // views::View:
+   void OnThemeChanged() override;
+ 
++  void OnFullscreenStateChanged();
++
+   const std::vector<ContentsContainerView*>& contents_container_views() const {
+     return contents_container_views_;
+   }
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -409,6 +409,10 @@ void MultiContentsView::OnThemeChanged()
+   UpdateContentsBorderAndOverlay();
+ }
+ 
++void MultiContentsView::OnFullscreenStateChanged() {
++  UpdateContentsBorderAndOverlay();
++}
++
+ int MultiContentsView::GetInactiveIndex() const {
+   return active_index_ == 0 ? 1 : 0;
+ }
+@@ -745,12 +749,29 @@ int MultiContentsView::GetMinViewWidth(g
+ }
+ 
+ void MultiContentsView::UpdateContentsBorderAndOverlay() {
++  const views::Widget* widget = browser_view_->GetWidget();
++  const bool is_fullscreen = widget && widget->IsFullscreen();
++  const bool is_in_split = IsInSplitView();
++
++  const bool use_system_bottom_left_radius =
++      is_in_split && !is_fullscreen &&
++      !contents_separators_.should_show_leading;
++  const bool use_system_bottom_right_radius =
++      is_in_split && !is_fullscreen &&
++      !contents_separators_.should_show_trailing;
++
+   for (auto* contents_container_view : contents_container_views_) {
+     const bool is_active =
+         contents_container_view->contents_view() == GetActiveContentsView();
++    const bool is_first_view =
++        contents_container_view == contents_container_views_.front();
++    const bool is_last_view =
++        contents_container_view == contents_container_views_.back();
+     contents_container_view->UpdateBorderAndOverlay(
+-        IsInSplitView(), is_active,
+-        is_active && active_contents_view_highlighted_);
++        is_in_split, is_active,
++        is_active && active_contents_view_highlighted_,
++        use_system_bottom_left_radius && is_first_view,
++        use_system_bottom_right_radius && is_last_view);
+   }
+ }
+ 
+@@ -810,6 +831,9 @@ void MultiContentsView::SetShouldShowLea
+   contents_separators_.should_show_leading = should_show;
+   start_contents_view_inset_.set_left(
+       should_show ? 0 : MultiContentsView::kSplitViewContentInset);
++  if (IsInSplitView()) {
++    UpdateContentsBorderAndOverlay();
++  }
+ 
+   // This can be called during BrowserView layout, so protect against creating a
+   // layout loop.
+@@ -823,6 +847,9 @@ void MultiContentsView::SetShouldShowTra
+   contents_separators_.should_show_trailing = should_show;
+   end_contents_view_inset_.set_right(
+       should_show ? 0 : MultiContentsView::kSplitViewContentInset);
++  if (IsInSplitView()) {
++    UpdateContentsBorderAndOverlay();
++  }
+ 
+   // This can be called during BrowserView layout, so protect against creating a
+   // layout loop.
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -2360,6 +2360,7 @@ void BrowserView::FullscreenStateChanged
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+   browser_->WindowFullscreenStateChanged();
++  multi_contents_view_->OnFullscreenStateChanged();
+ 
+   exclusive_access_context_->GetExclusiveAccessManager()
+       ->fullscreen_controller()
+--- a/chrome/browser/ui/views/frame/contents_container_view.h
++++ b/chrome/browser/ui/views/frame/contents_container_view.h
+@@ -44,8 +44,7 @@ namespace enterprise_watermark {
+ class WatermarkView;
+ }  // namespace enterprise_watermark
+ 
+-// ContentsContainerView holds the ContentsWebView and the outlines and
+-// minitoolbar when in split view.
++// ContentsContainerView holds the ContentsWebView and split view outline.
+ class ContentsContainerView : public views::View,
+                               public views::LayoutDelegate,
+                               public views::ViewObserver {
+@@ -114,7 +113,9 @@ class ContentsContainerView : public vie
+ 
+   void UpdateBorderAndOverlay(bool is_in_split,
+                               bool is_active,
+-                              bool is_highlighted);
++                              bool is_highlighted,
++                              bool round_bottom_left_window_corner,
++                              bool round_bottom_right_window_corner);
+ 
+   void ShowCaptureContentsBorder();
+   void HideCaptureContentsBorder();
+@@ -157,6 +158,8 @@ class ContentsContainerView : public vie
+       const views::SizeBounds& size_bounds) const override;
+ 
+   bool is_in_split_ = false;
++  bool round_bottom_left_window_corner_ = false;
++  bool round_bottom_right_window_corner_ = false;
+ 
+   raw_ptr<BrowserView> browser_view_ = nullptr;
+   raw_ptr<ContentsWebView> contents_view_ = nullptr;
+--- a/chrome/browser/ui/views/frame/contents_container_view.cc
++++ b/chrome/browser/ui/views/frame/contents_container_view.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/ui/views/frame/scrim_view.h"
+ #include "chrome/browser/ui/views/frame/tab_modal_dialog_host.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
++#include "chrome/browser/ui/views/helium/frame_corner_radius.h"
+ #include "chrome/browser/ui/views/new_tab_footer/footer_web_view.h"
+ #include "chrome/common/chrome_features.h"
+ #include "components/search/ntp_features.h"
+@@ -37,6 +38,7 @@
+ #include "ui/compositor/layer.h"
+ #include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
+ #include "ui/views/border.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/layout/fill_layout.h"
+@@ -51,9 +53,7 @@
+ #endif
+ 
+ namespace {
+-constexpr float kContentCornerRadius = 6;
+-constexpr gfx::RoundedCornersF kContentRoundedCorners{kContentCornerRadius};
+-constexpr int kSplitViewContentPadding = 4;
++constexpr int kSplitViewContentPadding = 2;
+ 
+ constexpr int kNewTabFooterSeparatorHeight = 1;
+ constexpr int kNewTabFooterHeight = 56;
+@@ -68,7 +68,7 @@ ContentsContainerView::ContentsContainer
+   // The default z-order is the order in which children were added to the
+   // parent view. So first added devtools and the devtools scrim view (as it
+   // exists behind the content view), then the content view and new tab page
+-  // footer. This should be followed by scrims, borders and lastly mini-toolbar.
++  // footer. This should be followed by scrims and borders.
+ 
+   auto devtools_web_view =
+       std::make_unique<views::WebView>(browser_view->GetProfile());
+@@ -172,9 +172,16 @@ std::vector<views::View*> ContentsContai
+ 
+ void ContentsContainerView::UpdateBorderAndOverlay(bool is_in_split,
+                                                    bool is_active,
+-                                                   bool is_highlighted) {
++                                                   bool is_highlighted,
++                                                   bool round_bottom_left,
++                                                   bool round_bottom_right) {
+   const bool split_changed = is_in_split != is_in_split_;
++  const bool bottom_corner_state_changed =
++      round_bottom_left_window_corner_ != round_bottom_left ||
++      round_bottom_right_window_corner_ != round_bottom_right;
+   is_in_split_ = is_in_split;
++  round_bottom_left_window_corner_ = round_bottom_left;
++  round_bottom_right_window_corner_ = round_bottom_right;
+ 
+   if (!is_in_split) {
+     if (split_changed) {
+@@ -192,6 +199,8 @@ void ContentsContainerView::UpdateBorder
+     if (split_changed) {
+       SetBorder(views::CreateEmptyBorder(gfx::Insets(
+           kSplitViewContentPadding + ContentsContainerOutline::kThickness)));
++    }
++    if (split_changed || bottom_corner_state_changed) {
+       UpdateBorderRoundedCorners();
+     }
+ 
+@@ -213,10 +222,40 @@ void ContentsContainerView::UpdateBorder
+ }
+ 
+ void ContentsContainerView::UpdateBorderRoundedCorners() {
++  const int frame_radius = GetPaddedFrameRadius();
++  const int generic_radius = GetGenericFrameRadius();
++
++  const int lower_left_radius = round_bottom_left_window_corner_
++                                      ? frame_radius
++                                      : generic_radius;
++  const int lower_right_radius = round_bottom_right_window_corner_
++                                       ? frame_radius
++                                       : generic_radius;
++
++  const gfx::RoundedCornersF container_rounded_corners(
++      generic_radius, generic_radius, lower_right_radius, lower_left_radius);
++
++  const float inner_generic_radius = generic_radius - kSplitViewContentPadding;
++  const float inner_lower_left_radius =
++      lower_left_radius - kSplitViewContentPadding;
++  const float inner_lower_right_radius =
++      lower_right_radius - kSplitViewContentPadding;
++
++  const gfx::RoundedCornersF inner_rounded_corners(
++      inner_generic_radius, inner_generic_radius,
++      inner_lower_right_radius, inner_lower_left_radius);
++
++  container_outline_->SetCornerRadii(container_rounded_corners);
++  if (capture_contents_border_widget_) {
++    static_cast<ContentsCaptureBorderView*>(
++        capture_contents_border_widget_->GetContentsView())
++        ->SetCornerRadii(container_rounded_corners);
++  }
++
+   // Update devtools rounded corners. Note, devtools exists behind the contents
+   // view so all devtools corners are rounded.
+-  devtools_web_view_->holder()->SetCornerRadii(kContentRoundedCorners);
+-  devtools_scrim_view_->SetRoundedCorners(kContentRoundedCorners);
++  devtools_web_view_->holder()->SetCornerRadii(inner_rounded_corners);
++  devtools_scrim_view_->SetRoundedCorners(inner_rounded_corners);
+ 
+   const bool devtools_in_upper_left =
+       devtools_web_view_->GetVisible() &&
+@@ -234,18 +273,21 @@ void ContentsContainerView::UpdateBorder
+        current_devtools_docked_placement_ == DevToolsDockedPlacement::kRight);
+ 
+   const gfx::RoundedCornersF content_upper_rounded_corners =
+-      gfx::RoundedCornersF{devtools_in_upper_left ? 0 : kContentCornerRadius,
+-                           devtools_in_upper_right ? 0 : kContentCornerRadius,
+-                           0, 0};
++      gfx::RoundedCornersF{
++          devtools_in_upper_left ? 0 : inner_generic_radius,
++          devtools_in_upper_right ? 0 : inner_generic_radius, 0, 0};
++
+   const gfx::RoundedCornersF content_lower_rounded_corners =
+-      gfx::RoundedCornersF{0, 0,
+-                           devtools_in_lower_right ? 0 : kContentCornerRadius,
+-                           devtools_in_lower_left ? 0 : kContentCornerRadius};
++      gfx::RoundedCornersF{
++          0, 0, devtools_in_lower_right ? 0 : inner_lower_right_radius,
++          devtools_in_lower_left ? 0 : inner_lower_left_radius};
++
+   const gfx::RoundedCornersF content_rounded_corners =
+-      gfx::RoundedCornersF{devtools_in_upper_left ? 0 : kContentCornerRadius,
+-                           devtools_in_upper_right ? 0 : kContentCornerRadius,
+-                           devtools_in_lower_right ? 0 : kContentCornerRadius,
+-                           devtools_in_lower_left ? 0 : kContentCornerRadius};
++      gfx::RoundedCornersF{
++          devtools_in_upper_left ? 0 : inner_generic_radius,
++          devtools_in_upper_right ? 0 : inner_generic_radius,
++          devtools_in_lower_right ? 0 : inner_lower_right_radius,
++          devtools_in_lower_left ? 0 : inner_lower_left_radius};
+ 
+   auto radii = new_tab_footer_view_ && new_tab_footer_view_->GetVisible()
+                    ? content_upper_rounded_corners
+@@ -253,7 +295,7 @@ void ContentsContainerView::UpdateBorder
+ 
+   contents_view_->SetBackgroundRadii(radii);
+   contents_view_->holder()->SetCornerRadii(radii);
+-  contents_scrim_view_->SetRoundedCorners(kContentRoundedCorners);
++  contents_scrim_view_->SetRoundedCorners(inner_rounded_corners);
+ 
+   if (new_tab_footer_view_) {
+     new_tab_footer_view_->holder()->SetCornerRadii(
+--- a/chrome/browser/ui/views/frame/contents_container_outline.h
++++ b/chrome/browser/ui/views/frame/contents_container_outline.h
+@@ -8,6 +8,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_observer.h"
+ 
+@@ -32,10 +33,11 @@ class ContentsContainerOutline : public
+   static int GetThickness(bool is_highlighted);
+   static ui::ColorId GetColor(bool is_active, bool is_highlighted);
+   static SkPath GetPath(const gfx::RectF& local_bounds,
+-                        float corner_radius);
++                        const gfx::RoundedCornersF& radii);
+ 
+   bool is_highlighted() const { return is_highlighted_; }
+ 
++  void SetCornerRadii(const gfx::RoundedCornersF& radii);
+   void UpdateState(bool is_active, bool is_highlighted);
+ 
+  private:
+@@ -48,6 +50,7 @@ class ContentsContainerOutline : public
+ 
+   bool is_active_ = false;
+   bool is_highlighted_ = false;
++  gfx::RoundedCornersF corner_radii_{kCornerRadius};
+   base::ScopedObservation<views::View, views::ViewObserver>
+       view_bounds_observer_{this};
+ };
+--- a/chrome/browser/ui/views/frame/contents_container_outline.cc
++++ b/chrome/browser/ui/views/frame/contents_container_outline.cc
+@@ -13,8 +13,8 @@
+ #include "ui/color/color_provider.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/gfx/canvas.h"
+-#include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/border.h"
+ #include "ui/views/view_class_properties.h"
+@@ -48,27 +48,35 @@ ui::ColorId ContentsContainerOutline::Ge
+ 
+ // static
+ SkPath ContentsContainerOutline::GetPath(const gfx::RectF& local_bounds,
+-                                         float corner_radius) {
++                                         const gfx::RoundedCornersF& radii) {
++  const float upper_left_radius = radii.upper_left();
++  const float upper_right_radius = radii.upper_right();
++  const float lower_right_radius = radii.lower_right();
++  const float lower_left_radius = radii.lower_left();
++
+   SkPathBuilder path;
+-  path.moveTo(local_bounds.x(), local_bounds.y() + corner_radius);
+-  path.arcTo(SkVector(corner_radius, corner_radius), 0.0f,
++  path.moveTo(local_bounds.x(), local_bounds.y() + upper_left_radius);
++  path.arcTo(SkVector(upper_left_radius, upper_left_radius), 0.0f,
+              SkPathBuilder::kSmall_ArcSize, SkPathDirection::kCW,
+-             SkPoint(local_bounds.x() + corner_radius, local_bounds.y()));
+-  path.lineTo(local_bounds.right() - corner_radius, local_bounds.y());
+-  path.arcTo(SkVector(corner_radius, corner_radius), 0.0f,
++             SkPoint(local_bounds.x() + upper_left_radius, local_bounds.y()));
++  path.lineTo(local_bounds.right() - upper_right_radius, local_bounds.y());
++  path.arcTo(SkVector(upper_right_radius, upper_right_radius), 0.0f,
+              SkPathBuilder::kSmall_ArcSize, SkPathDirection::kCW,
+-             SkPoint(local_bounds.right(), local_bounds.y() + corner_radius));
++             SkPoint(local_bounds.right(),
++                     local_bounds.y() + upper_right_radius));
+ 
+-  path.lineTo(local_bounds.right(), local_bounds.bottom() - corner_radius);
++  path.lineTo(local_bounds.right(), local_bounds.bottom() - lower_right_radius);
+   path.arcTo(
+-      SkVector(corner_radius, corner_radius), 0.0f,
++      SkVector(lower_right_radius, lower_right_radius), 0.0f,
+       SkPathBuilder::kSmall_ArcSize, SkPathDirection::kCW,
+-      SkPoint(local_bounds.right() - corner_radius, local_bounds.bottom()));
++      SkPoint(local_bounds.right() -
++              lower_right_radius, local_bounds.bottom()));
+ 
+-  path.lineTo(local_bounds.x() + corner_radius, local_bounds.bottom());
+-  path.arcTo(SkVector(corner_radius, corner_radius), 0.0f,
++  path.lineTo(local_bounds.x() + lower_left_radius, local_bounds.bottom());
++  path.arcTo(SkVector(lower_left_radius, lower_left_radius), 0.0f,
+              SkPathBuilder::kSmall_ArcSize, SkPathDirection::kCW,
+-             SkPoint(local_bounds.x(), local_bounds.bottom() - corner_radius));
++             SkPoint(local_bounds.x(), local_bounds.bottom() -
++                     lower_left_radius));
+   path.close();
+ 
+   if (base::i18n::IsRTL()) {
+@@ -82,6 +90,15 @@ SkPath ContentsContainerOutline::GetPath
+   return path.detach();
+ }
+ 
++void ContentsContainerOutline::SetCornerRadii(
++    const gfx::RoundedCornersF& radii) {
++  if (corner_radii_ == radii) {
++    return;
++  }
++  corner_radii_ = radii;
++  SchedulePaint();
++}
++
+ void ContentsContainerOutline::UpdateState(bool is_active,
+                                            bool is_highlighted) {
+   is_active_ = is_active;
+@@ -102,10 +119,15 @@ void ContentsContainerOutline::OnPaint(g
+   gfx::RectF local_bounds(GetLocalBounds());
+   const float half_thickness = GetThickness(is_highlighted_) / 2.0f;
+   local_bounds.Inset(half_thickness);
+-  const float corner_radius = kCornerRadius - half_thickness;
++
++  const gfx::RoundedCornersF corner_radii(
++      corner_radii_.upper_left() - half_thickness,
++      corner_radii_.upper_right() - half_thickness,
++      corner_radii_.lower_right() - half_thickness,
++      corner_radii_.lower_left() - half_thickness);
+ 
+   SkPath path =
+-      GetPath(local_bounds, corner_radius);
++      GetPath(local_bounds, corner_radii);
+ 
+   canvas->DrawPath(path, flags);
+ }
+--- a/chrome/browser/ui/views/frame/contents_capture_border_view.h
++++ b/chrome/browser/ui/views/frame/contents_capture_border_view.h
+@@ -8,6 +8,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_observer.h"
+ 
+@@ -24,6 +25,7 @@ class ContentsCaptureBorderView : public
+   static constexpr int kContentsBorderThickness = 5;
+ 
+   void SetIsInSplit(bool is_in_split);
++  void SetCornerRadii(const gfx::RoundedCornersF& radii);
+ 
+   // views::View:
+   void OnPaint(gfx::Canvas* canvas) override;
+@@ -37,6 +39,7 @@ class ContentsCaptureBorderView : public
+   void OnViewIsDeleting(views::View* observed_view) override;
+ 
+   bool is_in_split_ = false;
++  gfx::RoundedCornersF corner_radii_;
+   base::ScopedObservation<views::View, views::ViewObserver>
+       view_bounds_observer_{this};
+ };
+--- a/chrome/browser/ui/views/frame/contents_capture_border_view.cc
++++ b/chrome/browser/ui/views/frame/contents_capture_border_view.cc
+@@ -14,7 +14,8 @@
+ #include "ui/views/view_class_properties.h"
+ 
+ ContentsCaptureBorderView::ContentsCaptureBorderView(
+-    views::View* /*mini_toolbar*/) {
++    views::View* /*mini_toolbar*/)
++    : corner_radii_(ContentsContainerOutline::kCornerRadius) {
+   SetProperty(views::kElementIdentifierKey, kContentsCaptureBorder);
+   SetBorder(views::CreateSolidBorder(kContentsBorderThickness,
+                                      kColorCapturedTabContentsBorder));
+@@ -36,6 +37,15 @@ void ContentsCaptureBorderView::SetIsInS
+   }
+ }
+ 
++void ContentsCaptureBorderView::SetCornerRadii(
++    const gfx::RoundedCornersF& radii) {
++  if (corner_radii_ == radii) {
++    return;
++  }
++  corner_radii_ = radii;
++  SchedulePaint();
++}
++
+ void ContentsCaptureBorderView::OnViewBoundsChanged(
+     views::View* observed_view) {
+   SchedulePaint();
+@@ -69,11 +79,15 @@ void ContentsCaptureBorderView::OnPaint(
+   gfx::RectF local_bounds(GetLocalBounds());
+   const float half_thickness = kContentsBorderThickness / 2.0f;
+   local_bounds.Inset(half_thickness);
+-  const float corner_radius =
+-      ContentsContainerOutline::kCornerRadius - half_thickness;
++
++  const gfx::RoundedCornersF corner_radii(
++      corner_radii_.upper_left() - half_thickness,
++      corner_radii_.upper_right() - half_thickness,
++      corner_radii_.lower_right() - half_thickness,
++      corner_radii_.lower_left() - half_thickness);
+ 
+   SkPath path = ContentsContainerOutline::GetPath(
+-      local_bounds, corner_radius);
++      local_bounds, corner_radii);
+ 
+   canvas->DrawPath(path, flags);
+ }

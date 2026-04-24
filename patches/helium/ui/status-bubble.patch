@@ -1,68 +1,107 @@
 --- a/chrome/browser/ui/views/status_bubble_views.cc
 +++ b/chrome/browser/ui/views/status_bubble_views.cc
-@@ -64,7 +64,7 @@
+@@ -5,7 +5,6 @@
+ #include "chrome/browser/ui/views/status_bubble_views.h"
+ 
+ #include <algorithm>
+-#include <array>
+ #include <string_view>
+ #include <utility>
+ 
+@@ -28,11 +27,9 @@
+ #include "chrome/browser/ui/views/chrome_widget_sublevel.h"
+ #include "components/url_formatter/elide_url.h"
+ #include "components/url_formatter/url_formatter.h"
+-#include "third_party/skia/include/core/SkPath.h"
+-#include "third_party/skia/include/core/SkRRect.h"
+-#include "third_party/skia/include/pathops/SkPathOps.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
+ #include "ui/display/display.h"
+ #include "ui/display/screen.h"
+ #include "ui/gfx/animation/linear_animation.h"
+@@ -40,9 +37,10 @@
+ #include "ui/gfx/font_list.h"
+ #include "ui/gfx/geometry/point.h"
+ #include "ui/gfx/geometry/rect.h"
+-#include "ui/gfx/geometry/rrect_f.h"
+-#include "ui/gfx/geometry/skia_conversions.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/scoped_canvas.h"
++#include "ui/gfx/shadow_value.h"
++#include "ui/gfx/skia_paint_util.h"
+ #include "ui/gfx/text_elider.h"
+ #include "ui/gfx/text_utils.h"
+ #include "ui/native_theme/native_theme.h"
+@@ -64,7 +62,10 @@
  namespace {
  
  // The roundedness of the edges of our bubble.
 -constexpr int kBubbleCornerRadius = 4;
-+constexpr int kBubbleCornerRadius = 7;
++constexpr int kBubbleCornerRadius = 16;
++constexpr int kBubbleStrokeWidth = 1;
++constexpr int kBubbleShadowMargin = 8;
++constexpr int kBubblePaintMargin = kBubbleShadowMargin + kBubbleStrokeWidth;
  
  // How close the mouse can get to the infobubble before it starts sliding
  // off-screen.
-@@ -72,7 +72,10 @@ constexpr int kMousePadding = 20;
+@@ -72,7 +73,9 @@ constexpr int kMousePadding = 20;
  
  // The minimum horizontal space between the edges of the text and the edges of
  // the status bubble, not including the outer shadow ring.
 -constexpr int kTextHorizPadding = 5;
-+constexpr int kTextHorizPadding = 8;
-+constexpr int kTextVertPadding = 3;
-+
-+constexpr int kWindowMargin = 10;
++constexpr int kTextHorizPadding = 10;
++constexpr int kTextVertPadding = 5;
++constexpr int kWindowMargin = 8;
  
  // Delays before we start hiding or showing the bubble after we receive a
  // show or hide request.
-@@ -268,7 +271,7 @@ StatusView::~StatusView() {
+@@ -268,8 +271,8 @@ StatusView::~StatusView() {
  }
  
  gfx::Insets StatusView::GetInsets() const {
 -  return gfx::Insets::VH(kShadowThickness,
-+  return gfx::Insets::VH(kShadowThickness + kTextVertPadding,
-                          kShadowThickness + kTextHorizPadding);
+-                         kShadowThickness + kTextHorizPadding);
++  return gfx::Insets::VH(kBubblePaintMargin + kTextVertPadding,
++                         kBubblePaintMargin + kTextHorizPadding);
  }
  
-@@ -470,16 +473,12 @@ void StatusView::CancelDestroyTimer() {
+ std::u16string_view StatusView::GetText() const {
+@@ -469,127 +472,48 @@ void StatusView::CancelDestroyTimer() {
+ }
  
  void StatusView::SetTextLabelColors(views::Label* text) {
-   const auto* color_provider = status_bubble_->base_view()->GetColorProvider();
--  const bool active =
--      status_bubble_->base_view()->GetWidget()->ShouldPaintAsActive();
-   SkColor bubble_color = color_provider->GetColor(
+-  const auto* color_provider = status_bubble_->base_view()->GetColorProvider();
+   const bool active =
+       status_bubble_->base_view()->GetWidget()->ShouldPaintAsActive();
+-  SkColor bubble_color = color_provider->GetColor(
 -      active ? kColorStatusBubbleBackgroundFrameActive
 -             : kColorStatusBubbleBackgroundFrameInactive);
-+      kColorStatusBubbleBackgroundFrameInactive);
-   text->SetBackgroundColor(bubble_color);
-   // Text color is the background tab text color, adjusted if required.
-   text->SetEnabledColor(color_provider->GetColor(
+-  text->SetBackgroundColor(bubble_color);
+-  // Text color is the background tab text color, adjusted if required.
+-  text->SetEnabledColor(color_provider->GetColor(
 -      active ? kColorStatusBubbleForegroundFrameActive
 -             : kColorStatusBubbleForegroundFrameInactive));
-+      kColorStatusBubbleForegroundFrameInactive));
++  const auto bubble_color_id = active ? kColorTabBackgroundActiveFrameActive
++                                      : kColorTabBackgroundActiveFrameInactive;
++  text->SetBackgroundColor(bubble_color_id);
++  // Text color is the focused tab text color, adjusted if required.
++  text->SetEnabledColor(active ? kColorTabForegroundActiveFrameActive
++                               : kColorTabForegroundActiveFrameInactive);
  }
  
  void StatusView::OnPaint(gfx::Canvas* canvas) {
-@@ -487,44 +486,12 @@ void StatusView::OnPaint(gfx::Canvas* ca
-   float scale = canvas->UndoDeviceScaleFactor();
-   const float radius = kBubbleCornerRadius * scale;
- 
+   gfx::ScopedCanvas scoped(canvas);
+-  float scale = canvas->UndoDeviceScaleFactor();
+-  const float radius = kBubbleCornerRadius * scale;
+-
 -  std::array<SkVector, 4> rad{};
 -  auto round_corner = [&rad, radius](gfx::RRectF::Corner c) {
 -    int index = std::to_underlying(c);
 -    rad[index] = {radius, radius};
-+  const SkVector corner = {radius, radius};
-+  std::array<SkVector, 4> rad = {
-+    corner, corner,
-+    corner, corner
-   };
- 
+-  };
+-
 -  // Top Edges - if the bubble is in its bottom position (sticking downwards),
 -  // then we square the top edges. Otherwise, we square the edges based on the
 -  // position of the bubble within the window (the bubble is positioned in the
@@ -95,13 +134,14 @@
 -#endif
 -  }
 -
-   // Snap to pixels to avoid shadow blurriness.
-   gfx::Size scaled_size = gfx::ScaleToRoundedSize(size(), scale);
- 
-@@ -533,20 +500,7 @@ void StatusView::OnPaint(gfx::Canvas* ca
-   // where the web content is visible.
-   const int shadow_thickness_pixels = std::floor(kShadowThickness * scale);
- 
+-  // Snap to pixels to avoid shadow blurriness.
+-  gfx::Size scaled_size = gfx::ScaleToRoundedSize(size(), scale);
+-
+-  // This needs to be pixel-aligned too. Floor is perferred here because a more
+-  // conservative value prevents the bottom edge from occasionally leaving a gap
+-  // where the web content is visible.
+-  const int shadow_thickness_pixels = std::floor(kShadowThickness * scale);
+-
 -  // The shadow will overlap the window frame. Clip it off when the bubble is
 -  // docked. Otherwise when the bubble is floating preserve the full shadow so
 -  // the bubble looks complete.
@@ -114,60 +154,161 @@
 -  }
 -
 -  const int clip_bottom = clip_left || clip_right ? shadow_thickness_pixels : 0;
-   gfx::Rect clip_rect(scaled_size);
+-  gfx::Rect clip_rect(scaled_size);
 -  clip_rect.Inset(gfx::Insets::TLBR(0, clip_left, clip_bottom, clip_right));
-   canvas->ClipRect(clip_rect);
- 
-   gfx::RectF bubble_rect{gfx::SizeF(scaled_size)};
-@@ -556,13 +510,7 @@ void StatusView::OnPaint(gfx::Canvas* ca
-   // bubble bounds by 1 DIP minus 1 pixel. Failing to do this results in drawing
-   // further and further outside the window as the scale increases.
-   const int inset = shadow_thickness_pixels - 1;
--  bubble_rect.Inset(
+-  canvas->ClipRect(clip_rect);
+-
+-  gfx::RectF bubble_rect{gfx::SizeF(scaled_size)};
+-  // Reposition() moves the bubble down and to the left in order to overlap the
+-  // client edge (or window frame when there's no client edge) by 1 DIP. We want
+-  // a 1 pixel shadow on the innermost pixel of that overlap. So we inset the
+-  // bubble bounds by 1 DIP minus 1 pixel. Failing to do this results in drawing
+-  // further and further outside the window as the scale increases.
+-  const int inset = shadow_thickness_pixels - 1;
++  const float scale = canvas->UndoDeviceScaleFactor();
++  const float stroke_width = kBubbleStrokeWidth * scale;
++  const float corner_radius =
++      std::max(0.0f, kBubbleCornerRadius * scale - stroke_width / 2.0f);
++  gfx::RectF bubble_rect{gfx::SizeF(gfx::ScaleToRoundedSize(size(), scale))};
+   bubble_rect.Inset(
 -      gfx::InsetsF()
 -          .set_left(style_ == BubbleStyle::kStandardRight ? 0 : inset)
 -          .set_right(style_ == BubbleStyle::kStandardRight ? inset : 0)
 -          .set_bottom(inset));
 -  // Align to pixel centers now that the layout is correct.
 -  bubble_rect.Inset(0.5);
-+  bubble_rect.Inset(gfx::InsetsF::VH(inset, inset));
+-
+-  const SkPath path = SkPath::RRect(
+-      SkRRect::MakeRectRadii(gfx::RectFToSkRect(bubble_rect), rad.data()));
++      gfx::InsetsF::VH(kBubblePaintMargin * scale, kBubblePaintMargin * scale));
++  bubble_rect.Inset(stroke_width / 2.0f);
  
-   const SkPath path = SkPath::RRect(
-       SkRRect::MakeRectRadii(gfx::RectFToSkRect(bubble_rect), rad.data()));
-@@ -581,15 +529,9 @@ void StatusView::OnPaint(gfx::Canvas* ca
++  const auto* color_provider = status_bubble_->base_view()->GetColorProvider();
++  const bool active =
++      status_bubble_->base_view()->GetWidget()->ShouldPaintAsActive();
++  const auto id = active ? kColorTabBackgroundActiveFrameActive
++                         : kColorTabBackgroundActiveFrameInactive;
+   cc::PaintFlags flags;
+-  flags.setStyle(cc::PaintFlags::kStroke_Style);
+-  flags.setStrokeWidth(1);
+   flags.setAntiAlias(true);
+-
+-  SkPath stroke_path;
+-  flags.getFillPath(path, &stroke_path);
+-
+-  // Get the fill path by subtracting the shadow so they align neatly.
+-  SkPath fill_path;
+-  Op(path, stroke_path, kDifference_SkPathOp, &fill_path);
    flags.setStyle(cc::PaintFlags::kFill_Style);
- 
-   const auto* color_provider = status_bubble_->base_view()->GetColorProvider();
+-
+-  const auto* color_provider = status_bubble_->base_view()->GetColorProvider();
 -  const auto id =
 -      status_bubble_->base_view()->GetWidget()->ShouldPaintAsActive()
 -          ? kColorStatusBubbleBackgroundFrameActive
 -          : kColorStatusBubbleBackgroundFrameInactive;
-+  const auto id = kColorStatusBubbleBackgroundFrameInactive;
    flags.setColor(color_provider->GetColor(id));
-   canvas->sk_canvas()->drawPath(fill_path, flags);
--
+-  canvas->sk_canvas()->drawPath(fill_path, flags);
+ 
 -  flags.setColor(color_provider->GetColor(kColorStatusBubbleShadow));
 -  canvas->sk_canvas()->drawPath(stroke_path, flags);
++  const auto shadow_color =
++      color_provider->GetColor(ui::kColorBubbleBorderShadowLarge);
++  flags.setLooper(gfx::CreateShadowDrawLooper(
++      {{gfx::Vector2d(), 16, shadow_color}}));
++  canvas->DrawRoundRect(bubble_rect, corner_radius, flags);
++
++  flags.setLooper(nullptr);
++  flags.setStyle(cc::PaintFlags::kStroke_Style);
++  flags.setStrokeWidth(stroke_width);
++  flags.setColor(color_provider->GetColor(kColorToolbarSeparator));
++  canvas->DrawRoundRect(bubble_rect, corner_radius, flags);
  }
  
  DEFINE_ENUM_CONVERTERS(StatusView::BubbleState,
-@@ -805,7 +747,9 @@ void StatusBubbleViews::Reposition() {
-   int overlap = kShadowThickness;
+@@ -732,6 +656,8 @@ void StatusBubbleViews::StatusViewExpand
+ // StatusBubbleViews -----------------------------------------------------------
+ 
+ const int StatusBubbleViews::kShadowThickness = 1;
++const int StatusBubbleViews::kTotalVerticalPadding =
++    2 * (kBubblePaintMargin + kTextVertPadding);
+ 
+ StatusBubbleViews::StatusBubbleViews(views::View* base_view)
+     : base_view_(base_view),
+@@ -764,6 +690,7 @@ void StatusBubbleViews::InitPopup() {
+     params.force_software_compositing = true;
+ #endif
+     params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++    params.shadow_type = views::Widget::InitParams::ShadowType::kNone;
+     params.accept_events = false;
+     views::Widget* widget = base_view_->GetWidget();
+     params.parent = widget->GetNativeView();
+@@ -800,12 +727,11 @@ void StatusBubbleViews::DestroyPopup() {
+ }
+ 
+ void StatusBubbleViews::Reposition() {
+-  // Overlap the client edge that's shown in restored mode, or when there is no
+-  // client edge this makes the bubble snug with the corner of the window.
+-  int overlap = kShadowThickness;
    int height = GetPreferredHeight();
    int base_view_height = base_view_->bounds().height();
 -  gfx::Point origin(-overlap, base_view_height - height + overlap);
-+  gfx::Point origin(
-+    -overlap + kWindowMargin, base_view_height - height - kWindowMargin + overlap
-+  );
++  gfx::Point origin(-kBubblePaintMargin + kWindowMargin,
++                    base_view_height - height - kWindowMargin +
++                        kBubblePaintMargin);
    SetBounds(origin.x(), origin.y(), base_view_->bounds().width() / 3, height);
  }
  
-@@ -843,7 +787,7 @@ int StatusBubbleViews::GetWidthForURL(co
+@@ -843,7 +769,7 @@ int StatusBubbleViews::GetWidthForURL(co
    // Get the width of the elided url
    int elided_url_width = gfx::GetStringWidth(url_string, GetFont());
    // Add proper paddings
 -  return elided_url_width + (kShadowThickness + kTextHorizPadding) * 2 + 1;
-+  return elided_url_width + (kShadowThickness + kTextHorizPadding) * 2;
++  return elided_url_width + (kBubblePaintMargin + kTextHorizPadding) * 2;
  }
  
  void StatusBubbleViews::SetStatus(const std::u16string& status_text) {
+@@ -898,7 +824,7 @@ void StatusBubbleViews::SetURL(const GUR
+ 
+   // Set Elided Text corresponding to the GURL object.
+   int text_width = static_cast<int>(
+-      size_.width() - (kShadowThickness + kTextHorizPadding) * 2 - 1);
++      size_.width() - (kBubblePaintMargin + kTextHorizPadding) * 2 - 1);
+   url_text_ = url_formatter::ElideUrl(url, GetFont(), text_width);
+ 
+   // Get the width of the URL if the bubble width is the maximum size.
+@@ -1016,9 +942,7 @@ void StatusBubbleViews::AvoidMouse(const
+            static_cast<float>(kMousePadding)));
+     }
+ 
+-    // Cap the offset and change the visual presentation of the bubble
+-    // depending on where it ends up (so that rounded corners square off
+-    // and mate to the edges of the tab content).
++    // Cap the offset and update the bubble state based on where it ends up.
+     if (offset >= size_.height() - kShadowThickness * 2) {
+       offset = size_.height() - kShadowThickness * 2;
+       view_->SetStyle(StatusView::BubbleStyle::kBottom);
+@@ -1096,7 +1020,7 @@ int StatusBubbleViews::GetMaxStatusBubbl
+   const ui::NativeTheme* theme = base_view_->GetNativeTheme();
+   return static_cast<int>(
+       std::max(0, base_view_->bounds().width() -
+-                      (kShadowThickness + kTextHorizPadding) * 2 - 1 -
++                      (kBubblePaintMargin + kTextHorizPadding) * 2 - 1 -
+                       views::ScrollBarViews::GetVerticalScrollBarWidth(theme)));
+ }
+ 
+--- a/chrome/browser/ui/views/status_bubble_views.h
++++ b/chrome/browser/ui/views/status_bubble_views.h
+@@ -34,11 +34,11 @@ class StatusBubbleViews : public StatusB
+  public:
+   class StatusView;
+ 
+-  // How wide the bubble's shadow is.
++  // Edge inset used while sliding the bubble away from the cursor.
+   static const int kShadowThickness;
+ 
+   // The combined vertical padding above and below the text.
+-  static const int kTotalVerticalPadding = 7;
++  static const int kTotalVerticalPadding;
+ 
+   // |base_view| is the view that this bubble is positioned relative to.
+   explicit StatusBubbleViews(views::View* base_view);

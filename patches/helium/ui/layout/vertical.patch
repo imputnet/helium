@@ -283,7 +283,24 @@
    }
  
    if (dynamic_tab_strip) {
-@@ -1119,26 +1048,25 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+@@ -1008,6 +937,16 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+     params.InsetHorizontal(visible_width, contents_height_side_panel_leading);
+   }
+ 
++  if (tab_strip_type == TabStripType::kVertical) {
++    // Treat the vertical tab strip as an attached content edge, matching side
++    // panels, so rounded content drops its padding and bottom radius there.
++    if (vertical_right_aligned) {
++      show_trailing_separator = true;
++    } else {
++      show_leading_separator = true;
++    }
++  }
++
+   // Show separators in multi-contents view. Note that the multi-contents
+   // view is inside the main container so doesn't need to be laid out.
+   views().multi_contents_view->SetShouldShowLeadingSeparator(
+@@ -1119,26 +1058,25 @@ BrowserViewTabbedLayoutImpl::CalculatePr
          views().vertical_tab_strip_region_view, views().browser_view);
      CHECK(tabstrip_bounds);
  
@@ -1010,362 +1027,19 @@
    base::CallbackListSubscription collapsed_state_changed_subscription_;
    base::CallbackListSubscription new_tab_button_pressed_subscription_;
  
---- a/chrome/browser/ui/views/frame/multi_contents_view.h
-+++ b/chrome/browser/ui/views/frame/multi_contents_view.h
-@@ -152,6 +152,7 @@ class MultiContentsView : public views::
-   void OnResize(int resize_amount, bool done_resizing) override;
- 
-   // views::View:
-+  void Layout(PassKey pass_key) override;
-   void OnThemeChanged() override;
- 
-   const std::vector<ContentsContainerView*>& contents_container_views() const {
---- a/chrome/browser/ui/views/frame/multi_contents_view.cc
-+++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
-@@ -397,6 +397,11 @@ double MultiContentsView::CalculateRatio
-   return end_width / total_width;
- }
- 
-+void MultiContentsView::Layout(PassKey pass_key) {
-+  LayoutSuperclass<views::View>(this);
-+  UpdateContentsBorderAndOverlay();
-+}
-+
- void MultiContentsView::OnThemeChanged() {
-   views::View::OnThemeChanged();
-   UpdateContentsBorderAndOverlay();
-@@ -736,11 +741,10 @@ int MultiContentsView::GetMinViewWidth(g
- 
- void MultiContentsView::UpdateContentsBorderAndOverlay() {
-   for (auto* contents_container_view : contents_container_views_) {
--    const bool is_active =
--        contents_container_view->contents_view() == GetActiveContentsView();
--    contents_container_view->UpdateBorderAndOverlay(
--        IsInSplitView(), is_active,
--        is_active && active_contents_view_highlighted_);
-+    const bool is_first_view =
-+        contents_container_view == contents_container_views_.front();
-+    contents_container_view->UpdateBorderAndOverlay(IsInSplitView(),
-+                                                    is_first_view);
-   }
- }
- 
---- a/chrome/browser/ui/views/frame/contents_container_view.h
-+++ b/chrome/browser/ui/views/frame/contents_container_view.h
-@@ -8,6 +8,7 @@
- #include <memory>
- #include <optional>
- 
-+#include "base/callback_list.h"
- #include "base/memory/raw_ptr.h"
- #include "base/scoped_observation.h"
- #include "chrome/browser/devtools/devtools_contents_resizing_strategy.h"
-@@ -19,11 +20,16 @@
- class BrowserView;
- class ContentsContainerOutline;
- class ContentsWebView;
-+class LeadingCornerFillView;
- class MultiContentsViewMiniToolbar;
- class ScrimView;
- class ActorOverlayWebView;
- class ReadAnythingImmersiveOverlayView;
- 
-+namespace tabs {
-+class VerticalTabStripStateController;
-+}  // namespace tabs
-+
- namespace gfx {
- class Rect;
- }  // namespace gfx
-@@ -110,9 +116,7 @@ class ContentsContainerView : public vie
-                               SkColor outline_color,
-                               int font_size);
- 
--  void UpdateBorderAndOverlay(bool is_in_split,
--                              bool is_active,
--                              bool is_highlighted);
-+  void UpdateBorderAndOverlay(bool is_in_split, bool is_first_view);
- 
-   void ShowCaptureContentsBorder();
-   void HideCaptureContentsBorder();
-@@ -139,9 +143,9 @@ class ContentsContainerView : public vie
-   // the bounds of contents_webview relative to the local bounds of the
-   // container that holds both contents_webview and devtools_webview.
-   void UpdateDevToolsDockedPlacement();
-+  void OnVerticalTabStripStateChanged(tabs::VerticalTabStripStateController*);
- 
-   // views::View:
--  void ChildVisibilityChanged(View* child) override;
-   void Layout(PassKey) override;
- 
-   // views::ViewObserver:
-@@ -152,6 +156,7 @@ class ContentsContainerView : public vie
-       const views::SizeBounds& size_bounds) const override;
- 
-   bool is_in_split_ = false;
-+  bool is_first_view_ = false;
- 
-   raw_ptr<BrowserView> browser_view_ = nullptr;
-   raw_ptr<ContentsWebView> contents_view_ = nullptr;
-@@ -184,6 +189,9 @@ class ContentsContainerView : public vie
-   // open.
-   raw_ptr<ScrimView> contents_scrim_view_ = nullptr;
- 
-+  // Overlay rounded corner used in vertical layout.
-+  raw_ptr<LeadingCornerFillView> leading_corner_fill_view_ = nullptr;
-+
-   // The view that contains the Glic Actor Overlay. The Actor Overlay is a UI
-   // overlay that is shown on top of the web contents.
-   raw_ptr<ActorOverlayWebView> actor_overlay_web_view_ = nullptr;
-@@ -208,6 +216,7 @@ class ContentsContainerView : public vie
- 
-   DevToolsContentsResizingStrategy strategy_;
-   base::ScopedObservation<View, ViewObserver> view_bounds_observer_{this};
-+  base::CallbackListSubscription vertical_tab_strip_state_subscription_;
- };
- 
- #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_CONTENTS_CONTAINER_VIEW_H_
---- a/chrome/browser/ui/views/frame/contents_container_view.cc
-+++ b/chrome/browser/ui/views/frame/contents_container_view.cc
-@@ -7,6 +7,9 @@
- #include <memory>
- #include <optional>
- 
-+#include "base/functional/bind.h"
-+#include "base/i18n/rtl.h"
-+#include "base/scoped_observation.h"
- #include "chrome/browser/actor/ui/actor_overlay_web_view.h"
- #include "chrome/browser/devtools/devtools_contents_resizing_strategy.h"
- #include "chrome/browser/enterprise/watermark/watermark_view.h"
-@@ -16,7 +19,9 @@
- #include "chrome/browser/profiles/profile.h"
- #include "chrome/browser/ui/browser_element_identifiers.h"
- #include "chrome/browser/ui/color/chrome_color_id.h"
-+#include "chrome/browser/ui/layout_constants.h"
- #include "chrome/browser/ui/read_anything/read_anything_immersive_overlay_view.h"
-+#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
- #include "chrome/browser/ui/ui_features.h"
- #include "chrome/browser/ui/view_ids.h"
- #include "chrome/browser/ui/views/frame/browser_view.h"
-@@ -31,13 +36,17 @@
- #include "chrome/common/chrome_features.h"
- #include "components/search/ntp_features.h"
- #include "content/public/browser/web_contents.h"
-+#include "third_party/skia/include/core/SkPathBuilder.h"
-+#include "third_party/skia/include/core/SkRRect.h"
- #include "ui/accessibility/accessibility_features.h"
-+#include "ui/base/metadata/metadata_header_macros.h"
- #include "ui/base/metadata/metadata_impl_macros.h"
- #include "ui/color/color_provider.h"
- #include "ui/compositor/layer.h"
- #include "ui/gfx/geometry/insets.h"
- #include "ui/gfx/geometry/rect.h"
--#include "ui/views/border.h"
-+#include "ui/gfx/geometry/skia_conversions.h"
-+#include "ui/gfx/scoped_canvas.h"
- #include "ui/views/layout/delegating_layout_manager.h"
- #include "ui/views/layout/fill_layout.h"
- #include "ui/views/layout/proposed_layout.h"
-@@ -45,6 +54,7 @@
- #include "ui/views/view.h"
- #include "ui/views/view_class_properties.h"
- #include "ui/views/widget/widget.h"
-+#include "ui/views/widget/widget_observer.h"
- 
- #if BUILDFLAG(IS_WIN)
- #include "ui/views/widget/native_widget_aura.h"
-@@ -55,6 +65,107 @@ constexpr int kNewTabFooterSeparatorHeig
- constexpr int kNewTabFooterHeight = 56;
- }  // namespace
- 
-+class LeadingCornerFillView final : public views::View,
-+                                    public views::WidgetObserver {
-+  METADATA_HEADER(LeadingCornerFillView, views::View)
-+
-+ public:
-+  LeadingCornerFillView() {
-+    SetPaintToLayer();
-+    layer()->SetFillsBoundsOpaquely(false);
-+    SetCanProcessEventsWithinSubtree(false);
-+    SetVisible(false);
-+  }
-+
-+  gfx::Size CalculatePreferredSize(const views::SizeBounds&) const override {
-+    return gfx::Size(corner_radius_, corner_radius_);
-+  }
-+
-+  void SetCornerRadius(int corner_radius) {
-+    if (corner_radius_ == corner_radius) {
-+      return;
-+    }
-+    corner_radius_ = corner_radius;
-+    SetVisible(corner_radius_ > 0);
-+    PreferredSizeChanged();
-+    SchedulePaint();
-+  }
-+
-+  void SetCornerOnRight(bool corner_on_right) {
-+    if (corner_on_right_ == corner_on_right) {
-+      return;
-+    }
-+    corner_on_right_ = corner_on_right;
-+    PreferredSizeChanged();
-+    SchedulePaint();
-+  }
-+
-+  bool IsCornerOnRight() const { return corner_on_right_; }
-+
-+  void OnThemeChanged() override {
-+    View::OnThemeChanged();
-+    SchedulePaint();
-+  }
-+
-+  void AddedToWidget() override {
-+    View::AddedToWidget();
-+    if (auto* widget = GetWidget()) {
-+      widget_observation_.Observe(widget);
-+    }
-+  }
-+
-+  void RemovedFromWidget() override {
-+    widget_observation_.Reset();
-+    View::RemovedFromWidget();
-+  }
-+
-+  void OnPaint(gfx::Canvas* canvas) override {
-+    if (corner_radius_ <= 0) {
-+      return;
-+    }
-+
-+    const float corner_radius = static_cast<float>(corner_radius_);
-+    const bool is_rtl = base::i18n::IsRTL();
-+    const bool corner_on_right = is_rtl ? !corner_on_right_ : corner_on_right_;
-+    const SkVector rounded_vector = {corner_radius, corner_radius};
-+    const SkVector radii[4] = {
-+        corner_on_right ? SkVector{0, 0} : rounded_vector,
-+        corner_on_right ? rounded_vector : SkVector{0, 0},
-+        {0, 0},
-+        {0, 0},
-+    };
-+
-+    const SkRect bounds = gfx::RectToSkRect(GetLocalBounds());
-+    SkPathBuilder path;
-+    path.addRect(bounds);
-+    path.addRRect(SkRRect::MakeRectRadii(bounds, radii));
-+    SkPath outer_corner_path = path.detach();
-+    outer_corner_path.setFillType(SkPathFillType::kEvenOdd);
-+
-+    gfx::ScopedCanvas scoped_canvas(canvas);
-+    canvas->ClipPath(outer_corner_path, /*anti_alias=*/true);
-+    canvas->DrawColor(GetColorProvider()->GetColor(
-+        GetWidget() && !GetWidget()->ShouldPaintAsActive()
-+            ? ui::kColorFrameInactive
-+            : ui::kColorFrameActive));
-+  }
-+
-+  // views::WidgetObserver:
-+  void OnWidgetActivationChanged(views::Widget* /*widget*/,
-+                                 bool /*active*/) override {
-+    SchedulePaint();
-+  }
-+
-+ private:
-+  int corner_radius_ = 0;
-+  bool corner_on_right_ = false;
-+  base::ScopedObservation<views::Widget, views::WidgetObserver>
-+      widget_observation_{this};
-+};
-+
-+BEGIN_METADATA(LeadingCornerFillView)
-+END_METADATA
-+
- ContentsContainerView::ContentsContainerView(BrowserView* browser_view)
-     : browser_view_(browser_view),
-       web_contents_modal_dialog_host_(browser_view_, this) {
-@@ -78,6 +189,8 @@ ContentsContainerView::ContentsContainer
-   contents_view_ = AddChildView(
-       std::make_unique<ContentsWebView>(browser_view->GetProfile()));
-   contents_view_->SetID(VIEW_ID_TAB_CONTAINER);
-+  leading_corner_fill_view_ =
-+      AddChildView(std::make_unique<LeadingCornerFillView>());
- 
-   if (base::FeatureList::IsEnabled(ntp_features::kNtpFooter)) {
-     new_tab_footer_view_separator_ =
-@@ -137,6 +250,15 @@ ContentsContainerView::ContentsContainer
-   }
- 
-   view_bounds_observer_.Observe(contents_view_);
-+
-+  auto* vertical_controller =
-+      tabs::VerticalTabStripStateController::From(browser_view_->browser());
-+  if (vertical_controller) {
-+    vertical_tab_strip_state_subscription_ =
-+        vertical_controller->RegisterOnCollapseChanged(base::BindRepeating(
-+            &ContentsContainerView::OnVerticalTabStripStateChanged,
-+            base::Unretained(this)));
-+  }
- }
- 
- ContentsContainerView::~ContentsContainerView() {
-@@ -164,10 +286,31 @@ std::vector<views::View*> ContentsContai
- }
- 
- void ContentsContainerView::UpdateBorderAndOverlay(bool is_in_split,
--                                                   bool is_active,
--                                                   bool is_highlighted) {}
--
--void ContentsContainerView::ChildVisibilityChanged(View* child) {}
-+                                                   bool is_first_view) {
-+  is_in_split_ = is_in_split;
-+  is_first_view_ = is_first_view;
-+
-+  const bool show_corner_fill = browser_view_->ShouldDrawVerticalTabStrip() &&
-+                                (!is_in_split || is_first_view);
-+  bool corner_on_right = false;
-+  if (show_corner_fill) {
-+    auto* controller =
-+        tabs::VerticalTabStripStateController::From(browser_view_->browser());
-+    corner_on_right = controller && controller->IsTabStripRightAligned();
-+  }
-+  const int corner_radius =
-+      show_corner_fill
-+          ? GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius)
-+          : 0;
-+  leading_corner_fill_view_->SetCornerOnRight(corner_on_right);
-+  leading_corner_fill_view_->SetCornerRadius(corner_radius);
-+}
-+
-+void ContentsContainerView::OnVerticalTabStripStateChanged(
-+    tabs::VerticalTabStripStateController*) {
-+  UpdateBorderAndOverlay(is_in_split_, is_first_view_);
-+  InvalidateLayout();
-+}
- 
- void ContentsContainerView::Layout(PassKey pass_key) {
-   LayoutSuperclass<views::View>(this);
-@@ -441,6 +584,19 @@ views::ProposedLayout ContentsContainerV
-   layouts.child_layouts.emplace_back(
-       contents_view_.get(), contents_view_->GetVisible(), contents_rect);
- 
-+  if (leading_corner_fill_view_) {
-+    const gfx::Size corner_size = leading_corner_fill_view_->GetPreferredSize();
-+    const gfx::Rect corner_bounds(
-+        leading_corner_fill_view_->IsCornerOnRight()
-+            ? gfx::Point(contents_rect.right() - corner_size.width(),
-+                         contents_rect.y())
-+            : contents_rect.origin(),
-+        corner_size);
-+    layouts.child_layouts.emplace_back(leading_corner_fill_view_.get(),
-+                                       leading_corner_fill_view_->GetVisible(),
-+                                       corner_bounds);
-+  }
-+
-   if (glic_border_) {
-     // |glic_border_| should not be seen over devtools.
-     layouts.child_layouts.emplace_back(glic_border_.get(),
 --- a/chrome/browser/ui/views/frame/browser_view.h
 +++ b/chrome/browser/ui/views/frame/browser_view.h
-@@ -1313,10 +1313,6 @@ class BrowserView : public BrowserWindow
+@@ -354,6 +354,9 @@ class BrowserView : public BrowserWindow
+   // Returns whether a vertical tabstrip should be shown.
+   bool ShouldDrawVerticalTabStrip() const;
+ 
++  // Returns whether vertical tabs are aligned to the right edge.
++  bool IsVerticalTabStripRightAligned() const;
++
+   // Returns whether the webapp frame toolbar should be drawn.
+   bool ShouldDrawWebAppFrameToolbar() const;
+ 
+@@ -1313,10 +1316,6 @@ class BrowserView : public BrowserWindow
    // The view responsible for housing the contents of the vertical tab strip.
    raw_ptr<VerticalTabStripRegionView> vertical_tab_strip_region_view_ = nullptr;
  
@@ -1405,7 +1079,7 @@
  #include "chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h"
  #include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
  #include "chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h"
-@@ -1086,25 +1086,6 @@ BrowserView::BrowserView(Browser* browse
+@@ -1087,25 +1087,6 @@ BrowserView::BrowserView(Browser* browse
  
      vertical_tab_strip_region_view_ =
          AddChildView(std::move(vertical_tab_strip_container));
@@ -1431,7 +1105,7 @@
    } else {
      horizontal_tab_strip_region_view_->InitializeTabStrip();
    }
-@@ -1221,8 +1202,6 @@ BrowserView::~BrowserView() {
+@@ -1222,8 +1203,6 @@ BrowserView::~BrowserView() {
    window_scrim_view_ = nullptr;
    contents_container_ = nullptr;
    vertical_tab_strip_region_view_ = nullptr;
@@ -1440,7 +1114,19 @@
    projects_panel_container_ = nullptr;
    toolbar_height_side_panel_ = nullptr;
    contents_height_side_panel_ = nullptr;
-@@ -1614,7 +1593,20 @@ bool BrowserView::IsInSplitView() const
+@@ -1498,6 +1477,11 @@ bool BrowserView::ShouldDrawVerticalTabS
+          controller->ShouldDisplayVerticalTabs() && browser_->is_type_normal();
+ }
+ 
++bool BrowserView::IsVerticalTabStripRightAligned() const {
++  auto* controller = tabs::VerticalTabStripStateController::From(browser_);
++  return controller && controller->IsTabStripRightAligned();
++}
++
+ bool BrowserView::ShouldDrawWebAppFrameToolbar() const {
+   return !IsUnframedModeEnabled() &&
+          GetFrameView()->ShouldShowWebAppFrameToolbar();
+@@ -1615,7 +1599,20 @@ bool BrowserView::IsInSplitView() const
  
  void BrowserView::OnVerticalTabStripModeChanged(
      tabs::VerticalTabStripStateController* controller) {
@@ -1462,7 +1148,7 @@
      horizontal_tab_strip_region_view_->ResetTabStrip();
      vertical_tab_strip_region_view_->InitializeTabStrip();
    } else {
-@@ -4474,13 +4466,23 @@ void BrowserView::CreateTabSearchBubble(
+@@ -4476,13 +4473,23 @@ void BrowserView::CreateTabSearchBubble(
    }
  #endif  // BUILDFLAG(ENABLE_WEBUI_TAB_STRIP)
  
@@ -1488,7 +1174,7 @@
      tab_search_host->CloseTabSearchBubble();
    }
  }
-@@ -4520,34 +4522,41 @@ void BrowserView::UpdateTabSearchBubbleH
+@@ -4522,34 +4529,41 @@ void BrowserView::UpdateTabSearchBubbleH
      return;
    }
  
@@ -1550,7 +1236,7 @@
    }
  }
  
-@@ -5308,9 +5317,6 @@ void BrowserView::AddedToWidget() {
+@@ -5310,9 +5324,6 @@ void BrowserView::AddedToWidget() {
    layout_views.horizontal_tab_strip_region_view =
        horizontal_tab_strip_region_view_;
    layout_views.vertical_tab_strip_region_view = vertical_tab_strip_region_view_;
@@ -1615,3 +1301,43 @@
    AddSeparator(ui::NORMAL_SEPARATOR);
  
    AddItemWithStringId(TabStripModel::CommandDiscard, IDS_TAB_CXMENU_HIBERNATE);
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+@@ -11,7 +11,6 @@
+ #include "chrome/browser/ui/find_bar/find_bar_controller.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
+-#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -60,9 +59,7 @@ bool BrowserViewLayoutDelegateImpl::IsVe
+ }
+ 
+ bool BrowserViewLayoutDelegateImpl::IsVerticalTabStripRightAligned() const {
+-  auto* controller =
+-      tabs::VerticalTabStripStateController::From(browser_view_->browser());
+-  return controller && controller->IsTabStripRightAligned();
++  return browser_view_->IsVerticalTabStripRightAligned();
+ }
+ 
+ bool BrowserViewLayoutDelegateImpl::ShouldDrawWebAppFrameToolbar() const {
+--- a/chrome/browser/ui/views/side_panel/side_panel.cc
++++ b/chrome/browser/ui/views/side_panel/side_panel.cc
+@@ -113,11 +113,12 @@ gfx::RoundedCornersF GetContentRoundedCo
+       side_panel->GetWidget() && side_panel->GetWidget()->IsFullscreen();
+   const int window_edge_radius =
+       is_fullscreen ? generic_radius : GetPaddedFrameRadius();
+-  const bool lower_corner_touches_window_edge =
+-      !browser_view->ShouldDrawVerticalTabStrip() ||
+-      side_panel->IsRightAligned() != base::i18n::IsRTL();
++  const bool vertical_tabstrip_on_panel_side =
++      browser_view->ShouldDrawVerticalTabStrip() &&
++      (browser_view->IsVerticalTabStripRightAligned() ==
++       side_panel->IsRightAligned());
+   const int lower_window_edge_radius =
+-      lower_corner_touches_window_edge ? window_edge_radius : generic_radius;
++      !vertical_tabstrip_on_panel_side ? window_edge_radius : generic_radius;
+ 
+   return side_panel->IsRightAligned()
+              ? gfx::RoundedCornersF(generic_radius, generic_radius,
