@@ -178,18 +178,19 @@
    HeliumLayoutType GetBrowserLayout() const;
 --- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
-@@ -48,6 +48,8 @@ void RegisterProfilePrefs(user_prefs::Pr
+@@ -48,6 +48,9 @@ void RegisterProfilePrefs(user_prefs::Pr
    registry->RegisterIntegerPref(prefs::kHeliumLayout,
                                  std::to_underlying(HeliumLayoutType::kClassic));
    registry->RegisterBooleanPref(prefs::kHeliumVerticalRightAligned, false);
 +  registry->RegisterBooleanPref(prefs::kHeliumZenMode, false);
 +  registry->RegisterBooleanPref(prefs::kHeliumZenModeSidebarPinned, false);
++  registry->RegisterBooleanPref(prefs::kHeliumZenModeTopChromePinned, false);
    registry->RegisterBooleanPref(prefs::kHeliumVerticalCollapsed, false);
    registry->RegisterIntegerPref(prefs::kHeliumVerticalUncollapsedWidth,
                                  kVerticalTabStripDefaultUncollapsedWidth);
 --- a/chrome/common/pref_names.h
 +++ b/chrome/common/pref_names.h
-@@ -1246,6 +1246,13 @@ inline constexpr char kHeliumLayout[] =
+@@ -1246,6 +1246,17 @@ inline constexpr char kHeliumLayout[] =
  inline constexpr char kHeliumVerticalRightAligned[] =
      "helium.browser.vertical_right_aligned";
  
@@ -200,6 +201,83 @@
 +inline constexpr char kHeliumZenModeSidebarPinned[] =
 +    "helium.browser.zen_mode_sidebar_pinned";
 +
++// A boolean pref set to true if the top toolbar is pinned in zen mode.
++inline constexpr char kHeliumZenModeTopChromePinned[] =
++    "helium.browser.zen_mode_top_chrome_pinned";
++
  // A boolean pref set to true if vertical tabs are collapsed.
  inline constexpr char kHeliumVerticalCollapsed[] =
      "helium.browser.vertical_collapsed";
+--- a/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
+@@ -270,6 +270,7 @@ void BrowserNativeWidgetMac::ValidateUse
+     case IDC_PRINT:
+     case IDC_RELOAD:
+     case IDC_CTRL_S_SHORTCUT:
++    case IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN:
+     case IDC_SAVE_PAGE:
+     case IDC_SELECT_NEXT_TAB:
+     case IDC_SELECT_PREVIOUS_TAB:
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -103,6 +103,7 @@
+ #define IDC_BROWSER_LAYOUT_DYNAMIC      34086
+ 
+ #define IDC_CTRL_S_SHORTCUT             34090
++#define IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN 34091
+ 
+ // Tab group Commands
+ #define IDC_ADD_NEW_TAB_TO_GROUP      34100
+--- a/chrome/app/chrome_dll.rc
++++ b/chrome/app/chrome_dll.rc
+@@ -61,6 +61,7 @@ BEGIN
+     "A",            IDC_FOCUS_INACTIVE_POPUP_FOR_ACCESSIBILITY,         VIRTKEY, SHIFT, ALT
+     "D",            IDC_FOCUS_LOCATION,         VIRTKEY, ALT
+     "L",            IDC_FOCUS_LOCATION,         VIRTKEY, CONTROL
++    "L",            IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN, VIRTKEY, CONTROL, SHIFT
+     VK_F10,         IDC_FOCUS_MENU_BAR,         VIRTKEY
+     VK_MENU,        IDC_FOCUS_MENU_BAR,         VIRTKEY
+     VK_F6,          IDC_FOCUS_NEXT_PANE,        VIRTKEY
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -144,6 +144,7 @@ const std::vector<KeyboardShortcutData>&
+       {true,  false, false, false, kVK_ANSI_Keypad9,      IDC_SELECT_LAST_TAB},
+ 
+       {true,  false, false, false, kVK_ANSI_S,            IDC_CTRL_S_SHORTCUT},
++      {true,  true,  false, false, kVK_ANSI_L,            IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN},
+ 
+       {true,  true,  false, false, kVK_ANSI_M,            IDC_SHOW_AVATAR_MENU},
+       {true,  false, false, true,  kVK_ANSI_L,            IDC_SHOW_DOWNLOADS},
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -65,6 +65,8 @@ const AcceleratorMapping kAcceleratorMap
+     {ui::VKEY_G, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR,
+      IDC_FIND_PREVIOUS},
+     {ui::VKEY_L, ui::EF_PLATFORM_ACCELERATOR, IDC_FOCUS_LOCATION},
++    {ui::VKEY_L, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR,
++     IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN},
+     {ui::VKEY_O, ui::EF_PLATFORM_ACCELERATOR, IDC_OPEN_FILE},
+     {ui::VKEY_P, ui::EF_PLATFORM_ACCELERATOR, IDC_PRINT},
+     {ui::VKEY_R, ui::EF_PLATFORM_ACCELERATOR, IDC_RELOAD},
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -1811,6 +1811,8 @@ void BrowserCommandController::InitComma
+   // These are always enabled; the menu determines their menu item visibility.
+   command_updater_.UpdateCommandEnabled(IDC_UPGRADE_DIALOG, true);
+   command_updater_.UpdateCommandEnabled(IDC_HELIUM_SERVICES_OPEN, true);
++  command_updater_.UpdateCommandEnabled(IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN,
++                                        false);
+   command_updater_.UpdateCommandEnabled(IDC_SET_BROWSER_AS_DEFAULT, true);
+ 
+   // Safety Hub commands.
+--- a/chrome/browser/ui/cocoa/accelerators_cocoa.mm
++++ b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+@@ -49,6 +49,8 @@ const struct AcceleratorMapping {
+     {IDC_PRINT, ui::EF_COMMAND_DOWN, ui::VKEY_P},
+     {IDC_RESTORE_TAB, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_T},
+     {IDC_CTRL_S_SHORTCUT, ui::EF_COMMAND_DOWN, ui::VKEY_S},
++    {IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN,
++     ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_L},
+     {IDC_SHOW_BOOKMARK_BAR, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
+      ui::VKEY_B},
+     {IDC_SHOW_BOOKMARK_MANAGER, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN,
