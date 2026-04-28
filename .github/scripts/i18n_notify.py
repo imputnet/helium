@@ -21,7 +21,7 @@ def main():
         if '/translations/' not in path:
             continue
         lang = path.split('/')[-1].removesuffix('.json')
-        for user in owners.get(lang, []):
+        for user in owners.get(lang) or []:
             mentions.add(f'@{user}')
 
     if mentions:
