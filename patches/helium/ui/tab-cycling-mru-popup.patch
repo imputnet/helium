@@ -1,0 +1,584 @@
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/tab_cycling_popup_view.h
+@@ -0,0 +1,84 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_TAB_CYCLING_POPUP_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_TAB_CYCLING_POPUP_VIEW_H_
++
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/controls/button/label_button.h"
++
++namespace ui {
++class ImageModel;
++}  // namespace ui
++
++class TabStripModel;
++
++class TabCyclingRowButton : public views::LabelButton {
++  METADATA_HEADER(TabCyclingRowButton, views::LabelButton)
++
++ public:
++  TabCyclingRowButton(const std::u16string& title,
++                      const ui::ImageModel& favicon);
++  ~TabCyclingRowButton() override;
++
++  TabCyclingRowButton(const TabCyclingRowButton&) = delete;
++  TabCyclingRowButton& operator=(const TabCyclingRowButton&) = delete;
++
++  void SetHighlighted(bool highlighted);
++
++  int tab_index() const { return tab_index_; }
++  void set_tab_index(int index) { tab_index_ = index; }
++
++ protected:
++  bool OnMousePressed(const ui::MouseEvent& event) override;
++  void OnMouseEntered(const ui::MouseEvent& event) override;
++  void OnMouseExited(const ui::MouseEvent& event) override;
++
++ private:
++  int tab_index_ = -1;
++};
++
++class TabCyclingPopupView : public views::BubbleDialogDelegateView {
++  METADATA_HEADER(TabCyclingPopupView, views::BubbleDialogDelegateView)
++
++ public:
++  using DestroyCallback = base::OnceClosure;
++
++  TabCyclingPopupView(views::View* anchor_view,
++                      TabStripModel* tab_strip_model,
++                      const std::vector<int>& mru_list);
++  ~TabCyclingPopupView() override;
++
++  TabCyclingPopupView(const TabCyclingPopupView&) = delete;
++  TabCyclingPopupView& operator=(const TabCyclingPopupView&) = delete;
++
++  void SetDestroyCallback(DestroyCallback callback);
++
++  void SetSelectedIndex(int index);
++  int GetSelectedIndex() const { return selected_index_; }
++
++  int GetSelectedTabIndex() const;
++
++  int GetRowCount() const { return static_cast<int>(rows_.size()); }
++
++  // views::BubbleDialogDelegateView:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void OnWidgetDestroying(views::Widget* widget) override;
++
++ private:
++  void PopulateRows(TabStripModel* model, const std::vector<int>& mru_list);
++  void UpdateHighlight();
++
++  std::vector<raw_ptr<TabCyclingRowButton>> rows_;
++  int selected_index_ = 0;
++  DestroyCallback destroy_callback_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_TAB_CYCLING_POPUP_VIEW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/tab_cycling_popup_view.cc
+@@ -0,0 +1,186 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/tab_cycling_popup_view.h"
++
++#include <string_view>
++
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/favicon/favicon_utils.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
++#include "chrome/grit/generated_resources.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_id.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/animation/ink_drop.h"
++#include "ui/views/background.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/style/typography.h"
++
++namespace {
++constexpr int kPopupWidth = 320;
++constexpr int kMaxVisibleRows = 10;
++constexpr int kRowPadding = 6;
++constexpr int kFaviconTitleSpacing = 10;
++constexpr int kCornerRadius = 8;
++}  // namespace
++
++TabCyclingRowButton::TabCyclingRowButton(const std::u16string& title,
++                                         const ui::ImageModel& favicon)
++    : LabelButton(PressedCallback(), title) {
++  SetImageModel(views::Button::STATE_NORMAL, favicon);
++  SetBorder(views::CreateEmptyBorder(
++      gfx::Insets::VH(kRowPadding, kRowPadding * 2)));
++  SetImageLabelSpacing(kFaviconTitleSpacing);
++  SetElideBehavior(gfx::ELIDE_TAIL);
++  SetMaxSize(gfx::Size(kPopupWidth, 0));
++
++  SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++  GetViewAccessibility().SetRole(ax::mojom::Role::kListBoxOption);
++
++  ConfigureInkDropForToolbar(
++      this, std::make_unique<views::RoundRectHighlightPathGenerator>(
++                gfx::Insets(), kCornerRadius / 2));
++  views::InkDrop::Get(this)->GetInkDrop()->SetShowHighlightOnHover(false);
++}
++
++TabCyclingRowButton::~TabCyclingRowButton() = default;
++
++void TabCyclingRowButton::SetHighlighted(bool highlighted) {
++  if (highlighted) {
++    SetBackground(views::CreateRoundedRectBackground(
++        ui::kColorSysStateHoverOnSubtle, kCornerRadius / 2));
++  } else {
++    SetBackground(nullptr);
++  }
++  GetViewAccessibility().SetIsSelected(highlighted);
++}
++
++// Popup is keyboard-only; swallow all mouse input so rows do not steal clicks.
++bool TabCyclingRowButton::OnMousePressed(const ui::MouseEvent& event) {
++  return false;
++}
++
++void TabCyclingRowButton::OnMouseEntered(const ui::MouseEvent& event) {}
++
++void TabCyclingRowButton::OnMouseExited(const ui::MouseEvent& event) {}
++
++BEGIN_METADATA(TabCyclingRowButton)
++END_METADATA
++
++TabCyclingPopupView::TabCyclingPopupView(
++    views::View* anchor_view,
++    TabStripModel* tab_strip_model,
++    const std::vector<int>& mru_list)
++    : BubbleDialogDelegateView(anchor_view, views::BubbleBorder::NONE) {
++  SetButtons(static_cast<int>(ui::mojom::DialogButton::kNone));
++  set_shadow(views::BubbleBorder::STANDARD_SHADOW);
++  set_corner_radius(kCornerRadius);
++  set_close_on_deactivate(false);
++  set_adjust_if_offscreen(false);
++  set_margins(gfx::Insets(kRowPadding));
++
++  SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical));
++
++  GetViewAccessibility().SetRole(ax::mojom::Role::kListBox);
++  GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_TAB_CYCLING_POPUP_ACCESSIBLE_NAME));
++
++  PopulateRows(tab_strip_model, mru_list);
++}
++
++TabCyclingPopupView::~TabCyclingPopupView() = default;
++
++void TabCyclingPopupView::SetDestroyCallback(DestroyCallback callback) {
++  destroy_callback_ = std::move(callback);
++}
++
++int TabCyclingPopupView::GetSelectedTabIndex() const {
++  if (selected_index_ >= 0 &&
++      selected_index_ < static_cast<int>(rows_.size())) {
++    return rows_[selected_index_]->tab_index();
++  }
++  return -1;
++}
++
++void TabCyclingPopupView::PopulateRows(TabStripModel* model,
++                                       const std::vector<int>& mru_list) {
++  const int visible_count =
++      std::min(static_cast<int>(mru_list.size()), kMaxVisibleRows);
++
++  for (int i = 0; i < visible_count; ++i) {
++    const int tab_index = mru_list[i];
++    content::WebContents* contents = model->GetWebContentsAt(tab_index);
++    if (!contents)
++      continue;
++
++    ui::ImageModel favicon_image;
++    gfx::Image favicon = favicon::TabFaviconFromWebContents(contents);
++    if (!favicon.IsEmpty())
++      favicon_image = ui::ImageModel::FromImage(favicon);
++
++    std::u16string title = contents->GetTitle();
++    if (title.empty()) {
++      std::string_view host = contents->GetLastCommittedURL().host();
++      title = host.empty()
++                  ? l10n_util::GetStringUTF16(IDS_TAB_CYCLING_UNTITLED_TAB)
++                  : base::UTF8ToUTF16(host);
++    }
++
++    auto* row = AddChildView(
++        std::make_unique<TabCyclingRowButton>(title, favicon_image));
++    row->set_tab_index(tab_index);
++    rows_.push_back(row);
++  }
++
++  const int remaining =
++      static_cast<int>(mru_list.size()) - visible_count;
++  if (remaining > 0) {
++    auto* footer = AddChildView(std::make_unique<views::Label>(
++        l10n_util::GetPluralStringFUTF16(
++            IDS_TAB_CYCLING_AND_MORE_TABS, remaining)));
++    footer->SetHorizontalAlignment(gfx::ALIGN_CENTER);
++    footer->SetTextContext(views::style::CONTEXT_LABEL);
++    footer->SetTextStyle(views::style::STYLE_SECONDARY);
++    footer->SetBorder(
++        views::CreateEmptyBorder(gfx::Insets::VH(kRowPadding / 2, 0)));
++  }
++}
++
++void TabCyclingPopupView::SetSelectedIndex(int index) {
++  selected_index_ = index;
++  UpdateHighlight();
++}
++
++void TabCyclingPopupView::UpdateHighlight() {
++  for (size_t i = 0; i < rows_.size(); ++i) {
++    rows_[i]->SetHighlighted(static_cast<int>(i) == selected_index_);
++  }
++}
++
++gfx::Size TabCyclingPopupView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  gfx::Size size =
++      views::BubbleDialogDelegateView::CalculatePreferredSize(available_size);
++  size.set_width(kPopupWidth);
++  return size;
++}
++
++void TabCyclingPopupView::OnWidgetDestroying(views::Widget* widget) {
++  if (destroy_callback_)
++    std::move(destroy_callback_).Run();
++  BubbleDialogDelegateView::OnWidgetDestroying(widget);
++}
++
++BEGIN_METADATA(TabCyclingPopupView)
++END_METADATA
+--- a/ui/views/bubble/bubble_dialog_delegate_view.h
++++ b/ui/views/bubble/bubble_dialog_delegate_view.h
+@@ -75,6 +75,7 @@ class PluginVmInstallerView;
+ class ProfileMenuViewBase;
+ class RemoveSuggestionBubbleDialogDelegateView;
+ class StoragePressureBubbleView;
++class TabCyclingPopupView;
+ class TabGroupEditorBubbleView;
+ class TabHoverCardBubbleView;
+ class TestBubbleView;
+@@ -832,6 +833,7 @@ class VIEWS_EXPORT BubbleDialogDelegateV
+   friend class ::ProfileMenuViewBase;
+   friend class ::RemoveSuggestionBubbleDialogDelegateView;
+   friend class ::StoragePressureBubbleView;
++  friend class ::TabCyclingPopupView;
+   friend class ::TabGroupEditorBubbleView;
+   friend class ::TabHoverCardBubbleView;
+   friend class ::TestBubbleView;
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -43,6 +43,7 @@
+ #error This file should only be included on desktop.
+ #endif
+ 
++class Browser;
+ class DraggingTabsSession;
+ class Profile;
+ class TabGroupModel;
+@@ -617,6 +618,13 @@ class TabStripModel {
+   // Used in BrowserView::StopTabCycling().
+   void StopMRUCycling();
+ 
++  const std::vector<int>& GetMRUCycleList() const {
++    return mru_cycle_list_;
++  }
++
++  // -1 if no cycling session is active.
++  int GetPendingMRUTabIndex() const;
++
+   // Moves the active in the specified direction. Respects group boundaries.
+   void MoveTabNext();
+   void MoveTabPrevious();
+@@ -1488,6 +1496,9 @@ class TabStripModel {
+   // List of tabs for MRU cycling
+   std::vector<int> mru_cycle_list_;
+ 
++  // Cached browser for the current MRU cycling session.
++  raw_ptr<Browser> mru_cycle_browser_ = nullptr;
++
+   base::WeakPtrFactory<TabStripModel> weak_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -4038,10 +4038,15 @@ void TabStripModel::SelectRelativeTabCyc
+ void TabStripModel::SelectMRUTab(TabRelativeDirection direction,
+                                  TabStripUserGestureDetails detail) {
+   if (mru_cycle_list_.empty()) {
+-    Browser* browser = chrome::FindBrowserWithTab(GetWebContentsAt(0));
++    content::WebContents* contents = GetWebContentsAt(0);
++    if (!contents) {
++      return;
++    }
++    Browser* browser = chrome::FindBrowserWithTab(contents);
+     if (!browser) {
+       return;
+     }
++    mru_cycle_browser_ = browser;
+ 
+     for (int i = 0; i < count(); ++i) {
+       mru_cycle_list_.push_back(i);
+@@ -4066,11 +4071,25 @@ void TabStripModel::SelectMRUTab(TabRela
+                 mru_cycle_list_.rend());
+   }
+ 
+-  ActivateTabAt(mru_cycle_list_[0], detail);
++  if (!mru_cycle_browser_) {
++    return;
++  }
++  BrowserView* browser_view = mru_cycle_browser_->window()->AsBrowserView();
++  if (browser_view) {
++    browser_view->UpdateTabCyclingSelection(
++        direction == TabRelativeDirection::kNext);
++  }
++}
++
++int TabStripModel::GetPendingMRUTabIndex() const {
++  if (mru_cycle_list_.empty())
++    return -1;
++  return mru_cycle_list_[0];
+ }
+ 
+ void TabStripModel::StopMRUCycling() {
+   mru_cycle_list_.clear();
++  mru_cycle_browser_ = nullptr;
+ }
+ 
+ void TabStripModel::SelectRelativeTab(TabRelativeDirection direction,
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -90,6 +90,7 @@ class ProjectsPanelView;
+ class ScrimView;
+ class SidePanel;
+ class TabCyclingEventHandler;
++class TabCyclingPopupView;
+ class TabDragTarget;
+ class TabSearchBubbleHost;
+ class TabStrip;
+@@ -621,6 +622,7 @@ class BrowserView : public BrowserWindow
+ 
+   void StartTabCycling();
+   void StopTabCycling();
++  void UpdateTabCyclingSelection(bool forward);
+ 
+   SharingDialog* ShowSharingDialog(content::WebContents* contents,
+                                    SharingDialogData data) override;
+@@ -1521,6 +1523,11 @@ class BrowserView : public BrowserWindow
+   base::OneShotTimer zen_cursor_exit_timer_;
+   bool zen_mode_enabled_ = false;
+ 
++  bool EnsureTabCyclingPopup();
++
++  raw_ptr<TabCyclingPopupView> tab_cycling_popup_ = nullptr;
++  int tab_cycling_highlight_index_ = 0;
++
+   mutable base::WeakPtrFactory<BrowserView> weak_ptr_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -206,6 +206,7 @@
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_flat_edge_button.h"
+ #include "chrome/browser/ui/views/tabs/tab.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_accessibility.h"
++#include "chrome/browser/ui/views/tabs/tab_cycling_popup_view.h"
+ #include "chrome/browser/ui/views/tabs/tab_search_button.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_top_container.h"
+@@ -869,11 +870,20 @@ class TabCyclingEventHandler : public ui
+  private:
+   // ui::EventObserver overrides:
+   void OnEvent(const ui::Event& event) override {
+-    if (event.type() == ui::EventType::kKeyReleased &&
+-        event.AsKeyEvent()->key_code() == ui::VKEY_CONTROL) {
+-      // Ctrl key was released, stop the tab cycling.
+-      Stop();
+-      return;
++    if (event.type() == ui::EventType::kKeyReleased) {
++      const ui::KeyboardCode code = event.AsKeyEvent()->key_code();
++      bool stop_cycling = (code == ui::VKEY_CONTROL);
++#if BUILDFLAG(IS_MAC)
++      // Cmd or Option release also ends cycling on macOS.
++      stop_cycling = stop_cycling ||
++                     code == ui::VKEY_COMMAND ||
++                     code == ui::VKEY_MENU ||
++                     code == ui::VKEY_RMENU;
++#endif
++      if (stop_cycling) {
++        Stop();
++        return;
++      }
+     }
+ 
+     if (event.type() == ui::EventType::kMousePressed) {
+@@ -922,11 +932,111 @@ class TabCyclingEventHandler : public ui
+ 
+ void BrowserView::StartTabCycling() {
+   tab_cycling_event_handler_ = std::make_unique<TabCyclingEventHandler>(this);
++  tab_cycling_highlight_index_ = 0;
+ }
+ 
+ void BrowserView::StopTabCycling() {
++  TabStripModel* model = browser()->tab_strip_model();
++
++  if (tab_cycling_popup_) {
++    const int selected = tab_cycling_popup_->GetSelectedTabIndex();
++    tab_cycling_popup_->GetWidget()->Close();
++    tab_cycling_popup_ = nullptr;
++
++    if (selected >= 0 && selected < model->count()) {
++      model->ActivateTabAt(
++          selected,
++          TabStripUserGestureDetails(
++              TabStripUserGestureDetails::GestureType::kOther));
++    }
++  }
++
+   tab_cycling_event_handler_.reset();
+-  browser()->tab_strip_model()->StopMRUCycling();
++  model->StopMRUCycling();
++}
++
++bool BrowserView::EnsureTabCyclingPopup() {
++  if (tab_cycling_popup_)
++    return false;
++  if (!features::IsHeliumTabCyclingPopupFeatureEnabled())
++    return false;
++
++  const auto& mru_list =
++      browser()->tab_strip_model()->GetMRUCycleList();
++  if (mru_list.size() <= 1)
++    return false;
++
++  auto popup = std::make_unique<TabCyclingPopupView>(
++      contents_web_view(), browser()->tab_strip_model(), mru_list);
++  TabCyclingPopupView* popup_raw = popup.get();
++  views::Widget* bubble_widget =
++      views::BubbleDialogDelegateView::CreateBubble(std::move(popup));
++
++  if (!bubble_widget || bubble_widget->IsClosed())
++    return false;
++
++  if (popup_raw->GetRowCount() == 0) {
++    bubble_widget->Close();
++    return false;
++  }
++
++  tab_cycling_popup_ = popup_raw;
++  popup_raw->SetDestroyCallback(base::BindOnce(
++      [](base::WeakPtr<BrowserView> bv) {
++        if (bv) {
++          bv->tab_cycling_popup_ = nullptr;
++        }
++      },
++      weak_ptr_factory_.GetWeakPtr()));
++
++  gfx::Rect browser_bounds = GetWidget()->GetWindowBoundsInScreen();
++  gfx::Size widget_size =
++      bubble_widget->non_client_view()->GetPreferredSize();
++
++  const int max_height = browser_bounds.height() * 3 / 4;
++  if (widget_size.height() > max_height)
++    widget_size.set_height(std::max(max_height, 0));
++
++  gfx::Point center(
++      browser_bounds.x() +
++          (browser_bounds.width() - widget_size.width()) / 2,
++      browser_bounds.y() +
++          (browser_bounds.height() - widget_size.height()) / 2);
++  bubble_widget->SetBounds(gfx::Rect(center, widget_size));
++  bubble_widget->ShowInactive();
++  tab_cycling_popup_->SetSelectedIndex(0);
++  return true;
++}
++
++void BrowserView::UpdateTabCyclingSelection(bool forward) {
++  const bool just_created = EnsureTabCyclingPopup();
++
++  if (!tab_cycling_popup_) {
++    int pending = browser()->tab_strip_model()->GetPendingMRUTabIndex();
++    if (pending >= 0 && pending < browser()->tab_strip_model()->count()) {
++      browser()->tab_strip_model()->ActivateTabAt(
++          pending,
++          TabStripUserGestureDetails(
++              TabStripUserGestureDetails::GestureType::kOther));
++    }
++    return;
++  }
++
++  if (just_created)
++    return;
++
++  const int row_count = tab_cycling_popup_->GetRowCount();
++  if (row_count == 0)
++    return;
++
++  if (forward) {
++    tab_cycling_highlight_index_ =
++        (tab_cycling_highlight_index_ + 1) % row_count;
++  } else {
++    tab_cycling_highlight_index_ =
++        (tab_cycling_highlight_index_ - 1 + row_count) % row_count;
++  }
++  tab_cycling_popup_->SetSelectedIndex(tab_cycling_highlight_index_);
+ }
+ 
+ class BrowserView::AccessibilityModeObserver : public ui::AXModeObserver {
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -4519,6 +4519,8 @@ static_library("ui") {
+       "views/tabs/tab_container_controller.h",
+       "views/tabs/tab_container_impl.cc",
+       "views/tabs/tab_container_impl.h",
++      "views/tabs/tab_cycling_popup_view.cc",
++      "views/tabs/tab_cycling_popup_view.h",
+       "views/tabs/tab_group_accessibility.cc",
+       "views/tabs/tab_group_accessibility.h",
+       "views/tabs/tab_group_editor_bubble_tracker.cc",
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -325,6 +325,17 @@
+   <message name="IDS_SETTINGS_ZEN_PIN_TOP_TOOLBAR" desc="Description for the toggle to pin the top bar when in Zen mode.">
+     Always show the top bar
+   </message>
++  <message name="IDS_TAB_CYCLING_POPUP_ACCESSIBLE_NAME" desc="Screen reader label for the MRU tab cycling popup.">
++    Recently used tabs
++  </message>
++  <message name="IDS_TAB_CYCLING_AND_MORE_TABS" desc="Footer shown at the bottom of the MRU tab cycling popup when additional tabs are not visible.">
++    {COUNT, plural,
++     =1 {and 1 more...}
++     other {and # more...}}
++  </message>
++  <message name="IDS_TAB_CYCLING_UNTITLED_TAB" desc="Fallback label in the MRU tab cycling popup when a tab has no title.">
++    Untitled
++  </message>
+   <message name="IDS_SETTINGS_SHOW_HOME_BUTTON" desc="Label for the checkbox which enables or disables showing the home button in the toolbar.">
+     Show home button
+   </message>
