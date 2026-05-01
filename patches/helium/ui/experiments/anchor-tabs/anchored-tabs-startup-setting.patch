@@ -1,0 +1,239 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -1071,6 +1071,9 @@
+   <message name="IDS_SETTINGS_ON_STARTUP_CONTINUE" desc="Radio button option to continue where you left off.">
+     Continue where you left off
+   </message>
++  <message name="IDS_SETTINGS_ON_STARTUP_CONTINUE_WITH_ANCHORING" desc="Experimental radio button option to continue where you left off with anchored tab behavior enabled.">
++    [Experimental] Continue where you left off with tab anchoring
++  </message>
+   <message name="IDS_SETTINGS_ON_STARTUP_OPEN_SPECIFIC" desc="Radio button option to open a specific set of pages.">
+     Open a specific page or set of pages
+   </message>
+--- a/chrome/browser/prefs/session_startup_pref.cc
++++ b/chrome/browser/prefs/session_startup_pref.cc
+@@ -29,6 +29,8 @@ int TypeToPrefValue(SessionStartupPref::
+   switch (type) {
+     case SessionStartupPref::LAST:
+       return SessionStartupPref::kPrefValueLast;
++    case SessionStartupPref::LAST_WITH_ANCHORING:
++      return SessionStartupPref::kPrefValueLastWithAnchoring;
+     case SessionStartupPref::URLS:
+       return SessionStartupPref::kPrefValueURLs;
+     case SessionStartupPref::LAST_AND_URLS:
+@@ -174,6 +176,8 @@ SessionStartupPref::Type SessionStartupP
+   switch (pref_value) {
+     case kPrefValueLast:
+       return SessionStartupPref::LAST;
++    case kPrefValueLastWithAnchoring:
++      return SessionStartupPref::LAST_WITH_ANCHORING;
+     case kPrefValueURLs:
+       return SessionStartupPref::URLS;
+     case kPrefValueLastAndURLs:
+@@ -191,7 +195,7 @@ SessionStartupPref::SessionStartupPref(c
+ SessionStartupPref::~SessionStartupPref() = default;
+ 
+ bool SessionStartupPref::ShouldRestoreLastSession() const {
+-  return type == LAST || type == LAST_AND_URLS;
++  return type == LAST || type == LAST_WITH_ANCHORING || type == LAST_AND_URLS;
+ }
+ 
+ bool SessionStartupPref::ShouldOpenUrls() const {
+--- a/chrome/browser/prefs/session_startup_pref.h
++++ b/chrome/browser/prefs/session_startup_pref.h
+@@ -32,6 +32,10 @@ struct SessionStartupPref {
+     // Indicates the user wants to restore the last session.
+     LAST = 2,
+ 
++    // Indicates the user wants to restore the last session with anchored tab
++    // behavior enabled.
++    LAST_WITH_ANCHORING = 5,
++
+     // Indicates the user wants to open a specific set of URLs. The URLs
+     // are contained in urls.
+     URLS = 3,
+@@ -50,7 +54,8 @@ struct SessionStartupPref {
+     kPrefValueURLs = 4,
+     kPrefValueNewTab = 5,
+     kPrefValueLastAndURLs = 6,
+-    kPrefValueMax = 7,
++    kPrefValueLastWithAnchoring = 7,
++    kPrefValueMax = 8,
+   };
+ 
+   static void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+--- a/chrome/browser/profile_resetter/resettable_settings_snapshot.cc
++++ b/chrome/browser/profile_resetter/resettable_settings_snapshot.cc
+@@ -183,6 +183,7 @@ std::unique_ptr<reset_report::ChromeRese
+             reset_report::ChromeResetReport_SessionStartupType_DEFAULT);
+         break;
+       case SessionStartupPref::LAST:
++      case SessionStartupPref::LAST_WITH_ANCHORING:
+         report->set_startup_type(
+             reset_report::ChromeResetReport_SessionStartupType_LAST);
+         break;
+--- a/chrome/browser/resources/settings/on_startup_page/on_startup_page.html
++++ b/chrome/browser/resources/settings/on_startup_page/on_startup_page.html
+@@ -22,6 +22,17 @@
+             pref="[[prefs.session.restore_on_startup]]"
+             label="$i18n{onStartupContinue}">
+         </controlled-radio-button>
++        <controlled-radio-button name="[[getName_(
++          prefValuesEnum_.CONTINUE_WITH_ANCHORING)]]"
++            pref="[[prefs.session.restore_on_startup]]"
++            label="$i18n{onStartupContinueWithAnchoring}">
++          <template is="dom-if" if="[[shouldShowAnchoredTabsRestart_(
++              prefs.session.restore_on_startup.value)]]">
++            <cr-button slot="additional-content" on-click="onRestartClick_">
++              $i18n{restart}
++            </cr-button>
++          </template>
++        </controlled-radio-button>
+         <controlled-radio-button name="[[getName_(prefValuesEnum_.OPEN_SPECIFIC)]]"
+             pref="[[prefs.session.restore_on_startup]]"
+             label="$i18n{onStartupOpenSpecific}">
+@@ -50,3 +61,8 @@
+     </template>
+ </if>
+   </settings-section>
++  <template is="dom-if" if="[[shouldShowRelaunchDialog]]" restamp>
++    <relaunch-confirmation-dialog restart-type="[[restartTypeEnum.RESTART]]"
++        on-close="onRelaunchDialogClose">
++    </relaunch-confirmation-dialog>
++  </template>
+--- a/chrome/browser/resources/settings/on_startup_page/on_startup_page.ts
++++ b/chrome/browser/resources/settings/on_startup_page/on_startup_page.ts
+@@ -6,11 +6,12 @@
+  * @fileoverview
+  * 'settings-on-startup-page' is a settings page.
+  */
++import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_shared_style.css.js';
+ import '../controls/controlled_radio_button.js';
+ import '/shared/settings/controls/extension_controlled_indicator.js';
+ import '../controls/settings_radio_group.js';
+-import '../i18n_setup.js';
++import '../relaunch_confirmation_dialog.js';
+ import '../settings_page/settings_section.js';
+ import '../settings_shared.css.js';
+ import './startup_urls_page.js';
+@@ -20,11 +21,10 @@ import '../controls/settings_toggle_butt
+ // </if>
+ 
+ import {WebUiListenerMixin} from 'chrome://resources/cr_elements/web_ui_listener_mixin.js';
+-// <if expr="is_win">
+-import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
+-// </if>
+ import {PolymerElement} from 'chrome://resources/polymer/v3_0/polymer/polymer_bundled.min.js';
+ 
++import {loadTimeData} from '../i18n_setup.js';
++import {RelaunchMixin, RestartType} from '../relaunch_mixin.js';
+ import {getSearchManager} from '../search_settings.js';
+ import type {SettingsPlugin} from '../settings_main/settings_plugin.js';
+ 
+@@ -39,9 +39,11 @@ enum PrefValues {
+   OPEN_NEW_TAB = 5,
+   OPEN_SPECIFIC = 4,
+   CONTINUE_AND_OPEN_SPECIFIC = 6,
++  CONTINUE_WITH_ANCHORING = 7,
+ }
+ 
+-const SettingsOnStartupPageElementBase = WebUiListenerMixin(PolymerElement);
++const SettingsOnStartupPageElementBase =
++    WebUiListenerMixin(RelaunchMixin(PolymerElement));
+ 
+ export class SettingsOnStartupPageElement extends
+     SettingsOnStartupPageElementBase implements SettingsPlugin {
+@@ -68,6 +70,11 @@ export class SettingsOnStartupPageElemen
+       },
+       // </if>
+ 
++      isHeliumAnchoredTabsEnabled_: {
++        type: Boolean,
++        value: () => loadTimeData.getBoolean('isHeliumAnchoredTabsEnabled'),
++      },
++
+       ntpExtension_: Object,
+ 
+       prefValuesEnum_: {readOnly: true, type: Object, value: PrefValues},
+@@ -78,6 +85,7 @@ export class SettingsOnStartupPageElemen
+   // <if expr="is_win">
+   declare private isForegroundLaunchFeatureEnabled_: boolean;
+   // </if>
++  declare private isHeliumAnchoredTabsEnabled_: boolean;
+   declare private ntpExtension_: NtpExtension|null;
+ 
+   override connectedCallback() {
+@@ -96,6 +104,21 @@ export class SettingsOnStartupPageElemen
+     return value.toString();
+   }
+ 
++  private isAnchoredTabsStartupValue_(restoreOnStartup: PrefValues): boolean {
++    return restoreOnStartup === PrefValues.CONTINUE_WITH_ANCHORING;
++  }
++
++  private shouldShowAnchoredTabsRestart_(restoreOnStartup: PrefValues):
++      boolean {
++    return this.isAnchoredTabsStartupValue_(restoreOnStartup) !==
++        this.isHeliumAnchoredTabsEnabled_;
++  }
++
++  private onRestartClick_(e: Event) {
++    e.stopPropagation();
++    this.performRestart(RestartType.RESTART);
++  }
++
+   /**
+    * Determine whether to show the user defined startup pages.
+    * @param restoreOnStartup Enum value from PrefValues.
+--- a/chrome/browser/sessions/restore_on_startup_policy_handler.cc
++++ b/chrome/browser/sessions/restore_on_startup_policy_handler.cc
+@@ -48,6 +48,7 @@ bool RestoreOnStartupPolicyHandler::Chec
+         errors->AddError(policy_name(), IDS_POLICY_VALUE_DEPRECATED);
+         break;
+       case SessionStartupPref::kPrefValueLast:
++      case SessionStartupPref::kPrefValueLastWithAnchoring:
+       case SessionStartupPref::kPrefValueLastAndURLs: {
+         // If the "restore last session" policy is set, session cookies are
+         // treated as permanent cookies and site data needed to restore the
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -1325,6 +1325,8 @@ void AddOnStartupStrings(content::WebUID
+       {"onStartup", IDS_SETTINGS_ON_STARTUP},
+       {"onStartupOpenNewTab", IDS_SETTINGS_ON_STARTUP_OPEN_NEW_TAB},
+       {"onStartupContinue", IDS_SETTINGS_ON_STARTUP_CONTINUE},
++      {"onStartupContinueWithAnchoring",
++       IDS_SETTINGS_ON_STARTUP_CONTINUE_WITH_ANCHORING},
+       {"onStartupOpenSpecific", IDS_SETTINGS_ON_STARTUP_OPEN_SPECIFIC},
+       {"onStartupContinueAndOpenSpecific",
+        IDS_SETTINGS_ON_STARTUP_CONTINUE_AND_OPEN_SPECIFIC},
+@@ -1348,6 +1350,8 @@ void AddOnStartupStrings(content::WebUID
+   html_source->AddBoolean("isForegroundLaunchFeatureEnabled",
+                           features::IsForegroundLaunchEnabled());
+ #endif
++  html_source->AddBoolean("isHeliumAnchoredTabsEnabled",
++                          features::IsHeliumAnchoredTabsEnabled());
+ }
+ 
+ bool CheckDeviceAuthAvailability(content::WebContents* web_contents) {
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -150,6 +150,8 @@ inline constexpr char kSessionExitType[]
+ // 3: unused, previously indicated the user wants to restore a saved session.
+ // 4: restore the URLs defined in kURLsToRestoreOnStartup.
+ // 5: open the New Tab Page on startup.
++// 6: restore the last session and the URLs defined in kURLsToRestoreOnStartup.
++// 7: restore the last session with anchored tab behavior enabled.
+ inline constexpr char kRestoreOnStartup[] = "session.restore_on_startup";
+ 
+ // The URLs to restore on startup or when the home button is pressed. The URLs
+--- a/tools/metrics/histograms/metadata/settings/enums.xml
++++ b/tools/metrics/histograms/metadata/settings/enums.xml
+@@ -336,6 +336,7 @@ chromium-metrics-reviews@google.com.
+   <int value="4" label="Open URLs"/>
+   <int value="5" label="Open new tab page"/>
+   <int value="6" label="Restore the last session and open URLs"/>
++  <int value="7" label="Restore the last session with tab anchoring"/>
+ </enum>
+ 
+ <!-- LINT.IfChange(SettingsAiPageComposeInteractions) -->
