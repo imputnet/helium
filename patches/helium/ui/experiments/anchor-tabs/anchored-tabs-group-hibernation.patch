@@ -1,8 +1,6 @@
-Index: src/chrome/browser/ui/BUILD.gn
-===================================================================
---- src.orig/chrome/browser/ui/BUILD.gn
-+++ src/chrome/browser/ui/BUILD.gn
-@@ -4058,6 +4058,8 @@ static_library("ui") {
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -4048,6 +4048,8 @@ static_library("ui") {
        "views/helium/frame_corner_radius.h",
        "views/hover_button_controller.cc",
        "views/hover_button_controller.h",
@@ -18,7 +16,7 @@ Index: src/chrome/browser/helium_flag_choices.h
 @@ -34,7 +34,10 @@ namespace helium {
    constexpr const char kHeliumNoiseCpuCoresCommandLine[] =
        "helium-noise-hw-concurrency";
- 
+
 -  constexpr const char kMiddleClickAutoscrollCommandLine[] = "middle-click-autoscroll";
 +  constexpr const char kMiddleClickAutoscrollCommandLine[] =
 +      "middle-click-autoscroll";
@@ -42,14 +40,280 @@ Index: src/chrome/browser/helium_flag_entries.h
      {helium::kHeliumCompactLocationWidthCommandLine,
       "Automatic address bar width in compact layout",
       "Allows the location bar to automatically reduce its width in the compact browser layout. The omnibox may be uncomfortable to use. Helium flag.",
+--- a/chrome/browser/sessions/session_service.cc
++++ b/chrome/browser/sessions/session_service.cc
+@@ -6,6 +6,7 @@
+
+ #include <stddef.h>
+
++#include <map>
+ #include <set>
+ #include <string>
+ #include <utility>
+@@ -16,7 +17,6 @@
+ #include "base/debug/dump_without_crashing.h"
+ #include "base/functional/bind.h"
+ #include "base/metrics/histogram_functions.h"
+-#include "base/strings/utf_string_conversions.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/apps/app_service/launch_utils.h"
+@@ -42,14 +42,13 @@
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/session_crashed_bubble.h"
+ #include "chrome/browser/ui/startup/profile_launch_observer.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+-#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+-#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "chrome/common/chrome_switches.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+@@ -60,7 +59,6 @@
+ #include "components/sessions/core/session_constants.h"
+ #include "components/sessions/core/session_types.h"
+ #include "components/sessions/core/tab_restore_service.h"
+-#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_details.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/session_storage_namespace.h"
+@@ -644,15 +642,11 @@ void SessionService::BuildCommandsForTab
+         sessions::CreateSplitTabCommand(session_id, std::move(split)));
+   }
+
+-  if (tabs::TabInterface* const tab_interface =
+-          tabs::TabInterface::GetFromContents(tab)) {
+-    if (TabUIHelper* const helper = TabUIHelper::From(tab_interface);
+-        helper && !helper->custom_title().empty()) {
+-      command_storage_manager()->AppendRebuildCommand(
+-          sessions::CreateAddTabExtraDataCommand(
+-              session_id, TabUIHelper::kCustomTitleSessionKey,
+-              base::UTF16ToUTF8(helper->custom_title())));
+-    }
++  std::map<std::string, std::string> extra_data;
++  helium::AddAnchoredTabExtraData(tab, &extra_data);
++  for (const auto& [key, value] : extra_data) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddTabExtraDataCommand(session_id, key, value));
+   }
+ }
+
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -10,7 +10,6 @@
+ #include <utility>
+
+ #include "base/check_deref.h"
+-#include "base/strings/utf_string_conversions.h"
+ #include "base/token.h"
+ #include "base/uuid.h"
+ #include "base/values.h"
+@@ -30,10 +29,11 @@
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "components/saved_tab_groups/public/features.h"
+ #include "components/saved_tab_groups/public/saved_tab_group.h"
+@@ -47,7 +47,6 @@
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tab_groups/tab_group_visual_data.h"
+ #include "components/tabs/public/tab_group.h"
+-#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/session_storage_namespace.h"
+ #include "content/public/browser/web_contents.h"
+@@ -157,15 +156,7 @@ std::map<std::string, std::string> Brows
+   content::WebContents* const web_contents =
+       tab_strip_model_->GetWebContentsAt(index);
+   glic::PopulateGlicExtraData(web_contents, &extra_data);
+-
+-  if (tabs::TabInterface* const tab =
+-          tabs::TabInterface::GetFromContents(web_contents)) {
+-    if (TabUIHelper* const helper = TabUIHelper::From(tab);
+-        helper && !helper->custom_title().empty()) {
+-      extra_data[TabUIHelper::kCustomTitleSessionKey] =
+-          base::UTF16ToUTF8(helper->custom_title());
+-    }
+-  }
++  helium::AddAnchoredTabExtraData(web_contents, &extra_data);
+
+   return extra_data;
+ }
+@@ -336,7 +327,11 @@ sessions::LiveTab* BrowserLiveTabContext
+   }
+
+   CHECK(web_contents);
+-  TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, tab.extra_data);
++  helium::RestoreAnchoredTabExtraData(web_contents, tab.extra_data);
++
++  if (features::IsHeliumAnchoredTabsEnabled() && web_contents->WasDiscarded()) {
++    return sessions::ContentLiveTab::GetOrCreateForWebContents(web_contents);
++  }
+
+   if (performance_manager::policies::CanScheduleLoadForRestoredTabs()) {
+     performance_manager::policies::ScheduleLoadForRestoredTabs({web_contents});
+--- a/chrome/browser/ui/tab_ui_helper.cc
++++ b/chrome/browser/ui/tab_ui_helper.cc
+@@ -28,6 +28,7 @@
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_web_contents_listener.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_network_state.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -121,9 +122,13 @@ base::CallbackListSubscription TabUIHelp
+ }
+
+ std::u16string TabUIHelper::GetTitle() const {
+-  if (!custom_title_.empty()) {
++  if (features::IsHeliumAnchoredTabsEnabled() && !custom_title_.empty()) {
+     return custom_title_;
+   }
++  if (features::IsHeliumAnchoredTabsEnabled() &&
++      tab().GetContents()->WasDiscarded() && !anchored_title_.empty()) {
++    return anchored_title_;
++  }
+   const tab_groups::SavedTabGroupWebContentsListener* wc_listener =
+       tab().GetTabFeatures()->saved_tab_group_web_contents_listener();
+   if (wc_listener) {
+@@ -229,7 +234,13 @@ ui::ImageModel TabUIHelper::GetFavicon()
+   content::NavigationEntry* const entry =
+       web_contents()->GetController().GetLastCommittedEntry();
+   gfx::Image favicon = favicon::TabFaviconFromWebContents(web_contents());
+-  if (entry && favicon.IsEmpty()) {
++  if (features::IsHeliumAnchoredTabsEnabled() && entry &&
++      (favicon.IsEmpty() || web_contents()->WasDiscarded())) {
++    const content::FaviconStatus& favicon_status = entry->GetFavicon();
++    if (favicon_status.valid && !favicon_status.image.IsEmpty()) {
++      return ui::ImageModel::FromImage(favicon_status.image);
++    }
++
+     MaybeFetchRestoredFavicon(entry);
+   }
+
+@@ -366,6 +377,10 @@ bool TabUIHelper::IsDiscarded() {
+ }
+
+ bool TabUIHelper::ShouldShowDiscardStatus() {
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
+   content::WebContents* const web_contents = tab().GetContents();
+   std::optional<mojom::LifecycleUnitDiscardReason> discard_reason =
+       memory_saver::GetDiscardReason(web_contents);
+@@ -467,6 +482,10 @@ void TabUIHelper::OnRestoredFaviconFetch
+ }
+
+ void TabUIHelper::SetCustomTitle(std::u16string title, bool persist) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return;
++  }
++
+   custom_title_ = std::move(title);
+   // Push the new title through the existing tab-state-changed plumbing.
+   if (web_contents()) {
+@@ -497,7 +516,7 @@ void TabUIHelper::SetCustomTitle(std::u1
+ void TabUIHelper::RestoreCustomTitleFromExtraData(
+     content::WebContents* web_contents,
+     const std::map<std::string, std::string>& extra_data) {
+-  if (!web_contents) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
+     return;
+   }
+
+@@ -514,6 +533,70 @@ void TabUIHelper::RestoreCustomTitleFrom
+     }
+   }
+ }
++
++void TabUIHelper::SetAnchoredURL(const GURL& url,
++                                 std::u16string title,
++                                 bool persist) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !url.is_valid()) {
++    return;
++  }
++
++  anchored_url_ = url;
++  anchored_title_ = std::move(title);
++  if (!persist || !web_contents()) {
++    return;
++  }
++
++  Profile* const profile =
++      Profile::FromBrowserContext(web_contents()->GetBrowserContext());
++  SessionService* const session_service =
++      profile ? SessionServiceFactory::GetForProfile(profile) : nullptr;
++  sessions::SessionTabHelper* const tab_helper =
++      sessions::SessionTabHelper::FromWebContents(web_contents());
++  if (!session_service || !tab_helper) {
++    return;
++  }
++
++  session_service->AddTabExtraData(
++      tab_helper->window_id(), tab_helper->session_id(), kAnchoredURLSessionKey,
++      anchored_url_.spec());
++  if (!anchored_title_.empty()) {
++    session_service->AddTabExtraData(
++        tab_helper->window_id(), tab_helper->session_id(),
++        kAnchoredTitleSessionKey, base::UTF16ToUTF8(anchored_title_));
++  }
++}
++
++void TabUIHelper::RestoreAnchoredURLFromExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
++    return;
++  }
++
++  auto it = extra_data.find(kAnchoredURLSessionKey);
++  if (it == extra_data.end()) {
++    return;
++  }
++
++  const GURL url(it->second);
++  if (!url.is_valid()) {
++    return;
++  }
++
++  std::u16string title;
++  if (auto title_it = extra_data.find(kAnchoredTitleSessionKey);
++      title_it != extra_data.end()) {
++    title = base::UTF8ToUTF16(title_it->second);
++  }
++
++  if (tabs::TabInterface* const tab_interface =
++          tabs::TabInterface::GetFromContents(web_contents)) {
++    if (TabUIHelper* const helper = TabUIHelper::From(tab_interface)) {
++      helper->SetAnchoredURL(url, std::move(title), /*persist=*/false);
++    }
++  }
++}
+
+ base::WeakPtr<TabUIHelper> TabUIHelper::GetWeakPtr() {
+   return weak_factory_.GetWeakPtr();
 Index: src/chrome/browser/ui/ui_features.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/ui_features.cc
 +++ src/chrome/browser/ui/ui_features.cc
 @@ -18,6 +18,13 @@
- 
+
  namespace features {
- 
+
 +// Anchored tabs: tab-group centric tab renaming, hibernation, and restore.
 +BASE_FEATURE(kHeliumAnchoredTabs, base::FEATURE_ENABLED_BY_DEFAULT);
 +
@@ -59,7 +323,7 @@ Index: src/chrome/browser/ui/ui_features.cc
 +
  // Automatic location bar width in compact layout
  BASE_FEATURE(kHeliumCompactLocationWidth, base::FEATURE_DISABLED_BY_DEFAULT);
- 
+
 Index: src/chrome/browser/ui/ui_features.h
 ===================================================================
 --- src.orig/chrome/browser/ui/ui_features.h
@@ -67,18 +331,46 @@ Index: src/chrome/browser/ui/ui_features.h
 @@ -19,6 +19,9 @@ namespace features {
  // All features in alphabetical order. The features should be documented
  // alongside the definition of their values in the .cc file.
- 
+
 +BASE_DECLARE_FEATURE(kHeliumAnchoredTabs);
 +bool IsHeliumAnchoredTabsEnabled();
 +
  BASE_DECLARE_FEATURE(kHeliumCompactLocationWidth);
  bool HeliumUseCompactLocationWidth();
- 
-Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
-===================================================================
+
+--- a/chrome/browser/ui/tab_ui_helper.h
++++ b/chrome/browser/ui/tab_ui_helper.h
+@@ -138,7 +138,18 @@ class TabUIHelper : public tabs::Content
+       content::WebContents* web_contents,
+       const std::map<std::string, std::string>& extra_data);
+   const std::u16string& custom_title() const { return custom_title_; }
++  void SetAnchoredURL(const GURL& url,
++                      std::u16string title,
++                      bool persist = true);
++  static void RestoreAnchoredURLFromExtraData(
++      content::WebContents* web_contents,
++      const std::map<std::string, std::string>& extra_data);
++  const GURL& anchored_url() const { return anchored_url_; }
++  const std::u16string& anchored_title() const { return anchored_title_; }
+   static constexpr char kCustomTitleSessionKey[] = "helium.custom_title";
++  static constexpr char kHibernatedSessionKey[] = "helium.hibernated";
++  static constexpr char kAnchoredURLSessionKey[] = "helium.anchored_url";
++  static constexpr char kAnchoredTitleSessionKey[] = "helium.anchored_title";
+
+   base::WeakPtr<TabUIHelper> GetWeakPtr();
+
+@@ -159,6 +170,8 @@ class TabUIHelper : public tabs::Content
+   ui::ScopedUnownedUserData<TabUIHelper> scoped_unowned_user_data_;
+
+   std::u16string custom_title_;
++  GURL anchored_url_;
++  std::u16string anchored_title_;
+   GURL last_requested_favicon_page_url_;
+   bool favicon_fetch_in_flight_ = false;
+   base::CancelableTaskTracker favicon_task_tracker_;
 --- /dev/null
-+++ src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
-@@ -0,0 +1,308 @@
++++ b/chrome/browser/ui/helium/anchored_tab_hibernation.cc
+@@ -0,0 +1,343 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -111,8 +403,6 @@ Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
 +
 +namespace {
 +
-+constexpr char kHibernatedSessionKey[] = "helium.hibernated";
-+
 +bool StampWebContentsHibernatedForRestore(content::WebContents* web_contents,
 +                                          bool mark_discarded) {
 +  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
@@ -128,7 +418,7 @@ Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
 +  if (session_service && tab_helper) {
 +    session_service->AddTabExtraData(tab_helper->window_id(),
 +                                     tab_helper->session_id(),
-+                                     kHibernatedSessionKey, "1");
++                                     TabUIHelper::kHibernatedSessionKey, "1");
 +  }
 +
 +  if (mark_discarded) {
@@ -198,12 +488,40 @@ Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
 +    return false;
 +  }
 +
++  GURL anchored_url;
++  std::u16string anchored_title;
++  if (tabs::TabInterface* const tab =
++          tabs::TabInterface::GetFromContents(web_contents)) {
++    if (TabUIHelper* const helper = TabUIHelper::From(tab)) {
++      anchored_url = helper->anchored_url();
++      anchored_title = helper->anchored_title();
++    }
++  }
++
 +  StampWebContentsHibernatedForRestore(web_contents, false);
 +
 +  content::WebContents* const discarded_contents =
 +      g_browser_process->GetTabManager()->DiscardTabByExtension(web_contents);
 +  if (!discarded_contents) {
 +    return false;
++  }
++
++  if (anchored_url.is_valid()) {
++    content::NavigationEntry* const entry =
++        discarded_contents->GetController().GetLastCommittedEntry();
++    if (entry) {
++      entry->SetURL(anchored_url);
++      entry->SetVirtualURL(anchored_url);
++      if (!anchored_title.empty()) {
++        entry->SetTitle(anchored_title);
++      }
++    }
++    if (tabs::TabInterface* const tab =
++            tabs::TabInterface::GetFromContents(discarded_contents)) {
++      if (TabUIHelper* const helper = TabUIHelper::From(tab)) {
++        helper->SetAnchoredURL(anchored_url, std::move(anchored_title));
++      }
++    }
 +  }
 +
 +  StampWebContentsHibernatedForRestore(discarded_contents, true);
@@ -251,11 +569,19 @@ Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
 +        (*extra_data)[TabUIHelper::kCustomTitleSessionKey] =
 +            base::UTF16ToUTF8(helper->custom_title());
 +      }
++      if (helper->anchored_url().is_valid()) {
++        (*extra_data)[TabUIHelper::kAnchoredURLSessionKey] =
++            helper->anchored_url().spec();
++      }
++      if (!helper->anchored_title().empty()) {
++        (*extra_data)[TabUIHelper::kAnchoredTitleSessionKey] =
++            base::UTF16ToUTF8(helper->anchored_title());
++      }
 +    }
 +  }
 +
 +  if (web_contents->WasDiscarded()) {
-+    (*extra_data)[kHibernatedSessionKey] = "1";
++    (*extra_data)[TabUIHelper::kHibernatedSessionKey] = "1";
 +  }
 +}
 +
@@ -267,6 +593,7 @@ Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
 +  }
 +
 +  TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, extra_data);
++  TabUIHelper::RestoreAnchoredURLFromExtraData(web_contents, extra_data);
 +}
 +
 +bool ShouldRestoreHibernated(
@@ -275,7 +602,7 @@ Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
 +    return false;
 +  }
 +
-+  auto it = extra_data.find(kHibernatedSessionKey);
++  auto it = extra_data.find(TabUIHelper::kHibernatedSessionKey);
 +  return it != extra_data.end() && it->second == "1";
 +}
 +
@@ -387,10 +714,8 @@ Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
 +}
 +
 +}  // namespace helium
-Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.h
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/helium/anchored_tab_hibernation.h
++++ b/chrome/browser/ui/helium/anchored_tab_hibernation.h
 @@ -0,0 +1,45 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
