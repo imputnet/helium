@@ -1,3 +1,16 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -4058,6 +4058,8 @@ static_library("ui") {
+       "views/helium/frame_corner_radius.h",
+       "views/hover_button_controller.cc",
+       "views/hover_button_controller.h",
++      "helium/anchored_tab_hibernation.cc",
++      "helium/anchored_tab_hibernation.h",
+       "views/helium/tab_rename_dialog.cc",
+       "views/helium/tab_rename_dialog.h",
+       "views/hung_renderer_view.cc",
 Index: src/chrome/browser/helium_flag_choices.h
 ===================================================================
 --- src.orig/chrome/browser/helium_flag_choices.h
@@ -61,3 +74,366 @@ Index: src/chrome/browser/ui/ui_features.h
  BASE_DECLARE_FEATURE(kHeliumCompactLocationWidth);
  bool HeliumUseCompactLocationWidth();
  
+Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/anchored_tab_hibernation.cc
+@@ -0,0 +1,308 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/resource_coordinator/tab_manager.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "chrome/browser/ui/ui_features.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/gfx/range/range.h"
++#include "url/gurl.h"
++
++namespace {
++
++constexpr char kHibernatedSessionKey[] = "helium.hibernated";
++
++bool StampWebContentsHibernatedForRestore(content::WebContents* web_contents,
++                                          bool mark_discarded) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
++    return false;
++  }
++
++  Profile* const profile =
++      Profile::FromBrowserContext(web_contents->GetBrowserContext());
++  SessionService* const session_service =
++      profile ? SessionServiceFactory::GetForProfile(profile) : nullptr;
++  sessions::SessionTabHelper* const tab_helper =
++      sessions::SessionTabHelper::FromWebContents(web_contents);
++  if (session_service && tab_helper) {
++    session_service->AddTabExtraData(tab_helper->window_id(),
++                                     tab_helper->session_id(),
++                                     kHibernatedSessionKey, "1");
++  }
++
++  if (mark_discarded) {
++    web_contents->SetWasDiscarded(true);
++  }
++  return true;
++}
++
++std::optional<int> FindFallbackTabIndex(
++    TabStripModel* model,
++    int model_index,
++    std::optional<tab_groups::TabGroupId> target_group) {
++  CHECK(model);
++
++  for (int i = model_index + 1; i < model->count(); ++i) {
++    if ((!target_group.has_value() ||
++         model->GetTabGroupForTab(i) != target_group) &&
++        model->GetWebContentsAt(i) &&
++        !model->GetWebContentsAt(i)->WasDiscarded()) {
++      return i;
++    }
++  }
++  for (int i = model_index - 1; i >= 0; --i) {
++    if ((!target_group.has_value() ||
++         model->GetTabGroupForTab(i) != target_group) &&
++        model->GetWebContentsAt(i) &&
++        !model->GetWebContentsAt(i)->WasDiscarded()) {
++      return i;
++    }
++  }
++  if (model_index + 1 < model->count()) {
++    content::WebContents* const contents =
++        model->GetWebContentsAt(model_index + 1);
++    if (contents && !contents->WasDiscarded()) {
++      return model_index + 1;
++    }
++  }
++  if (model_index - 1 >= 0) {
++    content::WebContents* const contents =
++        model->GetWebContentsAt(model_index - 1);
++    if (contents && !contents->WasDiscarded()) {
++      return model_index - 1;
++    }
++  }
++
++  return std::nullopt;
++}
++
++bool ActivateFallbackTab(TabStripModel* model,
++                         int model_index,
++                         std::optional<tab_groups::TabGroupId> target_group) {
++  const std::optional<int> fallback_index =
++      FindFallbackTabIndex(model, model_index, target_group);
++  if (!fallback_index.has_value()) {
++    model->delegate()->AddTabAt(GURL(), -1, true);
++    return model->active_index() != model_index;
++  }
++
++  model->ActivateTabAt(fallback_index.value(),
++                       TabStripUserGestureDetails(
++                           TabStripUserGestureDetails::GestureType::kOther));
++  return model->active_index() != model_index;
++}
++
++bool HibernateWebContents(content::WebContents* web_contents) {
++  if (!web_contents || web_contents->WasDiscarded()) {
++    return false;
++  }
++
++  StampWebContentsHibernatedForRestore(web_contents, false);
++
++  content::WebContents* const discarded_contents =
++      g_browser_process->GetTabManager()->DiscardTabByExtension(web_contents);
++  if (!discarded_contents) {
++    return false;
++  }
++
++  StampWebContentsHibernatedForRestore(discarded_contents, true);
++  return true;
++}
++
++std::optional<tab_groups::TabGroupId> GetTabGroupFromModel(
++    const tabs::TabInterface* tab) {
++  if (!tab || !tab->GetBrowserWindowInterface()) {
++    return std::nullopt;
++  }
++
++  const TabStripModel* const model =
++      tab->GetBrowserWindowInterface()->GetTabStripModel();
++  if (!model) {
++    return std::nullopt;
++  }
++
++  const std::optional<int> index = model->GetIndexOfTab(tab);
++  if (!index.has_value()) {
++    return std::nullopt;
++  }
++  return model->GetTabGroupForTab(index.value());
++}
++
++}  // namespace
++
++namespace helium {
++
++bool MarkWebContentsHibernatedForRestore(content::WebContents* web_contents) {
++  return StampWebContentsHibernatedForRestore(web_contents, true);
++}
++
++void AddAnchoredTabExtraData(content::WebContents* web_contents,
++                             std::map<std::string, std::string>* extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents ||
++      !extra_data) {
++    return;
++  }
++
++  if (tabs::TabInterface* const tab =
++          tabs::TabInterface::GetFromContents(web_contents)) {
++    if (TabUIHelper* const helper = TabUIHelper::From(tab)) {
++      if (!helper->custom_title().empty()) {
++        (*extra_data)[TabUIHelper::kCustomTitleSessionKey] =
++            base::UTF16ToUTF8(helper->custom_title());
++      }
++    }
++  }
++
++  if (web_contents->WasDiscarded()) {
++    (*extra_data)[kHibernatedSessionKey] = "1";
++  }
++}
++
++void RestoreAnchoredTabExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
++    return;
++  }
++
++  TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, extra_data);
++}
++
++bool ShouldRestoreHibernated(
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
++  auto it = extra_data.find(kHibernatedSessionKey);
++  return it != extra_data.end() && it->second == "1";
++}
++
++bool IsAnchoredTab(const TabStripModel* model, int model_index) {
++  return features::IsHeliumAnchoredTabsEnabled() && model &&
++         model->ContainsIndex(model_index) &&
++         (model->GetTabGroupForTab(model_index).has_value() ||
++          model->IsTabPinned(model_index));
++}
++
++bool IsLiveAnchoredTab(const TabStripModel* model, int model_index) {
++  return IsAnchoredTab(model, model_index) &&
++         model->GetWebContentsAt(model_index) &&
++         !model->GetWebContentsAt(model_index)->WasDiscarded();
++}
++
++bool MaybeHibernateAnchoredTab(TabStripModel* model, int model_index) {
++  if (!IsLiveAnchoredTab(model, model_index)) {
++    return false;
++  }
++
++  const std::optional<tab_groups::TabGroupId> group =
++      model->GetTabGroupForTab(model_index);
++  content::WebContents* const web_contents =
++      model->GetWebContentsAt(model_index);
++  if (model_index == model->active_index() &&
++      !ActivateFallbackTab(model, model_index, group)) {
++    return false;
++  }
++
++  return HibernateWebContents(web_contents);
++}
++
++bool MaybeHibernateGroupedTab(TabStripModel* model, int model_index) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
++  if (!model || !model->ContainsIndex(model_index) || model->count() <= 1) {
++    return false;
++  }
++
++  const std::optional<tab_groups::TabGroupId> group =
++      model->GetTabGroupForTab(model_index);
++  if (!group.has_value()) {
++    return false;
++  }
++
++  if (model_index == model->active_index() &&
++      !ActivateFallbackTab(model, model_index, group)) {
++    return false;
++  }
++
++  return HibernateWebContents(model->GetWebContentsAt(model_index));
++}
++
++bool HibernateTabGroup(TabStripModel* model, tab_groups::TabGroupId group) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
++  if (!model || !model->group_model()->ContainsTabGroup(group)) {
++    return false;
++  }
++
++  bool any_hibernated = false;
++  const gfx::Range tab_range =
++      model->group_model()->GetTabGroup(group)->ListTabs();
++  for (int model_index : tab_range.ToIntVector()) {
++    content::WebContents* const web_contents =
++        model->GetWebContentsAt(model_index);
++    any_hibernated |= HibernateWebContents(web_contents);
++  }
++
++  return any_hibernated;
++}
++
++bool ShouldShowGroupedTabHibernateAffordance(const tabs::TabInterface* tab,
++                                             bool is_tab_discarded) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !tab || is_tab_discarded) {
++    return false;
++  }
++
++  return GetTabGroupFromModel(tab).has_value();
++}
++
++bool ShouldShowCollapsedGroupHibernateAffordance(TabStripModel* model,
++                                                 tab_groups::TabGroupId group) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
++  if (!model || !model->group_model()->ContainsTabGroup(group) ||
++      !model->IsGroupCollapsed(group)) {
++    return false;
++  }
++
++  const gfx::Range tab_range =
++      model->group_model()->GetTabGroup(group)->ListTabs();
++  for (int model_index : tab_range.ToIntVector()) {
++    content::WebContents* const web_contents =
++        model->GetWebContentsAt(model_index);
++    if (web_contents && !web_contents->WasDiscarded()) {
++      return true;
++    }
++  }
++
++  return false;
++}
++
++}  // namespace helium
+Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/helium/anchored_tab_hibernation.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
++#define CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
++
++#include <map>
++#include <string>
++
++#include "components/tabs/public/tab_group.h"
++
++class TabStripModel;
++
++namespace content {
++class WebContents;
++}
++
++namespace tabs {
++class TabInterface;
++}
++
++namespace helium {
++
++bool MarkWebContentsHibernatedForRestore(content::WebContents* web_contents);
++void AddAnchoredTabExtraData(content::WebContents* web_contents,
++                             std::map<std::string, std::string>* extra_data);
++void RestoreAnchoredTabExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data);
++bool ShouldRestoreHibernated(
++    const std::map<std::string, std::string>& extra_data);
++bool IsAnchoredTab(const TabStripModel* model, int model_index);
++bool IsLiveAnchoredTab(const TabStripModel* model, int model_index);
++bool MaybeHibernateAnchoredTab(TabStripModel* model, int model_index);
++bool MaybeHibernateGroupedTab(TabStripModel* model, int model_index);
++bool HibernateTabGroup(TabStripModel* model, tab_groups::TabGroupId group);
++bool ShouldShowGroupedTabHibernateAffordance(const tabs::TabInterface* tab,
++                                             bool is_tab_discarded);
++bool ShouldShowCollapsedGroupHibernateAffordance(TabStripModel* model,
++                                                 tab_groups::TabGroupId group);
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
