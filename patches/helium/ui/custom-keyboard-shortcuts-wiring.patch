@@ -1,0 +1,145 @@
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -42,6 +42,7 @@
+ #include "chrome/browser/actor/ui/actor_overlay_web_view.h"
+ #include "chrome/browser/app_mode/app_mode_utils.h"
+ #include "chrome/browser/ash/boca/on_task/on_task_locked_controller.h"
++#include "chrome/browser/browser_features.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browsing_data/browsing_data_important_sites_util.h"
+ #include "chrome/browser/desktop_to_mobile_promos/promos_utils.h"
+@@ -85,6 +86,7 @@
+ #include "chrome/browser/ui/browser_finder.h"
+ #include "chrome/browser/ui/browser_list.h"
+ #include "chrome/browser/ui/browser_navigator.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window_state.h"
+@@ -1170,6 +1172,15 @@ BrowserView::BrowserView(Browser* browse
+     focus_manager_observation_.Observe(GetFocusManager());
+   }
+ 
++  if (base::FeatureList::IsEnabled(features::kCustomizableBrowserShortcuts)) {
++    browser_shortcut_service_ =
++        browser_shortcuts::BrowserShortcutServiceFactory::GetForProfile(
++            browser_->profile());
++    if (browser_shortcut_service_) {
++      browser_shortcut_service_->AddObserver(this);
++    }
++  }
++
+ #if BUILDFLAG(IS_CHROMEOS)
+   on_locked_task_subscription_ =
+       ash::boca::OnTaskLockedController::From(browser_)
+@@ -1179,6 +1190,11 @@ BrowserView::BrowserView(Browser* browse
+ }
+ 
+ BrowserView::~BrowserView() {
++  if (browser_shortcut_service_) {
++    browser_shortcut_service_->RemoveObserver(this);
++    browser_shortcut_service_ = nullptr;
++  }
++
+   // Remove the layout manager to avoid dangling. This needs to be earlier than
+   // other cleanups that destroy views referenced in the layout manager.
+   SetLayoutManager(nullptr);
+@@ -5878,7 +5894,20 @@ void BrowserView::LoadAccelerators() {
+       browser_->GetProfile()->IsOffTheRecord() &&
+       browser_->GetProfile()->GetOTRProfileID().IsCaptivePortal();
+ #endif
+-  const std::vector<AcceleratorMapping> accelerator_list(GetAcceleratorList());
++  std::vector<AcceleratorMapping> accelerator_list(GetAcceleratorList());
++  if (browser_shortcut_service_ &&
++      base::FeatureList::IsEnabled(features::kCustomizableBrowserShortcuts)) {
++    std::erase_if(accelerator_list, [this](const AcceleratorMapping& entry) {
++      return browser_shortcut_service_->HasDefaultAccelerator(
++          entry.command_id,
++          ui::Accelerator(entry.keycode, entry.modifiers));
++    });
++    for (const auto& [accelerator, command_id] :
++         browser_shortcut_service_->GetAcceleratorMap()) {
++      accelerator_list.push_back(
++          {accelerator.key_code(), accelerator.modifiers(), command_id});
++    }
++  }
+   for (const auto& entry : accelerator_list) {
+     // In app mode, only allow accelerators of allowlisted commands to pass
+     // through.
+@@ -5905,12 +5934,28 @@ void BrowserView::LoadAccelerators() {
+ #endif
+ 
+     ui::Accelerator accelerator(entry.keycode, entry.modifiers);
++    const bool already_registered = accelerator_table_.contains(accelerator);
+     accelerator_table_[accelerator] = entry.command_id;
+ 
+-    // Also register with the focus manager.
+-    focus_manager->RegisterAccelerator(
+-        accelerator, ui::AcceleratorManager::kNormalPriority, this);
++    if (!already_registered) {
++      focus_manager->RegisterAccelerator(
++          accelerator, ui::AcceleratorManager::kNormalPriority, this);
++    }
++  }
++}
++
++void BrowserView::ReloadAccelerators() {
++  views::FocusManager* focus_manager = GetFocusManager();
++  if (!focus_manager) {
++    return;
+   }
++  focus_manager->UnregisterAccelerators(this);
++  accelerator_table_.clear();
++  LoadAccelerators();
++}
++
++void BrowserView::OnBrowserShortcutsChanged() {
++  ReloadAccelerators();
+ }
+ 
+ int BrowserView::GetCommandIDForAppCommandID(int app_command_id) const {
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -21,6 +21,7 @@
+ #include "base/timer/timer.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/tabs/projects/projects_panel_state_controller.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -143,6 +144,7 @@ class BrowserView : public BrowserWindow
+                     public infobars::InfoBarContainer::Delegate,
+                     public ImmersiveModeController::Observer,
+                     public webapps::AppBannerManager::Observer,
++                    public browser_shortcuts::BrowserShortcutService::Observer,
+                     public views::FocusChangeListener {
+   METADATA_HEADER(BrowserView, views::ClientView)
+ 
+@@ -784,6 +786,9 @@ class BrowserView : public BrowserWindow
+   // ui::AcceleratorTarget:
+   bool AcceleratorPressed(const ui::Accelerator& accelerator) override;
+ 
++  // browser_shortcuts::BrowserShortcutService::Observer:
++  void OnBrowserShortcutsChanged() override;
++
+   // ImmersiveModeController::Observer:
+   void OnImmersiveFullscreenEntered() override;
+   void OnImmersiveFullscreenExited() override;
+@@ -1032,6 +1037,7 @@ class BrowserView : public BrowserWindow
+   // Copy the accelerator table from the app resources into something we can
+   // use.
+   void LoadAccelerators();
++  void ReloadAccelerators();
+ 
+   // Retrieves the command id for the specified Windows app command.
+   int GetCommandIDForAppCommandID(int app_command_id) const;
+@@ -1342,6 +1348,8 @@ class BrowserView : public BrowserWindow
+ 
+   // A mapping between accelerators and command IDs.
+   std::map<ui::Accelerator, int> accelerator_table_;
++  raw_ptr<browser_shortcuts::BrowserShortcutService> browser_shortcut_service_ =
++      nullptr;
+ 
+   // True if we have already been initialized.
+   bool initialized_ = false;
