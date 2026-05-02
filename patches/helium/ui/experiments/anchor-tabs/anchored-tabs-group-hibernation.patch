@@ -9,10 +9,302 @@
        "views/helium/tab_rename_dialog.cc",
        "views/helium/tab_rename_dialog.h",
        "views/hung_renderer_view.cc",
-Index: src/chrome/browser/helium_flag_choices.h
-===================================================================
---- src.orig/chrome/browser/helium_flag_choices.h
-+++ src/chrome/browser/helium_flag_choices.h
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -14,6 +14,7 @@
+ #include <set>
+ #include <string>
+ #include <utility>
++#include <vector>
+
+ #include "base/command_line.h"
+ #include "base/containers/flat_map.h"
+@@ -65,11 +66,12 @@
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ #include "chrome/browser/ui/startup/startup_types.h"
+-#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
++#include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+@@ -99,6 +101,7 @@
+ #include "content/public/browser/session_storage_namespace.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/common/url_constants.h"
+ #include "extensions/browser/extension_registry.h"
+ #include "extensions/common/extension_set.h"
+ #include "ui/base/mojom/window_show_state.mojom.h"
+@@ -138,6 +141,18 @@ bool HasSingleNewTabPage(Browser* browse
+          search::IsInstantNTP(active_tab);
+ }
+
++bool IsAnchoredNewTabSessionTab(const sessions::SessionTab& tab) {
++  if (tab.navigations.empty()) {
++    return true;
++  }
++
++  const GURL& url =
++      tab.navigations[tab.normalized_navigation_index()].virtual_url();
++  return url == chrome::kChromeUINewTabURL ||
++         (url.SchemeIs(content::kChromeUIScheme) &&
++          url.host() == chrome::kChromeUINewTabHost);
++}
++
+ // Pointers to SessionRestoreImpls which are currently restoring the session.
+ std::set<SessionRestoreImpl*>* active_session_restorers = nullptr;
+
+@@ -416,7 +431,7 @@ class SessionRestoreImpl : public Browse
+       web_contents->GetController().LoadIfNecessary();
+     }
+
+-    TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, tab.extra_data);
++    helium::RestoreAnchoredTabExtraData(web_contents, tab.extra_data);
+
+     if (use_new_window) {
+       browser->tab_strip_model()->ActivateTabAt(
+@@ -925,6 +940,17 @@ class SessionRestoreImpl : public Browse
+
+     const int selected_tab_index = std::clamp(
+         window.selected_tab_index, 0, static_cast<int>(window.tabs.size() - 1));
++    const bool helium_anchor_restore =
++        features::IsHeliumAnchoredTabsEnabled() && initial_tab_count == 0 &&
++        browser->is_type_normal();
++    const int restored_tab_offset = 0;
++    if (helium_anchor_restore) {
++      chrome::AddTabAt(browser, GURL(), 0, true);
++      if (browser != browser_) {
++        did_show_browser = true;
++      }
++      ShowBrowser(browser, 0);
++    }
+
+     // Capture all the splits and all tabs to split.
+     std::map<split_tabs::SplitTabId, std::vector<tabs::TabInterface*>>
+@@ -932,13 +958,30 @@ class SessionRestoreImpl : public Browse
+
+     const base::Time epoch_time = base::Time::UnixEpoch();
+     const base::TimeTicks epoch_time_ticks = base::TimeTicks::UnixEpoch();
++    std::vector<int> restore_order;
++    restore_order.reserve(window.tabs.size());
++    if (!helium_anchor_restore && initial_tab_count == 0) {
++      restore_order.push_back(selected_tab_index);
++    }
+     for (int i = 0; i < static_cast<int>(window.tabs.size()); ++i) {
++      if (!helium_anchor_restore && initial_tab_count == 0 &&
++          i == selected_tab_index) {
++        continue;
++      }
++      restore_order.push_back(i);
++    }
++
++    for (int i : restore_order) {
+       const sessions::SessionTab& tab = *(window.tabs[i]);
++      if (helium_anchor_restore && IsAnchoredNewTabSessionTab(tab)) {
++        continue;
++      }
+
+       // Loads are scheduled for each restored tab unless the tab is going to
+       // be selected as ShowBrowser() will load the selected tab.
+-      bool is_selected_tab =
+-          (initial_tab_count == 0) && (i == selected_tab_index);
++      bool is_selected_tab = !helium_anchor_restore &&
++                             (initial_tab_count == 0) &&
++                             (i == selected_tab_index);
+
+       // Convert the last active time because WebContents needs a TimeTicks.
+       const base::TimeDelta delta = tab.last_active_time - epoch_time;
+@@ -947,7 +990,7 @@ class SessionRestoreImpl : public Browse
+       // If the browser already has tabs, we want to restore the new ones after
+       // the existing ones. E.g. this happens in Win8 Metro where we merge
+       // windows or when launching a hosted app from the app launcher.
+-      int tab_index = i + initial_tab_count;
++      int tab_index = i + initial_tab_count + restored_tab_offset;
+       RestoreTab(tab, browser, is_active_browser, restored_tabs, new_group_ids,
+                  &tabs_by_split_id, tab_index, is_selected_tab,
+                  last_active_time_ticks, tab.last_active_time,
+@@ -1031,12 +1074,28 @@ class SessionRestoreImpl : public Browse
+         tab.extra_data, true /* from_session_restore */, is_active_browser);
+     DCHECK(web_contents);
+
+-    TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, tab.extra_data);
++    helium::RestoreAnchoredTabExtraData(web_contents, tab.extra_data);
++
++    // avoid tab-manager side effects while startup restore is still building.
++    const bool helium_hibernate_on_restore =
++        features::IsHeliumAnchoredTabsEnabled() && !is_selected_tab;
++    if (helium_hibernate_on_restore) {
++      web_contents->SetWasDiscarded(true);
++      web_contents->NotifyWasDiscarded();
++      const int restored_index =
++          browser->tab_strip_model()->GetIndexOfWebContents(web_contents);
++      if (restored_index != TabStripModel::kNoTab) {
++        browser->tab_strip_model()->UpdateWebContentsStateAt(
++            restored_index, TabChangeType::kAll);
++      }
++    }
+
+     RestoredTab restored_tab(web_contents, is_selected_tab,
+                              tab.extension_app_id.empty(), tab.pinned,
+                              new_group, tab.split_id);
+-    restored_tabs.push_back(restored_tab);
++    if (!helium_hibernate_on_restore) {
++      restored_tabs.push_back(restored_tab);
++    }
+
+     if (tab.split_id) {
+       // add tab to tabs_by_split_id.
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+
+ #include "base/containers/span.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
+ #include "chrome/browser/glic/glic_tab_restore_helper.h"
+@@ -19,11 +20,13 @@
+ #include "chrome/browser/tab_contents/tab_util.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser.h"
+ #include "chrome/common/buildflags.h"
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+@@ -48,6 +52,31 @@ namespace chrome {
+
+ namespace {
+
++GURL GetAnchoredURL(const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return GURL();
++  }
++
++  const auto it = extra_data.find(TabUIHelper::kAnchoredURLSessionKey);
++  if (it == extra_data.end()) {
++    return GURL();
++  }
++
++  const GURL url(it->second);
++  return url.is_valid() ? url : GURL();
++}
++
++std::u16string GetAnchoredTitle(
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return std::u16string();
++  }
++
++  const auto it = extra_data.find(TabUIHelper::kAnchoredTitleSessionKey);
++  return it == extra_data.end() ? std::u16string()
++                                : base::UTF8ToUTF16(it->second);
++}
++
+ std::unique_ptr<WebContents> CreateRestoredTab(
+     Browser* browser,
+     base::span<const SerializedNavigationEntry> navigations,
+@@ -60,7 +89,23 @@ std::unique_ptr<WebContents> CreateResto
+     const std::map<std::string, std::string>& extra_data,
+     bool initially_hidden,
+     bool from_session_restore) {
+-  GURL restore_url = navigations[selected_navigation].virtual_url();
++  std::vector<SerializedNavigationEntry> anchored_navigations(
++      navigations.begin(), navigations.end());
++  const GURL anchored_url = GetAnchoredURL(extra_data);
++  if (anchored_url.is_valid() && selected_navigation >= 0 &&
++      selected_navigation < static_cast<int>(anchored_navigations.size())) {
++    anchored_navigations[selected_navigation].set_virtual_url(anchored_url);
++    anchored_navigations[selected_navigation].set_original_request_url(
++        anchored_url);
++    anchored_navigations[selected_navigation].set_encoded_page_state(
++        std::string());
++    const std::u16string anchored_title = GetAnchoredTitle(extra_data);
++    if (!anchored_title.empty()) {
++      anchored_navigations[selected_navigation].set_title(anchored_title);
++    }
++  }
++
++  GURL restore_url = anchored_navigations[selected_navigation].virtual_url();
+   // TODO(ajwong): Remove the temporary session_storage_namespace_map when
+   // we teach session restore to understand that one tab can have multiple
+   // SessionStorageNamespace objects. Also remove the
+@@ -87,7 +132,7 @@ std::unique_ptr<WebContents> CreateResto
+
+   std::vector<std::unique_ptr<NavigationEntry>> entries =
+       ContentSerializedNavigationBuilder::ToNavigationEntries(
+-          navigations, browser->profile());
++          anchored_navigations, browser->profile());
+
+   blink::UserAgentOverride ua_override;
+   ua_override.ua_string_override = user_agent_override.ua_string_override;
+@@ -111,6 +156,10 @@ std::unique_ptr<WebContents> CreateResto
+ // cross-platform expectations about events it observes.
+ void LoadRestoredTabIfVisible(Browser* browser,
+                               content::WebContents* web_contents) {
++  if (web_contents->WasDiscarded()) {
++    return;
++  }
++
+   if (web_contents->GetVisibility() != content::Visibility::VISIBLE) {
+     return;
+   }
+@@ -138,6 +187,7 @@ WebContents* AddRestoredTabImpl(std::uni
+                                 bool select,
+                                 bool pin,
+                                 bool from_session_restore,
++                                bool restore_hibernated,
+                                 std::optional<bool> is_active_browser) {
+   TabStripModel* const tab_strip_model = browser->tab_strip_model();
+
+@@ -189,6 +239,10 @@ WebContents* AddRestoredTabImpl(std::uni
+                                          add_types, group);
+   }
+
++  if (restore_hibernated) {
++    raw_web_contents->SetWasDiscarded(true);
++  }
++
+   if (from_session_restore) {
+     // Indicate that the tab is created by session restore. This is used to hide
+     // the throbber when a background restored tab is loading.
+@@ -284,10 +338,19 @@ WebContents* AddRestoredTab(
+       browser, navigations, selected_navigation, extension_app_id,
+       last_active_time_ticks, last_active_time, session_storage_namespace,
+       user_agent_override, extra_data, initially_hidden, from_session_restore);
++  const bool helium_pre_discard =
++      features::IsHeliumAnchoredTabsEnabled() &&
++      (helium::ShouldRestoreHibernated(extra_data) ||
++       (!select && from_session_restore && (group.has_value() || pin)));
++  if (helium_pre_discard) {
++    web_contents->SetWasDiscarded(true);
++  }
+
+-  return AddRestoredTabImpl(std::move(web_contents), browser, tab_index, group,
+-                            select, pin, from_session_restore,
+-                            is_active_browser);
++  WebContents* const raw_web_contents = AddRestoredTabImpl(
++      std::move(web_contents), browser, tab_index, group, select, pin,
++      from_session_restore, helium_pre_discard, is_active_browser);
++  helium::RestoreAnchoredTabExtraData(raw_web_contents, extra_data);
++  return raw_web_contents;
+ }
+
+ WebContents* ReplaceRestoredTab(
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
 @@ -34,7 +34,10 @@ namespace helium {
    constexpr const char kHeliumNoiseCpuCoresCommandLine[] =
        "helium-noise-hw-concurrency";
@@ -25,10 +317,8 @@ Index: src/chrome/browser/helium_flag_choices.h
    constexpr const char kHeliumCompactLocationWidthCommandLine[] =
        "helium-compact-location-width";
    constexpr const char kHeliumZenModeCommandLine[] = "helium-zen-mode";
-Index: src/chrome/browser/helium_flag_entries.h
-===================================================================
---- src.orig/chrome/browser/helium_flag_entries.h
-+++ src/chrome/browser/helium_flag_entries.h
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
 @@ -37,6 +37,10 @@
       "Middle Click Autoscroll",
       "Enables autoscroll on middle click. Helium flag, Chromium feature.",
@@ -306,28 +596,62 @@ Index: src/chrome/browser/helium_flag_entries.h
 
  base::WeakPtr<TabUIHelper> TabUIHelper::GetWeakPtr() {
    return weak_factory_.GetWeakPtr();
-Index: src/chrome/browser/ui/ui_features.cc
-===================================================================
---- src.orig/chrome/browser/ui/ui_features.cc
-+++ src/chrome/browser/ui/ui_features.cc
-@@ -18,6 +18,13 @@
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -4,11 +4,16 @@
+
+ #include "chrome/browser/ui/ui_features.h"
+
++#include <optional>
++
+ #include "base/feature_list.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/prefs/session_startup_pref.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/common/chrome_features.h"
+ #include "components/search/ntp_features.h"
+ #include "components/variations/service/variations_service.h"
+@@ -18,6 +23,34 @@
 
  namespace features {
 
++namespace {
++
++bool IsHeliumAnchoredTabsStartupModeEnabled() {
++  static std::optional<bool> enabled_at_startup;
++  if (enabled_at_startup.has_value()) {
++    return *enabled_at_startup;
++  }
++
++  Profile* profile = ProfileManager::GetLastUsedProfileIfLoaded();
++  if (!profile) {
++    return false;
++  }
++
++  enabled_at_startup = SessionStartupPref::GetStartupPref(profile).type ==
++                       SessionStartupPref::LAST_WITH_ANCHORING;
++  return *enabled_at_startup;
++}
++
++}  // namespace
++
 +// Anchored tabs: tab-group centric tab renaming, hibernation, and restore.
 +BASE_FEATURE(kHeliumAnchoredTabs, base::FEATURE_ENABLED_BY_DEFAULT);
 +
 +bool IsHeliumAnchoredTabsEnabled() {
-+  return base::FeatureList::IsEnabled(kHeliumAnchoredTabs);
++  return base::FeatureList::IsEnabled(kHeliumAnchoredTabs) &&
++         IsHeliumAnchoredTabsStartupModeEnabled();
 +}
 +
  // Automatic location bar width in compact layout
  BASE_FEATURE(kHeliumCompactLocationWidth, base::FEATURE_DISABLED_BY_DEFAULT);
 
-Index: src/chrome/browser/ui/ui_features.h
-===================================================================
---- src.orig/chrome/browser/ui/ui_features.h
-+++ src/chrome/browser/ui/ui_features.h
+--- a/chrome/browser/ui/ui_features.h
++++ b/chrome/browser/ui/ui_features.h
 @@ -19,6 +19,9 @@ namespace features {
  // All features in alphabetical order. The features should be documented
  // alongside the definition of their values in the .cc file.
@@ -338,6 +662,39 @@ Index: src/chrome/browser/ui/ui_features.h
  BASE_DECLARE_FEATURE(kHeliumCompactLocationWidth);
  bool HeliumUseCompactLocationWidth();
 
+--- a/chrome/browser/ui/browser_navigator.cc
++++ b/chrome/browser/ui/browser_navigator.cc
+@@ -40,6 +40,7 @@
+ #include "chrome/browser/ui/tab_helpers.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/web_applications/web_app_tabbed_utils.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+@@ -623,6 +624,22 @@ base::WeakPtr<content::NavigationHandle>
+                                   ->GetActiveWebContents();
+   }
+
++  if (features::IsHeliumAnchoredTabsEnabled() && params->source_contents &&
++      params->browser &&
++      params->disposition == WindowOpenDisposition::CURRENT_TAB &&
++      (params->transition & ui::PAGE_TRANSITION_FROM_ADDRESS_BAR)) {
++    TabStripModel* const model =
++        params->browser->GetBrowserForMigrationOnly()->tab_strip_model();
++    const int source_index =
++        model ? model->GetIndexOfWebContents(params->source_contents)
++              : TabStripModel::kNoTab;
++    if (source_index != TabStripModel::kNoTab &&
++        model->GetTabGroupForTab(source_index).has_value()) {
++      params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++      params->group = std::nullopt;
++    }
++  }
++
+   WebContents* contents_to_navigate_or_insert =
+       params->contents_to_insert.get();
+   if (params->switch_to_singleton_tab) {
 --- a/chrome/browser/ui/tab_ui_helper.h
 +++ b/chrome/browser/ui/tab_ui_helper.h
 @@ -138,7 +138,18 @@ class TabUIHelper : public tabs::Content
