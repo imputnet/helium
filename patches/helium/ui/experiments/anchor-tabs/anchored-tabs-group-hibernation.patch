@@ -9,6 +9,148 @@
        "views/helium/tab_rename_dialog.cc",
        "views/helium/tab_rename_dialog.h",
        "views/hung_renderer_view.cc",
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -79,6 +79,7 @@
+ #include "chrome/browser/ui/exclusive_access/fullscreen_controller.h"
+ #include "chrome/browser/ui/find_bar/find_bar.h"
+ #include "chrome/browser/ui/find_bar/find_bar_controller.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/intent_picker_tab_helper.h"
+ #include "chrome/browser/ui/lens/lens_search_controller.h"
+@@ -1167,6 +1168,12 @@ void NewTabToRight(Browser* browser) {
+ void CloseTab(BrowserWindowInterface* browser) {
+   base::RecordAction(UserMetricsAction("CloseTab_Accelerator"));
+ 
++  if (TabStripModel* const model = browser->GetTabStripModel();
++      model->selection_model().size() == 1 && !model->IsActiveTabSplit() &&
++      helium::MaybeHibernateAnchoredTab(model, model->active_index())) {
++    return;
++  }
++
+   // If the selection model consists of only the indices of a single split tab,
+   // decide if just the active tab in the split is closed instead of all tabs in
+   // the split.
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/ui/browser_navigator_params.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+@@ -397,6 +398,10 @@ void BrowserTabStripController::CloseTab
+   // Cancel any pending tab transition.
+   hover_tab_selector_.CancelTabTransition();
+ 
++  if (helium::MaybeHibernateGroupedTab(model_, model_index)) {
++    return;
++  }
++
+   model_->CloseWebContentsAt(model_index,
+                              TabCloseTypes::CLOSE_USER_GESTURE |
+                                  TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/split_tab_util.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+@@ -38,6 +39,7 @@
+ #include "components/tabs/public/tab_collection_types.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/view_utils.h"
+@@ -221,6 +223,10 @@ void VerticalTabStripController::CloseTa
+     return;
+   }
+ 
++  if (helium::MaybeHibernateGroupedTab(model_, tab_index.value())) {
++    return;
++  }
++
+   model_->CloseWebContentsAt(tab_index.value(),
+                              TabCloseTypes::CLOSE_USER_GESTURE |
+                                  TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+@@ -265,38 +271,21 @@ void VerticalTabStripController::ToggleT
+     ToggleTabGroupCollapsedStateOrigin origin) {
+   bool is_currently_collapsed = group->visual_data()->is_collapsed();
+   bool should_toggle_group = true;
++  std::optional<int> active_group_tab_index;
+ 
+   tabs::TabInterface* active_tab = model_->GetActiveTab();
+   if (!is_currently_collapsed && active_tab) {
+-    if (active_tab->GetGroup() == group->id()) {
+-      // If the active tab is in the group that is toggling to collapse, the
+-      // active tab should switch to the next available tab. If there are no
+-      // available tabs for the active tab to switch to, a new tab will
+-      // be created.
+-      const std::optional<int> next_active =
+-          model_->GetNextExpandedActiveTab(group->id());
+-      if (next_active.has_value()) {
+-        model_->ActivateTabAt(
+-            next_active.value(),
+-            TabStripUserGestureDetails(
+-                TabStripUserGestureDetails::GestureType::kOther));
+-      } else {
+-        // Create a new tab that will automatically be activated
+-        should_toggle_group = false;
+-        // We intentionally do not call CreateNewTab() here because it
+-        // respects the IsNewTabAddsToActiveGroupEnabled() feature, which would
+-        // add the new tab to the same group as the currently active tab.
+-        // In the "collapse group" scenario, we want the new tab to be created
+-        // outside of any group to avoid it being collapsed immediately.
+-        model_->delegate()->AddTabAt(GURL(), -1, true);
+-      }
+-    } else {
++    if (active_tab->GetGroup() != group->id()) {
+       // If the active tab is not in the group that is toggling to collapse,
+       // reactive the active tab to deselect any other potentially selected
+       // tabs.
+       SelectTab(active_tab,
+                 TabStripUserGestureDetails(
+                     TabStripUserGestureDetails::GestureType::kOther));
++    } else if (content::WebContents* const active_contents =
++                   active_tab->GetContents();
++               active_contents && !active_contents->WasDiscarded()) {
++      active_group_tab_index = model_->GetIndexOfTab(active_tab);
+     }
+   }
+ 
+@@ -308,6 +297,13 @@ void VerticalTabStripController::ToggleT
+                                        group->visual_data()->color(),
+                                        !is_currently_collapsed),
+         true);
++    if (active_group_tab_index.has_value() &&
++        model_->ContainsIndex(*active_group_tab_index)) {
++      model_->ActivateTabAt(
++          *active_group_tab_index,
++          TabStripUserGestureDetails(
++              TabStripUserGestureDetails::GestureType::kOther));
++    }
+   }
+ 
+   if (should_toggle_group &&
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h
+@@ -71,6 +71,7 @@ class VerticalTabStripController : publi
+   views::Widget* ShowGroupEditorBubble(const tab_groups::TabGroupId& group_id,
+                                        views::View* anchor_view,
+                                        bool stop_context_menu_propagation);
++  TabStripModel* GetModel() const { return model_; }
+   bool IsCollapsed() const;
+ 
+   tab_groups::TabGroupSyncService* GetTabGroupSyncService();
 --- a/chrome/browser/sessions/session_restore.cc
 +++ b/chrome/browser/sessions/session_restore.cc
 @@ -14,6 +14,7 @@
