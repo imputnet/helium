@@ -53,6 +53,101 @@
    model_->CloseWebContentsAt(model_index,
                               TabCloseTypes::CLOSE_USER_GESTURE |
                                   TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tab_contents/core_tab_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert.h"
+@@ -987,6 +988,10 @@ void Tab::SetData(tabs::TabData data) {
+     title = Browser::FormatTitleForDisplay(title);
+   }
+   title_->SetText(title);
++  close_button_->SetIconVariant(helium::ShouldShowGroupedTabHibernateAffordance(
++                                    tab_handle_.Get(), data_.is_tab_discarded)
++                                    ? TabCloseButton::IconVariant::kMinus
++                                    : TabCloseButton::IconVariant::kClose);
+ 
+   const auto new_alert_state = data_.alert_state;
+   const auto old_alert_state = old.alert_state;
+--- a/chrome/browser/ui/views/tabs/tab/tab_close_button.cc
++++ b/chrome/browser/ui/views/tabs/tab/tab_close_button.cc
+@@ -124,6 +124,14 @@ void TabCloseButton::SetColors(TabStyle:
+   OnPropertyChanged(&colors_, views::PropertyEffects::kPaint);
+ }
+ 
++void TabCloseButton::SetIconVariant(IconVariant icon_variant) {
++  if (icon_variant_ == icon_variant) {
++    return;
++  }
++  icon_variant_ = icon_variant;
++  UpdateIcon();
++}
++
+ views::View* TabCloseButton::GetTooltipHandlerForPoint(
+     const gfx::Point& point) {
+   // Tab close button has no children, so tooltip handler should be the same
+@@ -215,7 +223,9 @@ bool TabCloseButton::GetHitTestMask(SkPa
+   return true;
+ }
+ void TabCloseButton::UpdateIcon() {
+-  const auto& icon = kCloseTabChromeRefreshIcon;
++  const auto& icon = icon_variant_ == IconVariant::kMinus
++                         ? kRemoveIcon
++                         : kCloseTabChromeRefreshIcon;
+ 
+   SetImageModel(views::Button::STATE_NORMAL,
+                 ui::ImageModel::FromVectorIcon(
+--- a/chrome/browser/ui/views/tabs/tab/tab_close_button.h
++++ b/chrome/browser/ui/views/tabs/tab/tab_close_button.h
+@@ -22,6 +22,10 @@ class TabCloseButton : public views::Lab
+  public:
+   using MouseEventCallback =
+       base::RepeatingCallback<void(views::View*, const ui::MouseEvent&)>;
++  enum class IconVariant {
++    kClose,
++    kMinus,
++  };
+ 
+   // The mouse_event callback will be called for every mouse event to allow
+   // middle clicks to be handled by the parent.
+@@ -39,6 +43,7 @@ class TabCloseButton : public views::Lab
+   // changes (this class does not track tab activation state), and when the
+   // theme changes.
+   void SetColors(TabStyle::TabColors colors);
++  void SetIconVariant(IconVariant icon_variant);
+ 
+   // views::LabelButton:
+   View* GetTooltipHandlerForPoint(const gfx::Point& point) override;
+@@ -66,6 +71,7 @@ class TabCloseButton : public views::Lab
+   MouseEventCallback mouse_event_callback_;
+ 
+   TabStyle::TabColors colors_;
++  IconVariant icon_variant_ = IconVariant::kClose;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_TAB_TAB_CLOSE_BUTTON_H_
+--- a/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
+@@ -441,6 +441,12 @@ bool TabStripLayoutHelper::SlotIsCollaps
+   // Otherwise, a tab is only collapsed if it is in an explicitly collapsed
+   // group.
+   const std::optional<tab_groups::TabGroupId> id = slots_[i].view->group();
+-  return slots_[i].type == TabSlotView::ViewType::kTab && id.has_value() &&
+-         controller_->IsGroupCollapsed(id.value());
++  if (slots_[i].type != TabSlotView::ViewType::kTab || !id.has_value() ||
++      !controller_->IsGroupCollapsed(id.value())) {
++    return false;
++  }
++
++  // Live tabs stay visible when their group is collapsed.
++  const Tab* const tab = static_cast<const Tab*>(slots_[i].view.get());
++  return tab->IsDiscarded();
+ }
 --- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
 +++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
 @@ -14,6 +14,7 @@
