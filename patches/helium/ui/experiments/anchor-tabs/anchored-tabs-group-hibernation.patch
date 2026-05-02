@@ -596,6 +596,306 @@
 
  base::WeakPtr<TabUIHelper> TabUIHelper::GetWeakPtr() {
    return weak_factory_.GetWeakPtr();
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -299,11 +299,15 @@ void TabMenuModel::Build(TabStripModel*
+ 
+   AddSeparator(ui::NORMAL_SEPARATOR);
+ 
+-  // Bulk rename of multiple tabs would be confusing.
+-  if (indices.size() == 1 &&
+-      tab_strip->GetTabGroupForTab(indices.front()).has_value()) {
++  const bool helium_is_single_anchored_tab =
++      features::IsHeliumAnchoredTabsEnabled() && indices.size() == 1 &&
++      (tab_strip->GetTabGroupForTab(indices.front()).has_value() ||
++       tab_strip->IsTabPinned(indices.front()));
++  if (helium_is_single_anchored_tab) {
+     AddItemWithStringId(TabStripModel::CommandRenameTab,
+                         IDS_TAB_CXMENU_RENAMETAB);
++    AddItem(TabStripModel::CommandReplaceAnchoredURL,
++            u"Replace anchored URL with Current");
+     AddSeparator(ui::NORMAL_SEPARATOR);
+   }
+ 
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -51,6 +51,7 @@
+ #include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
+ #include "chrome/browser/resource_coordinator/tab_helper.h"
+ #include "chrome/browser/send_tab_to_self/send_tab_to_self_util.h"
++#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_utils.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+@@ -58,6 +59,7 @@
+ #include "chrome/browser/ui/browser_finder.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/features.h"
+@@ -101,6 +103,7 @@
+ #include "components/performance_manager/public/performance_manager.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/reading_list/core/reading_list_model.h"
++#include "components/saved_tab_groups/public/tab_group_sync_service.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tab_groups/tab_group_id.h"
+@@ -134,6 +137,72 @@ namespace {
+ 
+ TabGroupModelFactory* factory_instance = nullptr;
+ 
++GURL GetCurrentTabURLForAnchor(WebContents* contents) {
++  if (!contents) {
++    return GURL();
++  }
++
++  const GURL url = contents->GetLastCommittedURL();
++  if (url.is_valid()) {
++    return url;
++  }
++  return contents->GetVisibleURL();
++}
++
++std::u16string GetCurrentTabTitleForAnchor(WebContents* contents) {
++  if (!contents) {
++    return std::u16string();
++  }
++
++  return contents->GetTitle();
++}
++
++TabUIHelper* GetTabUIHelper(WebContents* contents) {
++  tabs::TabInterface* const tab =
++      contents ? tabs::TabInterface::GetFromContents(contents) : nullptr;
++  return tab ? TabUIHelper::From(tab) : nullptr;
++}
++
++void MaybeSetInitialAnchoredURL(WebContents* contents) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return;
++  }
++
++  TabUIHelper* const helper = GetTabUIHelper(contents);
++  if (!helper || helper->anchored_url().is_valid()) {
++    return;
++  }
++
++  helper->SetAnchoredURL(GetCurrentTabURLForAnchor(contents),
++                         GetCurrentTabTitleForAnchor(contents));
++}
++
++void SetAnchoredURLToCurrent(TabStripModel* model, int index) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !model ||
++      !model->ContainsIndex(index)) {
++    return;
++  }
++
++  WebContents* const contents = model->GetWebContentsAt(index);
++  TabUIHelper* const helper = GetTabUIHelper(contents);
++  const GURL url = GetCurrentTabURLForAnchor(contents);
++  if (!helper || !url.is_valid()) {
++    return;
++  }
++
++  helper->SetAnchoredURL(url, GetCurrentTabTitleForAnchor(contents));
++
++  auto* const service =
++      tab_groups::TabGroupSyncServiceFactory::GetForProfile(model->profile());
++  const std::optional<tab_groups::TabGroupId> group =
++      model->GetTabGroupForTab(index);
++  tabs::TabInterface* const tab = tabs::TabInterface::GetFromContents(contents);
++  if (service && group.has_value() && tab) {
++    service->NavigateTab(group.value(), tab->GetHandle().raw_value(), url,
++                         contents->GetTitle());
++  }
++}
++
+ // Works similarly to base::AutoReset but checks for access from the wrong
+ // thread as well as ensuring that the previous value of the re-entrancy guard
+ // variable was false.
+@@ -216,6 +285,11 @@ base::WeakPtr<performance_manager::PageN
+   return page_node;
+ }
+ 
++bool ContainsWebContents(base::span<content::WebContents* const> items,
++                         content::WebContents* contents) {
++  return std::ranges::find(items, contents) != items.end();
++}
++
+ }  // namespace
+ 
+ TabGroupModelFactory::TabGroupModelFactory() {
+@@ -1360,6 +1434,11 @@ void TabStripModel::CloseAllTabsInGroupI
+       gfx::Range(tabs_in_group.GetMax(), tabs_in_group.GetMin()).ToIntVector();
+   std::vector<content::WebContents*> closing_tabs =
+       GetWebContentsesByIndices(reversed_group_indices);
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    for (content::WebContents* contents : closing_tabs) {
++      helium::MarkWebContentsHibernatedForRestore(contents);
++    }
++  }
+   CloseTabs(closing_tabs, TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+ }
+ 
+@@ -1458,7 +1537,12 @@ int TabStripModel::SetTabPinned(int inde
+     return index;
+   }
+ 
+-  return SetTabPinnedImpl(index, pinned);
++  tabs::TabInterface* const tab = GetTabAtIndex(index);
++  const int final_index = SetTabPinnedImpl(index, pinned);
++  if (pinned && tab) {
++    MaybeSetInitialAnchoredURL(tab->GetContents());
++  }
++  return final_index;
+ }
+ 
+ bool TabStripModel::IsTabPinned(int index) const {
+@@ -2466,6 +2550,10 @@ bool TabStripModel::IsContextMenuCommand
+       return delegate_->CanReload();
+ 
+     case CommandDiscard: {
++      if (helium::IsLiveAnchoredTab(this, context_index)) {
++        return true;
++      }
++
+       auto* const eligibility_policy = GetDiscardEligibilityPolicy();
+       if (!eligibility_policy) {
+         return false;
+@@ -2481,9 +2569,15 @@ bool TabStripModel::IsContextMenuCommand
+     }
+ 
+     case CommandRenameTab: {
+-      return GetTabGroupForTab(context_index).has_value();
++      return helium::IsAnchoredTab(this, context_index);
+     }
+ 
++    case CommandReplaceAnchoredURL:
++      return context_index == active_index() &&
++             helium::IsAnchoredTab(this, context_index) &&
++             GetCurrentTabURLForAnchor(GetWebContentsAt(context_index))
++                 .is_valid();
++
+     case CommandCloseOtherTabs:
+     case CommandCloseTabsToRight: {
+       return !GetIndicesClosedByCommand(context_index, command_id).empty();
+@@ -2653,6 +2747,10 @@ void TabStripModel::ExecuteContextMenuCo
+     }
+ 
+     case CommandDiscard: {
++      if (helium::MaybeHibernateAnchoredTab(this, context_index)) {
++        break;
++      }
++
+       auto* const eligibility_policy = GetDiscardEligibilityPolicy();
+       if (!eligibility_policy) {
+         break;
+@@ -2674,6 +2772,9 @@ void TabStripModel::ExecuteContextMenuCo
+     }
+ 
+     case CommandRenameTab: {
++      if (!features::IsHeliumAnchoredTabsEnabled()) {
++        break;
++      }
+       base::RecordAction(UserMetricsAction("TabContextMenu_RenameTab"));
+       WebContents* const contents = GetWebContentsAt(context_index);
+       if (!contents) {
+@@ -2700,6 +2801,16 @@ void TabStripModel::ExecuteContextMenuCo
+       break;
+     }
+ 
++    case CommandReplaceAnchoredURL: {
++      if (!features::IsHeliumAnchoredTabsEnabled()) {
++        break;
++      }
++      base::RecordAction(
++          UserMetricsAction("TabContextMenu_ReplaceAnchoredURL"));
++      SetAnchoredURLToCurrent(this, context_index);
++      break;
++    }
++
+     case CommandCloseTab: {
+       base::UmaHistogramCounts1000("Tab.ContextMenu.CloseTab.SelectedTabsCount",
+                                    selection_model_.size());
+@@ -3710,6 +3821,10 @@ int TabStripModel::InsertTabAtImpl(
+     NotifyForegroundTabsWillEnterBackground();
+   }
+ 
++  if (pin) {
++    MaybeSetInitialAnchoredURL(tab->GetContents());
++  }
++
+   // Have to get the active contents before we monkey with the contents
+   // otherwise we run into problems when we try to change the active contents
+   // since the old contents and the new contents will be the same...
+@@ -3796,6 +3911,22 @@ void TabStripModel::CloseTabs(base::span
+     return;
+   }
+ 
++  if (features::IsHeliumAnchoredTabsEnabled() && !closing_all_ &&
++      ContainsWebContents(filtered_items, GetActiveWebContents())) {
++    bool has_live_fallback = false;
++    for (int i = 0; i < count(); ++i) {
++      content::WebContents* const contents = GetWebContentsAt(i);
++      if (!ContainsWebContents(filtered_items, contents) &&
++          !contents->WasDiscarded()) {
++        has_live_fallback = true;
++        break;
++      }
++    }
++    if (!has_live_fallback) {
++      delegate()->AddTabAt(GURL(), -1, true);
++    }
++  }
++
+   const bool closing_all = static_cast<int>(filtered_items.size()) == count();
+   base::WeakPtr<TabStripModel> ref = weak_factory_.GetWeakPtr();
+   if (closing_all) {
+@@ -4564,6 +4695,7 @@ void TabStripModel::AddToNewGroupImpl(
+   const gfx::Range tab_indices =
+       group_model()->GetTabGroup(new_group)->ListTabs();
+   for (auto index = tab_indices.start(); index < tab_indices.end(); ++index) {
++    MaybeSetInitialAnchoredURL(GetWebContentsAt(index));
+     if (active_index() != static_cast<int>(index) && IsTabSelected(index)) {
+       DeselectTabAt(index);
+     }
+@@ -4622,6 +4754,11 @@ void TabStripModel::AddToExistingGroupIm
+     MoveTabsAndSetPropertiesImpl(tabs_right_of_group, last_tab_index + 1, group,
+                                  false);
+   }
++
++  const gfx::Range tab_indices = group_object->ListTabs();
++  for (auto index = tab_indices.start(); index < tab_indices.end(); ++index) {
++    MaybeSetInitialAnchoredURL(GetWebContentsAt(index));
++  }
+ }
+ 
+ void TabStripModel::MoveTabsAndSetPropertiesImpl(
+@@ -5553,6 +5690,21 @@ std::optional<int> TabStripModel::Determ
+ 
+   gfx::Range block_tabs = gfx::Range(start_index, start_index + block_size);
+ 
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    for (int i = block_tabs.end(); i < count(); ++i) {
++      content::WebContents* const contents = GetWebContentsAt(i);
++      if (!IsTabCollapsed(i) && contents && !contents->WasDiscarded()) {
++        return GetTabIndexAfterClosing(i, block_tabs);
++      }
++    }
++    for (int i = block_tabs.start() - 1; i >= 0; --i) {
++      content::WebContents* const contents = GetWebContentsAt(i);
++      if (!IsTabCollapsed(i) && contents && !contents->WasDiscarded()) {
++        return GetTabIndexAfterClosing(i, block_tabs);
++      }
++    }
++  }
++
+   // First preference is a tab the block opened.
+   int new_selected_index = GetIndexOfNextWebContentsOpenedBy(block_tabs);
+   if (new_selected_index != TabStripModel::kNoTab &&
 --- a/chrome/browser/ui/ui_features.cc
 +++ b/chrome/browser/ui/ui_features.cc
 @@ -4,11 +4,16 @@
@@ -725,6 +1025,16 @@
    GURL last_requested_favicon_page_url_;
    bool favicon_fetch_in_flight_ = false;
    base::CancelableTaskTracker favicon_task_tracker_;
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -787,6 +787,7 @@ class TabStripModel {
+     CommandGlicUnshare,
+     CommandDiscard,
+     CommandRenameTab,
++    CommandReplaceAnchoredURL,
+     CommandLast
+   };
+   // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
 --- /dev/null
 +++ b/chrome/browser/ui/helium/anchored_tab_hibernation.cc
 @@ -0,0 +1,343 @@
