@@ -25,18 +25,19 @@
    registry->RegisterBooleanPref(prefs::kShowHomeButton, false,
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.h
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
-@@ -342,6 +342,10 @@ class ToolbarView : public views::Access
+@@ -342,6 +342,11 @@ class ToolbarView : public views::Access
  
    void OnShowMediaButtonChanged();
  
 +  void OnLocationBarCenteredChanged();
 +
-+  void MaybeCenterLocationBar();
++  gfx::Rect GetCenteredLocationBarBounds(gfx::Rect bounds,
++                                         int toolbar_width) const;
 +
    void OnTouchUiChanged();
  
    void NewTabButtonPressed(const ui::Event& event);
-@@ -457,6 +461,8 @@ class ToolbarView : public views::Access
+@@ -457,6 +462,8 @@ class ToolbarView : public views::Access
  
    BooleanPrefMember show_media_button_;
  
@@ -47,7 +48,15 @@
    // The display mode used when laying out the toolbar.
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
-@@ -212,6 +212,27 @@ constexpr int kBrowserAppMenuRefreshColl
+@@ -12,6 +12,7 @@
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback.h"
+ #include "base/i18n/number_formatting.h"
+ #include "base/i18n/rtl.h"
+ #include "base/metrics/histogram_macros.h"
+@@ -212,6 +213,61 @@ constexpr int kBrowserAppMenuRefreshColl
  constexpr int kLargeSpaceBetweenButtons = 6;
  constexpr int kInsideBorderAroundGlicButtons = 2;
  constexpr int kOutsideBorderAroundGlicButtons = 11;
@@ -72,10 +81,44 @@
 +  }
 +  return 0;
 +}
++
++class CenteredLocationBarLayout : public views::FlexLayout {
++ public:
++  using GetCenteredBoundsCallback =
++      base::RepeatingCallback<gfx::Rect(gfx::Rect, int)>;
++
++  CenteredLocationBarLayout(views::View* location_bar,
++                            GetCenteredBoundsCallback callback)
++      : location_bar_(location_bar), callback_(std::move(callback)) {}
++
++  CenteredLocationBarLayout(const CenteredLocationBarLayout&) = delete;
++  CenteredLocationBarLayout& operator=(const CenteredLocationBarLayout&) =
++      delete;
++
++  ~CenteredLocationBarLayout() override = default;
++
++ protected:
++  views::ProposedLayout CalculateProposedLayout(
++      const views::SizeBounds& size_bounds) const override {
++    views::ProposedLayout layout =
++        views::FlexLayout::CalculateProposedLayout(size_bounds);
++    views::ChildLayout* const location_bar_layout =
++        layout.GetLayoutFor(location_bar_);
++    if (location_bar_layout && location_bar_layout->visible) {
++      location_bar_layout->bounds =
++          callback_.Run(location_bar_layout->bounds, layout.host_size.width());
++    }
++    return layout;
++  }
++
++ private:
++  const raw_ptr<views::View> location_bar_;
++  GetCenteredBoundsCallback callback_;
++};
  
  }  // namespace
  
-@@ -681,6 +702,11 @@ void ToolbarView::Init() {
+@@ -681,6 +737,11 @@ void ToolbarView::Init() {
      OnShowMediaButtonChanged();
    }
  
@@ -87,15 +130,20 @@
    InitLayout();
  
    for (auto* button : std::array<views::Button*, 5>{back_, forward_, reload_,
-@@ -1505,6 +1531,7 @@ void ToolbarView::Layout(PassKey) {
-   // Call super implementation to ensure layout manager and child layouts
-   // happen.
-   LayoutSuperclass<AccessiblePaneView>(this);
-+  MaybeCenterLocationBar();
- }
+@@ -1569,7 +1630,11 @@ void ToolbarView::InitLayout() {
+                                views::MaximumFlexSizeRule::kUnbounded)
+           .WithOrder(kLocationBarFlexOrder);
  
- void ToolbarView::OnThemeChanged() {
-@@ -1938,6 +1965,48 @@ void ToolbarView::OnShowMediaButtonChang
+-  layout_manager_ = SetLayoutManager(std::make_unique<views::FlexLayout>());
++  layout_manager_ =
++      SetLayoutManager(std::make_unique<CenteredLocationBarLayout>(
++          location_bar_view_,
++          base::BindRepeating(&ToolbarView::GetCenteredLocationBarBounds,
++                              base::Unretained(this))));
+ 
+   layout_manager_->SetOrientation(views::LayoutOrientation::kHorizontal)
+       .SetCrossAxisAlignment(views::LayoutAlignment::kCenter)
+@@ -1938,6 +2003,46 @@ void ToolbarView::OnShowMediaButtonChang
    InvalidateLayout();
  }
  
@@ -103,19 +151,18 @@
 +  InvalidateLayout();
 +}
 +
-+void ToolbarView::MaybeCenterLocationBar() {
++gfx::Rect ToolbarView::GetCenteredLocationBarBounds(gfx::Rect bounds,
++                                                    int toolbar_width) const {
 +  if (display_mode_ != DisplayMode::kNormal ||
 +      !location_bar_is_centered_.GetValue()) {
-+    return;
++    return bounds;
 +  }
 +
-+  const int toolbar_width = width();
 +  const int width_reduction = CenteredLocationBarWidthReduction(toolbar_width);
 +  if (width_reduction == 0) {
-+    return;
++    return bounds;
 +  }
 +
-+  gfx::Rect bounds = location_bar_view_->bounds();
 +  const int centered_width =
 +      std::clamp(bounds.width() - width_reduction,
 +                 location_bar_view_->GetMinimumSize().width(),
@@ -137,8 +184,7 @@
 +
 +  bounds.set_x(centered_x);
 +  bounds.set_width(centered_width);
-+
-+  location_bar_view_->SetBoundsRect(bounds);
++  return bounds;
 +}
 +
  void ToolbarView::OnTouchUiChanged() {
