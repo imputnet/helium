@@ -275,6 +275,197 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.
  
    const raw_ptr<views::ImageView> collapse_icon_ = nullptr;
    const raw_ref<Delegate> delegate_;
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -8,10 +8,12 @@
+ 
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_group_features.h"
+ #include "chrome/browser/ui/tabs/tab_group_theme.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/tabs/tab_group_accessibility.h"
+ #include "chrome/browser/ui/views/tabs/tab_hover_card_controller.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_types.h"
+@@ -119,6 +121,8 @@ views::ProposedLayout VerticalTabGroupVi
+   int width = 0;
+   int height = kGroupHeaderVerticalMargin;
+   bool is_tab_strip_collapsed = IsTabStripCollapsed();
++  const bool hide_group_line =
++      features::IsHeliumAnchoredTabsEnabled() && is_tab_strip_collapsed;
+ 
+   gfx::Rect header_bounds;
+   gfx::Rect group_line_bounds;
+@@ -156,11 +160,13 @@ views::ProposedLayout VerticalTabGroupVi
+   const std::vector<views::View*> children =
+       collection_node_ ? collection_node_->GetDirectChildren()
+                        : std::vector<views::View*>();
++  bool has_visible_child = false;
+ 
+   // Layout children in order. Children will have their preferred height and
+   // fill available width.
+   for (auto* child : children) {
+     gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(size_bounds));
++    const bool child_visible = child->GetVisible();
+ 
+     auto drag_data = GetVisualDataForDraggedView(*child);
+     CHECK(!drag_data || !drag_data->should_hide);
+@@ -176,18 +182,25 @@ views::ProposedLayout VerticalTabGroupVi
+     if (size_bounds.width().is_bounded()) {
+       bounds.set_width(size_bounds.width().value() - bounds.x());
+     }
+-    layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
++    layouts.child_layouts.emplace_back(child, child_visible, bounds);
++    has_visible_child |= child_visible;
++    if (!child_visible) {
++      continue;
++    }
+     height += bounds.height() + kTabVerticalPadding;
+     width = std::max(width, bounds.width());
+   }
+-  // Remove excess padding.
+-  height -= kTabVerticalPadding;
++  if (has_visible_child) {
++    // Remove excess padding.
++    height -= kTabVerticalPadding;
++  }
+ 
+-  if (!children.empty()) {
++  if (has_visible_child) {
+     group_line_bounds.set_height(height - group_line_bounds.y());
+   }
+-  layouts.child_layouts.emplace_back(
+-      group_line_.get(), group_line_->GetVisible(), group_line_bounds);
++  layouts.child_layouts.emplace_back(group_line_.get(),
++                                     has_visible_child && !hide_group_line,
++                                     group_line_bounds);
+ 
+   // Add extra padding below the group if not collapsed.
+   const bool is_collapsed = IsCollapsed();
+@@ -196,7 +209,7 @@ views::ProposedLayout VerticalTabGroupVi
+   }
+ 
+   layouts.host_size = gfx::Size(
+-      width, is_collapsed
++      width, is_collapsed && !has_visible_child
+                  ? header_bounds.height() + (2 * kGroupHeaderVerticalMargin)
+                  : height);
+   return layouts;
+@@ -283,6 +296,32 @@ std::u16string VerticalTabGroupView::Get
+   return tab_groups::GetGroupContentString(group);
+ }
+ 
++bool VerticalTabGroupView::ShouldShowHibernateButton() const {
++  if (!collection_node_ || !IsCollapsed()) {
++    return false;
++  }
++
++  for (views::View* child : children()) {
++    if (auto* tab_view = views::AsViewClass<VerticalTabView>(child)) {
++      if (tab_view->GetVisible() && !tab_view->data().is_tab_discarded) {
++        return true;
++      }
++    }
++  }
++
++  return false;
++}
++
++void VerticalTabGroupView::HibernateRemainingTabs() {
++  if (!collection_node_) {
++    return;
++  }
++
++  helium::HibernateTabGroup(collection_node_->GetController()->GetModel(),
++                            GetTabGroupFromNode(collection_node_)->id());
++  OnDataChanged();
++}
++
+ void VerticalTabGroupView::AttachChildView(
+     std::unique_ptr<views::View> child_view,
+     const gfx::Rect& previous_bounds_in_screen) {
+@@ -326,11 +365,7 @@ void VerticalTabGroupView::OnDataChanged
+   group_header_->OnDataChanged(&tab_group_visual_data_, has_attention,
+                                GetIsShared());
+ 
+-  // If the tab group is not collapsed update child visibility immediately. This
+-  // allows tabs to be visible as they are animated in.
+-  if (!tab_group_visual_data_.is_collapsed()) {
+-    UpdateChildVisibilityForCollapseState(false);
+-  }
++  UpdateChildVisibilityForCollapseState(tab_group_visual_data_.is_collapsed());
+ 
+   if (GetColorProvider()) {
+     SkColor color = GetColorProvider()->GetColor(GetTabGroupTabStripColorId(
+@@ -342,15 +377,40 @@ void VerticalTabGroupView::OnDataChanged
+   InvalidateLayout();
+ }
+ 
++void VerticalTabGroupView::OnChildTabStateChanged() {
++  if (!collection_node_ || !IsCollapsed()) {
++    return;
++  }
++
++  const TabGroup* group = GetTabGroupFromNode(collection_node_);
++  const bool has_attention =
++      SupportsDataSharing() &&
++      group->GetTabGroupFeatures()->attention_indicator()->GetHasAttention();
++  group_header_->OnDataChanged(&tab_group_visual_data_, has_attention,
++                               GetIsShared());
++  UpdateChildVisibilityForCollapseState(true);
++  InvalidateLayout();
++}
++
+ void VerticalTabGroupView::UpdateChildVisibilityForCollapseState(
+     bool collapsed) {
+   // Collection node may not exist at this point during browser shutdown.
+   if (!collection_node_) {
+     return;
+   }
+-  group_line_->SetVisible(!collapsed);
++  group_line_->SetVisible(
++      !collapsed &&
++      !(features::IsHeliumAnchoredTabsEnabled() && IsTabStripCollapsed()));
+   for (auto* child : collection_node_->GetDirectChildren()) {
+-    child->SetVisible(!collapsed);
++    bool visible = !collapsed;
++    if (collapsed) {
++      if (auto* tab_view = views::AsViewClass<VerticalTabView>(child)) {
++        visible = tab_view->IsActive() && !tab_view->data().is_tab_discarded;
++      } else {
++        visible = false;
++      }
++    }
++    child->SetVisible(visible);
+   }
+ }
+ 
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -54,6 +54,8 @@ class VerticalTabGroupView
+   views::Widget* ShowGroupEditorBubble(
+       bool stop_context_menu_propagation) override;
+   std::u16string GetGroupContentString() const override;
++  bool ShouldShowHibernateButton() const override;
++  void HibernateRemainingTabs() override;
+   void InitHeaderDrag(const ui::MouseEvent& event) override;
+   bool ContinueHeaderDrag(const ui::MouseEvent& event) override;
+   void CancelHeaderDrag() override;
+@@ -80,6 +82,7 @@ class VerticalTabGroupView
+   const VerticalTabGroupHeaderView* group_header() const {
+     return group_header_;
+   }
++  void OnChildTabStateChanged();
+ 
+  private:
+   // VerticalDraggedTabsContainer:
 Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
@@ -377,6 +568,177 @@ Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h
    bool IsCollapsed() const;
  
    tab_groups::TabGroupSyncService* GetTabGroupSyncService();
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -13,6 +13,7 @@
+ #include "base/metrics/user_metrics_action.h"
+ #include "base/notimplemented.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "cc/paint/paint_flags.h"
+ #include "chrome/browser/glic/browser_ui/tab_underline_view.h"
+ #include "chrome/browser/glic/browser_ui/tab_underline_view_controller_impl.h"
+ #include "chrome/browser/glic/public/glic_enabling.h"
+@@ -20,6 +21,7 @@
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tab_contents/core_tab_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert.h"
+@@ -29,6 +31,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/event_utils.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -42,6 +45,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h"
+ #include "chrome/common/buildflags.h"
+@@ -82,6 +86,9 @@ constexpr int kTitleMinWidth = 10;
+ constexpr int kHorizontalInset = 7;
+ constexpr int kDefaultPadding = 4;
+ constexpr int kFocusRingInset = 0.0f;
++constexpr int kAnchoredGroupIndicatorWidth = 8;
++constexpr int kAnchoredGroupIndicatorStrokeWidth = 2;
++constexpr int kAnchoredGroupIndicatorVerticalInset = 11;
+ 
+ class VerticalTabHighlightPathGenerator : public views::HighlightPathGenerator {
+  public:
+@@ -112,6 +119,40 @@ class VerticalTabTitle : public views::L
+ BEGIN_METADATA(VerticalTabTitle)
+ END_METADATA
+ 
++class AnchoredGroupIndicatorView : public views::View {
++  METADATA_HEADER(AnchoredGroupIndicatorView, views::View)
++
++ public:
++  AnchoredGroupIndicatorView() = default;
++
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(kAnchoredGroupIndicatorWidth,
++                     GetLayoutConstant(LayoutConstant::kVerticalTabHeight));
++  }
++
++  void OnPaint(gfx::Canvas* canvas) override {
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(
++        GetColorProvider()->GetColor(ui::kColorLabelForegroundSecondary));
++    flags.setStrokeCap(cc::PaintFlags::kRound_Cap);
++    flags.setStrokeWidth(kAnchoredGroupIndicatorStrokeWidth);
++    flags.setStyle(cc::PaintFlags::kStroke_Style);
++
++    const gfx::Rect bounds = GetLocalBounds();
++    canvas->DrawLine(
++        gfx::PointF(bounds.CenterPoint().x() + 1,
++                    bounds.y() + kAnchoredGroupIndicatorVerticalInset),
++        gfx::PointF(bounds.CenterPoint().x() - 1,
++                    bounds.bottom() - kAnchoredGroupIndicatorVerticalInset),
++        flags);
++  }
++};
++
++BEGIN_METADATA(AnchoredGroupIndicatorView)
++END_METADATA
++
+ bool IsSelectionModifierDown(const ui::MouseEvent& event) {
+ #if BUILDFLAG(IS_MAC)
+   return event.IsCommandDown();
+@@ -140,6 +181,8 @@ VerticalTabView::VerticalTabView(TabColl
+       collection_node_(collection_node),
+       tab_style_(TabStyle::Get()),
+       icon_(AddChildView(std::make_unique<TabIcon>())),
++      anchored_group_indicator_(
++          AddChildView(std::make_unique<AnchoredGroupIndicatorView>())),
+       title_(AddChildView(std::make_unique<VerticalTabTitle>())),
+       alert_indicator_(
+           AddChildView(std::make_unique<AlertIndicatorButton>(this))),
+@@ -179,6 +222,10 @@ VerticalTabView::VerticalTabView(TabColl
+       TabChildConfig(icon_, kIconDesignWidth, kHorizontalInset,
+                      /*align_leading=*/true,
+                      /*expand=*/false),
++      TabChildConfig(anchored_group_indicator_, kAnchoredGroupIndicatorWidth,
++                     kDefaultPadding,
++                     /*align_leading=*/true,
++                     /*expand=*/false),
+       TabChildConfig(alert_indicator_, kIconDesignWidth, kDefaultPadding,
+                      /*align_leading=*/false,
+                      /*expand=*/false, /*decorate_on_collapse=*/true),
+@@ -598,7 +645,10 @@ void VerticalTabView::AddedToWidget() {
+ 
+ void VerticalTabView::RemovedFromWidget() {
+   paint_as_active_subscription_ = {};
+-  UpdateHovered(false);
++  hovered_ = false;
++  if (hover_controller_ && !split_) {
++    hover_controller_->Hide(TabStyle::HideHoverStyle::kGradual);
++  }
+ }
+ 
+ void VerticalTabView::OnFocus() {
+@@ -685,6 +735,10 @@ VerticalTabView::CalculateChildVisibilit
+   const bool should_hide_icon_for_alert = pinned_ || collapsed_;
+   child_visibility_map[icon_] =
+       !child_visibility_map[alert_indicator_] || !should_hide_icon_for_alert;
++  child_visibility_map[anchored_group_indicator_] =
++      features::IsHeliumAnchoredTabsEnabled() && !collapsed_ &&
++      !data().is_tab_discarded && GetTabInterface() &&
++      GetTabInterface()->GetGroup().has_value();
+ 
+   if (pinned_) {
+     child_visibility_map[close_button_] = false;
+@@ -896,6 +950,9 @@ void VerticalTabView::OnDataChanged() {
+   UpdateTabData(tab);
+ 
+   UpdateColors();
++  if (auto* group_view = views::AsViewClass<VerticalTabGroupView>(parent())) {
++    group_view->OnChildTabStateChanged();
++  }
+   InvalidateLayout();
+ }
+ 
+@@ -990,11 +1047,20 @@ void VerticalTabView::UpdateThemeColors(
+ }
+ 
+ void VerticalTabView::UpdateColors() {
++  const tabs::TabInterface* tab_interface = GetTabInterface();
++  if (!tab_interface) {
++    return;
++  }
++
+   UpdateContrastRatioValues();
+   TabStyle::TabColors colors = tab_style_->CalculateTargetColors(
+       GetSelectionState(), IsApparentlyActive(), hovered_, IsFrameActive(),
+       GetColorProvider());
+   title_->SetEnabledColor(colors.foreground_color);
++  close_button_->SetIconVariant(helium::ShouldShowGroupedTabHibernateAffordance(
++                                    tab_interface, data().is_tab_discarded)
++                                    ? TabCloseButton::IconVariant::kMinus
++                                    : TabCloseButton::IconVariant::kClose);
+   close_button_->SetColors(colors);
+   alert_indicator_->OnParentTabButtonColorChanged();
+ 
+@@ -1099,6 +1165,9 @@ bool VerticalTabView::IsDragging() const
+ }
+ 
+ const tabs::TabInterface* VerticalTabView::GetTabInterface() const {
++  if (!collection_node_) {
++    return nullptr;
++  }
+   return std::get<const tabs::TabInterface*>(collection_node_->GetNodeData());
+ }
+ 
 Index: src/chrome/browser/sessions/session_restore.cc
 ===================================================================
 --- src.orig/chrome/browser/sessions/session_restore.cc
@@ -1652,6 +2014,18 @@ Index: src/chrome/browser/ui/tabs/saved_tab_groups/tab_group_sync_delegate_deskt
  }
  
  void TabGroupSyncDelegateDesktop::CreateLocalTabGroup(
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.cc
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.cc
+@@ -56,6 +56,7 @@ class VerticalNewTabButtonActionViewInte
+ VerticalNewTabButton::VerticalNewTabButton() {
+   SetEnabledTextColors(kColorToolbarButtonIconDisabled);
+   SetTextColor(views::Button::STATE_DISABLED, kColorToolbarButtonIconDisabled);
++  label()->SetSubpixelRenderingEnabled(false);
+ 
+   SetBorder(views::CreateEmptyBorder(
+       gfx::Insets::VH(kBasePadding, kBasePadding * 2)));
 Index: src/chrome/browser/ui/browser_navigator.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/browser_navigator.cc
@@ -2129,55 +2503,15 @@ Index: src/chrome/browser/ui/helium/anchored_tab_hibernation.h
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
-Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
 ===================================================================
---- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
-+++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
-@@ -8,6 +8,7 @@
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
+@@ -203,6 +203,7 @@ class VerticalTabView : public views::Vi
+   const raw_ptr<const TabStyle> tab_style_;
  
- #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
-+#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
- #include "chrome/browser/ui/layout_constants.h"
- #include "chrome/browser/ui/tabs/tab_group_features.h"
- #include "chrome/browser/ui/tabs/tab_group_theme.h"
-@@ -283,6 +284,26 @@ std::u16string VerticalTabGroupView::Get
-   return tab_groups::GetGroupContentString(group);
- }
- 
-+bool VerticalTabGroupView::ShouldShowHibernateButton() const {
-+  if (!collection_node_ || !collection_node_->GetController()) {
-+    return false;
-+  }
-+
-+  const TabGroup* group = GetTabGroupFromNode(collection_node_);
-+  return helium::ShouldShowCollapsedGroupHibernateAffordance(
-+      collection_node_->GetController()->GetModel(), group->id());
-+}
-+
-+void VerticalTabGroupView::HibernateRemainingTabs() {
-+  if (!collection_node_ || !collection_node_->GetController()) {
-+    return;
-+  }
-+
-+  const TabGroup* group = GetTabGroupFromNode(collection_node_);
-+  helium::HibernateTabGroup(collection_node_->GetController()->GetModel(),
-+                            group->id());
-+}
-+
- void VerticalTabGroupView::AttachChildView(
-     std::unique_ptr<views::View> child_view,
-     const gfx::Rect& previous_bounds_in_screen) {
-Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
-===================================================================
---- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
-+++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
-@@ -54,6 +54,8 @@ class VerticalTabGroupView
-   views::Widget* ShowGroupEditorBubble(
-       bool stop_context_menu_propagation) override;
-   std::u16string GetGroupContentString() const override;
-+  bool ShouldShowHibernateButton() const override;
-+  void HibernateRemainingTabs() override;
-   void InitHeaderDrag(const ui::MouseEvent& event) override;
-   bool ContinueHeaderDrag(const ui::MouseEvent& event) override;
-   void CancelHeaderDrag() override;
+   const raw_ptr<TabIcon> icon_;
++  const raw_ptr<views::View> anchored_group_indicator_;
+   const raw_ptr<views::Label> title_;
+   const raw_ptr<AlertIndicatorButton> alert_indicator_;
+   const raw_ptr<TabCloseButton> close_button_;
