@@ -33,6 +33,7 @@ CONTINGENT_PATHS = (
     'third_party/devtools-frontend/src/third_party/rollup_libs/',
     'third_party/enterprise_companion/chromium_linux64/cipd/',
     'third_party/google-java-format/',
+    'third_party/gperf/cipd/',
     'third_party/libei/cipd/',
     'third_party/ninja/',
     'third_party/openscreen/src/third_party/ninja/',
