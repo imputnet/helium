@@ -1,8 +1,8 @@
 --- a/chrome/common/pref_names.h
 +++ b/chrome/common/pref_names.h
-@@ -1254,6 +1254,11 @@ inline constexpr char kHeliumVerticalCol
- inline constexpr char kHeliumVerticalUncollapsedWidth[] =
-     "helium.browser.vertical_uncollapsed_width";
+@@ -840,6 +840,11 @@ inline constexpr char kHeliumLayout[] =
+ inline constexpr char kHeliumVerticalRightAligned[] =
+     "helium.browser.vertical_right_aligned";
  
 +// A boolean pref set to true if the address bar should be centered.
 +// When false, the address bar uses the full available width.
@@ -25,18 +25,19 @@
    registry->RegisterBooleanPref(prefs::kShowHomeButton, false,
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.h
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
-@@ -340,6 +340,10 @@ class ToolbarView : public views::Access
+@@ -342,6 +342,11 @@ class ToolbarView : public views::Access
  
    void OnShowMediaButtonChanged();
  
 +  void OnLocationBarCenteredChanged();
 +
-+  void MaybeCenterLocationBar();
++  gfx::Rect GetCenteredLocationBarBounds(gfx::Rect bounds,
++                                         int toolbar_width) const;
 +
    void OnTouchUiChanged();
  
    void NewTabButtonPressed(const ui::Event& event);
-@@ -448,6 +452,8 @@ class ToolbarView : public views::Access
+@@ -457,6 +462,8 @@ class ToolbarView : public views::Access
  
    BooleanPrefMember show_media_button_;
  
@@ -47,10 +48,18 @@
    // The display mode used when laying out the toolbar.
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
-@@ -216,6 +216,28 @@ constexpr int kLargeSpaceBetweenButtons
+@@ -12,6 +12,7 @@
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback.h"
+ #include "base/i18n/number_formatting.h"
+ #include "base/i18n/rtl.h"
+ #include "base/metrics/histogram_macros.h"
+@@ -212,6 +213,61 @@ constexpr int kBrowserAppMenuRefreshColl
+ constexpr int kLargeSpaceBetweenButtons = 6;
  constexpr int kInsideBorderAroundGlicButtons = 2;
  constexpr int kOutsideBorderAroundGlicButtons = 11;
- 
 +constexpr int kCenteredLocationBarMaxWidth = 700;
 +
 +struct CenteredLocationBarStep {
@@ -73,10 +82,43 @@
 +  return 0;
 +}
 +
- bool IsMigratedClickToCallBubble(
-     IntentPickerBubbleView::BubbleType bubble_type) {
-   return bubble_type == IntentPickerBubbleView::BubbleType::kClickToCall &&
-@@ -657,6 +679,11 @@ void ToolbarView::Init() {
++class CenteredLocationBarLayout : public views::FlexLayout {
++ public:
++  using GetCenteredBoundsCallback =
++      base::RepeatingCallback<gfx::Rect(gfx::Rect, int)>;
++
++  CenteredLocationBarLayout(views::View* location_bar,
++                            GetCenteredBoundsCallback callback)
++      : location_bar_(location_bar), callback_(std::move(callback)) {}
++
++  CenteredLocationBarLayout(const CenteredLocationBarLayout&) = delete;
++  CenteredLocationBarLayout& operator=(const CenteredLocationBarLayout&) =
++      delete;
++
++  ~CenteredLocationBarLayout() override = default;
++
++ protected:
++  views::ProposedLayout CalculateProposedLayout(
++      const views::SizeBounds& size_bounds) const override {
++    views::ProposedLayout layout =
++        views::FlexLayout::CalculateProposedLayout(size_bounds);
++    views::ChildLayout* const location_bar_layout =
++        layout.GetLayoutFor(location_bar_);
++    if (location_bar_layout && location_bar_layout->visible) {
++      location_bar_layout->bounds =
++          callback_.Run(location_bar_layout->bounds, layout.host_size.width());
++    }
++    return layout;
++  }
++
++ private:
++  const raw_ptr<views::View> location_bar_;
++  GetCenteredBoundsCallback callback_;
++};
+ 
+ }  // namespace
+ 
+@@ -681,6 +737,11 @@ void ToolbarView::Init() {
      OnShowMediaButtonChanged();
    }
  
@@ -88,15 +130,20 @@
    InitLayout();
  
    for (auto* button : std::array<views::Button*, 5>{back_, forward_, reload_,
-@@ -1455,6 +1482,7 @@ void ToolbarView::Layout(PassKey) {
-   // Call super implementation to ensure layout manager and child layouts
-   // happen.
-   LayoutSuperclass<AccessiblePaneView>(this);
-+  MaybeCenterLocationBar();
- }
+@@ -1569,7 +1630,11 @@ void ToolbarView::InitLayout() {
+                                views::MaximumFlexSizeRule::kUnbounded)
+           .WithOrder(kLocationBarFlexOrder);
  
- void ToolbarView::OnThemeChanged() {
-@@ -1887,6 +1915,48 @@ void ToolbarView::OnShowMediaButtonChang
+-  layout_manager_ = SetLayoutManager(std::make_unique<views::FlexLayout>());
++  layout_manager_ =
++      SetLayoutManager(std::make_unique<CenteredLocationBarLayout>(
++          location_bar_view_,
++          base::BindRepeating(&ToolbarView::GetCenteredLocationBarBounds,
++                              base::Unretained(this))));
+ 
+   layout_manager_->SetOrientation(views::LayoutOrientation::kHorizontal)
+       .SetCrossAxisAlignment(views::LayoutAlignment::kCenter)
+@@ -1938,6 +2003,46 @@ void ToolbarView::OnShowMediaButtonChang
    InvalidateLayout();
  }
  
@@ -104,19 +151,18 @@
 +  InvalidateLayout();
 +}
 +
-+void ToolbarView::MaybeCenterLocationBar() {
++gfx::Rect ToolbarView::GetCenteredLocationBarBounds(gfx::Rect bounds,
++                                                    int toolbar_width) const {
 +  if (display_mode_ != DisplayMode::kNormal ||
 +      !location_bar_is_centered_.GetValue()) {
-+    return;
++    return bounds;
 +  }
 +
-+  const int toolbar_width = width();
 +  const int width_reduction = CenteredLocationBarWidthReduction(toolbar_width);
 +  if (width_reduction == 0) {
-+    return;
++    return bounds;
 +  }
 +
-+  gfx::Rect bounds = location_bar_view_->bounds();
 +  const int centered_width =
 +      std::clamp(bounds.width() - width_reduction,
 +                 location_bar_view_->GetMinimumSize().width(),
@@ -138,8 +184,7 @@
 +
 +  bounds.set_x(centered_x);
 +  bounds.set_width(centered_width);
-+
-+  location_bar_view_->SetBoundsRect(bounds);
++  return bounds;
 +}
 +
  void ToolbarView::OnTouchUiChanged() {
@@ -159,7 +204,7 @@
    </message>
 --- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
 +++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
-@@ -511,6 +511,7 @@ void AddAppearanceStrings(content::WebUI
+@@ -524,6 +524,7 @@ void AddAppearanceStrings(content::WebUI
        {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
        {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
        {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
@@ -169,7 +214,7 @@
        {"showBookmarksBar", IDS_SETTINGS_SHOW_BOOKMARKS_BAR},
 --- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
 +++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
-@@ -207,6 +207,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+@@ -208,6 +208,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
    (*s_allowlist)[::prefs::kHeliumLayout] = settings_api::PrefType::kNumber;
    (*s_allowlist)[::prefs::kHeliumVerticalRightAligned] =
        settings_api::PrefType::kBoolean;
@@ -180,7 +225,7 @@
    (*s_allowlist)[::embedder_support::kAlternateErrorPagesEnabled] =
 --- a/chrome/browser/resources/settings/appearance_page/appearance_page.ts
 +++ b/chrome/browser/resources/settings/appearance_page/appearance_page.ts
-@@ -485,6 +485,10 @@ export class SettingsAppearancePageEleme
+@@ -496,6 +496,10 @@ export class SettingsAppearancePageEleme
      return this.showVerticalTabsEnabled_ && layout === BrowserLayout.VERTICAL;
    }
  
