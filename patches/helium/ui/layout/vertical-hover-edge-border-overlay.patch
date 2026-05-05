@@ -1,0 +1,409 @@
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -87,20 +87,139 @@ constexpr int kOuterEdgeHoverOvershoot =
+ constexpr base::TimeDelta kOuterEdgeHoverOvershootDelay =
+     base::Milliseconds(150);
+ 
+-int GetZenModeRoundedFrameSeparatorBottomInset() {
++int GetRoundedFrameSidebarSeparatorBottomInset() {
+   return GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
+ }
+ 
+-int GetZenModeRoundedFrameSidebarCornerRadius() {
+-  return GetLayoutConstant(LayoutConstant::kHeliumBasePadding) +
+-         GetPaddedFrameRadius();
++int GetRoundedFrameSidebarSeparatorCornerRadius() {
++  return GetGenericFrameRadius();
+ }
+ 
+-int GetSidebarContentEdgeTopRadius() {
+-  return GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius);
+-}
+ }  // namespace
+ 
++VerticalTabStripEdgeBorderView::VerticalTabStripEdgeBorderView(
++    BrowserView* browser_view,
++    tabs::VerticalTabStripStateController* state_controller)
++    : browser_view_(browser_view), state_controller_(state_controller) {
++  collapsed_state_changed_subscription_ =
++      state_controller_->RegisterOnCollapseChanged(base::BindRepeating(
++          [](VerticalTabStripEdgeBorderView* view,
++             tabs::VerticalTabStripStateController*) {
++            view->SchedulePaint();
++          },
++          base::Unretained(this)));
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++  SetCanProcessEventsWithinSubtree(false);
++}
++
++VerticalTabStripEdgeBorderView::~VerticalTabStripEdgeBorderView() = default;
++
++int VerticalTabStripEdgeBorderView::GetOverlayWidth() {
++  return GetRoundedFrameSidebarSeparatorCornerRadius() +
++         views::Separator::kThickness * 2;
++}
++
++void VerticalTabStripEdgeBorderView::OnPaint(gfx::Canvas* canvas) {
++  const bool zen_mode = browser_view_->IsZenModeEnabledForLayout();
++  const auto* vertical_tab_strip_region =
++      browser_view_->vertical_tab_strip_region_view_for_testing();
++  const bool hover_expanded_overlay =
++      !zen_mode && state_controller_->IsCollapsed() &&
++      vertical_tab_strip_region &&
++      !vertical_tab_strip_region->IsVisuallyCollapsed();
++  if (!zen_mode && !hover_expanded_overlay) {
++    return;
++  }
++
++  const bool rounded_frame =
++      browser_view_->browser()->profile()->GetPrefs()->GetBoolean(
++          prefs::kHeliumRoundedFrame);
++  if (zen_mode && browser_view_->IsZenModeSideChromePinned()) {
++    return;
++  }
++
++  const int thickness = views::Separator::kThickness;
++  const int bottom_inset = rounded_frame
++                               ? GetRoundedFrameSidebarSeparatorBottomInset()
++                               : 0;
++  const bool top_bar_hidden =
++      zen_mode && browser_view_->GetTopChromeRevealRatio() <= 0.0f;
++  const int top_inset = rounded_frame && top_bar_hidden
++                            ? GetRoundedFrameSidebarSeparatorBottomInset()
++                            : 0;
++  const int line_height = std::max(0, height() - top_inset - bottom_inset);
++  if (line_height <= 0) {
++    return;
++  }
++
++  const bool right_aligned = state_controller_->IsTabStripRightAligned();
++  const float half_thickness = thickness / 2.0f;
++  const float x = right_aligned ? width() - half_thickness : half_thickness;
++
++  SkPathBuilder path_builder;
++  const bool use_rounded_edge = rounded_frame || hover_expanded_overlay;
++  if (use_rounded_edge) {
++    const float start_y = top_inset + half_thickness;
++    const float end_y = top_inset + line_height - half_thickness;
++    const float curve_radius = std::min<float>(
++        GetRoundedFrameSidebarSeparatorCornerRadius(),
++        std::max(0.0f, (end_y - start_y) / 2.0f));
++    const float content_sign = right_aligned ? -1.0f : 1.0f;
++    const bool round_top = zen_mode || hover_expanded_overlay || top_inset > 0;
++    const bool round_bottom = bottom_inset > 0;
++
++    // The rounded content outline is still present behind this overlay. Mask
++    // its top/bottom horizontal stroke inside the overlay strip before drawing
++    // our replacement curve, otherwise it reads as a straight segment extending
++    // too far under the sidebar.
++    cc::PaintFlags mask_flags;
++    mask_flags.setColor(
++        GetColorProvider()->GetColor(kColorWebContentsBackground));
++    mask_flags.setStyle(cc::PaintFlags::kFill_Style);
++    const float endpoint_radius = curve_radius;
++    // Leave a small subpixel overlap with the existing content outline so AA
++    // at the curve endpoint does not create a visible hairline gap.
++    const float mask_width =
++        std::max(0.0f, x + endpoint_radius - thickness);
++    const float mask_x = right_aligned ? width() - mask_width : 0.0f;
++    canvas->DrawRect(
++        gfx::RectF(mask_x, top_inset, mask_width, thickness + 1),
++        mask_flags);
++    if (round_bottom) {
++      canvas->DrawRect(gfx::RectF(mask_x, end_y - half_thickness, mask_width,
++                                  thickness + 1),
++                       mask_flags);
++    }
++    if (round_top) {
++      path_builder.moveTo(x + content_sign * endpoint_radius, start_y);
++      path_builder.quadTo(x, start_y, x, start_y + curve_radius);
++    } else {
++      path_builder.moveTo(x, start_y);
++    }
++
++    path_builder.lineTo(x, end_y - (round_bottom ? curve_radius : 0.0f));
++    if (round_bottom) {
++      path_builder.quadTo(x, end_y,
++                          x + content_sign * endpoint_radius, end_y);
++    }
++  } else {
++    path_builder.moveTo(x, top_inset);
++    path_builder.lineTo(x, top_inset + line_height);
++  }
++
++  cc::PaintFlags flags;
++  flags.setStrokeWidth(thickness);
++  flags.setColor(
++      GetColorProvider()->GetColor(kColorToolbarContentAreaSeparator));
++  flags.setStyle(cc::PaintFlags::kStroke_Style);
++  flags.setAntiAlias(use_rounded_edge);
++  canvas->DrawPath(path_builder.detach(), flags);
++}
++
++BEGIN_METADATA(VerticalTabStripEdgeBorderView)
++END_METADATA
++
+ VerticalTabStripRegionView::VerticalTabStripRegionView(
+     tabs::VerticalTabStripStateController* state_controller,
+     actions::ActionItem* root_action_item,
+@@ -217,30 +336,11 @@ void VerticalTabStripRegionView::Layout(
+       gfx::Rect(resize_area_x, 0, resize_area_width_, bounds().height()));
+ 
+   auto* background = static_cast<CustomCornersBackground*>(this->background());
+-  CustomCornersBackground::Corners corners;
+-  const bool zen_mode = browser_view_->IsZenModeEnabledForLayout();
+-  const bool rounded_frame =
+-      browser_view_->browser()->profile()->GetPrefs()->GetBoolean(
+-          prefs::kHeliumRoundedFrame);
+-  const bool paints_overlay_separator =
+-      (!zen_mode && state_controller_->IsHoverExpanded()) ||
+-      (zen_mode &&
+-       (!browser_view_->IsZenModeSideChromePinned() || rounded_frame));
+-  if (paints_overlay_separator) {
+-    if (rounded_frame) {
+-      CustomCornersBackground::Corner bottom_content_edge_corner;
+-      bottom_content_edge_corner.type =
+-          CustomCornersBackground::CornerType::kRoundedWithBackground;
+-      bottom_content_edge_corner.radius =
+-          GetZenModeRoundedFrameSidebarCornerRadius();
+-      if (state_controller_->IsTabStripRightAligned()) {
+-        corners.lower_leading = bottom_content_edge_corner;
+-      } else {
+-        corners.lower_trailing = bottom_content_edge_corner;
+-      }
+-    }
+-  }
+-  background->SetCorners(corners);
++  // Keep the vertical tab strip edge visually consistent across normal, Zen,
++  // hover-expanded, and persistently expanded states.  The sidebar itself
++  // should not add rounded content-edge corners; web-content rounding remains
++  // controlled independently by the rounded-frame preference.
++  background->SetCorners(CustomCornersBackground::Corners());
+ }
+ 
+ void VerticalTabStripRegionView::OnMouseEntered(const ui::MouseEvent& event) {
+@@ -264,61 +364,9 @@ void VerticalTabStripRegionView::OnPaint
+     return;
+   }
+ 
+-  const bool rounded_frame =
+-      browser_view_->browser()->profile()->GetPrefs()->GetBoolean(
+-          prefs::kHeliumRoundedFrame);
+-  if (zen_mode && browser_view_->IsZenModeSideChromePinned() &&
+-      !rounded_frame) {
+-    return;
+-  }
+-
+-  const int thickness = views::Separator::kThickness;
+-  int line_height = height();
+-  if (rounded_frame) {
+-    line_height =
+-        std::max(0, line_height - GetZenModeRoundedFrameSeparatorBottomInset());
+-  }
+-
+-  if (line_height <= 0) {
+-    return;
+-  }
+-
+-  const bool right_aligned = state_controller_->IsTabStripRightAligned();
+-  const float half_thickness = thickness / 2.0f;
+-  const float x = right_aligned ? half_thickness : width() - half_thickness;
+-  const float top_y = half_thickness;
+-  const float sidebar_inside_sign = right_aligned ? 1.0f : -1.0f;
+-  const float top_radius =
+-      std::min<float>(GetSidebarContentEdgeTopRadius(),
+-                      std::max(0.0f, line_height - 2.0f * half_thickness));
+-  const float bottom_radius =
+-      rounded_frame
+-          ? std::min<float>(GetZenModeRoundedFrameSidebarCornerRadius(),
+-                            std::max(0.0f, line_height - top_radius -
+-                                               2.0f * half_thickness))
+-          : 0.0f;
+-
+-  SkPathBuilder path_builder;
+-  if (top_radius > 0.0f) {
+-    path_builder.moveTo(x + sidebar_inside_sign * top_radius, top_y);
+-    path_builder.quadTo(x, top_y, x, top_y + top_radius);
+-  } else {
+-    path_builder.moveTo(x, top_y);
+-  }
+-  path_builder.lineTo(x, line_height - bottom_radius - half_thickness);
+-  if (bottom_radius > 0.0f) {
+-    path_builder.quadTo(x, line_height - half_thickness,
+-                        x + sidebar_inside_sign * bottom_radius,
+-                        line_height - half_thickness);
+-  }
+-
+-  cc::PaintFlags flags;
+-  flags.setStrokeWidth(thickness);
+-  flags.setColor(
+-      GetColorProvider()->GetColor(kColorToolbarContentAreaSeparator));
+-  flags.setStyle(cc::PaintFlags::kStroke_Style);
+-  flags.setAntiAlias(true);
+-  canvas->DrawPath(path_builder.detach(), flags);
++  // The content-edge border is painted by VerticalTabStripEdgeBorderView,
++  // which has extra transparent width outside the tab strip so rounded ends can
++  // be visible without changing layout or being clipped by this view.
+ }
+ 
+ void VerticalTabStripRegionView::OnEvent(const ui::Event& event) {
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1113,6 +1113,9 @@ BrowserView::BrowserView(Browser* browse
+ 
+     vertical_tab_strip_region_view_ =
+         AddChildView(std::move(vertical_tab_strip_container));
++    vertical_tab_strip_edge_border_view_ =
++        AddChildView(std::make_unique<VerticalTabStripEdgeBorderView>(
++            this, vertical_tab_strip_state_controller));
+   } else {
+     horizontal_tab_strip_region_view_->InitializeTabStrip();
+   }
+@@ -1235,6 +1238,7 @@ BrowserView::~BrowserView() {
+   window_scrim_view_ = nullptr;
+   contents_container_ = nullptr;
+   vertical_tab_strip_region_view_ = nullptr;
++  vertical_tab_strip_edge_border_view_ = nullptr;
+   projects_panel_container_ = nullptr;
+   toolbar_height_side_panel_ = nullptr;
+   contents_height_side_panel_ = nullptr;
+@@ -5799,6 +5803,8 @@ void BrowserView::AddedToWidget() {
+   layout_views.horizontal_tab_strip_region_view =
+       horizontal_tab_strip_region_view_;
+   layout_views.vertical_tab_strip_region_view = vertical_tab_strip_region_view_;
++  layout_views.vertical_tab_strip_edge_border_view =
++      vertical_tab_strip_edge_border_view_;
+   layout_views.projects_panel_container = projects_panel_container_;
+   layout_views.toolbar = toolbar_;
+   layout_views.infobar_container = infobar_container_;
+Index: src/chrome/browser/ui/views/frame/browser_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.h
++++ src/chrome/browser/ui/views/frame/browser_view.h
+@@ -100,6 +100,7 @@ class TopContainerLoadingBar;
+ class TopContainerView;
+ class TopControlsSlideController;
+ class TopControlsSlideControllerTest;
++class VerticalTabStripEdgeBorderView;
+ class VerticalTabStripRegionView;
+ class WebAppFrameToolbarView;
+ class WebUITabStripContainerView;
+@@ -1359,6 +1360,11 @@ class BrowserView : public BrowserWindow
+   // The view responsible for housing the contents of the vertical tab strip.
+   raw_ptr<VerticalTabStripRegionView> vertical_tab_strip_region_view_ = nullptr;
+ 
++  // Transparent overlay strip that paints the vertical tab strip's content-edge
++  // border with room for rounded ends outside the tab strip bounds.
++  raw_ptr<VerticalTabStripEdgeBorderView> vertical_tab_strip_edge_border_view_ =
++      nullptr;
++
+   // The view responsible for housing the contents of the projects panel.
+   raw_ptr<ProjectsPanelView> projects_panel_container_ = nullptr;
+ 
+Index: src/chrome/browser/ui/views/frame/layout/browser_view_layout.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/layout/browser_view_layout.h
++++ src/chrome/browser/ui/views/frame/layout/browser_view_layout.h
+@@ -24,6 +24,7 @@ class ProjectsPanelView;
+ class SidePanel;
+ class TabStrip;
+ class HorizontalTabStripRegionView;
++class VerticalTabStripEdgeBorderView;
+ class VerticalTabStripRegionView;
+ class WebAppFrameToolbarView;
+ 
+@@ -67,6 +68,8 @@ struct BrowserViewLayoutViews {
+   raw_ptr<HorizontalTabStripRegionView> horizontal_tab_strip_region_view =
+       nullptr;
+   raw_ptr<VerticalTabStripRegionView> vertical_tab_strip_region_view = nullptr;
++  raw_ptr<VerticalTabStripEdgeBorderView> vertical_tab_strip_edge_border_view =
++      nullptr;
+   raw_ptr<ProjectsPanelView> projects_panel_container = nullptr;
+   raw_ptr<views::View> toolbar = nullptr;
+   raw_ptr<InfoBarContainerView> infobar_container = nullptr;
+Index: src/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ src/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -735,10 +735,27 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+             0, horizontal_layout.vertical_tab_strip_width, 0, 0));
+       }
+     }
++    const bool show_vertical_tab_strip =
++        tab_strip_type == TabStripType::kVertical &&
++        vertical_tab_strip_bounds.width() > 0;
+     layout.AddChild(views().vertical_tab_strip_region_view,
+-                    vertical_tab_strip_bounds,
+-                    tab_strip_type == TabStripType::kVertical &&
+-                        vertical_tab_strip_bounds.width() > 0);
++                    vertical_tab_strip_bounds, show_vertical_tab_strip);
++
++    if (views().vertical_tab_strip_edge_border_view) {
++      const int overlay_width =
++          VerticalTabStripEdgeBorderView::GetOverlayWidth();
++      const int overlay_x =
++          vertical_right_aligned
++              ? vertical_tab_strip_bounds.x() - overlay_width +
++                    views::Separator::kThickness
++              : vertical_tab_strip_bounds.right() -
++                    views::Separator::kThickness;
++      layout.AddChild(views().vertical_tab_strip_edge_border_view,
++                      gfx::Rect(overlay_x, vertical_tab_strip_bounds.y(),
++                                overlay_width,
++                                vertical_tab_strip_bounds.height()),
++                      show_vertical_tab_strip);
++    }
+   }
+ 
+   // TODO(crbug.com/469425263): Ensure correct layout calculations for the
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -24,6 +24,7 @@
+ #include "ui/gfx/geometry/point.h"
+ #include "ui/views/accessible_pane_view.h"
+ #include "ui/views/controls/resize_area_delegate.h"
++#include "ui/views/view.h"
+ 
+ class BrowserView;
+ class RootTabCollectionNode;
+@@ -49,6 +50,33 @@ class View;
+ class FlexLayout;
+ }  // namespace views
+ 
++// Overlay strip that paints the vertical tab strip's content-edge border in a
++// small transparent region outside the tab strip bounds.  This gives rounded
++// border ends room to paint without affecting tab strip/content layout.
++class VerticalTabStripEdgeBorderView final : public views::View {
++  METADATA_HEADER(VerticalTabStripEdgeBorderView, views::View)
++
++ public:
++  VerticalTabStripEdgeBorderView(
++      BrowserView* browser_view,
++      tabs::VerticalTabStripStateController* state_controller);
++  VerticalTabStripEdgeBorderView(const VerticalTabStripEdgeBorderView&) =
++      delete;
++  VerticalTabStripEdgeBorderView& operator=(
++      const VerticalTabStripEdgeBorderView&) = delete;
++  ~VerticalTabStripEdgeBorderView() override;
++
++  static int GetOverlayWidth();
++
++  // views::View:
++  void OnPaint(gfx::Canvas* canvas) override;
++
++ private:
++  raw_ptr<BrowserView> browser_view_ = nullptr;
++  raw_ptr<tabs::VerticalTabStripStateController> state_controller_ = nullptr;
++  base::CallbackListSubscription collapsed_state_changed_subscription_;
++};
++
+ // Container for the vertical tabstrip and the other views sharing space with
+ // it, excluding the caption buttons.
+ class VerticalTabStripRegionView final : public TabStripRegionView,
