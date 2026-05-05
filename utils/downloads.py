@@ -17,7 +17,6 @@ import configparser
 import enum
 import hashlib
 import shutil
-import ssl
 import subprocess
 import sys
 import urllib.request
@@ -197,25 +196,16 @@ class _UrlRetrieveReportHook: #pylint: disable=too-few-public-methods
         print('\r' + status_line, end='')
 
 
-def _download_via_urllib(url, file_path, show_progress, disable_ssl_verification):
+def _download_via_urllib(url, file_path, show_progress):
     reporthook = None
     if show_progress:
         reporthook = _UrlRetrieveReportHook()
-    if disable_ssl_verification:
-        # TODO: Remove this or properly implement disabling SSL certificate verification
-        orig_https_context = ssl._create_default_https_context #pylint: disable=protected-access
-        ssl._create_default_https_context = ssl._create_unverified_context #pylint: disable=protected-access
-    try:
-        urllib.request.urlretrieve(url, str(file_path), reporthook=reporthook)
-    finally:
-        # Try to reduce damage of hack by reverting original HTTPS context ASAP
-        if disable_ssl_verification:
-            ssl._create_default_https_context = orig_https_context #pylint: disable=protected-access
+    urllib.request.urlretrieve(url, str(file_path), reporthook=reporthook)
     if show_progress:
         print()
 
 
-def _download_if_needed(file_path, url, show_progress, disable_ssl_verification):
+def _download_if_needed(file_path, url, show_progress):
     """
     Downloads a file from url to the specified path file_path if necessary.
 
@@ -243,7 +233,7 @@ def _download_if_needed(file_path, url, show_progress, disable_ssl_verification)
             raise exc
     else:
         get_logger().debug('Using urllib')
-        _download_via_urllib(url, tmp_file_path, show_progress, disable_ssl_verification)
+        _download_via_urllib(url, tmp_file_path, show_progress)
 
     # Download complete; rename file
     tmp_file_path.rename(file_path)
@@ -272,11 +262,7 @@ def _get_hash_pairs(download_properties, cache_dir):
             yield entry_type, entry_value
 
 
-def retrieve_downloads(download_info,
-                       cache_dir,
-                       components,
-                       show_progress,
-                       disable_ssl_verification=False):
+def retrieve_downloads(download_info, cache_dir, components, show_progress):
     """
     Retrieve downloads into the downloads cache.
 
@@ -284,8 +270,6 @@ def retrieve_downloads(download_info,
     cache_dir is the pathlib.Path to the downloads cache.
     components is a list of component names to download, if not empty.
     show_progress is a boolean indicating if download progress is printed to the console.
-    disable_ssl_verification is a boolean indicating if certificate verification
-        should be disabled for downloads using HTTPS.
 
     Raises FileNotFoundError if the downloads path does not exist.
     Raises NotADirectoryError if the downloads path is not a directory.
@@ -300,13 +284,11 @@ def retrieve_downloads(download_info,
         get_logger().info('Downloading "%s" to "%s" ...', download_name,
                           download_properties.download_filename)
         download_path = cache_dir / download_properties.download_filename
-        _download_if_needed(download_path, download_properties.url, show_progress,
-                            disable_ssl_verification)
+        _download_if_needed(download_path, download_properties.url, show_progress)
         if download_properties.has_hash_url():
             get_logger().info('Downloading hashes for "%s"', download_name)
             _, hash_filename, hash_url = download_properties.hashes['hash_url']
-            _download_if_needed(cache_dir / hash_filename, hash_url, show_progress,
-                                disable_ssl_verification)
+            _download_if_needed(cache_dir / hash_filename, hash_url, show_progress)
 
 
 def check_downloads(download_info, cache_dir, components, chunk_bytes=262144):
@@ -409,8 +391,7 @@ def _add_common_args(parser):
 def _retrieve_callback(args):
     info = DownloadInfo(args.ini)
     info.check_sections_exist(args.components)
-    retrieve_downloads(info, args.cache, args.components, args.show_progress,
-                       args.disable_ssl_verification)
+    retrieve_downloads(info, args.cache, args.components, args.show_progress)
     try:
         check_downloads(info, args.cache, args.components)
     except HashMismatchError as exc:
@@ -419,9 +400,6 @@ def _retrieve_callback(args):
 
 
 def _unpack_callback(args):
-    if args.skip_unused or args.sysroot:
-        get_logger().warning('The --skip-unused and --sysroot flags for downloads.py are'
-                             ' no longer functional and will be removed in the future.')
     extractors = {
         ExtractorEnum.SEVENZIP: args.sevenz_path,
         ExtractorEnum.WINRAR: args.winrar_path,
@@ -455,10 +433,6 @@ def main():
                                  action='store_false',
                                  dest='show_progress',
                                  help='Hide the download progress.')
-    retrieve_parser.add_argument(
-        '--disable-ssl-verification',
-        action='store_true',
-        help='Disables certification verification for downloads using HTTPS.')
     retrieve_parser.set_defaults(callback=_retrieve_callback)
 
     def _default_extractor_path(name):
@@ -491,8 +465,6 @@ def main():
         help=('Command or path to WinRAR\'s "winrar" binary. If "_use_registry" is '
               'specified, determine the path from the registry. Default: %(default)s'))
     unpack_parser.add_argument('output', type=Path, help='The directory to unpack to.')
-    unpack_parser.add_argument('--skip-unused', action='store_true', help='Deprecated')
-    unpack_parser.add_argument('--sysroot', choices=('amd64', 'i386'), help='Deprecated')
     unpack_parser.set_defaults(callback=_unpack_callback)
 
     args = parser.parse_args()
