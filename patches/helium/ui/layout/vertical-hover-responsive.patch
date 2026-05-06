@@ -62,7 +62,7 @@
  #include "chrome/app/vector_icons/vector_icons.h"
  #include "chrome/browser/ui/actions/chrome_action_id.h"
  #include "chrome/browser/ui/browser_actions.h"
-@@ -29,6 +32,11 @@ namespace tabs {
+@@ -29,6 +32,10 @@ namespace tabs {
  
  DEFINE_USER_DATA(VerticalTabStripStateController);
  
@@ -85,7 +85,7 @@
  
    state_.collapsed = pref_service_->GetBoolean(prefs::kHeliumVerticalCollapsed);
    state_.uncollapsed_width =
-@@ -121,18 +134,43 @@ bool VerticalTabStripStateController::Is
+@@ -121,18 +134,42 @@ bool VerticalTabStripStateController::Is
  }
  
  void VerticalTabStripStateController::SetCollapsed(bool collapsed) {
@@ -105,7 +105,7 @@
 +  state_.collapsed = collapsed;
 +  ClearHoverHoldState(/*notify=*/false);
 +  if (state_.collapsed) {
-+    StartHoverExpandTimerIfNeeded();
++    ExpandForHoverIfNeeded(/*notify=*/false);
 +  }
 +  NotifyCollapseChanged();
 +  if (auto* browser_element_views = BrowserElementsViews::From(browser_window_);
@@ -127,11 +127,10 @@
 +
 +  if (is_hovered_) {
 +    hover_collapse_timer_.Stop();
-+    StartHoverExpandTimerIfNeeded();
++    ExpandForHoverIfNeeded(/*notify=*/true);
 +    return;
 +  }
 +
-+  hover_expand_timer_.Stop();
 +  StartHoverCollapseTimerIfNeeded();
 +}
 +
@@ -144,7 +143,7 @@
      state_ = state;
 +    ClearHoverHoldState(/*notify=*/false);
 +    if (state_.collapsed) {
-+      StartHoverExpandTimerIfNeeded();
++      ExpandForHoverIfNeeded(/*notify=*/false);
 +    }
      NotifyCollapseChanged();
    }
@@ -156,12 +155,12 @@
 +  if (!ShouldDisplayVerticalTabs()) {
 +    ClearHoverHoldState(/*notify=*/false);
 +  } else if (state_.collapsed && is_hovered_) {
-+    StartHoverExpandTimerIfNeeded();
++    ExpandForHoverIfNeeded(/*notify=*/true);
 +  }
  
    NotifyModeChanged();
  }
-@@ -245,4 +292,74 @@ void VerticalTabStripStateController::Up
+@@ -245,4 +292,64 @@ void VerticalTabStripStateController::Up
    }
  }
  
@@ -174,7 +173,7 @@
 +    ClearHoverHoldState(/*notify=*/true);
 +    return;
 +  }
-+  StartHoverExpandTimerIfNeeded();
++  ExpandForHoverIfNeeded(/*notify=*/true);
 +}
 +
 +bool VerticalTabStripStateController::ShouldHoldExpandedForHover() const {
@@ -183,7 +182,6 @@
 +}
 +
 +void VerticalTabStripStateController::ClearHoverHoldState(bool notify) {
-+  hover_expand_timer_.Stop();
 +  hover_collapse_timer_.Stop();
 +  if (!held_by_hover_) {
 +    return;
@@ -194,21 +192,16 @@
 +  }
 +}
 +
-+void VerticalTabStripStateController::StartHoverExpandTimerIfNeeded() {
++bool VerticalTabStripStateController::ExpandForHoverIfNeeded(bool notify) {
 +  if (!ShouldHoldExpandedForHover() || !is_hovered_ || held_by_hover_) {
-+    return;
++    return false;
 +  }
 +  hover_collapse_timer_.Stop();
 +  held_by_hover_ = true;
-+  NotifyCollapseChanged();
-+}
-+
-+void VerticalTabStripStateController::OnHoverExpandDelayElapsed() {
-+  if (!ShouldHoldExpandedForHover() || !is_hovered_ || held_by_hover_) {
-+    return;
++  if (notify) {
++    NotifyCollapseChanged();
 +  }
-+  held_by_hover_ = true;
-+  NotifyCollapseChanged();
++  return true;
 +}
 +
 +void VerticalTabStripStateController::StartHoverCollapseTimerIfNeeded() {
@@ -251,7 +244,7 @@
  
    int GetUncollapsedWidth() const;
    void SetUncollapsedWidth(int width);
-@@ -96,6 +99,14 @@ class VerticalTabStripStateController {
+@@ -96,6 +99,13 @@ class VerticalTabStripStateController {
    // Update the Collapse Button's Action Item (kActionToggleCollapseVertical)
    // based on the Vertical Tab Strip's Collapse State.
    void UpdateCollapseActionItem();
@@ -259,20 +252,18 @@
 +  void OnHoverExpandEnabledPrefChanged();
 +  bool ShouldHoldExpandedForHover() const;
 +  void ClearHoverHoldState(bool notify);
-+  void StartHoverExpandTimerIfNeeded();
-+  void OnHoverExpandDelayElapsed();
++  bool ExpandForHoverIfNeeded(bool notify);
 +  void StartHoverCollapseTimerIfNeeded();
 +  void OnHoverCollapseDelayElapsed();
  
    void OnLockCreated();
    void OnLockDestroyed();
-@@ -106,6 +117,10 @@ class VerticalTabStripStateController {
+@@ -106,6 +117,9 @@ class VerticalTabStripStateController {
    raw_ptr<BrowserWindowInterface> browser_window_;
  
    VerticalTabStripState state_;
 +  bool is_hovered_ = false;
 +  bool held_by_hover_ = false;
-+  base::OneShotTimer hover_expand_timer_;
 +  base::OneShotTimer hover_collapse_timer_;
  
    base::RepeatingCallbackList<void(VerticalTabStripStateController*)>
@@ -387,7 +378,7 @@
  
    // Verify state hasn't changed.
    EXPECT_TRUE(controller()->ShouldDisplayVerticalTabs());
-@@ -247,4 +261,33 @@ TEST_F(VerticalTabStripStateControllerTe
+@@ -247,4 +261,45 @@ TEST_F(VerticalTabStripStateControllerTe
    EXPECT_EQ(2, call_count);
  }
  
@@ -405,6 +396,23 @@
 +
 +  task_environment_.FastForwardBy(base::Milliseconds(1));
 +  EXPECT_FALSE(controller()->IsHoverExpanded());
++}
++
++TEST_F(VerticalTabStripStateControllerTest, CollapseWhileHoveredNotifiesOnce) {
++  controller()->SetVerticalTabsEnabled(true);
++  controller()->SetHovered(true);
++
++  int call_count = 0;
++  auto subscription = controller()->RegisterOnCollapseChanged(
++      base::BindRepeating(
++          [](int* count, VerticalTabStripStateController*) { ++(*count); },
++          &call_count));
++
++  controller()->SetCollapsed(true);
++
++  EXPECT_TRUE(controller()->IsCollapsed());
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++  EXPECT_EQ(1, call_count);
 +}
 +
 +TEST_F(VerticalTabStripStateControllerTest, HoverExpandedDisabledByPref) {
