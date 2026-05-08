@@ -80,7 +80,7 @@
  // AIPageContent.
 --- /dev/null
 +++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.cc
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,532 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -93,8 +93,11 @@
 +
 +#include <algorithm>
 +#include <array>
++#include <cmath>
 +#include <cstddef>
 +#include <cstdint>
++#include <limits>
++#include <optional>
 +#include <vector>
 +
 +#include "base/check_op.h"
@@ -106,10 +109,13 @@
 +#include "third_party/blink/public/common/features.h"
 +#include "third_party/blink/renderer/core/execution_context/execution_context.h"
 +#include "third_party/blink/renderer/core/helium_noise/helium_noise_hash.h"
++#include "third_party/blink/renderer/core/html/canvas/image_data.h"
 +#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
 +#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
 +#include "third_party/skia/include/core/SkBitmap.h"
 +#include "third_party/skia/include/core/SkImageInfo.h"
++#include "third_party/skia/src/base/SkHalf.h"
++#include "third_party/skia/src/base/SkVx.h"
 +#include "ui/gfx/skia_span_util.h"
 +
 +namespace blink {
@@ -122,6 +128,7 @@
 +constexpr int kMaxAlphaNoise = 1;
 +constexpr uint8_t kChannelsPerPixel = 4u;
 +constexpr std::array<uint8_t, 4u> kEmptyPixel({0, 0, 0, 0});
++constexpr float kFloatChannelScale = 1.0f / 255.0f;
 +
 +struct PixelLocation {
 +  int x;
@@ -167,6 +174,16 @@
 +  return token_hash.GetValueBelow(max_abs_noise * 2 + 1) - max_abs_noise;
 +}
 +
++size_t CheckedPixelStorageSize(const int width,
++                               const int height,
++                               const size_t bytes_per_channel) {
++  base::CheckedNumeric<size_t> size = base::checked_cast<size_t>(width);
++  size *= base::checked_cast<size_t>(height);
++  size *= kChannelsPerPixel;
++  size *= bytes_per_channel;
++  return size.ValueOrDie();
++}
++
 +void HeliumNoisePixel(base::span<uint8_t> pixel, HeliumNoiseHash& token_hash) {
 +  base::SpanWriter writer(base::as_writable_bytes(pixel));
 +  const int shared_rgb_noise =
@@ -206,23 +223,72 @@
 +  }
 +}
 +
-+base::span<uint8_t, 4u> GetPixelAt(const int x,
-+                                   const int y,
-+                                   const int width,
-+                                   const base::span<uint8_t> pixels) {
-+  return pixels
-+      .subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
-+      .first<4u>();
++uint8_t QuantizeFloatChannel(float channel_value) {
++  if (!std::isfinite(channel_value)) {
++    return 0;
++  }
++
++  return base::checked_cast<uint8_t>(
++      std::clamp(std::lround(channel_value * 255.0f), 0L, 255L));
 +}
 +
-+base::span<const uint8_t, 4u> GetPixelAt(
-+    const int x,
-+    const int y,
-+    const int width,
-+    const base::span<const uint8_t> pixels) {
++std::array<uint8_t, 4u> QuantizeFloatPixel(
++    base::span<const float, kChannelsPerPixel> pixel) {
++  return {QuantizeFloatChannel(pixel[0]), QuantizeFloatChannel(pixel[1]),
++          QuantizeFloatChannel(pixel[2]), QuantizeFloatChannel(pixel[3])};
++}
++
++uint32_t QuantizedFloatPixelValue(
++    base::span<const float, kChannelsPerPixel> pixel) {
++  std::array<uint8_t, kChannelsPerPixel> quantized_pixel =
++      QuantizeFloatPixel(pixel);
++  return base::U32FromLittleEndian(base::span(quantized_pixel));
++}
++
++void HeliumNoiseFloatPixel(base::span<float, kChannelsPerPixel> pixel,
++                           HeliumNoiseHash& token_hash) {
++  const int shared_rgb_noise =
++      GetSignedNoiseValue(token_hash, kMaxSharedRgbNoise);
++
++  for (int i = 0; i < kChannelsPerPixel; ++i) {
++    float channel_value = pixel[i];
++    if (!std::isfinite(channel_value)) {
++      continue;
++    }
++
++    const bool is_alpha = i == kChannelsPerPixel - 1;
++
++    // Keep alpha limits stable.
++    if (is_alpha && (channel_value <= 0.0f || channel_value >= 1.0f)) {
++      pixel[i] = std::clamp(channel_value, 0.0f, 1.0f);
++      continue;
++    }
++
++    int noise = 0;
++    if (is_alpha) {
++      noise = GetSignedNoiseValue(token_hash, kMaxAlphaNoise);
++    } else {
++      noise = shared_rgb_noise +
++              GetSignedNoiseValue(token_hash, kMaxIndependentRgbNoise);
++    }
++
++    const float lower_limit =
++        is_alpha && channel_value > 0.0f ? kFloatChannelScale : 0.0f;
++    const float upper_limit =
++        is_alpha ? 1.0f : std::numeric_limits<float>::max();
++    pixel[i] = std::clamp(channel_value + noise * kFloatChannelScale,
++                          lower_limit, upper_limit);
++  }
++}
++
++template <typename T>
++base::span<T, kChannelsPerPixel> GetPixelAt(const int x,
++                                            const int y,
++                                            const int width,
++                                            const base::span<T> pixels) {
 +  return pixels
 +      .subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
-+      .first<4u>();
++      .template first<kChannelsPerPixel>();
 +}
 +
 +uint64_t GetValueFromPixelLocations(
@@ -238,6 +304,78 @@
 +  return result;
 +}
 +
++struct FloatPixelTraits {
++  using Storage = float;
++
++  static std::array<float, kChannelsPerPixel>
++  Load(base::span<const float> pixels, int x, int y, int width) {
++    auto pixel =
++        pixels.subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++            .first<kChannelsPerPixel>();
++    return {pixel[0], pixel[1], pixel[2], pixel[3]};
++  }
++
++  static void Store(base::span<float> pixels,
++                    int x,
++                    int y,
++                    int width,
++                    const std::array<float, kChannelsPerPixel>& pixel) {
++    auto destination =
++        pixels.subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++            .first<kChannelsPerPixel>();
++    destination.copy_from(base::span(pixel));
++  }
++};
++
++struct HalfFloatPixelTraits {
++  using Storage = SkHalf;
++
++  static std::array<float, kChannelsPerPixel>
++  Load(base::span<const SkHalf> pixels, int x, int y, int width) {
++    auto pixel =
++        pixels.subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++            .first<kChannelsPerPixel>();
++    skvx::half4 half_pixel = {pixel[0], pixel[1], pixel[2], pixel[3]};
++    skvx::float4 float_pixel = skvx::from_half(half_pixel);
++    return {float_pixel[0], float_pixel[1], float_pixel[2], float_pixel[3]};
++  }
++
++  static void Store(base::span<SkHalf> pixels,
++                    int x,
++                    int y,
++                    int width,
++                    const std::array<float, kChannelsPerPixel>& pixel) {
++    auto destination =
++        pixels.subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++            .first<kChannelsPerPixel>();
++    skvx::float4 float_pixel = {std::isnan(pixel[0]) ? 0.0f : pixel[0],
++                                std::isnan(pixel[1]) ? 0.0f : pixel[1],
++                                std::isnan(pixel[2]) ? 0.0f : pixel[2],
++                                std::isnan(pixel[3]) ? 0.0f : pixel[3]};
++    skvx::half4 half_pixel = skvx::to_half(float_pixel);
++    for (size_t i = 0; i < kChannelsPerPixel; ++i) {
++      destination[i] = std::isnan(pixel[i]) ? SK_HalfNaN : half_pixel[i];
++    }
++  }
++};
++
++template <typename Traits>
++uint64_t GetValueFromFloatLikePixelLocations(
++    const std::pair<PixelLocation, PixelLocation> locations,
++    base::span<const typename Traits::Storage> pixels,
++    int width) {
++  std::array<float, kChannelsPerPixel> first_pixel =
++      Traits::Load(pixels, locations.first.x, locations.first.y, width);
++  std::array<float, kChannelsPerPixel> second_pixel =
++      Traits::Load(pixels, locations.second.x, locations.second.y, width);
++
++  uint64_t result = 0u;
++  result |= QuantizedFloatPixelValue(base::span(first_pixel));
++  result <<= 32u;
++  result |= QuantizedFloatPixelValue(base::span(second_pixel));
++  return result;
++}
++
 +void CopyPixelValue(const base::span<const uint8_t> from_pixel,
 +                    base::span<uint8_t> to_pixel) {
 +  base::SpanWriter writer(base::as_writable_bytes(to_pixel));
@@ -250,9 +388,11 @@
 +void HeliumNoisePixels(const HeliumNoiseHash& token_hash,
 +                       base::span<uint8_t> pixels,
 +                       const int width,
-+                       const int height) {
++                       const int height,
++                       const int x_offset = 0,
++                       const int y_offset = 0) {
 +  CHECK_EQ(pixels.size(),
-+           static_cast<size_t>(width * height * kChannelsPerPixel));
++           CheckedPixelStorageSize(width, height, sizeof(uint8_t)));
 +
 +  std::vector<uint8_t> source_pixel_storage(pixels.begin(), pixels.end());
 +  base::span<const uint8_t> source_pixels(source_pixel_storage);
@@ -267,8 +407,9 @@
 +      CopyPixelValue(source_pixel, pixel);
 +
 +      HeliumNoiseHash hash_copy = token_hash;
-+      hash_copy.Update((static_cast<uint64_t>(y) << 32) |
-+                       static_cast<uint32_t>(x));
++      hash_copy.Update(
++          (static_cast<uint64_t>(static_cast<uint32_t>(y + y_offset)) << 32) |
++          static_cast<uint32_t>(x + x_offset));
 +      hash_copy.Update(base::U32FromLittleEndian(source_pixel));
 +      // GetRandomPixelLocations consumes at most 32 bits from hash.
 +      const std::pair<PixelLocation, PixelLocation> other_pixels =
@@ -280,6 +421,109 @@
 +  }
 +}
 +
++template <typename Traits>
++void HeliumNoiseFloatLikePixels(const HeliumNoiseHash& token_hash,
++                                base::span<typename Traits::Storage> pixels,
++                                const int width,
++                                const int height,
++                                const int x_offset,
++                                const int y_offset) {
++  CHECK_EQ(pixels.size(), CheckedPixelStorageSize(
++                              width, height, sizeof(typename Traits::Storage)) /
++                              sizeof(typename Traits::Storage));
++
++  std::vector<typename Traits::Storage> source_pixel_storage(pixels.begin(),
++                                                             pixels.end());
++  base::span<const typename Traits::Storage> source_pixels(
++      source_pixel_storage);
++
++  for (int y = 0; y < height; ++y) {
++    for (int x = 0; x < width; ++x) {
++      std::array<float, kChannelsPerPixel> source_pixel =
++          Traits::Load(source_pixels, x, y, width);
++      if (QuantizeFloatPixel(base::span(source_pixel)) == kEmptyPixel) {
++        continue;
++      }
++      std::array<float, kChannelsPerPixel> pixel = source_pixel;
++
++      HeliumNoiseHash hash_copy = token_hash;
++      hash_copy.Update(
++          (static_cast<uint64_t>(static_cast<uint32_t>(y + y_offset)) << 32) |
++          static_cast<uint32_t>(x + x_offset));
++      hash_copy.Update(QuantizedFloatPixelValue(base::span(source_pixel)));
++      const std::pair<PixelLocation, PixelLocation> other_pixels =
++          GetRandomPixelLocations(hash_copy, {x, y}, width, height);
++      hash_copy.Update(GetValueFromFloatLikePixelLocations<Traits>(
++          other_pixels, source_pixels, width));
++      HeliumNoiseFloatPixel(base::span(pixel), hash_copy);
++
++      Traits::Store(pixels, x, y, width, pixel);
++    }
++  }
++}
++
++std::optional<HeliumNoiseHash> GetCanvasTokenHash(
++    ExecutionContext* execution_context) {
++  if (!base::FeatureList::IsEnabled(blink::features::kHeliumNoiseCanvas)) {
++    return std::nullopt;
++  }
++
++  if (!execution_context || !execution_context->GetHeliumNoiseTokens().contains(
++                                HeliumNoiseFeature::kCanvas)) {
++    return std::nullopt;
++  }
++
++  return HeliumNoiseHash(execution_context->GetHeliumNoiseTokens().at(
++      HeliumNoiseFeature::kCanvas));
++}
++
++bool IsSupportedNoisingColorType(SkColorType color_type) {
++  switch (color_type) {
++    case kRGBA_8888_SkColorType:
++    case kBGRA_8888_SkColorType:
++    case kRGBA_F16_SkColorType:
++    case kRGBA_F32_SkColorType:
++      return true;
++    default:
++      return false;
++  }
++}
++
++bool HeliumNoisePixelBuffer(const HeliumNoiseHash& token_hash,
++                            SkColorType color_type,
++                            base::span<uint8_t> pixels,
++                            int width,
++                            int height,
++                            int x_offset,
++                            int y_offset) {
++  switch (color_type) {
++    case kRGBA_8888_SkColorType:
++    case kBGRA_8888_SkColorType:
++      HeliumNoisePixels(token_hash, pixels, width, height, x_offset, y_offset);
++      return true;
++    case kRGBA_F16_SkColorType: {
++      CHECK_EQ(pixels.size(),
++               CheckedPixelStorageSize(width, height, sizeof(SkHalf)));
++      auto half_pixels = base::span(reinterpret_cast<SkHalf*>(pixels.data()),
++                                    pixels.size() / sizeof(SkHalf));
++
++      HeliumNoiseFloatLikePixels<HalfFloatPixelTraits>(
++          token_hash, half_pixels, width, height, x_offset, y_offset);
++      return true;
++    }
++    case kRGBA_F32_SkColorType: {
++      auto float_pixels = base::span(reinterpret_cast<float*>(pixels.data()),
++                                     pixels.size() / sizeof(float));
++      HeliumNoiseFloatLikePixels<FloatPixelTraits>(
++          token_hash, float_pixels, width, height, x_offset, y_offset);
++      return true;
++    }
++    default:
++      NOTREACHED() << "Unsupported canvas color type for noising: "
++                   << static_cast<int>(color_type);
++  }
++}
++
 +}  // namespace
 +
 +// static
@@ -288,23 +532,24 @@
 +    scoped_refptr<StaticBitmapImage>& snapshot) {
 +  CHECK(snapshot);
 +
-+  if (!base::FeatureList::IsEnabled(
-+        blink::features::kHeliumNoiseCanvas)) {
++  std::optional<HeliumNoiseHash> token_hash =
++      GetCanvasTokenHash(execution_context);
++  if (!token_hash) {
 +    return false;
 +  }
 +
-+  // Check if execution context exists and has a canvas noise token
-+  if (!execution_context ||
-+      !execution_context->GetHeliumNoiseTokens().contains(
-+          HeliumNoiseFeature::kCanvas)) {
-+    return false;
++  // Read back unpremultiplied pixels because noising mutates raw channel
++  // values, including alpha for non-transparent/non-opaque pixels. If the
++  // snapshot format does not map to a noising-supported color type, read it
++  // back as RGBA_8888 and noise that representation. RGBA_8888 is the default
++  // ImageData format (see |color_type| in t/b/r/c/html/canvas/image_data.cc).
++  SkColorType color_type =
++      viz::ToClosestSkColorType(snapshot->GetSharedImageFormat());
++  if (!IsSupportedNoisingColorType(color_type)) {
++    color_type = kRGBA_8888_SkColorType;
 +  }
-+
-+  // Use kUnpremul_SkAlphaType as alpha type as we are changing the pixel values
-+  // of all channels, including the alpha channel.
 +  auto info = SkImageInfo::Make(
-+      snapshot->GetSize().width(), snapshot->GetSize().height(),
-+      viz::ToClosestSkColorType(snapshot->GetSharedImageFormat()),
++      snapshot->GetSize().width(), snapshot->GetSize().height(), color_type,
 +      kUnpremul_SkAlphaType, snapshot->GetColorSpace().ToSkColorSpace());
 +  SkBitmap bm;
 +  if (!bm.tryAllocPixels(info)) {
@@ -324,12 +569,11 @@
 +  base::span<uint8_t> modify_pixels =
 +      gfx::SkPixmapToWritableSpan(pixmap_to_noise);
 +
-+  auto token_hash =
-+      HeliumNoiseHash(execution_context->GetHeliumNoiseTokens().at(
-+          HeliumNoiseFeature::kCanvas));
-+
-+  HeliumNoisePixels(token_hash, modify_pixels, pixmap_to_noise.width(),
-+                    pixmap_to_noise.height());
++  if (!HeliumNoisePixelBuffer(*token_hash, pixmap_to_noise.colorType(),
++                              modify_pixels, pixmap_to_noise.width(),
++                              pixmap_to_noise.height(), 0, 0)) {
++    return false;
++  }
 +
 +  auto noised_image = bm.asImage();
 +  snapshot = blink::UnacceleratedStaticBitmapImage::Create(
@@ -338,10 +582,40 @@
 +  return true;
 +}
 +
++// static
++bool CanvasNoisingHelper::MaybeNoiseImageData(
++    ExecutionContext* execution_context,
++    ImageData* image_data,
++    int source_x,
++    int source_y) {
++  CHECK(image_data);
++
++  std::optional<HeliumNoiseHash> token_hash =
++      GetCanvasTokenHash(execution_context);
++  if (!token_hash) {
++    return false;
++  }
++
++  base::span<uint8_t> pixels = image_data->RawByteSpan();
++  SkColorType color_type = image_data->GetSkColorType();
++  if (!IsSupportedNoisingColorType(color_type)) {
++    // ImageData creation currently only exposes RGBA_8888, RGBA_F16, and
++    // RGBA_F32. If a future ImageData format reaches this path before noising
++    // support is added, avoid both renderer crashes and unnoised readback.
++    DCHECK(false) << "Trying to noise unsupported color type: " << color_type;
++    std::ranges::fill(pixels, 0u);
++    return true;
++  }
++
++  return HeliumNoisePixelBuffer(*token_hash, color_type, pixels,
++                                image_data->width(), image_data->height(),
++                                source_x, source_y);
++}
++
 +}  // namespace blink
 --- /dev/null
 +++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.h
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,40 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -359,12 +633,21 @@
 +
 +namespace blink {
 +
++class ImageData;
++
 +class CORE_EXPORT CanvasNoisingHelper {
 + public:
 +  // If allowed, performs noising on a copy of the snapshot StaticBitmapImage
 +  // and modifies it in place. Returns true if noise was applied.
 +  static bool MaybeNoiseSnapshot(ExecutionContext* execution_context,
 +                                 scoped_refptr<StaticBitmapImage>& snapshot);
++
++  // If allowed, performs noising in place on RGBA ImageData readbacks.
++  // Returns true if noise was applied.
++  static bool MaybeNoiseImageData(ExecutionContext* execution_context,
++                                  ImageData* image_data,
++                                  int source_x,
++                                  int source_y);
 +
 + private:
 +  CanvasNoisingHelper() = delete;
@@ -437,3 +720,23 @@
      auto* async_creator = MakeGarbageCollected<CanvasAsyncBlobCreator>(
          image_bitmap, options, function_type, start_time, execution_context,
          resolver);
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -48,6 +48,7 @@
+ #include "third_party/blink/renderer/core/event_type_names.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/geometry/dom_matrix.h"
++#include "third_party/blink/renderer/core/helium_noise/canvas_noising_helper.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_font_cache.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_performance_monitor.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+@@ -534,6 +535,9 @@ ImageData* BaseRenderingContext2D::getIm
+       SkIRect bounds =
+           snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
+       DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
++    } else {
++      CanvasNoisingHelper::MaybeNoiseImageData(GetExecutionContext(),
++                                               image_data, sx, sy);
+     }
+   }
+ 
