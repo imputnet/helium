@@ -1,0 +1,3329 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -4110,6 +4110,8 @@ static_library("ui") {
+       "views/helium/frame_corner_radius.h",
+       "views/hover_button_controller.cc",
+       "views/hover_button_controller.h",
++      "helium/anchored_tab_hibernation.cc",
++      "helium/anchored_tab_hibernation.h",
+       "views/helium/tab_rename_dialog.cc",
+       "views/helium/tab_rename_dialog.h",
+       "views/hung_renderer_view.cc",
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -80,6 +80,7 @@
+ #include "chrome/browser/ui/exclusive_access/fullscreen_controller.h"
+ #include "chrome/browser/ui/find_bar/find_bar.h"
+ #include "chrome/browser/ui/find_bar/find_bar_controller.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/intent_picker_tab_helper.h"
+ #include "chrome/browser/ui/lens/lens_search_controller.h"
+@@ -1185,6 +1186,12 @@ void NewTabToRight(BrowserWindowInterfac
+ void CloseTab(BrowserWindowInterface* browser) {
+   base::RecordAction(UserMetricsAction("CloseTab_Accelerator"));
+ 
++  if (TabStripModel* const model = browser->GetTabStripModel();
++      model->selection_model().size() == 1 && !model->IsActiveTabSplit() &&
++      helium::MaybeHibernateAnchoredTab(model, model->active_index())) {
++    return;
++  }
++
+   // If the selection model consists of only the indices of a single split tab,
+   // decide if just the active tab in the split is closed instead of all tabs in
+   // the split.
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/ui/browser_navigator_params.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+@@ -404,6 +405,10 @@ void BrowserTabStripController::CloseTab
+   // Cancel any pending tab transition.
+   hover_tab_selector_.CancelTabTransition();
+ 
++  if (helium::MaybeHibernateGroupedTab(model_, model_index)) {
++    return;
++  }
++
+   model_->CloseWebContentsAt(model_index,
+                              TabCloseTypes::CLOSE_USER_GESTURE |
+                                  TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
+@@ -36,6 +36,7 @@
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tab_contents/core_tab_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+@@ -1344,6 +1345,10 @@ void Tab::OnTabDataChanged(TabChangeType
+   if (did_title_change) {
+     title_->SetText(title);
+   }
++  close_button_->SetIconVariant(helium::ShouldShowGroupedTabHibernateAffordance(
++                                    tab_handle_.Get(), data_.is_tab_discarded)
++                                    ? TabCloseButton::IconVariant::kMinus
++                                    : TabCloseButton::IconVariant::kClose);
+ 
+   const bool did_alert_state_change = previous_alert_state != data_.alert_state;
+   if (did_alert_state_change) {
+--- a/chrome/browser/ui/views/tabs/tab/tab_close_button.cc
++++ b/chrome/browser/ui/views/tabs/tab/tab_close_button.cc
+@@ -124,6 +124,14 @@ void TabCloseButton::SetColors(TabStyle:
+   OnPropertyChanged(&colors_, views::PropertyEffects::kPaint);
+ }
+ 
++void TabCloseButton::SetIconVariant(IconVariant icon_variant) {
++  if (icon_variant_ == icon_variant) {
++    return;
++  }
++  icon_variant_ = icon_variant;
++  UpdateIcon();
++}
++
+ views::View* TabCloseButton::GetTooltipHandlerForPoint(
+     const gfx::Point& point) {
+   // Tab close button has no children, so tooltip handler should be the same
+@@ -215,7 +223,9 @@ bool TabCloseButton::GetHitTestMask(SkPa
+   return true;
+ }
+ void TabCloseButton::UpdateIcon() {
+-  const auto& icon = kCloseTabChromeRefreshIcon;
++  const auto& icon = icon_variant_ == IconVariant::kMinus
++                         ? kRemoveIcon
++                         : kCloseTabChromeRefreshIcon;
+ 
+   SetImageModel(views::Button::STATE_NORMAL,
+                 ui::ImageModel::FromVectorIcon(
+--- a/chrome/browser/ui/views/tabs/tab/tab_close_button.h
++++ b/chrome/browser/ui/views/tabs/tab/tab_close_button.h
+@@ -22,6 +22,10 @@ class TabCloseButton : public views::Lab
+  public:
+   using MouseEventCallback =
+       base::RepeatingCallback<void(views::View*, const ui::MouseEvent&)>;
++  enum class IconVariant {
++    kClose,
++    kMinus,
++  };
+ 
+   // The mouse_event callback will be called for every mouse event to allow
+   // middle clicks to be handled by the parent.
+@@ -39,6 +43,7 @@ class TabCloseButton : public views::Lab
+   // changes (this class does not track tab activation state), and when the
+   // theme changes.
+   void SetColors(TabStyle::TabColors colors);
++  void SetIconVariant(IconVariant icon_variant);
+ 
+   // views::LabelButton:
+   View* GetTooltipHandlerForPoint(const gfx::Point& point) override;
+@@ -66,6 +71,7 @@ class TabCloseButton : public views::Lab
+   MouseEventCallback mouse_event_callback_;
+ 
+   TabStyle::TabColors colors_;
++  IconVariant icon_variant_ = IconVariant::kClose;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_TAB_TAB_CLOSE_BUTTON_H_
+--- a/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
+@@ -441,6 +441,12 @@ bool TabStripLayoutHelper::SlotIsCollaps
+   // Otherwise, a tab is only collapsed if it is in an explicitly collapsed
+   // group.
+   const std::optional<tab_groups::TabGroupId> id = slots_[i].view->group();
+-  return slots_[i].type == TabSlotView::ViewType::kTab && id.has_value() &&
+-         controller_->IsGroupCollapsed(id.value());
++  if (slots_[i].type != TabSlotView::ViewType::kTab || !id.has_value() ||
++      !controller_->IsGroupCollapsed(id.value())) {
++    return false;
++  }
++
++  // Live tabs stay visible when their group is collapsed.
++  const Tab* const tab = static_cast<const Tab*>(slots_[i].view.get());
++  return tab->IsDiscarded();
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.cc
+@@ -90,6 +90,28 @@ void ConfigureEditorBubbleButton(views::
+                       kTabGroupEditorBubbleButtonElementId);
+ }
+ 
++void ConfigureHibernateButton(views::LabelButton* button) {
++  button->SetHasInkDropActionOnClick(true);
++
++  auto highlight_path =
++      std::make_unique<views::CircleHighlightPathGenerator>(gfx::Insets());
++  highlight_path->set_use_contents_bounds(true);
++  views::HighlightPathGenerator::Install(button, std::move(highlight_path));
++
++  views::InkDrop::Get(button)->SetMode(views::InkDropHost::InkDropMode::ON);
++  views::InkDrop::Get(button)->SetHighlightOpacity(0.2f);
++  views::InkDrop::Get(button)->SetVisibleOpacity(0.08f);
++
++  button->button_controller()->set_notify_action(
++      views::ButtonController::NotifyAction::kOnPress);
++  button->GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_VERTICAL_TAB_GROUP_HIBERNATE));
++  button->SetFocusBehavior(
++      VerticalTabGroupHeaderView::FocusBehavior::ACCESSIBLE_ONLY);
++  button->SetVisible(false);
++  views::FocusRing::Install(button);
++}
++
+ void UpdateEditorButtonColors(views::LabelButton* button,
+                               SkColor foreground_color) {
+   views::InkDrop::Get(button)->SetBaseColor(
+@@ -108,6 +130,21 @@ void UpdateEditorButtonColors(views::Lab
+                                      foreground_color, kIconSize));
+ }
+ 
++void UpdateHibernateButtonColors(views::LabelButton* button,
++                                 SkColor foreground_color) {
++  views::InkDrop::Get(button)->SetBaseColor(
++      color_utils::GetColorWithMaxContrast(foreground_color));
++  button->SetImageModel(
++      views::Button::STATE_NORMAL,
++      ui::ImageModel::FromVectorIcon(kRemoveIcon, foreground_color, kIconSize));
++  button->SetImageModel(
++      views::Button::STATE_HOVERED,
++      ui::ImageModel::FromVectorIcon(kRemoveIcon, foreground_color, kIconSize));
++  button->SetImageModel(
++      views::Button::STATE_PRESSED,
++      ui::ImageModel::FromVectorIcon(kRemoveIcon, foreground_color, kIconSize));
++}
++
+ class VerticalTabGroupHeaderLabel : public views::Label {
+   METADATA_HEADER(VerticalTabGroupHeaderLabel, views::Label)
+  public:
+@@ -135,6 +172,10 @@ VerticalTabGroupHeaderView::VerticalTabG
+       editor_bubble_button_(AddChildView(std::make_unique<views::LabelButton>(
+           base::BindRepeating(&VerticalTabGroupHeaderView::ShowEditorBubble,
+                               base::Unretained(this))))),
++      hibernate_button_(
++          AddChildView(std::make_unique<views::LabelButton>(base::BindRepeating(
++              &VerticalTabGroupHeaderView::Delegate::HibernateRemainingTabs,
++              base::Unretained(&delegate))))),
+       collapse_icon_(AddChildView(std::make_unique<views::ImageView>())),
+       delegate_(delegate),
+       editor_bubble_tracker_(state_controller) {
+@@ -144,6 +185,7 @@ VerticalTabGroupHeaderView::VerticalTabG
+   SetNotifyEnterExitOnChild(true);
+ 
+   ConfigureEditorBubbleButton(editor_bubble_button_);
++  ConfigureHibernateButton(hibernate_button_);
+   editor_bubble_opened_subscription_ =
+       editor_bubble_tracker_.RegisterOnBubbleOpened(base::BindRepeating(
+           &VerticalTabGroupHeaderView::OnBubbleOpened, base::Unretained(this)));
+@@ -474,6 +516,8 @@ void VerticalTabGroupHeaderView::OnDataC
+ 
+     // Update editor bubble button.
+     UpdateEditorButtonColors(editor_bubble_button_, foreground_color);
++    UpdateHibernateButtonColors(hibernate_button_, foreground_color);
++    hibernate_button_->SetVisible(delegate_->ShouldShowHibernateButton());
+ 
+     // Update collapse icon.
+     collapse_icon_->SetImage(
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_header_view.h
+@@ -49,6 +49,8 @@ class VerticalTabGroupHeaderView : publi
+     virtual views::Widget* ShowGroupEditorBubble(
+         bool stop_context_menu_propagation) = 0;
+     virtual std::u16string GetGroupContentString() const = 0;
++    virtual bool ShouldShowHibernateButton() const = 0;
++    virtual void HibernateRemainingTabs() = 0;
+ 
+     virtual bool IsValid() const = 0;
+     virtual void InitHeaderDrag(const ui::LocatedEvent& event) = 0;
+@@ -111,6 +113,9 @@ class VerticalTabGroupHeaderView : publi
+   void OnAttentionStateChanged(bool needs_attention);
+ 
+   views::LabelButton* editor_bubble_button() { return editor_bubble_button_; }
++  views::LabelButton* hibernate_button_for_testing() {
++    return hibernate_button_;
++  }
+   views::ImageView* collapse_icon_for_testing() { return collapse_icon_; }
+   views::ImageView* attention_indicator_for_testing() {
+     return attention_indicator_;
+@@ -146,6 +151,7 @@ class VerticalTabGroupHeaderView : publi
+   const raw_ptr<views::ImageView> attention_indicator_ = nullptr;
+ 
+   const raw_ptr<views::LabelButton> editor_bubble_button_ = nullptr;
++  const raw_ptr<views::LabelButton> hibernate_button_ = nullptr;
+ 
+   const raw_ptr<views::ImageView> collapse_icon_ = nullptr;
+   const raw_ref<Delegate> delegate_;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -8,10 +8,12 @@
+ 
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_group_features.h"
+ #include "chrome/browser/ui/tabs/tab_group_theme.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/groups/tab_group_accessibility.h"
+@@ -132,6 +134,11 @@ views::ProposedLayout VerticalTabGroupVi
+   int width = 0;
+   int height = kGroupHeaderVerticalMargin;
+   auto tab_strip_collapse_state = GetTabStripCollapseState();
++  const bool is_tab_strip_collapsed =
++      tab_strip_collapse_state !=
++      tabs::VerticalTabStripCollapseState::kExpanded;
++  const bool hide_group_line =
++      features::IsHeliumAnchoredTabsEnabled() && is_tab_strip_collapsed;
+ 
+   gfx::Rect header_bounds;
+   gfx::Rect group_line_bounds;
+@@ -139,8 +146,7 @@ views::ProposedLayout VerticalTabGroupVi
+ 
+   // If the tab strip is collapsed then the group line should appear on the
+   // leading side of all grouped tabs and the header.
+-  if (tab_strip_collapse_state !=
+-      tabs::VerticalTabStripCollapseState::kExpanded) {
++  if (is_tab_strip_collapsed) {
+     group_line_bounds.set_x(kGroupLineCollapsedLeadingPadding);
+     group_line_bounds.set_y(height);
+     header_bounds.set_x(GetLayoutConstant(
+@@ -172,11 +178,13 @@ views::ProposedLayout VerticalTabGroupVi
+   const std::vector<views::View*> children =
+       collection_node_ ? collection_node_->GetDirectChildren()
+                        : std::vector<views::View*>();
++  bool has_visible_child = false;
+ 
+   // Layout children in order. Children will have their preferred height and
+   // fill available width.
+   for (auto* child : children) {
+     gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(size_bounds));
++    const bool child_visible = child->GetVisible();
+ 
+     auto drag_data = GetVisualDataForDraggedView(*child);
+     CHECK(!drag_data || !drag_data->should_hide);
+@@ -194,18 +202,25 @@ views::ProposedLayout VerticalTabGroupVi
+     if (size_bounds.width().is_bounded()) {
+       bounds.set_width(size_bounds.width().value() - bounds.x());
+     }
+-    layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
++    layouts.child_layouts.emplace_back(child, child_visible, bounds);
++    has_visible_child |= child_visible;
++    if (!child_visible) {
++      continue;
++    }
+     height += bounds.height() + kTabVerticalPadding;
+     width = std::max(width, bounds.width());
+   }
+-  // Remove excess padding.
+-  height -= kTabVerticalPadding;
++  if (has_visible_child) {
++    // Remove excess padding.
++    height -= kTabVerticalPadding;
++  }
+ 
+-  if (!children.empty()) {
++  if (has_visible_child) {
+     group_line_bounds.set_height(height - group_line_bounds.y());
+   }
+-  layouts.child_layouts.emplace_back(
+-      group_line_.get(), group_line_->GetVisible(), group_line_bounds);
++  layouts.child_layouts.emplace_back(group_line_.get(),
++                                     has_visible_child && !hide_group_line,
++                                     group_line_bounds);
+ 
+   // Add extra padding below the group if not collapsed.
+   const bool is_group_collapsed = IsCollapsed();
+@@ -214,7 +229,7 @@ views::ProposedLayout VerticalTabGroupVi
+   }
+ 
+   layouts.host_size = gfx::Size(
+-      width, is_group_collapsed
++      width, is_group_collapsed && !has_visible_child
+                  ? header_bounds.height() + (2 * kGroupHeaderVerticalMargin)
+                  : height);
+   return layouts;
+@@ -314,6 +329,32 @@ bool VerticalTabGroupView::IsValid() con
+   return collection_node_;
+ }
+ 
++bool VerticalTabGroupView::ShouldShowHibernateButton() const {
++  if (!collection_node_ || !IsCollapsed()) {
++    return false;
++  }
++
++  for (views::View* child : children()) {
++    if (auto* tab_view = views::AsViewClass<VerticalTabView>(child)) {
++      if (tab_view->GetVisible() && !tab_view->data().is_tab_discarded) {
++        return true;
++      }
++    }
++  }
++
++  return false;
++}
++
++void VerticalTabGroupView::HibernateRemainingTabs() {
++  if (!collection_node_) {
++    return;
++  }
++
++  helium::HibernateTabGroup(collection_node_->GetController()->GetModel(),
++                            GetTabGroupFromNode(collection_node_)->id());
++  OnDataChanged();
++}
++
+ void VerticalTabGroupView::AttachChildView(
+     std::unique_ptr<views::View> child_view,
+     const gfx::Rect& previous_bounds_in_screen) {
+@@ -354,11 +395,7 @@ void VerticalTabGroupView::OnDataChanged
+   tab_group_visual_data_ = *group->visual_data();
+   group_header_->OnDataChanged(&tab_group_visual_data_, GetIsShared());
+ 
+-  // If the tab group is not collapsed update child visibility immediately. This
+-  // allows tabs to be visible as they are animated in.
+-  if (!tab_group_visual_data_.is_collapsed()) {
+-    UpdateChildVisibilityForCollapseState(false);
+-  }
++  UpdateChildVisibilityForCollapseState(tab_group_visual_data_.is_collapsed());
+ 
+   if (GetColorProvider()) {
+     SkColor color = GetColorProvider()->GetColor(GetTabGroupTabStripColorId(
+@@ -370,15 +407,36 @@ void VerticalTabGroupView::OnDataChanged
+   InvalidateLayout();
+ }
+ 
++void VerticalTabGroupView::OnChildTabStateChanged() {
++  if (!collection_node_ || !IsCollapsed()) {
++    return;
++  }
++
++  group_header_->OnDataChanged(&tab_group_visual_data_, GetIsShared());
++  UpdateChildVisibilityForCollapseState(true);
++  InvalidateLayout();
++}
++
+ void VerticalTabGroupView::UpdateChildVisibilityForCollapseState(
+     bool collapsed) {
+   // Collection node may not exist at this point during browser shutdown.
+   if (!collection_node_) {
+     return;
+   }
+-  group_line_->SetVisible(!collapsed);
++  group_line_->SetVisible(
++      !collapsed && !(features::IsHeliumAnchoredTabsEnabled() &&
++                      GetTabStripCollapseState() !=
++                          tabs::VerticalTabStripCollapseState::kExpanded));
+   for (auto* child : collection_node_->GetDirectChildren()) {
+-    child->SetVisible(!collapsed);
++    bool visible = !collapsed;
++    if (collapsed) {
++      if (auto* tab_view = views::AsViewClass<VerticalTabView>(child)) {
++        visible = tab_view->IsActive() && !tab_view->data().is_tab_discarded;
++      } else {
++        visible = false;
++      }
++    }
++    child->SetVisible(visible);
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -57,6 +57,8 @@ class VerticalTabGroupView
+   views::Widget* ShowGroupEditorBubble(
+       bool stop_context_menu_propagation) override;
+   std::u16string GetGroupContentString() const override;
++  bool ShouldShowHibernateButton() const override;
++  void HibernateRemainingTabs() override;
+   bool IsValid() const override;
+   void InitHeaderDrag(const ui::LocatedEvent& event) override;
+   bool ContinueHeaderDrag(const ui::LocatedEvent& event) override;
+@@ -88,6 +90,7 @@ class VerticalTabGroupView
+   const VerticalTabGroupHeaderView* group_header() const {
+     return group_header_;
+   }
++  void OnChildTabStateChanged();
+ 
+  private:
+   // VerticalDraggedTabsContainer:
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/split_tab_util.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+@@ -38,6 +39,7 @@
+ #include "components/tabs/public/tab_collection_types.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+ #include "ui/views/view_utils.h"
+@@ -232,6 +234,10 @@ void VerticalTabStripController::CloseTa
+     return;
+   }
+ 
++  if (helium::MaybeHibernateGroupedTab(model_, tab_index.value())) {
++    return;
++  }
++
+   model_->CloseWebContentsAt(tab_index.value(),
+                              TabCloseTypes::CLOSE_USER_GESTURE |
+                                  TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+@@ -281,38 +287,21 @@ void VerticalTabStripController::ToggleT
+     ToggleTabGroupCollapsedStateOrigin origin) {
+   bool is_currently_collapsed = group->visual_data()->is_collapsed();
+   bool should_toggle_group = true;
++  std::optional<int> active_group_tab_index;
+ 
+   tabs::TabInterface* active_tab = model_->GetActiveTab();
+   if (!is_currently_collapsed && active_tab) {
+-    if (active_tab->GetGroup() == group->id()) {
+-      // If the active tab is in the group that is toggling to collapse, the
+-      // active tab should switch to the next available tab. If there are no
+-      // available tabs for the active tab to switch to, a new tab will
+-      // be created.
+-      const std::optional<int> next_active =
+-          model_->GetNextExpandedActiveTab(group->id());
+-      if (next_active.has_value()) {
+-        model_->ActivateTabAt(
+-            next_active.value(),
+-            TabStripUserGestureDetails(
+-                TabStripUserGestureDetails::GestureType::kOther));
+-      } else {
+-        // Create a new tab that will automatically be activated
+-        should_toggle_group = false;
+-        // We intentionally do not call CreateNewTab() here because it
+-        // respects the IsNewTabAddsToActiveGroupEnabled() feature, which would
+-        // add the new tab to the same group as the currently active tab.
+-        // In the "collapse group" scenario, we want the new tab to be created
+-        // outside of any group to avoid it being collapsed immediately.
+-        model_->delegate()->AddTabAt(GURL(), -1, true);
+-      }
+-    } else {
++    if (active_tab->GetGroup() != group->id()) {
+       // If the active tab is not in the group that is toggling to collapse,
+       // reactive the active tab to deselect any other potentially selected
+       // tabs.
+       SelectTab(active_tab,
+                 TabStripUserGestureDetails(
+                     TabStripUserGestureDetails::GestureType::kOther));
++    } else if (content::WebContents* const active_contents =
++                   active_tab->GetContents();
++               active_contents && !active_contents->WasDiscarded()) {
++      active_group_tab_index = model_->GetIndexOfTab(active_tab);
+     }
+   }
+ 
+@@ -324,6 +313,13 @@ void VerticalTabStripController::ToggleT
+                                        group->visual_data()->color(),
+                                        !is_currently_collapsed),
+         true);
++    if (active_group_tab_index.has_value() &&
++        model_->ContainsIndex(*active_group_tab_index)) {
++      model_->ActivateTabAt(
++          *active_group_tab_index,
++          TabStripUserGestureDetails(
++              TabStripUserGestureDetails::GestureType::kOther));
++    }
+   }
+ 
+   if (should_toggle_group &&
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h
+@@ -74,6 +74,7 @@ class VerticalTabStripController : publi
+   views::Widget* ShowGroupEditorBubble(const tab_groups::TabGroupId& group_id,
+                                        views::View* anchor_view,
+                                        bool stop_context_menu_propagation);
++  TabStripModel* GetModel() const { return model_; }
+ 
+   tab_groups::TabGroupSyncService* GetTabGroupSyncService();
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
+@@ -201,6 +201,7 @@ class VerticalTabView : public views::Vi
+   const raw_ptr<const TabStyle> tab_style_;
+ 
+   const raw_ptr<TabIcon> icon_;
++  const raw_ptr<views::View> anchored_group_indicator_;
+   const raw_ptr<TabTitle> title_;
+   const raw_ptr<AlertIndicatorButton> alert_indicator_;
+   const raw_ptr<TabCloseButton> close_button_;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -13,6 +13,7 @@
+ #include "base/metrics/user_metrics_action.h"
+ #include "base/notimplemented.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "cc/paint/paint_flags.h"
+ #include "chrome/browser/glic/browser_ui/tab_underline_controller.h"
+ #include "chrome/browser/glic/browser_ui/tab_underline_view.h"
+ #include "chrome/browser/glic/public/glic_enabling.h"
+@@ -20,6 +21,7 @@
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tab_contents/core_tab_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+@@ -28,6 +30,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/event_utils.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -87,6 +90,9 @@ constexpr int kTitleMinWidth = 10;
+ constexpr int kHorizontalInset = 7;
+ constexpr int kDefaultPadding = 4;
+ constexpr int kFocusRingInset = 0.0f;
++constexpr int kAnchoredGroupIndicatorWidth = 8;
++constexpr int kAnchoredGroupIndicatorStrokeWidth = 2;
++constexpr int kAnchoredGroupIndicatorVerticalInset = 11;
+ 
+ class VerticalTabHighlightPathGenerator : public views::HighlightPathGenerator {
+  public:
+@@ -102,6 +108,40 @@ class VerticalTabHighlightPathGenerator
+   raw_ptr<VerticalTabView> tab_view_;
+ };
+ 
++class AnchoredGroupIndicatorView : public views::View {
++  METADATA_HEADER(AnchoredGroupIndicatorView, views::View)
++
++ public:
++  AnchoredGroupIndicatorView() = default;
++
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(kAnchoredGroupIndicatorWidth,
++                     GetLayoutConstant(LayoutConstant::kVerticalTabHeight));
++  }
++
++  void OnPaint(gfx::Canvas* canvas) override {
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(
++        GetColorProvider()->GetColor(ui::kColorLabelForegroundSecondary));
++    flags.setStrokeCap(cc::PaintFlags::kRound_Cap);
++    flags.setStrokeWidth(kAnchoredGroupIndicatorStrokeWidth);
++    flags.setStyle(cc::PaintFlags::kStroke_Style);
++
++    const gfx::Rect bounds = GetLocalBounds();
++    canvas->DrawLine(
++        gfx::PointF(bounds.CenterPoint().x() + 1,
++                    bounds.y() + kAnchoredGroupIndicatorVerticalInset),
++        gfx::PointF(bounds.CenterPoint().x() - 1,
++                    bounds.bottom() - kAnchoredGroupIndicatorVerticalInset),
++        flags);
++  }
++};
++
++BEGIN_METADATA(AnchoredGroupIndicatorView)
++END_METADATA
++
+ bool IsSelectionModifierDown(const ui::MouseEvent& event) {
+ #if BUILDFLAG(IS_MAC)
+   return event.IsCommandDown();
+@@ -130,6 +170,8 @@ VerticalTabView::VerticalTabView(TabColl
+       collection_node_(collection_node),
+       tab_style_(TabStyle::Get()),
+       icon_(AddChildView(std::make_unique<TabIcon>())),
++      anchored_group_indicator_(
++          AddChildView(std::make_unique<AnchoredGroupIndicatorView>())),
+       title_(AddChildView(std::make_unique<TabTitle>())),
+       alert_indicator_(
+           AddChildView(std::make_unique<AlertIndicatorButton>(this))),
+@@ -169,6 +211,10 @@ VerticalTabView::VerticalTabView(TabColl
+       TabChildConfig(icon_, kIconDesignWidth, kHorizontalInset,
+                      /*align_leading=*/true,
+                      /*expand=*/false),
++      TabChildConfig(anchored_group_indicator_, kAnchoredGroupIndicatorWidth,
++                     kDefaultPadding,
++                     /*align_leading=*/true,
++                     /*expand=*/false),
+       TabChildConfig(alert_indicator_, kIconDesignWidth, kDefaultPadding,
+                      /*align_leading=*/false,
+                      /*expand=*/false, /*decorate_on_collapse=*/true),
+@@ -631,7 +677,10 @@ void VerticalTabView::AddedToWidget() {
+ 
+ void VerticalTabView::RemovedFromWidget() {
+   paint_as_active_subscription_ = {};
+-  UpdateHovered(false);
++  hovered_ = false;
++  if (hover_controller_ && !split_) {
++    hover_controller_->Hide(TabStyle::HideHoverStyle::kGradual);
++  }
+ }
+ 
+ void VerticalTabView::OnFocus() {
+@@ -726,7 +775,15 @@ bool VerticalTabView::IsChildVisible(con
+ 
+   if (child_view == icon_) {
+     const bool should_hide_icon_for_alert = pinned_ || collapsed_;
+-    return !should_hide_icon_for_alert || !IsChildVisible(alert_indicator_, width);
++    return !should_hide_icon_for_alert ||
++           !IsChildVisible(alert_indicator_, width);
++  }
++
++  if (child_view == anchored_group_indicator_) {
++    const tabs::TabInterface* tab_interface = GetTabInterface();
++    return features::IsHeliumAnchoredTabsEnabled() && !collapsed_ &&
++           !tab_data_.is_tab_discarded && tab_interface &&
++           tab_interface->GetGroup().has_value();
+   }
+ 
+   if (child_view == close_button_) {
+@@ -953,6 +1010,9 @@ void VerticalTabView::OnDataChanged() {
+   UpdateTabData(tab);
+ 
+   UpdateColors();
++  if (auto* group_view = views::AsViewClass<VerticalTabGroupView>(parent())) {
++    group_view->OnChildTabStateChanged();
++  }
+   InvalidateLayout();
+ }
+ 
+@@ -1050,11 +1110,20 @@ void VerticalTabView::UpdateThemeColors(
+ }
+ 
+ void VerticalTabView::UpdateColors() {
++  const tabs::TabInterface* tab_interface = GetTabInterface();
++  if (!tab_interface) {
++    return;
++  }
++
+   UpdateContrastRatioValues();
+   TabStyle::TabColors colors = tab_style_->CalculateTargetColors(
+       GetSelectionState(), IsApparentlyActive(), hovered_, IsFrameActive(),
+       GetColorProvider());
+   title_->SetEnabledColor(colors.foreground_color);
++  close_button_->SetIconVariant(helium::ShouldShowGroupedTabHibernateAffordance(
++                                    tab_interface, data().is_tab_discarded)
++                                    ? TabCloseButton::IconVariant::kMinus
++                                    : TabCloseButton::IconVariant::kClose);
+   close_button_->SetColors(colors);
+   alert_indicator_->OnParentTabButtonColorChanged();
+ 
+@@ -1176,6 +1245,9 @@ bool VerticalTabView::IsInExpandOnHover(
+ }
+ 
+ const tabs::TabInterface* VerticalTabView::GetTabInterface() const {
++  if (!collection_node_) {
++    return nullptr;
++  }
+   return std::get<const tabs::TabInterface*>(collection_node_->GetNodeData());
+ }
+ 
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -14,6 +14,7 @@
+ #include <set>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/command_line.h"
+ #include "base/containers/flat_map.h"
+@@ -64,11 +65,12 @@
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+ #include "chrome/browser/ui/startup/startup_types.h"
+-#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
++#include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+@@ -98,6 +100,7 @@
+ #include "content/public/browser/session_storage_namespace.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/common/url_constants.h"
+ #include "extensions/browser/extension_registry.h"
+ #include "extensions/common/extension_set.h"
+ #include "ui/base/mojom/window_show_state.mojom.h"
+@@ -137,6 +140,18 @@ bool HasSingleNewTabPage(Browser* browse
+          search::IsInstantNTP(active_tab);
+ }
+ 
++bool IsAnchoredNewTabSessionTab(const sessions::SessionTab& tab) {
++  if (tab.navigations.empty()) {
++    return true;
++  }
++
++  const GURL& url =
++      tab.navigations[tab.normalized_navigation_index()].virtual_url();
++  return url == chrome::kChromeUINewTabURL ||
++         (url.SchemeIs(content::kChromeUIScheme) &&
++          url.host() == chrome::kChromeUINewTabHost);
++}
++
+ // Pointers to SessionRestoreImpls which are currently restoring the session.
+ std::set<SessionRestoreImpl*>* active_session_restorers = nullptr;
+ 
+@@ -411,7 +426,7 @@ class SessionRestoreImpl : public Browse
+       web_contents->GetController().LoadIfNecessary();
+     }
+ 
+-    TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, tab.extra_data);
++    helium::RestoreAnchoredTabExtraData(web_contents, tab.extra_data);
+ 
+     if (use_new_window) {
+       browser->tab_strip_model()->ActivateTabAt(
+@@ -920,6 +935,17 @@ class SessionRestoreImpl : public Browse
+ 
+     const int selected_tab_index = std::clamp(
+         window.selected_tab_index, 0, static_cast<int>(window.tabs.size() - 1));
++    const bool helium_anchor_restore =
++        features::IsHeliumAnchoredTabsEnabled() && initial_tab_count == 0 &&
++        browser->is_type_normal();
++    const int restored_tab_offset = helium_anchor_restore ? 1 : 0;
++    if (helium_anchor_restore) {
++      chrome::AddTabAt(browser, GURL(), 0, true);
++      if (browser != browser_) {
++        did_show_browser = true;
++      }
++      ShowBrowser(browser, 0);
++    }
+ 
+     // Capture all the splits and all tabs to split.
+     std::map<split_tabs::SplitTabId, std::vector<tabs::TabInterface*>>
+@@ -927,13 +953,30 @@ class SessionRestoreImpl : public Browse
+ 
+     const base::Time epoch_time = base::Time::UnixEpoch();
+     const base::TimeTicks epoch_time_ticks = base::TimeTicks::UnixEpoch();
++    std::vector<int> restore_order;
++    restore_order.reserve(window.tabs.size());
++    if (!helium_anchor_restore && initial_tab_count == 0) {
++      restore_order.push_back(selected_tab_index);
++    }
+     for (int i = 0; i < static_cast<int>(window.tabs.size()); ++i) {
++      if (!helium_anchor_restore && initial_tab_count == 0 &&
++          i == selected_tab_index) {
++        continue;
++      }
++      restore_order.push_back(i);
++    }
++
++    for (int i : restore_order) {
+       const sessions::SessionTab& tab = *(window.tabs[i]);
++      if (helium_anchor_restore && IsAnchoredNewTabSessionTab(tab)) {
++        continue;
++      }
+ 
+       // Loads are scheduled for each restored tab unless the tab is going to
+       // be selected as ShowBrowser() will load the selected tab.
+-      bool is_selected_tab =
+-          (initial_tab_count == 0) && (i == selected_tab_index);
++      bool is_selected_tab = !helium_anchor_restore &&
++                             (initial_tab_count == 0) &&
++                             (i == selected_tab_index);
+ 
+       // Convert the last active time because WebContents needs a TimeTicks.
+       const base::TimeDelta delta = tab.last_active_time - epoch_time;
+@@ -942,7 +985,7 @@ class SessionRestoreImpl : public Browse
+       // If the browser already has tabs, we want to restore the new ones after
+       // the existing ones. E.g. this happens in Win8 Metro where we merge
+       // windows or when launching a hosted app from the app launcher.
+-      int tab_index = i + initial_tab_count;
++      int tab_index = i + initial_tab_count + restored_tab_offset;
+       RestoreTab(tab, browser, is_active_browser, restored_tabs, new_group_ids,
+                  &tabs_by_split_id, tab_index, is_selected_tab,
+                  last_active_time_ticks, tab.last_active_time,
+@@ -1026,12 +1069,28 @@ class SessionRestoreImpl : public Browse
+         tab.extra_data, true /* from_session_restore */, is_active_browser);
+     DCHECK(web_contents);
+ 
+-    TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, tab.extra_data);
++    helium::RestoreAnchoredTabExtraData(web_contents, tab.extra_data);
++
++    // avoid tab-manager side effects while startup restore is still building.
++    const bool helium_hibernate_on_restore =
++        features::IsHeliumAnchoredTabsEnabled() && !is_selected_tab;
++    if (helium_hibernate_on_restore) {
++      helium::MarkWebContentsHibernatedForRestore(web_contents);
++      web_contents->NotifyWasDiscarded();
++      const int restored_index =
++          browser->tab_strip_model()->GetIndexOfWebContents(web_contents);
++      if (restored_index != TabStripModel::kNoTab) {
++        browser->tab_strip_model()->UpdateWebContentsStateAt(
++            restored_index, TabChangeType::kAll);
++      }
++    }
+ 
+     RestoredTab restored_tab(web_contents, is_selected_tab,
+                              tab.extension_app_id.empty(), tab.pinned,
+                              new_group, tab.split_id);
+-    restored_tabs.push_back(restored_tab);
++    if (!helium_hibernate_on_restore) {
++      restored_tabs.push_back(restored_tab);
++    }
+ 
+     if (tab.split_id) {
+       // add tab to tabs_by_split_id.
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "base/containers/span.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
+ #include "chrome/browser/glic/glic_tab_restore_helper.h"
+@@ -19,11 +20,13 @@
+ #include "chrome/browser/tab_contents/tab_util.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser.h"
+ #include "chrome/common/buildflags.h"
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+@@ -49,6 +52,31 @@ namespace chrome {
+ 
+ namespace {
+ 
++GURL GetAnchoredURL(const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return GURL();
++  }
++
++  const auto it = extra_data.find(TabUIHelper::kAnchoredURLSessionKey);
++  if (it == extra_data.end()) {
++    return GURL();
++  }
++
++  const GURL url(it->second);
++  return url.is_valid() ? url : GURL();
++}
++
++std::u16string GetAnchoredTitle(
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return std::u16string();
++  }
++
++  const auto it = extra_data.find(TabUIHelper::kAnchoredTitleSessionKey);
++  return it == extra_data.end() ? std::u16string()
++                                : base::UTF8ToUTF16(it->second);
++}
++
+ std::unique_ptr<WebContents> CreateRestoredTab(
+     Browser* browser,
+     base::span<const SerializedNavigationEntry> navigations,
+@@ -61,7 +89,23 @@ std::unique_ptr<WebContents> CreateResto
+     const std::map<std::string, std::string>& extra_data,
+     bool initially_hidden,
+     bool from_session_restore) {
+-  GURL restore_url = navigations[selected_navigation].virtual_url();
++  std::vector<SerializedNavigationEntry> anchored_navigations(
++      navigations.begin(), navigations.end());
++  const GURL anchored_url = GetAnchoredURL(extra_data);
++  if (anchored_url.is_valid() && selected_navigation >= 0 &&
++      selected_navigation < static_cast<int>(anchored_navigations.size())) {
++    anchored_navigations[selected_navigation].set_virtual_url(anchored_url);
++    anchored_navigations[selected_navigation].set_original_request_url(
++        anchored_url);
++    anchored_navigations[selected_navigation].set_encoded_page_state(
++        std::string());
++    const std::u16string anchored_title = GetAnchoredTitle(extra_data);
++    if (!anchored_title.empty()) {
++      anchored_navigations[selected_navigation].set_title(anchored_title);
++    }
++  }
++
++  GURL restore_url = anchored_navigations[selected_navigation].virtual_url();
+   // TODO(ajwong): Remove the temporary session_storage_namespace_map when
+   // we teach session restore to understand that one tab can have multiple
+   // SessionStorageNamespace objects. Also remove the
+@@ -88,7 +132,7 @@ std::unique_ptr<WebContents> CreateResto
+ 
+   std::vector<std::unique_ptr<NavigationEntry>> entries =
+       ContentSerializedNavigationBuilder::ToNavigationEntries(
+-          navigations, browser->profile());
++          anchored_navigations, browser->profile());
+ 
+   blink::UserAgentOverride ua_override;
+   ua_override.ua_string_override = user_agent_override.ua_string_override;
+@@ -112,6 +156,10 @@ std::unique_ptr<WebContents> CreateResto
+ // cross-platform expectations about events it observes.
+ void LoadRestoredTabIfVisible(Browser* browser,
+                               content::WebContents* web_contents) {
++  if (web_contents->WasDiscarded()) {
++    return;
++  }
++
+   if (web_contents->GetVisibility() != content::Visibility::VISIBLE) {
+     return;
+   }
+@@ -139,6 +187,7 @@ WebContents* AddRestoredTabImpl(std::uni
+                                 bool select,
+                                 bool pin,
+                                 bool from_session_restore,
++                                bool restore_hibernated,
+                                 std::optional<bool> is_active_browser) {
+   TabStripModel* const tab_strip_model = browser->tab_strip_model();
+ 
+@@ -190,6 +239,10 @@ WebContents* AddRestoredTabImpl(std::uni
+                                          add_types, group);
+   }
+ 
++  if (restore_hibernated) {
++    helium::MarkWebContentsHibernatedForRestore(raw_web_contents);
++  }
++
+   if (from_session_restore) {
+     // Indicate that the tab is created by session restore. This is used to hide
+     // the throbber when a background restored tab is loading.
+@@ -285,10 +338,19 @@ WebContents* AddRestoredTab(
+       browser, navigations, selected_navigation, extension_app_id,
+       last_active_time_ticks, last_active_time, session_storage_namespace,
+       user_agent_override, extra_data, initially_hidden, from_session_restore);
++  const bool helium_pre_discard =
++      features::IsHeliumAnchoredTabsEnabled() &&
++      (helium::ShouldRestoreHibernated(extra_data) ||
++       (!select && from_session_restore && (group.has_value() || pin)));
++  if (helium_pre_discard) {
++    web_contents->SetWasDiscarded(true);
++  }
+ 
+-  return AddRestoredTabImpl(std::move(web_contents), browser, tab_index, group,
+-                            select, pin, from_session_restore,
+-                            is_active_browser);
++  WebContents* const raw_web_contents = AddRestoredTabImpl(
++      std::move(web_contents), browser, tab_index, group, select, pin,
++      from_session_restore, helium_pre_discard, is_active_browser);
++  helium::RestoreAnchoredTabExtraData(raw_web_contents, extra_data);
++  return raw_web_contents;
+ }
+ 
+ WebContents* ReplaceRestoredTab(
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -34,7 +34,10 @@ namespace helium {
+   constexpr const char kHeliumNoiseCpuCoresCommandLine[] =
+       "helium-noise-hw-concurrency";
+ 
+-  constexpr const char kMiddleClickAutoscrollCommandLine[] = "middle-click-autoscroll";
++  constexpr const char kMiddleClickAutoscrollCommandLine[] =
++      "middle-click-autoscroll";
++  constexpr const char kHeliumAnchoredTabsCommandLine[] =
++      "helium-anchored-tabs";
+   constexpr const char kHeliumCompactLocationWidthCommandLine[] =
+       "helium-compact-location-width";
+   constexpr const char kHeliumZenModeCommandLine[] = "helium-zen-mode";
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -4,45 +4,54 @@
+ 
+ #ifndef CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_
+ #define CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_
+-    {helium::kChannelCommandLine,
+-     "Update channel", "Selects which update channel to use for update checking. Helium flag.",
+-     kOsAll, MULTI_VALUE_TYPE(helium::kChannelChoices)},
++{helium::kChannelCommandLine, "Update channel",
++ "Selects which update channel to use for update checking. Helium flag.",
++ kOsAll, MULTI_VALUE_TYPE(helium::kChannelChoices)},
+     {helium::kEnergySaverFrameRateCommandLine,
+      "Maximum frame rate for Energy Saver",
+-     "Configures the frame rate the browser is throttled to when Energy Saver is enabled. Helium flag.",
++     "Configures the frame rate the browser is throttled to when Energy Saver "
++     "is enabled. Helium flag.",
+      kOsDesktop, MULTI_VALUE_TYPE(helium::kEnergySaverFrameRateChoices)},
+-    {helium::kDisableEchCommandLine,
+-     "Disable ECH (Encrypted Client Hello)",
+-     "Disables TLS Encrypted Client Hello. Not recommended unless you live in an area with heavy Internet"
++    {helium::kDisableEchCommandLine, "Disable ECH (Encrypted Client Hello)",
++     "Disables TLS Encrypted Client Hello. Not recommended unless you live in "
++     "an area with heavy Internet"
+      " censorship and ECH prevents websites from loading. Helium flag.",
+      kOsAll, SINGLE_VALUE_TYPE(helium::kDisableEchCommandLine)},
+-    {helium::kHeliumNoiseCommandLine,
+-     "Helium Noise",
+-     "Helium's anti-fingerprinting functionality. Adds insignificant noise to various features to deceive fingerprinting scripts. Enabled by default, must be enabled for other anti-fingerprinting features to work. Helium flag.",
++    {helium::kHeliumNoiseCommandLine, "Helium Noise",
++     "Helium's anti-fingerprinting functionality. Adds insignificant noise to "
++     "various features to deceive fingerprinting scripts. Enabled by default, "
++     "must be enabled for other anti-fingerprinting features to work. Helium "
++     "flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoise)},
+     {helium::kHeliumNoiseCanvasCommandLine,
+      "[Helium Noise] Canvas pixel noising",
+-     "Adds insignificant noise to canvas pixels during readback to deceive canvas-based fingerprinting. Helium flag.",
++     "Adds insignificant noise to canvas pixels during readback to deceive "
++     "canvas-based fingerprinting. Helium flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseCanvas)},
+     {helium::kHeliumNoiseAudioCommandLine,
+      "[Helium Noise] Jitter audio context data",
+-     "Adds insignificant jitter to audio data to deceive AudioContext-based fingerprinting. Helium flag.",
++     "Adds insignificant jitter to audio data to deceive AudioContext-based "
++     "fingerprinting. Helium flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseAudio)},
+     {helium::kHeliumNoiseCpuCoresCommandLine,
+      "[Helium Noise] Randomize number of CPU cores",
+      "Randomizes the number of cores returned by "
+      "`navigator.hardwareConcurrency` in a reasonable range. Helium flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseCpuCores)},
+-    {helium::kMiddleClickAutoscrollCommandLine,
+-     "Middle Click Autoscroll",
++    {helium::kMiddleClickAutoscrollCommandLine, "Middle Click Autoscroll",
+      "Enables autoscroll on middle click. Helium flag, Chromium feature.",
+-     kOsDesktop, FEATURE_VALUE_TYPE(blink::features::kHeliumMiddleClickAutoscroll)},
++     kOsDesktop,
++     FEATURE_VALUE_TYPE(blink::features::kHeliumMiddleClickAutoscroll)},
++    {helium::kHeliumAnchoredTabsCommandLine, "Anchored tabs",
++     "Enables tab-group anchored tab renaming, hibernation, and restore "
++     "behavior. Helium flag.",
++     kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumAnchoredTabs)},
+     {helium::kHeliumCompactLocationWidthCommandLine,
+      "Automatic address bar width in compact layout",
+-     "Allows the location bar to automatically reduce its width in the compact browser layout. The omnibox may be uncomfortable to use. Helium flag.",
++     "Allows the location bar to automatically reduce its width in the compact "
++     "browser layout. The omnibox may be uncomfortable to use. Helium flag.",
+      kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumCompactLocationWidth)},
+-    {helium::kHeliumZenModeCommandLine,
+-     "Zen Mode",
++    {helium::kHeliumZenModeCommandLine, "Zen Mode",
+      "Hides browser chrome (toolbar, tab strip, bookmarks bar) and reveals it "
+      "on hover near the window edges. Helium flag.",
+      kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumZenMode)},
+--- a/chrome/browser/sessions/session_service.cc
++++ b/chrome/browser/sessions/session_service.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <stddef.h>
+ 
++#include <map>
+ #include <set>
+ #include <string>
+ #include <utility>
+@@ -16,7 +17,6 @@
+ #include "base/debug/dump_without_crashing.h"
+ #include "base/functional/bind.h"
+ #include "base/metrics/histogram_functions.h"
+-#include "base/strings/utf_string_conversions.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/apps/app_service/launch_utils.h"
+@@ -42,14 +42,13 @@
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/session_crashed_bubble.h"
+ #include "chrome/browser/ui/startup/profile_launch_observer.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+ #include "chrome/browser/ui/startup/startup_tab.h"
+-#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+-#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "chrome/common/chrome_switches.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+@@ -60,7 +59,6 @@
+ #include "components/sessions/core/session_constants.h"
+ #include "components/sessions/core/session_types.h"
+ #include "components/sessions/core/tab_restore_service.h"
+-#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_details.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/session_storage_namespace.h"
+@@ -640,15 +638,11 @@ void SessionService::BuildCommandsForTab
+         sessions::CreateSplitTabCommand(session_id, std::move(split)));
+   }
+ 
+-  if (tabs::TabInterface* const tab_interface =
+-          tabs::TabInterface::GetFromContents(tab)) {
+-    if (TabUIHelper* const helper = TabUIHelper::From(tab_interface);
+-        helper && !helper->custom_title().empty()) {
+-      command_storage_manager()->AppendRebuildCommand(
+-          sessions::CreateAddTabExtraDataCommand(
+-              session_id, TabUIHelper::kCustomTitleSessionKey,
+-              base::UTF16ToUTF8(helper->custom_title())));
+-    }
++  std::map<std::string, std::string> extra_data;
++  helium::AddAnchoredTabExtraData(tab, &extra_data);
++  for (const auto& [key, value] : extra_data) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddTabExtraDataCommand(session_id, key, value));
+   }
+ }
+ 
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -10,7 +10,6 @@
+ #include <utility>
+ 
+ #include "base/check_deref.h"
+-#include "base/strings/utf_string_conversions.h"
+ #include "base/token.h"
+ #include "base/uuid.h"
+ #include "base/values.h"
+@@ -29,10 +28,11 @@
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "components/saved_tab_groups/public/features.h"
+ #include "components/saved_tab_groups/public/saved_tab_group.h"
+@@ -46,7 +46,6 @@
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tab_groups/tab_group_visual_data.h"
+ #include "components/tabs/public/tab_group.h"
+-#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/session_storage_namespace.h"
+ #include "content/public/browser/web_contents.h"
+@@ -156,15 +155,7 @@ std::map<std::string, std::string> Brows
+   content::WebContents* const web_contents =
+       tab_strip_model_->GetWebContentsAt(index);
+   glic::PopulateGlicExtraData(web_contents, &extra_data);
+-
+-  if (tabs::TabInterface* const tab =
+-          tabs::TabInterface::GetFromContents(web_contents)) {
+-    if (TabUIHelper* const helper = TabUIHelper::From(tab);
+-        helper && !helper->custom_title().empty()) {
+-      extra_data[TabUIHelper::kCustomTitleSessionKey] =
+-          base::UTF16ToUTF8(helper->custom_title());
+-    }
+-  }
++  helium::AddAnchoredTabExtraData(web_contents, &extra_data);
+ 
+   return extra_data;
+ }
+@@ -346,7 +337,11 @@ sessions::LiveTab* BrowserLiveTabContext
+   }
+ 
+   CHECK(web_contents);
+-  TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, tab.extra_data);
++  helium::RestoreAnchoredTabExtraData(web_contents, tab.extra_data);
++
++  if (features::IsHeliumAnchoredTabsEnabled() && web_contents->WasDiscarded()) {
++    return sessions::ContentLiveTab::GetOrCreateForWebContents(web_contents);
++  }
+ 
+   if (performance_manager::policies::CanScheduleLoadForRestoredTabs()) {
+     performance_manager::policies::ScheduleLoadForRestoredTabs({web_contents});
+--- a/chrome/browser/ui/tab_ui_helper.cc
++++ b/chrome/browser/ui/tab_ui_helper.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_web_contents_listener.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -121,9 +122,13 @@ base::CallbackListSubscription TabUIHelp
+ }
+ 
+ std::u16string TabUIHelper::GetTitle() const {
+-  if (!custom_title_.empty()) {
++  if (features::IsHeliumAnchoredTabsEnabled() && !custom_title_.empty()) {
+     return custom_title_;
+   }
++  if (features::IsHeliumAnchoredTabsEnabled() &&
++      tab().GetContents()->WasDiscarded() && !anchored_title_.empty()) {
++    return anchored_title_;
++  }
+   const tab_groups::SavedTabGroupWebContentsListener* wc_listener =
+       tab().GetTabFeatures()->saved_tab_group_web_contents_listener();
+   if (wc_listener) {
+@@ -229,7 +234,13 @@ ui::ImageModel TabUIHelper::GetFavicon()
+   content::NavigationEntry* const entry =
+       web_contents()->GetController().GetLastCommittedEntry();
+   gfx::Image favicon = favicon::TabFaviconFromWebContents(web_contents());
+-  if (entry && favicon.IsEmpty()) {
++  if (features::IsHeliumAnchoredTabsEnabled() && entry &&
++      (favicon.IsEmpty() || web_contents()->WasDiscarded())) {
++    const content::FaviconStatus& favicon_status = entry->GetFavicon();
++    if (favicon_status.valid && !favicon_status.image.IsEmpty()) {
++      return ui::ImageModel::FromImage(favicon_status.image);
++    }
++
+     MaybeFetchRestoredFavicon(entry);
+   }
+ 
+@@ -467,6 +478,10 @@ void TabUIHelper::OnRestoredFaviconFetch
+ }
+ 
+ void TabUIHelper::SetCustomTitle(std::u16string title, bool persist) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return;
++  }
++
+   custom_title_ = std::move(title);
+   // Push the new title through the existing tab-state-changed plumbing.
+   if (web_contents()) {
+@@ -497,7 +512,7 @@ void TabUIHelper::SetCustomTitle(std::u1
+ void TabUIHelper::RestoreCustomTitleFromExtraData(
+     content::WebContents* web_contents,
+     const std::map<std::string, std::string>& extra_data) {
+-  if (!web_contents) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
+     return;
+   }
+ 
+@@ -514,6 +529,70 @@ void TabUIHelper::RestoreCustomTitleFrom
+     }
+   }
+ }
++
++void TabUIHelper::SetAnchoredURL(const GURL& url,
++                                 std::u16string title,
++                                 bool persist) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !url.is_valid()) {
++    return;
++  }
++
++  anchored_url_ = url;
++  anchored_title_ = std::move(title);
++  if (!persist || !web_contents()) {
++    return;
++  }
++
++  Profile* const profile =
++      Profile::FromBrowserContext(web_contents()->GetBrowserContext());
++  SessionService* const session_service =
++      profile ? SessionServiceFactory::GetForProfile(profile) : nullptr;
++  sessions::SessionTabHelper* const tab_helper =
++      sessions::SessionTabHelper::FromWebContents(web_contents());
++  if (!session_service || !tab_helper) {
++    return;
++  }
++
++  session_service->AddTabExtraData(
++      tab_helper->window_id(), tab_helper->session_id(), kAnchoredURLSessionKey,
++      anchored_url_.spec());
++  if (!anchored_title_.empty()) {
++    session_service->AddTabExtraData(
++        tab_helper->window_id(), tab_helper->session_id(),
++        kAnchoredTitleSessionKey, base::UTF16ToUTF8(anchored_title_));
++  }
++}
++
++void TabUIHelper::RestoreAnchoredURLFromExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
++    return;
++  }
++
++  auto it = extra_data.find(kAnchoredURLSessionKey);
++  if (it == extra_data.end()) {
++    return;
++  }
++
++  const GURL url(it->second);
++  if (!url.is_valid()) {
++    return;
++  }
++
++  std::u16string title;
++  if (auto title_it = extra_data.find(kAnchoredTitleSessionKey);
++      title_it != extra_data.end()) {
++    title = base::UTF8ToUTF16(title_it->second);
++  }
++
++  if (tabs::TabInterface* const tab_interface =
++          tabs::TabInterface::GetFromContents(web_contents)) {
++    if (TabUIHelper* const helper = TabUIHelper::From(tab_interface)) {
++      helper->SetAnchoredURL(url, std::move(title), /*persist=*/false);
++    }
++  }
++}
+ 
+ base::WeakPtr<TabUIHelper> TabUIHelper::GetWeakPtr() {
+   return weak_factory_.GetWeakPtr();
+--- a/chrome/browser/ui/tabs/saved_tab_groups/local_tab_group_listener.cc
++++ b/chrome/browser/ui/tabs/saved_tab_groups/local_tab_group_listener.cc
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "components/saved_tab_groups/public/features.h"
+ #include "components/saved_tab_groups/public/saved_tab_group_tab.h"
+@@ -26,10 +27,35 @@
+ #include "components/saved_tab_groups/public/utils.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ namespace tab_groups {
++namespace {
++
++bool WebContentsMatchesSavedUrl(content::WebContents* contents,
++                                const GURL& saved_url) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return contents->GetURL() == saved_url;
++  }
++
++  if (contents->GetURL() == saved_url ||
++      contents->GetVisibleURL() == saved_url) {
++    return true;
++  }
++
++  content::NavigationController& controller = contents->GetController();
++  const content::NavigationEntry* entry = controller.GetLastCommittedEntry();
++  if (!entry) {
++    entry = controller.GetVisibleEntry();
++  }
++  return entry &&
++         (entry->GetURL() == saved_url || entry->GetVirtualURL() == saved_url);
++}
++
++}  // namespace
+ 
+ LocalTabGroupListener::LocalTabGroupListener(
+     const tab_groups::TabGroupId local_id,
+@@ -327,7 +353,8 @@ void LocalTabGroupListener::MatchLocalTa
+                                        false);
+ 
+     // Navigate if needed.
+-    if (saved_tab.url() != local_tab->GetContents()->GetURL()) {
++    if (!WebContentsMatchesSavedUrl(local_tab->GetContents(),
++                                    saved_tab.url())) {
+       SavedTabGroupWebContentsListener* listener =
+           local_tab->GetTabFeatures()->saved_tab_group_web_contents_listener();
+       listener->NavigateToUrl(base::PassKey<LocalTabGroupListener>(),
+--- a/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_web_contents_listener.cc
++++ b/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_web_contents_listener.cc
+@@ -15,10 +15,12 @@
+ #include "chrome/browser/tab_group_sync/tab_group_sync_utils.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/most_recent_shared_tab_update_store.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "components/data_sharing/public/features.h"
+ #include "components/favicon/core/favicon_service.h"
+ #include "components/favicon_base/favicon_callback.h"
+@@ -190,8 +192,12 @@ void SavedTabGroupWebContentsListener::N
+   // If deferring remote navigations is enabled (sharing) and the tab is in the
+   // background, then dont actually perform the navigation, instead cache the
+   // URL for performing the navigation later.
+-  if (!data_sharing::features::IsDataSharingFunctionalityEnabled() ||
+-      local_tab_->IsActivated()) {
++  const bool should_defer_navigation =
++      (features::IsHeliumAnchoredTabsEnabled() && !local_tab_->IsActivated() &&
++       contents()->WasDiscarded()) ||
++      (data_sharing::features::IsDataSharingFunctionalityEnabled() &&
++       !local_tab_->IsActivated());
++  if (!should_defer_navigation) {
+     PerformNavigation(url);
+   } else {
+     favicon::FaviconService* favicon_service =
+@@ -278,6 +284,14 @@ void SavedTabGroupWebContentsListener::D
+   SavedTabGroupTab* tab = group->GetTab(local_tab_id());
+   CHECK(tab);
+ 
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    TabUIHelper* const helper = TabUIHelper::From(local_tab_);
++    if (helper && !helper->anchored_url().is_valid()) {
++      helper->SetAnchoredURL(tab->url(), tab->title());
++    }
++    return;
++  }
++
+   service_->NavigateTab(group->local_group_id().value(), local_tab_id(),
+                         contents()->GetURL(), contents()->GetTitle());
+ 
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -286,11 +286,15 @@ void TabMenuModel::Build(TabStripModel*
+ 
+   AddSeparator(ui::NORMAL_SEPARATOR);
+ 
+-  // Bulk rename of multiple tabs would be confusing.
+-  if (indices.size() == 1 &&
+-      tab_strip->GetTabGroupForTab(indices.front()).has_value()) {
++  const bool helium_is_single_anchored_tab =
++      features::IsHeliumAnchoredTabsEnabled() && indices.size() == 1 &&
++      (tab_strip->GetTabGroupForTab(indices.front()).has_value() ||
++       tab_strip->IsTabPinned(indices.front()));
++  if (helium_is_single_anchored_tab) {
+     AddItemWithStringId(TabStripModel::CommandRenameTab,
+                         IDS_TAB_CXMENU_RENAMETAB);
++    AddItemWithStringId(TabStripModel::CommandReplaceAnchoredURL,
++                        IDS_TAB_CXMENU_REPLACE_ANCHORED_URL);
+     AddSeparator(ui::NORMAL_SEPARATOR);
+   }
+ 
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -51,6 +51,7 @@
+ #include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
+ #include "chrome/browser/resource_coordinator/tab_helper.h"
+ #include "chrome/browser/send_tab_to_self/send_tab_to_self_util.h"
++#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_utils.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+@@ -59,6 +60,7 @@
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/features.h"
+@@ -98,6 +100,7 @@
+ #include "components/performance_manager/public/performance_manager.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/reading_list/core/reading_list_model.h"
++#include "components/saved_tab_groups/public/tab_group_sync_service.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tab_groups/tab_group_id.h"
+@@ -132,6 +135,72 @@ namespace {
+ 
+ TabGroupModelFactory* factory_instance = nullptr;
+ 
++GURL GetCurrentTabURLForAnchor(WebContents* contents) {
++  if (!contents) {
++    return GURL();
++  }
++
++  const GURL url = contents->GetLastCommittedURL();
++  if (url.is_valid()) {
++    return url;
++  }
++  return contents->GetVisibleURL();
++}
++
++std::u16string GetCurrentTabTitleForAnchor(WebContents* contents) {
++  if (!contents) {
++    return std::u16string();
++  }
++
++  return contents->GetTitle();
++}
++
++TabUIHelper* GetTabUIHelper(WebContents* contents) {
++  tabs::TabInterface* const tab =
++      contents ? tabs::TabInterface::GetFromContents(contents) : nullptr;
++  return tab ? TabUIHelper::From(tab) : nullptr;
++}
++
++void MaybeSetInitialAnchoredURL(WebContents* contents) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return;
++  }
++
++  TabUIHelper* const helper = GetTabUIHelper(contents);
++  if (!helper || helper->anchored_url().is_valid()) {
++    return;
++  }
++
++  helper->SetAnchoredURL(GetCurrentTabURLForAnchor(contents),
++                         GetCurrentTabTitleForAnchor(contents));
++}
++
++void SetAnchoredURLToCurrent(TabStripModel* model, int index) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !model ||
++      !model->ContainsIndex(index)) {
++    return;
++  }
++
++  WebContents* const contents = model->GetWebContentsAt(index);
++  TabUIHelper* const helper = GetTabUIHelper(contents);
++  const GURL url = GetCurrentTabURLForAnchor(contents);
++  if (!helper || !url.is_valid()) {
++    return;
++  }
++
++  helper->SetAnchoredURL(url, GetCurrentTabTitleForAnchor(contents));
++
++  auto* const service =
++      tab_groups::TabGroupSyncServiceFactory::GetForProfile(model->profile());
++  const std::optional<tab_groups::TabGroupId> group =
++      model->GetTabGroupForTab(index);
++  tabs::TabInterface* const tab = tabs::TabInterface::GetFromContents(contents);
++  if (service && group.has_value() && tab) {
++    service->NavigateTab(group.value(), tab->GetHandle().raw_value(), url,
++                         contents->GetTitle());
++  }
++}
++
+ // Works similarly to base::AutoReset but checks for access from the wrong
+ // thread as well as ensuring that the previous value of the re-entrancy guard
+ // variable was false.
+@@ -214,6 +283,11 @@ base::WeakPtr<performance_manager::PageN
+   return page_node;
+ }
+ 
++bool ContainsWebContents(base::span<content::WebContents* const> items,
++                         content::WebContents* contents) {
++  return std::ranges::find(items, contents) != items.end();
++}
++
+ }  // namespace
+ 
+ TabGroupModelFactory::TabGroupModelFactory() {
+@@ -1368,6 +1442,11 @@ void TabStripModel::CloseAllTabsInGroupI
+       gfx::Range(tabs_in_group.GetMax(), tabs_in_group.GetMin()).ToIntVector();
+   std::vector<content::WebContents*> closing_tabs =
+       GetWebContentsesByIndices(reversed_group_indices);
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    for (content::WebContents* contents : closing_tabs) {
++      helium::MarkWebContentsHibernatedForRestore(contents);
++    }
++  }
+   CloseTabs(closing_tabs, TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+ }
+ 
+@@ -1466,7 +1545,12 @@ int TabStripModel::SetTabPinned(int inde
+     return index;
+   }
+ 
+-  return SetTabPinnedImpl(index, pinned);
++  tabs::TabInterface* const tab = GetTabAtIndex(index);
++  const int final_index = SetTabPinnedImpl(index, pinned);
++  if (pinned && tab) {
++    MaybeSetInitialAnchoredURL(tab->GetContents());
++  }
++  return final_index;
+ }
+ 
+ bool TabStripModel::IsTabPinned(int index) const {
+@@ -1785,6 +1869,11 @@ void TabStripModel::AddTab(std::unique_p
+   if (ui::PageTransitionTypeIncludingQualifiersIs(transition,
+                                                   ui::PAGE_TRANSITION_LINK) &&
+       (add_types & ADD_FORCE_INDEX) == 0) {
++    const std::optional<tab_groups::TabGroupId> opener_group =
++        GetTabGroupForTab(active_index());
++    const bool open_outside_anchored_group =
++        features::IsHeliumAnchoredTabsEnabled() && opener_group.has_value();
++
+     // We assume tabs opened via link clicks are part of the same task as their
+     // parent.  Note that when |force_index| is true (e.g. when the user
+     // drag-and-drops a link to the tab strip), callers aren't really handling
+@@ -1795,8 +1884,14 @@ void TabStripModel::AddTab(std::unique_p
+ 
+     // The current active index is our opener. If the tab we are adding is not
+     // in a group, set the group of the tab to that of its opener.
+-    if (!group.has_value()) {
+-      group = GetTabGroupForTab(active_index());
++    if (open_outside_anchored_group) {
++      group = std::nullopt;
++      if (group_model_) {
++        index = static_cast<int>(
++            group_model_->GetTabGroup(*opener_group)->ListTabs().end());
++      }
++    } else if (!group.has_value()) {
++      group = opener_group;
+     }
+   } else {
+     // For all other types, respect what was passed to us, normalizing -1s and
+@@ -2488,6 +2583,10 @@ bool TabStripModel::IsContextMenuCommand
+       return delegate_->CanReload();
+ 
+     case CommandDiscard: {
++      if (helium::IsLiveAnchoredTab(this, context_index)) {
++        return true;
++      }
++
+       auto* const eligibility_policy = GetDiscardEligibilityPolicy();
+       if (!eligibility_policy) {
+         return false;
+@@ -2503,9 +2602,15 @@ bool TabStripModel::IsContextMenuCommand
+     }
+ 
+     case CommandRenameTab: {
+-      return GetTabGroupForTab(context_index).has_value();
++      return helium::IsAnchoredTab(this, context_index);
+     }
+ 
++    case CommandReplaceAnchoredURL:
++      return context_index == active_index() &&
++             helium::IsAnchoredTab(this, context_index) &&
++             GetCurrentTabURLForAnchor(GetWebContentsAt(context_index))
++                 .is_valid();
++
+     case CommandCloseOtherTabs:
+     case CommandCloseTabsToLeft:
+     case CommandCloseTabsToRight: {
+@@ -2673,6 +2778,10 @@ void TabStripModel::ExecuteContextMenuCo
+     }
+ 
+     case CommandDiscard: {
++      if (helium::MaybeHibernateAnchoredTab(this, context_index)) {
++        break;
++      }
++
+       auto* const eligibility_policy = GetDiscardEligibilityPolicy();
+       if (!eligibility_policy) {
+         break;
+@@ -2694,6 +2803,9 @@ void TabStripModel::ExecuteContextMenuCo
+     }
+ 
+     case CommandRenameTab: {
++      if (!features::IsHeliumAnchoredTabsEnabled()) {
++        break;
++      }
+       base::RecordAction(UserMetricsAction("TabContextMenu_RenameTab"));
+       WebContents* const contents = GetWebContentsAt(context_index);
+       if (!contents) {
+@@ -2720,6 +2832,16 @@ void TabStripModel::ExecuteContextMenuCo
+       break;
+     }
+ 
++    case CommandReplaceAnchoredURL: {
++      if (!features::IsHeliumAnchoredTabsEnabled()) {
++        break;
++      }
++      base::RecordAction(
++          UserMetricsAction("TabContextMenu_ReplaceAnchoredURL"));
++      SetAnchoredURLToCurrent(this, context_index);
++      break;
++    }
++
+     case CommandCloseTab: {
+       base::UmaHistogramCounts1000("Tab.ContextMenu.CloseTab.SelectedTabsCount",
+                                    selection_model_.size());
+@@ -3729,6 +3851,10 @@ int TabStripModel::InsertTabAtImpl(
+     NotifyForegroundTabsWillEnterBackground();
+   }
+ 
++  if (pin) {
++    MaybeSetInitialAnchoredURL(tab->GetContents());
++  }
++
+   // Have to get the active contents before we monkey with the contents
+   // otherwise we run into problems when we try to change the active contents
+   // since the old contents and the new contents will be the same...
+@@ -3815,6 +3941,22 @@ void TabStripModel::CloseTabs(base::span
+     return;
+   }
+ 
++  if (features::IsHeliumAnchoredTabsEnabled() && !closing_all_ &&
++      ContainsWebContents(filtered_items, GetActiveWebContents())) {
++    bool has_live_fallback = false;
++    for (int i = 0; i < count(); ++i) {
++      content::WebContents* const contents = GetWebContentsAt(i);
++      if (!ContainsWebContents(filtered_items, contents) &&
++          !contents->WasDiscarded()) {
++        has_live_fallback = true;
++        break;
++      }
++    }
++    if (!has_live_fallback) {
++      delegate()->AddTabAt(GURL(), -1, true);
++    }
++  }
++
+   const bool closing_all = static_cast<int>(filtered_items.size()) == count();
+   base::WeakPtr<TabStripModel> ref = weak_factory_.GetWeakPtr();
+   if (closing_all) {
+@@ -4588,6 +4730,7 @@ void TabStripModel::AddToNewGroupImpl(
+   const gfx::Range tab_indices =
+       group_model()->GetTabGroup(new_group)->ListTabs();
+   for (auto index = tab_indices.start(); index < tab_indices.end(); ++index) {
++    MaybeSetInitialAnchoredURL(GetWebContentsAt(index));
+     if (active_index() != static_cast<int>(index) && IsTabSelected(index)) {
+       DeselectTabAt(index);
+     }
+@@ -4646,6 +4789,11 @@ void TabStripModel::AddToExistingGroupIm
+     MoveTabsAndSetPropertiesImpl(tabs_right_of_group, last_tab_index + 1, group,
+                                  false);
+   }
++
++  const gfx::Range tab_indices = group_object->ListTabs();
++  for (auto index = tab_indices.start(); index < tab_indices.end(); ++index) {
++    MaybeSetInitialAnchoredURL(GetWebContentsAt(index));
++  }
+ }
+ 
+ void TabStripModel::MoveTabsAndSetPropertiesImpl(
+@@ -5577,6 +5725,21 @@ std::optional<int> TabStripModel::Determ
+ 
+   gfx::Range block_tabs = gfx::Range(start_index, start_index + block_size);
+ 
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    for (int i = block_tabs.end(); i < count(); ++i) {
++      content::WebContents* const contents = GetWebContentsAt(i);
++      if (!IsTabCollapsed(i) && contents && !contents->WasDiscarded()) {
++        return GetTabIndexAfterClosing(i, block_tabs);
++      }
++    }
++    for (int i = block_tabs.start() - 1; i >= 0; --i) {
++      content::WebContents* const contents = GetWebContentsAt(i);
++      if (!IsTabCollapsed(i) && contents && !contents->WasDiscarded()) {
++        return GetTabIndexAfterClosing(i, block_tabs);
++      }
++    }
++  }
++
+   // First preference is a tab the block opened.
+   int new_selected_index = GetIndexOfNextWebContentsOpenedBy(block_tabs);
+   if (new_selected_index != TabStripModel::kNoTab &&
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -4,11 +4,16 @@
+ 
+ #include "chrome/browser/ui/ui_features.h"
+ 
++#include <optional>
++
+ #include "base/feature_list.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/prefs/session_startup_pref.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/common/chrome_features.h"
+ #include "components/search/ntp_features.h"
+ #include "components/variations/service/variations_service.h"
+@@ -18,6 +23,34 @@
+ 
+ namespace features {
+ 
++namespace {
++
++bool IsHeliumAnchoredTabsStartupModeEnabled() {
++  static std::optional<bool> enabled_at_startup;
++  if (enabled_at_startup.has_value()) {
++    return *enabled_at_startup;
++  }
++
++  Profile* profile = ProfileManager::GetLastUsedProfileIfLoaded();
++  if (!profile) {
++    return false;
++  }
++
++  enabled_at_startup = SessionStartupPref::GetStartupPref(profile).type ==
++                       SessionStartupPref::LAST_WITH_ANCHORING;
++  return *enabled_at_startup;
++}
++
++}  // namespace
++
++// Anchored tabs: tab-group centric tab renaming, hibernation, and restore.
++BASE_FEATURE(kHeliumAnchoredTabs, base::FEATURE_ENABLED_BY_DEFAULT);
++
++bool IsHeliumAnchoredTabsEnabled() {
++  return base::FeatureList::IsEnabled(kHeliumAnchoredTabs) &&
++         IsHeliumAnchoredTabsStartupModeEnabled();
++}
++
+ // Automatic location bar width in compact layout
+ BASE_FEATURE(kHeliumCompactLocationWidth, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+--- a/chrome/browser/ui/ui_features.h
++++ b/chrome/browser/ui/ui_features.h
+@@ -19,6 +19,9 @@ namespace features {
+ // All features in alphabetical order. The features should be documented
+ // alongside the definition of their values in the .cc file.
+ 
++BASE_DECLARE_FEATURE(kHeliumAnchoredTabs);
++bool IsHeliumAnchoredTabsEnabled();
++
+ BASE_DECLARE_FEATURE(kHeliumCompactLocationWidth);
+ bool HeliumUseCompactLocationWidth();
+ 
+--- a/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_model_listener.cc
++++ b/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_model_listener.cc
+@@ -12,10 +12,12 @@
+ #include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/local_tab_group_listener.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "components/saved_tab_groups/internal/saved_tab_group_model.h"
+ #include "components/saved_tab_groups/public/features.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+@@ -29,6 +31,35 @@ class WebContents;
+ 
+ namespace tab_groups {
+ 
++namespace {
++
++void PersistCustomTitlesBeforeClosingGroup(TabGroupSyncService* service,
++                                           const tab_groups::TabGroupId& id) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return;
++  }
++
++  const std::optional<SavedTabGroup> saved_group = service->GetGroup(id);
++  if (!saved_group) {
++    return;
++  }
++
++  for (tabs::TabInterface* tab : SavedTabGroupUtils::GetTabsInGroup(id)) {
++    if (!tab) {
++      continue;
++    }
++    TabUIHelper* helper = TabUIHelper::From(tab);
++    if (!helper || helper->custom_title().empty()) {
++      continue;
++    }
++    service->NavigateTab(id, tab->GetHandle().raw_value(),
++                         tab->GetContents()->GetVisibleURL(),
++                         helper->custom_title());
++  }
++}
++
++}  // namespace
++
+ SavedTabGroupModelListener::SavedTabGroupModelListener() = default;
+ 
+ SavedTabGroupModelListener::SavedTabGroupModelListener(
+@@ -84,6 +115,7 @@ void SavedTabGroupModelListener::OnTabGr
+     return;
+   }
+ 
++  PersistCustomTitlesBeforeClosingGroup(service_, group_id);
+   DisconnectLocalTabGroup(group_id, ClosingSource::kDeletedByUser);
+ }
+ 
+--- a/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.cc
++++ b/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/ui/browser_navigator.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_metrics.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/tab_group_action_context_desktop.h"
+ #include "chrome/browser/ui/tabs/tab_group_deletion_dialog_controller.h"
+@@ -60,6 +61,7 @@
+ #include "components/sync/service/sync_service.h"
+ #include "components/sync/service/sync_user_settings.h"
+ #include "components/tab_groups/tab_group_id.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/user_education/common/help_bubble/help_bubble_params.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/gfx/range/range.h"
+@@ -496,10 +498,19 @@ SavedTabGroupUtils::OpenSavedTabGroup(Br
+ SavedTabGroupTab SavedTabGroupUtils::CreateSavedTabGroupTabFromWebContents(
+     content::WebContents* contents,
+     base::Uuid saved_tab_group_id) {
+-  SavedTabGroupTab tab(
+-      contents->GetVisibleURL().is_empty() ? GURL(chrome::kChromeUINewTabURL)
+-                                           : contents->GetVisibleURL(),
+-      contents->GetTitle(), saved_tab_group_id, /*position=*/std::nullopt);
++  std::u16string title = contents->GetTitle();
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    tabs::TabInterface* tab = tabs::TabInterface::GetFromContents(contents);
++    if (TabUIHelper* helper = TabUIHelper::From(tab);
++        helper && !helper->custom_title().empty()) {
++      title = helper->custom_title();
++    }
++  }
++
++  SavedTabGroupTab tab(contents->GetVisibleURL().is_empty()
++                           ? GURL(chrome::kChromeUINewTabURL)
++                           : contents->GetVisibleURL(),
++                       title, saved_tab_group_id, /*position=*/std::nullopt);
+   return tab;
+ }
+ 
+--- a/chrome/browser/ui/tabs/saved_tab_groups/tab_group_sync_delegate_desktop.cc
++++ b/chrome/browser/ui/tabs/saved_tab_groups/tab_group_sync_delegate_desktop.cc
+@@ -6,22 +6,31 @@
+ 
+ #include <iterator>
+ #include <map>
++#include <string>
++#include <vector>
+ 
+ #include "base/containers/flat_set.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
+ #include "base/uuid.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_list.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_model_listener.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/tab_group_action_context_desktop.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "components/saved_tab_groups/internal/stats.h"
+ #include "components/saved_tab_groups/internal/tab_group_sync_service_impl.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+ #include "components/saved_tab_groups/public/types.h"
++#include "components/sessions/core/session_types.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "ui/gfx/range/range.h"
+ 
+@@ -118,6 +127,41 @@ tabs::TabInterface* MaybeOpenTabFromSave
+     return nullptr;
+   }
+ 
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    sessions::SerializedNavigationEntry navigation;
++    navigation.set_index(0);
++    navigation.set_virtual_url(saved_tab.url());
++    navigation.set_title(saved_tab.title());
++    navigation.set_timestamp(base::Time::Now());
++
++    std::vector<sessions::SerializedNavigationEntry> navigations = {navigation};
++    std::map<std::string, std::string> extra_data = {
++        {TabUIHelper::kHibernatedSessionKey, "1"},
++        {TabUIHelper::kAnchoredURLSessionKey, saved_tab.url().spec()}};
++    if (!saved_tab.title().empty()) {
++      extra_data[TabUIHelper::kAnchoredTitleSessionKey] =
++          base::UTF16ToUTF8(saved_tab.title());
++      extra_data[TabUIHelper::kCustomTitleSessionKey] =
++          base::UTF16ToUTF8(saved_tab.title());
++    }
++
++    content::WebContents* web_contents = chrome::AddRestoredTab(
++        browser, navigations, browser->tab_strip_model()->count(),
++        /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
++        /*group=*/std::nullopt, /*select=*/false, /*pin=*/false,
++        base::TimeTicks::Now(), base::Time::Now(), nullptr,
++        sessions::SerializedUserAgentOverride(), extra_data,
++        /*from_session_restore=*/false, /*is_active_browser=*/true);
++    if (!web_contents) {
++      return nullptr;
++    }
++
++    helium::RestoreAnchoredTabExtraData(web_contents, extra_data);
++    web_contents->SetWasDiscarded(true);
++    web_contents->NotifyWasDiscarded();
++    return browser->tab_strip_model()->GetTabForWebContents(web_contents);
++  }
++
+   content::NavigationHandle* navigation_handle =
+       SavedTabGroupUtils::OpenTabInBrowser(
+           saved_tab.url(), browser, browser->profile(),
+@@ -181,8 +225,9 @@ TabGroupSyncDelegateDesktop::HandleOpenT
+   // Add the tabs to a new group in the tabstrip and link it to `group`.
+   return AddOpenedTabsToGroup(
+       browser->tab_strip_model(), std::move(tab_guid_mapping), group.value(),
+-      desktop_context->opening_source !=
+-          tab_groups::OpeningSource::kOpenedFromTabRestore);
++      !features::IsHeliumAnchoredTabsEnabled() &&
++          desktop_context->opening_source !=
++              tab_groups::OpeningSource::kOpenedFromTabRestore);
+ }
+ 
+ void TabGroupSyncDelegateDesktop::CreateLocalTabGroup(
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -35,6 +35,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_api/tab_strip_service_feature.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/animations/tab_strip_animations.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/custom_corners_background.h"
+@@ -999,6 +1000,7 @@ views::View* VerticalTabStripRegionView:
+ 
+   tab_strip_view_ =
+       static_cast<VerticalTabStripView*>(AddChildView(std::move(view)));
++  ReorderChildView(resize_area_, children().size() - 1);
+   tab_strip_view_->SetProperty(
+       views::kFlexBehaviorKey,
+       views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
+@@ -1027,7 +1029,13 @@ views::View* VerticalTabStripRegionView:
+   std::optional<size_t> bottom_container_index =
+       GetIndexOf(bottom_button_container_);
+   CHECK(bottom_container_index.has_value());
+-  ReorderChildView(tab_strip_view_, bottom_container_index.value());
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    std::unique_ptr<views::View> bottom_container =
++        RemoveChildViewT(bottom_button_container_.get());
++    tab_strip_view_->SetUnpinnedMiddlePinnedView(std::move(bottom_container));
++  } else {
++    ReorderChildView(tab_strip_view_, bottom_container_index.value());
++  }
+ 
+   OnCollapseStateChanged(state_controller_->GetCollapseState());
+ 
+@@ -1045,6 +1053,13 @@ void VerticalTabStripRegionView::ClearTa
+ 
+   CHECK(tab_strip_view_);
+   CHECK(tab_strip_view_ == view);
++  if (features::IsHeliumAnchoredTabsEnabled() && bottom_button_container_ &&
++      bottom_button_container_->parent() != this) {
++    if (std::unique_ptr<views::View> bottom_container =
++            tab_strip_view_->RemoveUnpinnedMiddlePinnedView()) {
++      AddChildView(std::move(bottom_container));
++    }
++  }
+   RemoveChildViewT(std::exchange(tab_strip_view_, nullptr));
+ }
+ 
+@@ -1080,9 +1095,12 @@ void VerticalTabStripRegionView::OnColla
+       collapsed ? LayoutConstant::kVerticalTabStripCollapsedHorizontalPadding
+                 : LayoutConstant::kVerticalTabStripUncollapsedPadding);
+ 
+-  bottom_button_container_->SetProperty(
+-      views::kMarginsKey,
+-      gfx::Insets::TLBR(kBottomContainerGap, padding, 0, padding));
++  if (!features::IsHeliumAnchoredTabsEnabled() ||
++      bottom_button_container_->parent() == this) {
++    bottom_button_container_->SetProperty(
++        views::kMarginsKey,
++        gfx::Insets::TLBR(kBottomContainerGap, padding, 0, padding));
++  }
+ 
+   resize_area_width_ = collapsed ? kCollapsedResizeAreaWidth : kResizeAreaWidth;
+ 
+@@ -1111,9 +1129,13 @@ gfx::Rect VerticalTabStripRegionView::Ge
+   // tab strip's max size, saving space for the bottom button container and
+   // padding.
+   gfx::Rect tab_strip_draggable_bounds = tab_strip_view_->GetBoundsInScreen();
++  const int bottom_container_height =
++      (!features::IsHeliumAnchoredTabsEnabled() ||
++       bottom_button_container_->parent() == this)
++          ? bottom_button_container_->GetMinimumSize().height()
++          : 0;
+   tab_strip_draggable_bounds.set_height(
+-      GetBoundsInScreen().bottom() -
+-      bottom_button_container_->GetMinimumSize().height() -
++      GetBoundsInScreen().bottom() - bottom_container_height -
+       flex_layout_->interior_margin().height() -
+       tab_strip_draggable_bounds.y());
+   return tab_strip_draggable_bounds;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -5,7 +5,13 @@
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h"
+ 
+ #include "base/containers/adapters.h"
++#include "base/functional/bind.h"
++#include "base/time/time.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h"
+@@ -14,11 +20,17 @@
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_controller.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h"
++#include "chrome/grit/generated_resources.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
++#include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/button/label_button.h"
+ #include "ui/views/controls/scroll_view.h"
++#include "ui/views/controls/separator.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/layout/proposed_layout.h"
+@@ -30,6 +42,10 @@
+ 
+ namespace {
+ constexpr int kTabVerticalPadding = 2;
++constexpr int kAnchoredNewTabButtonTopOffset = 3;
++constexpr int kClearButtonSeparatorGap = 10;
++constexpr base::TimeDelta kAnchoredClearLayoutAnimationDuration =
++    base::Milliseconds(120);
+ 
+ // The following are percentages used to determine the amount that dragged
+ // tabs must be peeking into/out of a tab group view in order for the handling
+@@ -59,6 +75,10 @@ class VerticalUnpinnedTabContainerViewTa
+ 
+   bool DoesIntersectRect(const views::View* target,
+                          const gfx::Rect& rect) const override {
++    if (features::IsHeliumAnchoredTabsEnabled()) {
++      return view_->GetLocalBounds().Intersects(rect);
++    }
++
+     gfx::Rect content_bounds;
+     for (const views::View* child : view_->children()) {
+       if (child->GetVisible()) {
+@@ -72,6 +92,14 @@ class VerticalUnpinnedTabContainerViewTa
+   raw_ptr<views::View> view_;
+ };
+ 
++class ClearUngroupedTabsButton : public views::LabelButton {
++ public:
++  ClearUngroupedTabsButton(PressedCallback callback, std::u16string_view text)
++      : views::LabelButton(std::move(callback), text) {
++    label()->SetSubpixelRenderingEnabled(false);
++  }
++};
++
+ }  // namespace
+ 
+ VerticalUnpinnedTabContainerView::VerticalUnpinnedTabContainerView(
+@@ -87,9 +115,30 @@ VerticalUnpinnedTabContainerView::Vertic
+               /*delegate=*/*this,
+               /*animation_axis=*/
+               TabCollectionAnimatingLayoutManager::AnimationAxis::kVertical,
+-              /*animate_host_size=*/true))) {
++              /*animate_host_size=*/true,
++              kAnchoredClearLayoutAnimationDuration))) {
+   SetEventTargeter(std::make_unique<views::ViewTargeter>(
+       std::make_unique<VerticalUnpinnedTabContainerViewTargeter>(this)));
++  SetNotifyEnterExitOnChild(true);
++  grouped_tabs_separator_ = AddChildView(std::make_unique<views::Separator>());
++  std::unique_ptr<views::LabelButton> clear_button =
++      std::make_unique<ClearUngroupedTabsButton>(
++          base::BindRepeating(
++              &VerticalUnpinnedTabContainerView::CloseUngroupedTabs,
++              base::Unretained(this)),
++          std::u16string());
++  clear_ungrouped_tabs_button_ = AddChildView(std::move(clear_button));
++  clear_ungrouped_tabs_button_->SetBorder(
++      views::CreateEmptyBorder(gfx::Insets()));
++  clear_ungrouped_tabs_button_->SetEnabledTextColors(
++      ui::kColorLabelForegroundSecondary);
++  clear_ungrouped_tabs_button_->SetTextColor(views::Button::STATE_HOVERED,
++                                             ui::kColorLabelForeground);
++  clear_ungrouped_tabs_button_->SetTextColor(views::Button::STATE_PRESSED,
++                                             ui::kColorLabelForeground);
++  clear_ungrouped_tabs_button_->SetFocusBehavior(
++      FocusBehavior::ACCESSIBLE_ONLY);
++  clear_ungrouped_tabs_button_->SetEnabled(false);
+ 
+   collection_node->set_remove_child_from_node(base::BindRepeating(
+       &TabCollectionAnimatingLayoutManager::AnimateAndDestroyChildView,
+@@ -105,11 +154,150 @@ VerticalUnpinnedTabContainerView::Vertic
+ 
+ VerticalUnpinnedTabContainerView::~VerticalUnpinnedTabContainerView() = default;
+ 
++VerticalUnpinnedTabContainerView::ChildPartitions
++VerticalUnpinnedTabContainerView::PartitionChildren(
++    const std::vector<views::View*>& children) const {
++  ChildPartitions partitions;
++  partitions.grouped.reserve(children.size());
++  partitions.ungrouped.reserve(children.size());
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    for (views::View* child : children) {
++      if (views::AsViewClass<VerticalTabGroupView>(child)) {
++        partitions.grouped.push_back(child);
++      } else {
++        partitions.ungrouped.push_back(child);
++      }
++    }
++  }
++  return partitions;
++}
++
++void VerticalUnpinnedTabContainerView::AddChildLayout(
++    views::View* child,
++    const views::SizeBounds& size_bounds,
++    int horizontal_padding,
++    bool is_collapsed,
++    views::ProposedLayout* layouts,
++    LayoutState* state) const {
++  // Group color lines own the leading inset while collapsed.
++  const int x = views::AsViewClass<VerticalTabGroupView>(child) && is_collapsed
++                    ? 0
++                    : horizontal_padding;
++  views::SizeBounds child_size_bounds =
++      views::SizeBounds(size_bounds.width().is_bounded()
++                            ? (size_bounds.width() - (x + horizontal_padding))
++                            : size_bounds.width(),
++                        {});
++  gfx::Rect bounds(child->GetPreferredSize(child_size_bounds));
++  bounds.set_x(x);
++
++  auto drag_data = GetVisualDataForDraggedView(*child);
++  CHECK(!drag_data || !drag_data->should_hide);
++  bounds.set_y(drag_data ? drag_data->offset.y() : state->height);
++
++  if (size_bounds.width().is_bounded()) {
++    bounds.set_width(size_bounds.width().value() - bounds.x() -
++                     horizontal_padding);
++  }
++  layouts->child_layouts.emplace_back(child, child->GetVisible(), bounds);
++  state->height += bounds.height() + kTabVerticalPadding;
++  state->width = std::max(state->width, bounds.width() + bounds.x());
++}
++
++void VerticalUnpinnedTabContainerView::AddGroupedSeparatorLayout(
++    const views::SizeBounds& size_bounds,
++    int horizontal_padding,
++    bool is_collapsed,
++    views::ProposedLayout* layouts,
++    LayoutState* state) const {
++  state->height += kTabVerticalPadding;
++
++  gfx::Rect clear_button_bounds;
++  const bool layout_clear_button = clear_ungrouped_tabs_button_ != nullptr;
++  if (layout_clear_button) {
++    clear_button_bounds =
++        gfx::Rect(clear_ungrouped_tabs_button_->GetPreferredSize());
++    clear_button_bounds.set_x(
++        size_bounds.width().is_bounded()
++            ? std::max(horizontal_padding, size_bounds.width().value() -
++                                               horizontal_padding -
++                                               clear_button_bounds.width())
++            : GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth) -
++                  clear_button_bounds.width());
++    clear_button_bounds.set_y(state->height);
++  }
++
++  const int clear_button_space =
++      clear_ungrouped_tabs_hovered_ && !is_collapsed
++          ? clear_button_bounds.width() + kClearButtonSeparatorGap
++          : 0;
++  const int separator_width =
++      size_bounds.width().is_bounded()
++          ? std::max(0, size_bounds.width().value() - 2 * horizontal_padding -
++                            clear_button_space)
++          : GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth);
++  const int separator_height =
++      grouped_tabs_separator_->GetPreferredSize().height();
++  const int row_height =
++      layout_clear_button
++          ? std::max(separator_height, clear_button_bounds.height())
++          : separator_height;
++  gfx::Rect separator_bounds(
++      horizontal_padding, state->height + (row_height - separator_height) / 2,
++      separator_width, separator_height);
++  layouts->child_layouts.emplace_back(grouped_tabs_separator_.get(), true,
++                                      separator_bounds);
++  if (layout_clear_button && !is_collapsed) {
++    clear_button_bounds.set_y(state->height +
++                              (row_height - clear_button_bounds.height()) / 2);
++    layouts->child_layouts.emplace_back(clear_ungrouped_tabs_button_.get(),
++                                        true, clear_button_bounds);
++    state->width = std::max(
++        state->width, clear_button_bounds.width() + clear_button_bounds.x());
++  } else {
++    layouts->child_layouts.emplace_back(clear_ungrouped_tabs_button_.get(),
++                                        false, gfx::Rect());
++  }
++  state->height += row_height + kTabVerticalPadding;
++  state->width =
++      std::max(state->width, separator_bounds.width() + separator_bounds.x());
++}
++
++void VerticalUnpinnedTabContainerView::AddMiddlePinnedViewLayout(
++    const views::SizeBounds& size_bounds,
++    int horizontal_padding,
++    views::ProposedLayout* layouts,
++    LayoutState* state) const {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !middle_pinned_view_) {
++    return;
++  }
++
++  state->height += kAnchoredNewTabButtonTopOffset;
++  views::SizeBounds button_size_bounds =
++      views::SizeBounds(size_bounds.width().is_bounded()
++                            ? (size_bounds.width() - 2 * horizontal_padding)
++                            : size_bounds.width(),
++                        {});
++  gfx::Rect button_bounds(
++      middle_pinned_view_->GetPreferredSize(button_size_bounds));
++  button_bounds.set_x(horizontal_padding);
++  button_bounds.set_y(state->height);
++  if (size_bounds.width().is_bounded()) {
++    button_bounds.set_width(size_bounds.width().value() -
++                            2 * horizontal_padding);
++  }
++  layouts->child_layouts.emplace_back(middle_pinned_view_.get(),
++                                      middle_pinned_view_->GetVisible(),
++                                      button_bounds);
++  state->height += button_bounds.height() + kTabVerticalPadding;
++  state->width =
++      std::max(state->width, button_bounds.width() + button_bounds.x());
++}
++
+ views::ProposedLayout VerticalUnpinnedTabContainerView::CalculateProposedLayout(
+     const views::SizeBounds& size_bounds) const {
+   views::ProposedLayout layouts;
+-  int width = 0;
+-  int height = 0;
++  LayoutState state;
+   int dragged_view_bottom = 0;
+   auto collapse_state = GetTabStripCollapseState();
+ 
+@@ -122,42 +310,38 @@ views::ProposedLayout VerticalUnpinnedTa
+   const std::vector<views::View*> children =
+       collection_node_ ? collection_node_->GetDirectChildren()
+                        : std::vector<views::View*>();
++  const bool is_collapsed =
++      collapse_state != tabs::VerticalTabStripCollapseState::kExpanded;
++  const ChildPartitions partitions = PartitionChildren(children);
++  const std::vector<views::View*>& layout_children =
++      features::IsHeliumAnchoredTabsEnabled() ? partitions.grouped : children;
++
++  for (auto* child : layout_children) {
++    AddChildLayout(child, size_bounds, horizontal_padding, is_collapsed,
++                   &layouts, &state);
++  }
++
++  if (features::IsHeliumAnchoredTabsEnabled() && !partitions.grouped.empty()) {
++    AddGroupedSeparatorLayout(size_bounds, horizontal_padding, is_collapsed,
++                              &layouts, &state);
++  } else {
++    layouts.child_layouts.emplace_back(grouped_tabs_separator_.get(), false,
++                                       gfx::Rect());
++    layouts.child_layouts.emplace_back(clear_ungrouped_tabs_button_.get(),
++                                       false, gfx::Rect());
++  }
+ 
+-  // Layout children in order. Children will have their preferred height and
+-  // fill available width.
+-  for (auto* child : children) {
+-    // The leading inset should not be applied for tab groups when the tab strip
+-    // is collapsed since the group color line is drawn in that space.
+-    int x =
+-        views::AsViewClass<VerticalTabGroupView>(child) &&
+-                collapse_state != tabs::VerticalTabStripCollapseState::kExpanded
+-            ? 0
+-            : horizontal_padding;
+-    views::SizeBounds child_size_bounds =
+-        views::SizeBounds(size_bounds.width().is_bounded()
+-                              ? (size_bounds.width() - (x + horizontal_padding))
+-                              : size_bounds.width(),
+-                          {});
+-    gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(child_size_bounds));
+-    bounds.set_x(x);
+-
+-    auto drag_data = GetVisualDataForDraggedView(*child);
+-    CHECK(!drag_data || !drag_data->should_hide);
+-    bounds.set_y(drag_data ? drag_data->offset.y() : height);
+-
+-    // If width is bounded, child views should respect the width constraints and
+-    // take up the available width excluding trailing horizontal padding.
+-    if (size_bounds.width().is_bounded()) {
+-      bounds.set_width(size_bounds.width().value() - bounds.x() -
+-                       horizontal_padding);
++  AddMiddlePinnedViewLayout(size_bounds, horizontal_padding, &layouts, &state);
++
++  if (features::IsHeliumAnchoredTabsEnabled()) {
++    for (auto* child : partitions.ungrouped) {
++      AddChildLayout(child, size_bounds, horizontal_padding, is_collapsed,
++                     &layouts, &state);
+     }
+-    layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
+-    height += bounds.height() + kTabVerticalPadding;
+-    width = std::max(width, bounds.width() + bounds.x());
+   }
+   // Remove excess padding if needed.
+   if (!children.empty()) {
+-    height -= kTabVerticalPadding;
++    state.height -= kTabVerticalPadding;
+   }
+ 
+   if (IsHandlingDrag()) {
+@@ -172,7 +356,8 @@ views::ProposedLayout VerticalUnpinnedTa
+           std::min(dragged_view_bottom, size_bounds.height().value());
+     }
+   }
+-  layouts.host_size = gfx::Size(width, std::max(height, dragged_view_bottom));
++  layouts.host_size =
++      gfx::Size(state.width, std::max(state.height, dragged_view_bottom));
+   return layouts;
+ }
+ 
+@@ -191,6 +376,39 @@ gfx::Size VerticalUnpinnedTabContainerVi
+                    min_height);
+ }
+ 
++void VerticalUnpinnedTabContainerView::OnMouseEntered(
++    const ui::MouseEvent& event) {
++  SetClearButtonHoverState(true);
++}
++
++void VerticalUnpinnedTabContainerView::OnMouseMoved(
++    const ui::MouseEvent& event) {
++  SetClearButtonHoverState(true);
++  View::OnMouseMoved(event);
++}
++
++void VerticalUnpinnedTabContainerView::OnMouseExited(
++    const ui::MouseEvent& event) {
++  SetClearButtonHoverState(false);
++}
++
++views::View* VerticalUnpinnedTabContainerView::SetMiddlePinnedView(
++    std::unique_ptr<views::View> view) {
++  CHECK(view);
++  CHECK(!middle_pinned_view_);
++  middle_pinned_view_ = view.get();
++  return AddChildView(std::move(view));
++}
++
++std::unique_ptr<views::View>
++VerticalUnpinnedTabContainerView::RemoveMiddlePinnedView() {
++  if (!middle_pinned_view_) {
++    return nullptr;
++  }
++  views::View* view = std::exchange(middle_pinned_view_, nullptr);
++  return RemoveChildViewT(view);
++}
++
+ std::optional<BrowserRootView::DropIndex>
+ VerticalUnpinnedTabContainerView::GetLinkDropIndex(
+     const gfx::Point& loc_in_container) {
+@@ -281,6 +499,47 @@ void VerticalUnpinnedTabContainerView::R
+   collection_node_ = nullptr;
+ }
+ 
++void VerticalUnpinnedTabContainerView::CloseUngroupedTabs() {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !collection_node_ ||
++      !collection_node_->GetController()) {
++    return;
++  }
++
++  TabStripModel* const model = collection_node_->GetController()->GetModel();
++  if (!model) {
++    return;
++  }
++
++  for (int i = model->count() - 1; i >= 0; --i) {
++    if (!model->IsTabPinned(i) && !model->GetTabGroupForTab(i).has_value()) {
++      model->CloseWebContentsAt(i,
++                                TabCloseTypes::CLOSE_USER_GESTURE |
++                                    TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
++    }
++  }
++}
++
++void VerticalUnpinnedTabContainerView::SetClearButtonHoverState(bool hovered) {
++  if (!clear_ungrouped_tabs_button_) {
++    return;
++  }
++
++  hovered = hovered && features::IsHeliumAnchoredTabsEnabled() &&
++            GetTabStripCollapseState() ==
++                tabs::VerticalTabStripCollapseState::kExpanded;
++  if (clear_ungrouped_tabs_hovered_ == hovered) {
++    return;
++  }
++
++  clear_ungrouped_tabs_hovered_ = hovered;
++  clear_ungrouped_tabs_button_->SetText(
++      hovered ? l10n_util::GetStringUTF16(IDS_VERTICAL_TABS_CLEAR_UNGROUPED)
++              : std::u16string());
++  clear_ungrouped_tabs_button_->SetEnabled(hovered);
++  InvalidateLayout();
++  SchedulePaint();
++}
++
+ views::ScrollView* VerticalUnpinnedTabContainerView::GetScrollViewForContainer()
+     const {
+   return views::ScrollView::GetScrollViewForContents(
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
+@@ -5,18 +5,30 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_UNPINNED_TAB_CONTAINER_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_UNPINNED_TAB_CONTAINER_VIEW_H_
+ 
++#include <vector>
++
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/view.h"
+ 
+ class TabCollectionNode;
+ class VerticalTabGroupView;
+ 
++namespace views {
++class LabelButton;
++class Separator;
++}  // namespace views
++
++namespace ui {
++class MouseEvent;
++}
++
+ // The view class that represents the unpinned tab region for the
+ // vertical tab strip. It manages the layout of the all the unpinned tabs and
+ // serves as the drag target for unpinned tabs which aren't grouped.
+@@ -41,6 +53,9 @@ class VerticalUnpinnedTabContainerView
+ 
+   // views::View:
+   gfx::Size GetMinimumSize() const override;
++  void OnMouseEntered(const ui::MouseEvent& event) override;
++  void OnMouseMoved(const ui::MouseEvent& event) override;
++  void OnMouseExited(const ui::MouseEvent& event) override;
+ 
+   // TabCollectionAnimatingLayoutManager::Delegate:
+   bool IsDragging() const override;
+@@ -56,6 +71,10 @@ class VerticalUnpinnedTabContainerView
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
+       const gfx::Point& point_in_local_coords);
+ 
++  views::View* SetMiddlePinnedView(std::unique_ptr<views::View> view);
++  std::unique_ptr<views::View> RemoveMiddlePinnedView();
++  void SetClearButtonHoverState(bool hovered);
++
+  private:
+   // VerticalDraggedTabsContainer:
+   views::ScrollView* GetScrollViewForContainer() const override;
+@@ -72,8 +91,41 @@ class VerticalUnpinnedTabContainerView
+                                const gfx::Point& point_in_screen) const;
+ 
+   void ResetCollectionNode();
++  void CloseUngroupedTabs();
++
++  struct ChildPartitions {
++    std::vector<views::View*> grouped;
++    std::vector<views::View*> ungrouped;
++  };
++
++  struct LayoutState {
++    int width = 0;
++    int height = 0;
++  };
++
++  ChildPartitions PartitionChildren(
++      const std::vector<views::View*>& children) const;
++  void AddChildLayout(views::View* child,
++                      const views::SizeBounds& size_bounds,
++                      int horizontal_padding,
++                      bool is_collapsed,
++                      views::ProposedLayout* layouts,
++                      LayoutState* state) const;
++  void AddGroupedSeparatorLayout(const views::SizeBounds& size_bounds,
++                                 int horizontal_padding,
++                                 bool is_collapsed,
++                                 views::ProposedLayout* layouts,
++                                 LayoutState* state) const;
++  void AddMiddlePinnedViewLayout(const views::SizeBounds& size_bounds,
++                                 int horizontal_padding,
++                                 views::ProposedLayout* layouts,
++                                 LayoutState* state) const;
+ 
+   raw_ptr<TabCollectionNode> collection_node_;
++  raw_ptr<views::Separator> grouped_tabs_separator_ = nullptr;
++  raw_ptr<views::LabelButton> clear_ungrouped_tabs_button_ = nullptr;
++  bool clear_ungrouped_tabs_hovered_ = false;
++  raw_ptr<views::View> middle_pinned_view_ = nullptr;
+   const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.h
+@@ -45,6 +45,9 @@ class VerticalTabStripView final : publi
+   VerticalPinnedTabContainerView* GetPinnedTabsContainer();
+   VerticalUnpinnedTabContainerView* GetUnpinnedTabsContainer();
+ 
++  views::View* SetUnpinnedMiddlePinnedView(std::unique_ptr<views::View> view);
++  std::unique_ptr<views::View> RemoveUnpinnedMiddlePinnedView();
++
+   void SetCollapsedState(bool is_collapsed);
+   void SetIsAnimatingSize(bool is_animating);
+ 
+@@ -58,6 +61,7 @@ class VerticalTabStripView final : publi
+   void AddedToWidget() override;
+   void RemovedFromWidget() override;
+   void OnMouseEntered(const ui::MouseEvent& event) override;
++  void OnMouseMoved(const ui::MouseEvent& event) override;
+   void OnMouseExited(const ui::MouseEvent& event) override;
+ 
+   // views::WidgetObserver:
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.cc
+@@ -56,6 +56,7 @@ class VerticalNewTabButtonActionViewInte
+ VerticalNewTabButton::VerticalNewTabButton() {
+   SetEnabledTextColors(kColorToolbarButtonIconDisabled);
+   SetTextColor(views::Button::STATE_DISABLED, kColorToolbarButtonIconDisabled);
++  label()->SetSubpixelRenderingEnabled(false);
+ 
+   SetBorder(views::CreateEmptyBorder(
+       gfx::Insets::VH(kBasePadding, kBasePadding * 2)));
+--- a/chrome/browser/ui/browser_navigator.cc
++++ b/chrome/browser/ui/browser_navigator.cc
+@@ -41,6 +41,7 @@
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/web_applications/web_app_tabbed_utils.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+@@ -636,6 +637,22 @@ base::WeakPtr<content::NavigationHandle>
+                                   ->GetActiveWebContents();
+   }
+ 
++  if (features::IsHeliumAnchoredTabsEnabled() && params->source_contents &&
++      params->browser &&
++      params->disposition == WindowOpenDisposition::CURRENT_TAB &&
++      (params->transition & ui::PAGE_TRANSITION_FROM_ADDRESS_BAR)) {
++    TabStripModel* const model =
++        params->browser->GetBrowserForMigrationOnly()->tab_strip_model();
++    const int source_index =
++        model ? model->GetIndexOfWebContents(params->source_contents)
++              : TabStripModel::kNoTab;
++    if (source_index != TabStripModel::kNoTab &&
++        model->GetTabGroupForTab(source_index).has_value()) {
++      params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++      params->group = std::nullopt;
++    }
++  }
++
+   WebContents* contents_to_navigate_or_insert =
+       params->contents_to_insert.get();
+   if (params->switch_to_singleton_tab) {
+--- a/chrome/browser/ui/tab_ui_helper.h
++++ b/chrome/browser/ui/tab_ui_helper.h
+@@ -137,7 +137,18 @@ class TabUIHelper : public tabs::Content
+       content::WebContents* web_contents,
+       const std::map<std::string, std::string>& extra_data);
+   const std::u16string& custom_title() const { return custom_title_; }
++  void SetAnchoredURL(const GURL& url,
++                      std::u16string title,
++                      bool persist = true);
++  static void RestoreAnchoredURLFromExtraData(
++      content::WebContents* web_contents,
++      const std::map<std::string, std::string>& extra_data);
++  const GURL& anchored_url() const { return anchored_url_; }
++  const std::u16string& anchored_title() const { return anchored_title_; }
+   static constexpr char kCustomTitleSessionKey[] = "helium.custom_title";
++  static constexpr char kHibernatedSessionKey[] = "helium.hibernated";
++  static constexpr char kAnchoredURLSessionKey[] = "helium.anchored_url";
++  static constexpr char kAnchoredTitleSessionKey[] = "helium.anchored_title";
+ 
+   base::WeakPtr<TabUIHelper> GetWeakPtr();
+ 
+@@ -158,6 +169,8 @@ class TabUIHelper : public tabs::Content
+   ui::ScopedUnownedUserData<TabUIHelper> scoped_unowned_user_data_;
+ 
+   std::u16string custom_title_;
++  GURL anchored_url_;
++  std::u16string anchored_title_;
+   GURL last_requested_favicon_page_url_;
+   bool favicon_fetch_in_flight_ = false;
+   base::CancelableTaskTracker favicon_task_tracker_;
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -790,6 +790,7 @@ class TabStripModel {
+     CommandGlicUnshare,
+     CommandDiscard,
+     CommandRenameTab,
++    CommandReplaceAnchoredURL,
+     CommandLast
+   };
+   // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+--- /dev/null
++++ b/chrome/browser/ui/helium/anchored_tab_hibernation.cc
+@@ -0,0 +1,381 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/anchored_tab_hibernation.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/byte_size.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/performance_manager/public/user_tuning/user_performance_tuning_manager.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/resource_coordinator/tab_manager.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "chrome/browser/ui/ui_features.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/gfx/range/range.h"
++#include "url/gurl.h"
++
++namespace {
++
++void EnsureDiscardStatus(content::WebContents* web_contents) {
++  auto* const usage =
++      performance_manager::user_tuning::UserPerformanceTuningManager::
++          PreDiscardResourceUsage::FromWebContents(web_contents);
++  if (usage) {
++    usage->UpdateDiscardInfo(base::ByteSize(0),
++                             mojom::LifecycleUnitDiscardReason::EXTERNAL);
++    return;
++  }
++
++  performance_manager::user_tuning::UserPerformanceTuningManager::
++      PreDiscardResourceUsage::CreateForWebContents(
++          web_contents, base::ByteSize(0),
++          mojom::LifecycleUnitDiscardReason::EXTERNAL);
++}
++
++bool StampWebContentsHibernatedForRestore(content::WebContents* web_contents,
++                                          bool mark_discarded) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
++    return false;
++  }
++
++  Profile* const profile =
++      Profile::FromBrowserContext(web_contents->GetBrowserContext());
++  SessionService* const session_service =
++      profile ? SessionServiceFactory::GetForProfile(profile) : nullptr;
++  sessions::SessionTabHelper* const tab_helper =
++      sessions::SessionTabHelper::FromWebContents(web_contents);
++  if (session_service && tab_helper) {
++    session_service->AddTabExtraData(tab_helper->window_id(),
++                                     tab_helper->session_id(),
++                                     TabUIHelper::kHibernatedSessionKey, "1");
++  }
++
++  if (mark_discarded) {
++    web_contents->SetWasDiscarded(true);
++  }
++  EnsureDiscardStatus(web_contents);
++  return true;
++}
++
++std::optional<int> FindFallbackTabIndex(
++    TabStripModel* model,
++    int model_index,
++    std::optional<tab_groups::TabGroupId> target_group) {
++  CHECK(model);
++
++  auto is_live_tab_in_group = [&](int index,
++                                  tab_groups::TabGroupId group) {
++    return model->GetTabGroupForTab(index) == group &&
++           model->GetWebContentsAt(index) &&
++           !model->GetWebContentsAt(index)->WasDiscarded();
++  };
++  if (target_group.has_value()) {
++    for (int i = model_index + 1; i < model->count(); ++i) {
++      if (is_live_tab_in_group(i, *target_group)) {
++        return i;
++      }
++    }
++    for (int i = model_index - 1; i >= 0; --i) {
++      if (is_live_tab_in_group(i, *target_group)) {
++        return i;
++      }
++    }
++  }
++
++  for (int i = model_index + 1; i < model->count(); ++i) {
++    if ((!target_group.has_value() ||
++         model->GetTabGroupForTab(i) != target_group) &&
++        model->GetWebContentsAt(i) &&
++        !model->GetWebContentsAt(i)->WasDiscarded()) {
++      return i;
++    }
++  }
++  for (int i = model_index - 1; i >= 0; --i) {
++    if ((!target_group.has_value() ||
++         model->GetTabGroupForTab(i) != target_group) &&
++        model->GetWebContentsAt(i) &&
++        !model->GetWebContentsAt(i)->WasDiscarded()) {
++      return i;
++    }
++  }
++  if (model_index + 1 < model->count()) {
++    content::WebContents* const contents =
++        model->GetWebContentsAt(model_index + 1);
++    if (contents && !contents->WasDiscarded()) {
++      return model_index + 1;
++    }
++  }
++  if (model_index - 1 >= 0) {
++    content::WebContents* const contents =
++        model->GetWebContentsAt(model_index - 1);
++    if (contents && !contents->WasDiscarded()) {
++      return model_index - 1;
++    }
++  }
++
++  return std::nullopt;
++}
++
++bool ActivateFallbackTab(TabStripModel* model,
++                         int model_index,
++                         std::optional<tab_groups::TabGroupId> target_group) {
++  const std::optional<int> fallback_index =
++      FindFallbackTabIndex(model, model_index, target_group);
++  if (!fallback_index.has_value()) {
++    model->delegate()->AddTabAt(GURL(), -1, true);
++    return model->active_index() != model_index;
++  }
++
++  model->ActivateTabAt(fallback_index.value(),
++                       TabStripUserGestureDetails(
++                           TabStripUserGestureDetails::GestureType::kOther));
++  return model->active_index() != model_index;
++}
++
++bool HibernateWebContents(content::WebContents* web_contents) {
++  if (!web_contents || web_contents->WasDiscarded()) {
++    return false;
++  }
++
++  GURL anchored_url;
++  std::u16string anchored_title;
++  if (tabs::TabInterface* const tab =
++          tabs::TabInterface::GetFromContents(web_contents)) {
++    if (TabUIHelper* const helper = TabUIHelper::From(tab)) {
++      anchored_url = helper->anchored_url();
++      anchored_title = helper->anchored_title();
++    }
++  }
++
++  StampWebContentsHibernatedForRestore(web_contents, false);
++
++  content::WebContents* const discarded_contents =
++      g_browser_process->GetTabManager()->DiscardTabByExtension(web_contents);
++  if (!discarded_contents) {
++    return false;
++  }
++
++  if (anchored_url.is_valid()) {
++    content::NavigationEntry* const entry =
++        discarded_contents->GetController().GetLastCommittedEntry();
++    if (entry) {
++      entry->SetURL(anchored_url);
++      entry->SetVirtualURL(anchored_url);
++      if (!anchored_title.empty()) {
++        entry->SetTitle(anchored_title);
++      }
++    }
++    if (tabs::TabInterface* const tab =
++            tabs::TabInterface::GetFromContents(discarded_contents)) {
++      if (TabUIHelper* const helper = TabUIHelper::From(tab)) {
++        helper->SetAnchoredURL(anchored_url, std::move(anchored_title));
++      }
++    }
++  }
++
++  StampWebContentsHibernatedForRestore(discarded_contents, true);
++  return true;
++}
++
++std::optional<tab_groups::TabGroupId> GetTabGroupFromModel(
++    const tabs::TabInterface* tab) {
++  if (!tab || !tab->GetBrowserWindowInterface()) {
++    return std::nullopt;
++  }
++
++  const TabStripModel* const model =
++      tab->GetBrowserWindowInterface()->GetTabStripModel();
++  if (!model) {
++    return std::nullopt;
++  }
++
++  const std::optional<int> index = model->GetIndexOfTab(tab);
++  if (!index.has_value()) {
++    return std::nullopt;
++  }
++  return model->GetTabGroupForTab(index.value());
++}
++
++}  // namespace
++
++namespace helium {
++
++bool MarkWebContentsHibernatedForRestore(content::WebContents* web_contents) {
++  return StampWebContentsHibernatedForRestore(web_contents, true);
++}
++
++void AddAnchoredTabExtraData(content::WebContents* web_contents,
++                             std::map<std::string, std::string>* extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents ||
++      !extra_data) {
++    return;
++  }
++
++  if (tabs::TabInterface* const tab =
++          tabs::TabInterface::GetFromContents(web_contents)) {
++    if (TabUIHelper* const helper = TabUIHelper::From(tab)) {
++      if (!helper->custom_title().empty()) {
++        (*extra_data)[TabUIHelper::kCustomTitleSessionKey] =
++            base::UTF16ToUTF8(helper->custom_title());
++      }
++      if (helper->anchored_url().is_valid()) {
++        (*extra_data)[TabUIHelper::kAnchoredURLSessionKey] =
++            helper->anchored_url().spec();
++      }
++      if (!helper->anchored_title().empty()) {
++        (*extra_data)[TabUIHelper::kAnchoredTitleSessionKey] =
++            base::UTF16ToUTF8(helper->anchored_title());
++      }
++    }
++  }
++
++  if (web_contents->WasDiscarded()) {
++    (*extra_data)[TabUIHelper::kHibernatedSessionKey] = "1";
++  }
++}
++
++void RestoreAnchoredTabExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !web_contents) {
++    return;
++  }
++
++  TabUIHelper::RestoreCustomTitleFromExtraData(web_contents, extra_data);
++  TabUIHelper::RestoreAnchoredURLFromExtraData(web_contents, extra_data);
++}
++
++bool ShouldRestoreHibernated(
++    const std::map<std::string, std::string>& extra_data) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
++  auto it = extra_data.find(TabUIHelper::kHibernatedSessionKey);
++  return it != extra_data.end() && it->second == "1";
++}
++
++bool IsAnchoredTab(const TabStripModel* model, int model_index) {
++  return features::IsHeliumAnchoredTabsEnabled() && model &&
++         model->ContainsIndex(model_index) &&
++         (model->GetTabGroupForTab(model_index).has_value() ||
++          model->IsTabPinned(model_index));
++}
++
++bool IsLiveAnchoredTab(const TabStripModel* model, int model_index) {
++  return IsAnchoredTab(model, model_index) &&
++         model->GetWebContentsAt(model_index) &&
++         !model->GetWebContentsAt(model_index)->WasDiscarded();
++}
++
++bool MaybeHibernateAnchoredTab(TabStripModel* model, int model_index) {
++  if (!IsLiveAnchoredTab(model, model_index)) {
++    return false;
++  }
++
++  const std::optional<tab_groups::TabGroupId> group =
++      model->GetTabGroupForTab(model_index);
++  content::WebContents* const web_contents =
++      model->GetWebContentsAt(model_index);
++  if (model_index == model->active_index() &&
++      !ActivateFallbackTab(model, model_index, group)) {
++    return false;
++  }
++
++  return HibernateWebContents(web_contents);
++}
++
++bool MaybeHibernateGroupedTab(TabStripModel* model, int model_index) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
++  if (!model || !model->ContainsIndex(model_index) || model->count() <= 1) {
++    return false;
++  }
++
++  const std::optional<tab_groups::TabGroupId> group =
++      model->GetTabGroupForTab(model_index);
++  if (!group.has_value()) {
++    return false;
++  }
++
++  if (model_index == model->active_index() &&
++      !ActivateFallbackTab(model, model_index, group)) {
++    return false;
++  }
++
++  return HibernateWebContents(model->GetWebContentsAt(model_index));
++}
++
++bool HibernateTabGroup(TabStripModel* model, tab_groups::TabGroupId group) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
++  if (!model || !model->group_model()->ContainsTabGroup(group)) {
++    return false;
++  }
++
++  bool any_hibernated = false;
++  const gfx::Range tab_range =
++      model->group_model()->GetTabGroup(group)->ListTabs();
++  for (int model_index : tab_range.ToIntVector()) {
++    content::WebContents* const web_contents =
++        model->GetWebContentsAt(model_index);
++    any_hibernated |= HibernateWebContents(web_contents);
++  }
++
++  return any_hibernated;
++}
++
++bool ShouldShowGroupedTabHibernateAffordance(const tabs::TabInterface* tab,
++                                             bool is_tab_discarded) {
++  if (!features::IsHeliumAnchoredTabsEnabled() || !tab || is_tab_discarded) {
++    return false;
++  }
++
++  return GetTabGroupFromModel(tab).has_value();
++}
++
++bool ShouldShowCollapsedGroupHibernateAffordance(TabStripModel* model,
++                                                 tab_groups::TabGroupId group) {
++  if (!features::IsHeliumAnchoredTabsEnabled()) {
++    return false;
++  }
++
++  if (!model || !model->group_model()->ContainsTabGroup(group) ||
++      !model->IsGroupCollapsed(group)) {
++    return false;
++  }
++
++  const gfx::Range tab_range =
++      model->group_model()->GetTabGroup(group)->ListTabs();
++  for (int model_index : tab_range.ToIntVector()) {
++    content::WebContents* const web_contents =
++        model->GetWebContentsAt(model_index);
++    if (web_contents && !web_contents->WasDiscarded()) {
++      return true;
++    }
++  }
++
++  return false;
++}
++
++}  // namespace helium
+--- /dev/null
++++ b/chrome/browser/ui/helium/anchored_tab_hibernation.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
++#define CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
++
++#include <map>
++#include <string>
++
++#include "components/tabs/public/tab_group.h"
++
++class TabStripModel;
++
++namespace content {
++class WebContents;
++}
++
++namespace tabs {
++class TabInterface;
++}
++
++namespace helium {
++
++bool MarkWebContentsHibernatedForRestore(content::WebContents* web_contents);
++void AddAnchoredTabExtraData(content::WebContents* web_contents,
++                             std::map<std::string, std::string>* extra_data);
++void RestoreAnchoredTabExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data);
++bool ShouldRestoreHibernated(
++    const std::map<std::string, std::string>& extra_data);
++bool IsAnchoredTab(const TabStripModel* model, int model_index);
++bool IsLiveAnchoredTab(const TabStripModel* model, int model_index);
++bool MaybeHibernateAnchoredTab(TabStripModel* model, int model_index);
++bool MaybeHibernateGroupedTab(TabStripModel* model, int model_index);
++bool HibernateTabGroup(TabStripModel* model, tab_groups::TabGroupId group);
++bool ShouldShowGroupedTabHibernateAffordance(const tabs::TabInterface* tab,
++                                             bool is_tab_discarded);
++bool ShouldShowCollapsedGroupHibernateAffordance(TabStripModel* model,
++                                                 tab_groups::TabGroupId group);
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_ANCHORED_TAB_HIBERNATION_H_
+--- a/chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.cc
++++ b/chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.cc
+@@ -66,7 +66,8 @@ TabCollectionAnimatingLayoutManager::Tab
+     std::unique_ptr<LayoutManagerBase> target_layout_manager,
+     Delegate& delegate,
+     AnimationAxis animation_axis,
+-    bool animate_host_size)
++    bool animate_host_size,
++    base::TimeDelta animation_duration)
+     : views::AnimationDelegateViews(target_layout_manager->host_view()),
+       target_layout_manager_(
+           CHECK_DEREF(AddOwnedLayout(std::move(target_layout_manager)))),
+@@ -74,8 +75,7 @@ TabCollectionAnimatingLayoutManager::Tab
+       delegate_(delegate),
+       animation_axis_(animation_axis),
+       animate_host_size_(animate_host_size) {
+-  animation_.SetSlideDuration(
+-      gfx::Animation::RichAnimationDuration(base::Milliseconds(200)));
++  animation_.SetSlideDuration(animation_duration);
+   animation_.SetTweenType(gfx::Tween::EASE_IN_OUT);
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h
++++ b/chrome/browser/ui/views/tabs/vertical/tab_collection_animating_layout_manager.h
+@@ -12,6 +12,7 @@
+ #include "base/functional/callback_forward.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/memory/raw_ref.h"
++#include "base/time/time.h"
+ #include "ui/gfx/animation/slide_animation.h"
+ #include "ui/views/animation/animation_delegate_views.h"
+ #include "ui/views/layout/layout_manager_base.h"
+@@ -62,7 +63,9 @@ class TabCollectionAnimatingLayoutManage
+       std::unique_ptr<LayoutManagerBase> target_layout_manager,
+       Delegate& delegate,
+       AnimationAxis animation_axis = AnimationAxis::kVertical,
+-      bool animate_host_size = false);
++      bool animate_host_size = false,
++      base::TimeDelta animation_duration =
++          gfx::Animation::RichAnimationDuration(base::Milliseconds(200)));
+   TabCollectionAnimatingLayoutManager(
+       const TabCollectionAnimatingLayoutManager&) = delete;
+   TabCollectionAnimatingLayoutManager& operator=(
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_view.cc
+@@ -231,6 +231,10 @@ void VerticalTabStripView::OnMouseEntere
+   has_reported_time_mouse_entered_to_switch_ = false;
+ }
+ 
++void VerticalTabStripView::OnMouseMoved(const ui::MouseEvent& event) {
++  View::OnMouseMoved(event);
++}
++
+ void VerticalTabStripView::OnMouseExited(const ui::MouseEvent& event) {
+   if (!collection_node_) {
+     return;
+@@ -332,6 +336,20 @@ VerticalTabStripView::GetUnpinnedTabsCon
+   return unpinned_tabs_container_view_;
+ }
+ 
++views::View* VerticalTabStripView::SetUnpinnedMiddlePinnedView(
++    std::unique_ptr<views::View> view) {
++  CHECK(unpinned_tabs_container_view_);
++  return unpinned_tabs_container_view_->SetMiddlePinnedView(std::move(view));
++}
++
++std::unique_ptr<views::View>
++VerticalTabStripView::RemoveUnpinnedMiddlePinnedView() {
++  if (!unpinned_tabs_container_view_) {
++    return nullptr;
++  }
++  return unpinned_tabs_container_view_->RemoveMiddlePinnedView();
++}
++
+ void VerticalTabStripView::SetCollapsedState(bool is_collapsed) {
+   if (is_collapsed != is_collapsed_) {
+     is_collapsed_ = is_collapsed;
+--- a/chrome/browser/ui/tabs/tab_data.cc
++++ b/chrome/browser/ui/tabs/tab_data.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/tab_data.h"
+ 
++#include <optional>
+ #include <string>
+ 
+ #include "base/check.h"
+@@ -20,6 +21,7 @@
+ #include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_tab_helper.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "components/collaboration/public/messaging/messaging_backend_service.h"
+ #include "components/tabs/public/tab_alert.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -53,7 +55,10 @@ TabData TabData::FromTabInterface(tabs::
+   tab_data.network_state = tab_ui_helper->GetTabNetworkState();
+   tab_data.is_tab_discarded = tab_ui_helper->IsDiscarded();
+   tab_data.last_committed_url = tab_ui_helper->GetLastCommittedURL();
+-  tab_data.alert_state = tab_alert_controller->GetAlertToShow();
++  tab_data.alert_state =
++      features::IsHeliumAnchoredTabsEnabled() && tab_data.is_tab_discarded
++          ? std::nullopt
++          : tab_alert_controller->GetAlertToShow();
+   tab_data.pinned = tab_interface->IsPinned();
+   tab_data.blocked = tab_interface->IsBlocked();
+ 
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -12075,6 +12075,15 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_HIBERNATE" desc="The label of the 'Hibernate' Tab context menu item.">
+           Hibernate
+         </message>
++        <message name="IDS_TAB_CXMENU_REPLACE_ANCHORED_URL" desc="The label of the tab context menu item that updates an anchored tab to use the tab's current URL as its saved anchored URL.">
++          Replace anchored URL with current
++        </message>
++        <message name="IDS_VERTICAL_TABS_CLEAR_UNGROUPED" desc="The label of the vertical tab strip button that closes all unpinned tabs that are not in a group.">
++          Clear
++        </message>
++        <message name="IDS_VERTICAL_TAB_GROUP_HIBERNATE" desc="The accessibility label for the vertical tab group button that hibernates the group's remaining live tabs.">
++          Hibernate group
++        </message>
+         <message name="IDS_TAB_CXMENU_RENAMETAB" desc="The label of the 'Rename tab' context menu item and rename-tab dialog title.">
+           Rename tab
+         </message>
+@@ -12203,6 +12212,15 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_HIBERNATE" desc="In Title Case: The label of the 'Hibernate' Tab context menu item.">
+           Hibernate
+         </message>
++        <message name="IDS_TAB_CXMENU_REPLACE_ANCHORED_URL" desc="In Title Case: The label of the tab context menu item that updates an anchored tab to use the tab's current URL as its saved anchored URL.">
++          Replace Anchored URL with Current
++        </message>
++        <message name="IDS_VERTICAL_TABS_CLEAR_UNGROUPED" desc="In Title Case: The label of the vertical tab strip button that closes all unpinned tabs that are not in a group.">
++          Clear
++        </message>
++        <message name="IDS_VERTICAL_TAB_GROUP_HIBERNATE" desc="In Title Case: The accessibility label for the vertical tab group button that hibernates the group's remaining live tabs.">
++          Hibernate Group
++        </message>
+         <message name="IDS_TAB_CXMENU_RENAMETAB" desc="In Title Case: The label of the 'Rename Tab' context menu item and rename-tab dialog title.">
+           Rename Tab
+         </message>
