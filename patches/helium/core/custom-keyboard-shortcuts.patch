@@ -1792,7 +1792,7 @@
        return shortcut.chrome_command;
 --- /dev/null
 +++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,29 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1800,6 +1800,7 @@
 +#ifndef CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PLATFORM_MAC_H_
 +#define CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PLATFORM_MAC_H_
 +
++#include <utility>
 +#include <vector>
 +
 +#include "ui/base/accelerators/accelerator.h"
@@ -1815,12 +1816,15 @@
 +std::vector<BrowserShortcutPlatformDefaultAccelerator>
 +GetPlatformDefaultAccelerators();
 +
++void UpdatePlatformMenuAccelerators(
++    const std::vector<std::pair<ui::Accelerator, int>>& accelerators);
++
 +}  // namespace browser_shortcuts
 +
 +#endif  // CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PLATFORM_MAC_H_
 --- /dev/null
 +++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.mm
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,250 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1829,12 +1833,16 @@
 +
 +#import <AppKit/AppKit.h>
 +
++#include <map>
 +#include <optional>
 +
 +#include "base/containers/flat_set.h"
++#include "base/no_destructor.h"
 +#include "chrome/app/chrome_command_ids.h"
 +#include "chrome/browser/global_keyboard_shortcuts_mac.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h"
 +#include "chrome/browser/ui/cocoa/accelerators_cocoa.h"
++#include "ui/base/accelerators/platform_accelerator_cocoa.h"
 +#include "ui/events/cocoa/cocoa_event_utils.h"
 +#include "ui/events/event_constants.h"
 +#include "ui/events/keycodes/keyboard_code_conversion_mac.h"
@@ -1842,6 +1850,8 @@
 +namespace browser_shortcuts {
 +
 +namespace {
++
++using AcceleratorsByCommandId = std::map<int, ui::Accelerator>;
 +
 +bool KeyEquivalentRequiresShift(unichar key_equivalent) {
 +  if (key_equivalent >= 'A' && key_equivalent <= 'Z') {
@@ -1909,6 +1919,28 @@
 +  return NO_COMMAND;
 +}
 +
++base::flat_set<int>& HeliumManagedMenuCommandIds() {
++  static base::NoDestructor<base::flat_set<int>> command_ids;
++  return *command_ids;
++}
++
++bool IsMenuCommandHeliumModifiable(
++    int command_id,
++    const std::optional<ui::Accelerator>& accelerator) {
++  const ui::Accelerator* default_accelerator =
++      AcceleratorsCocoa::GetInstance()->GetAcceleratorForCommand(command_id);
++  if (!default_accelerator) {
++    return false;
++  }
++
++  if (!HeliumManagedMenuCommandIds().contains(command_id) &&
++      (!accelerator.has_value() || *default_accelerator != *accelerator)) {
++    return false;
++  }
++
++  return IsBrowserShortcutDefaultUserModifiable(command_id);
++}
++
 +void AppendMenuItems(
 +    NSMenu* menu,
 +    std::vector<BrowserShortcutPlatformDefaultAccelerator>* defaults,
@@ -1923,9 +1955,20 @@
 +      live_menu_command_ids->insert(command_id);
 +    }
 +    std::optional<ui::Accelerator> accelerator = AcceleratorFromMenuItem(item);
-+    if (command_id != NO_COMMAND && accelerator.has_value()) {
-+      defaults->push_back(
-+          {command_id, *accelerator, /*user_modifiable=*/false});
++    if (command_id != NO_COMMAND) {
++      const bool user_modifiable =
++          IsMenuCommandHeliumModifiable(command_id, accelerator);
++      const ui::Accelerator* default_accelerator =
++          user_modifiable
++              ? AcceleratorsCocoa::GetInstance()->GetAcceleratorForCommand(
++                    command_id)
++              : nullptr;
++      if (default_accelerator) {
++        defaults->push_back(
++            {command_id, *default_accelerator, user_modifiable});
++      } else if (accelerator.has_value()) {
++        defaults->push_back({command_id, *accelerator, user_modifiable});
++      }
 +    }
 +
 +    if (item.submenu) {
@@ -1940,6 +1983,52 @@
 +  for (const KeyboardShortcutAcceleratorData& shortcut : shortcuts) {
 +    defaults->push_back({shortcut.chrome_command, shortcut.accelerator,
 +                         /*user_modifiable=*/false});
++  }
++}
++
++bool ShouldManageMenuItem(NSMenuItem* item, int command_id) {
++  if (HeliumManagedMenuCommandIds().contains(command_id)) {
++    return true;
++  }
++
++  return IsMenuCommandHeliumModifiable(command_id, AcceleratorFromMenuItem(item));
++}
++
++void ApplyMenuItemAccelerator(
++    NSMenuItem* item,
++    const AcceleratorsByCommandId& accelerators_by_command_id,
++    int command_id) {
++  auto accelerator_it = accelerators_by_command_id.find(command_id);
++  if (accelerator_it == accelerators_by_command_id.end()) {
++    item.keyEquivalent = @"";
++    item.keyEquivalentModifierMask = 0;
++    return;
++  }
++
++  KeyEquivalentAndModifierMask* equivalent =
++      ui::GetKeyEquivalentAndModifierMaskFromAccelerator(
++          accelerator_it->second);
++  item.keyEquivalent = equivalent.keyEquivalent;
++  item.keyEquivalentModifierMask = equivalent.modifierMask;
++}
++
++void UpdateMenuItems(
++    NSMenu* menu,
++    const AcceleratorsByCommandId& accelerators_by_command_id) {
++  if (menu == NSApp.servicesMenu) {
++    return;
++  }
++
++  for (NSMenuItem* item in menu.itemArray) {
++    const int command_id = CommandIdFromMenuItem(item);
++    if (command_id != NO_COMMAND && ShouldManageMenuItem(item, command_id)) {
++      ApplyMenuItemAccelerator(item, accelerators_by_command_id, command_id);
++      HeliumManagedMenuCommandIds().insert(command_id);
++    }
++
++    if (item.submenu) {
++      UpdateMenuItems(item.submenu, accelerators_by_command_id);
++    }
 +  }
 +}
 +
@@ -1969,6 +2058,20 @@
 +                     &defaults);
 +
 +  return defaults;
++}
++
++void UpdatePlatformMenuAccelerators(
++    const std::vector<std::pair<ui::Accelerator, int>>& accelerators) {
++  if (!NSApp.mainMenu) {
++    return;
++  }
++
++  std::map<int, ui::Accelerator> accelerators_by_command_id;
++  for (const auto& [accelerator, command_id] : accelerators) {
++    accelerators_by_command_id.try_emplace(command_id, accelerator);
++  }
++
++  UpdateMenuItems(NSApp.mainMenu, accelerators_by_command_id);
 +}
 +
 +}  // namespace browser_shortcuts
