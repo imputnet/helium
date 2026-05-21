@@ -1,0 +1,160 @@
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.cc
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_finder.h"
++#include "chrome/browser/ui/browser_list.h"
+ #include "chrome/browser/ui/browser_tab_strip_tracker.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -40,6 +41,7 @@ void AutoPictureInPictureTabStripObserverHelper::StartObserving() {
+   auto* tab_strip_model = GetCurrentTabStripModel();
+   UpdateIsTabActivated(tab_strip_model);
+ 
++  BrowserList::AddObserver(this);
+   ObserveTabStripModel(tab_strip_model);
+ }
+ 
+@@ -53,6 +55,7 @@ void AutoPictureInPictureTabStripObserverHelper::StopObserving() {
+     observed_tab_strip_model_->RemoveObserver(this);
+     observed_tab_strip_model_ = nullptr;
+   }
++  BrowserList::RemoveObserver(this);
+   browser_tab_strip_tracker_.reset();
+ }
+ 
+@@ -88,6 +91,37 @@ void AutoPictureInPictureTabStripObserverHelper::OnTabStripModelChanged(
+     return;
+   }
+ 
++  UpdateAndNotifyIfTabActivationChanged();
++}
++
++void AutoPictureInPictureTabStripObserverHelper::OnBrowserSetLastActive(
++    Browser* browser) {
++  UpdateAndNotifyIfBrowserActivationChanged(browser);
++}
++
++void AutoPictureInPictureTabStripObserverHelper::OnBrowserNoLongerActive(
++    Browser* browser) {
++  UpdateAndNotifyIfBrowserActivationChanged(browser);
++}
++
++void AutoPictureInPictureTabStripObserverHelper::
++    UpdateAndNotifyIfBrowserActivationChanged(Browser* browser) {
++  auto* current_tab_strip_model = GetCurrentTabStripModel();
++  if (browser->tab_strip_model() != observed_tab_strip_model_ &&
++      browser->tab_strip_model() != current_tab_strip_model) {
++    return;
++  }
++
++  UpdateAndNotifyIfTabActivationChanged();
++}
++
++void AutoPictureInPictureTabStripObserverHelper::
++    UpdateAndNotifyIfTabActivationChanged() {
++  auto* current_tab_strip_model = GetCurrentTabStripModel();
++  if (current_tab_strip_model != observed_tab_strip_model_) {
++    ObserveTabStripModel(current_tab_strip_model);
++  }
++
+   const bool old_is_tab_activated = is_tab_activated_;
+   UpdateIsTabActivated(current_tab_strip_model);
+   if (is_tab_activated_ == old_is_tab_activated) {
+@@ -115,6 +149,14 @@ void AutoPictureInPictureTabStripObserverHelper::UpdateIsTabActivated(
+     const tabs::TabInterface* active_tab = tab_strip_model->GetActiveTab();
+     const tabs::TabInterface* observed_tab =
+         tabs::TabInterface::GetFromContents(GetObservedWebContents());
++    Browser* browser = chrome::FindBrowserWithTab(GetObservedWebContents());
++    if (!browser || !browser->IsActive()) {
++      is_tab_activated_ = false;
++      return;
++    }
++
++    // Treat a tab as active only while its browser window is active, so Auto PiP
++    // uses the same path for tab, window, and application focus changes.
+     is_tab_activated_ =
+         (tab_strip_model->GetActiveWebContents() == GetObservedWebContents()) ||
+         (active_tab->IsSplit() &&
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.h
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/functional/callback.h"
+ #include "chrome/browser/picture_in_picture/auto_picture_in_picture_tab_observer_helper_base.h"
++#include "chrome/browser/ui/browser_list_observer.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ 
+ namespace content {
+@@ -24,6 +25,7 @@ class BrowserTabStripTracker;
+ // and vice versa.
+ class AutoPictureInPictureTabStripObserverHelper final
+     : public AutoPictureInPictureTabObserverHelperBase,
++      public BrowserListObserver,
+       public TabStripModelObserver {
+  public:
+   AutoPictureInPictureTabStripObserverHelper(content::WebContents* web_contents,
+@@ -39,6 +41,10 @@ class AutoPictureInPictureTabStripObserverHelper final
+   void StopObserving() override;
+   content::WebContents* GetActiveWebContents() const override;
+ 
++  // BrowserListObserver:
++  void OnBrowserSetLastActive(Browser* browser) override;
++  void OnBrowserNoLongerActive(Browser* browser) override;
++
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+       TabStripModel* tab_strip_model,
+@@ -46,6 +52,10 @@ class AutoPictureInPictureTabStripObserverHelper final
+       const TabStripSelectionChange& selection) override;
+ 
+  private:
++  void UpdateAndNotifyIfBrowserActivationChanged(Browser* browser);
++
++  void UpdateAndNotifyIfTabActivationChanged();
++
+   void UpdateIsTabActivated(const TabStripModel* tab_strip_model);
+ 
+   void ObserveTabStripModel(TabStripModel* tab_strip_model);
+@@ -59,7 +69,7 @@ class AutoPictureInPictureTabStripObserverHelper final
+ 
+   raw_ptr<TabStripModel> observed_tab_strip_model_ = nullptr;
+ 
+-  // True if the tab is the activated tab on its tab strip.
++  // True if the tab is the activated tab in the active browser window.
+   bool is_tab_activated_ = false;
+ 
+   // True if we're currently observing |web_contents_|'s tabstrip.
+--- a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
++++ b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
+@@ -500,12 +500,8 @@ gfx::Rect PictureInPictureWindowManager::CalculateOuterWindowBounds(
+   int window_diff_width = work_area.right() - window_bounds.width();
+   int window_diff_height = work_area.bottom() - window_bounds.height();
+ 
+-  // Keep a margin distance of 2% the average of the two window size
+-  // differences, keeping the margins consistent.
+-  int buffer = (window_diff_width + window_diff_height) / 2 * 0.02;
+-
+   gfx::Point default_origin =
+-      gfx::Point(window_diff_width - buffer, window_diff_height - buffer);
++      gfx::Point(window_diff_width, window_diff_height);
+   window_bounds.set_origin(default_origin);
+ 
+   return window_bounds;
+--- a/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
++++ b/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
+@@ -543,12 +543,8 @@ gfx::Rect VideoOverlayWindowViews::CalculateAndUpdateWindowBounds() {
+   int window_diff_width = work_area.right() - window_size.width();
+   int window_diff_height = work_area.bottom() - window_size.height();
+ 
+-  // Keep a margin distance of 2% the average of the two window size
+-  // differences, keeping the margins consistent.
+-  int buffer = (window_diff_width + window_diff_height) / 2 * 0.02;
+-
+   gfx::Point default_origin =
+-      gfx::Point(window_diff_width - buffer, window_diff_height - buffer);
++      gfx::Point(window_diff_width, window_diff_height);
+ 
+   if (has_been_shown_) {
+     // Make sure window is displayed entirely in the work area.
