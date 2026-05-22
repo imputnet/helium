@@ -1,0 +1,312 @@
+--- a/chrome/browser/ui/views/zoom/zoom_view_controller.cc
++++ b/chrome/browser/ui/views/zoom/zoom_view_controller.cc
+@@ -20,7 +20,9 @@
+ #include "chrome/browser/ui/views/location_bar/zoom_bubble_view.h"
+ #include "chrome/browser/ui/views/page_action/page_action_controller.h"
+ #include "chrome/browser/ui/views/page_action/page_action_view.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/zoom/zoom_controller.h"
+ #include "content/public/browser/web_contents.h"
+@@ -31,9 +33,11 @@ namespace zoom {
+ 
+ ZoomViewController::ZoomViewController(
+     tabs::TabInterface& tab_interface,
+-    page_actions::PageActionController& page_action_controller)
++    page_actions::PageActionController& page_action_controller,
++    const PrefService& pref_service)
+     : tab_interface_(tab_interface),
+-      page_action_controller_(page_action_controller) {
++      page_action_controller_(page_action_controller),
++      pref_service_(pref_service) {
+   DCHECK(IsPageActionMigrated(PageActionIconType::kZoom));
+ }
+ 
+@@ -94,6 +98,11 @@ void ZoomViewController::UpdatePageActio
+       zoom::ZoomController::FromWebContents(GetWebContents());
+   CHECK(zoom_controller);
+ 
++  if (!pref_service_->GetBoolean(prefs::kShowZoomAction)) {
++    page_action_controller_->Hide(kActionZoomNormal);
++    return;
++  }
++
+   const bool is_at_default_zoom = zoom_controller->IsAtDefaultZoom();
+   if (is_at_default_zoom && !is_bubble_visible) {
+     page_action_controller_->Hide(kActionZoomNormal);
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -282,6 +282,9 @@
+   <message name="IDS_SETTINGS_SHOW_HOME_BUTTON" desc="Label for the checkbox which enables or disables showing the home button in the toolbar.">
+     Show home button
+   </message>
++  <message name="IDS_SETTINGS_SHOW_ZOOM_ACTION" desc="Label for the checkbox which enables or disables showing the zoom action in the location bar.">
++    Show zoom action in location bar
++  </message>
+   <message name="IDS_SETTINGS_SHOW_BOOKMARKS_BAR" desc="Label for the checkbox which enables or disables showing the bookmarks bar in the toolbar.">
+     Show bookmarks bar
+   </message>
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -901,6 +901,10 @@ inline constexpr char kShowMenuButton[]
+ // the toolbar.
+ inline constexpr char kShowMediaButton[] = "helium.browser.show_media_button";
+ 
++// A boolean pref set to true if the page zoom action should be visible in
++// the location bar.
++inline constexpr char kShowZoomAction[] = "helium.browser.show_zoom_action";
++
+ // A boolean pref set to true if Gemini integration be enabled. This is managed
+ // by enterprise policy.
+ inline constexpr char kGeminiSettings[] = "browser.gemini_settings";
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -144,6 +144,7 @@ void RegisterBrowserUserPrefs(user_prefs
+   registry->RegisterBooleanPref(prefs::kShowExtensionsButton, true);
+   registry->RegisterBooleanPref(prefs::kShowMenuButton, true);
+   registry->RegisterBooleanPref(prefs::kShowMediaButton, true);
++  registry->RegisterBooleanPref(prefs::kShowZoomAction, false);
+ 
+   registry->RegisterInt64Pref(prefs::kDefaultBrowserInfobarLastDeclined, 0);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateOnDesktop, true);
+--- a/chrome/browser/ui/tabs/tab_features.cc
++++ b/chrome/browser/ui/tabs/tab_features.cc
+@@ -217,7 +217,7 @@ void TabFeatures::Init(TabInterface& tab
+ 
+     if (IsPageActionMigrated(PageActionIconType::kZoom)) {
+       zoom_view_controller_ = std::make_unique<zoom::ZoomViewController>(
+-          tab, *page_action_controller_);
++          tab, *page_action_controller_, *profile->GetPrefs());
+     }
+ 
+     pwa_install_page_action_controller_ =
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -269,6 +269,7 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+ 
+   (*s_allowlist)[::prefs::kShowHomeButton] = settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kShowZoomAction] = settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kShowForwardButton] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kPinContextualTaskButton] =
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html
+@@ -140,6 +140,10 @@
+             </settings-radio-group>
+           </div>
+         </template>
++        <settings-toggle-button
++            pref="{{prefs.helium.browser.show_zoom_action}}"
++            label="$i18n{showZoomAction}">
++        </settings-toggle-button>
+         <div
+             class="hr"
+             hidden="[[!showHr_(
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1146,6 +1146,10 @@ BrowserView::BrowserView(Browser* browse
+       prefs::kFullscreenAllowed,
+       base::BindRepeating(&BrowserView::UpdateFullscreenAllowedFromPolicy,
+                           base::Unretained(this), CanFullscreen()));
++  registrar_.Add(
++      prefs::kShowZoomAction,
++      base::BindRepeating(&BrowserView::ZoomChangedForActiveTab,
++                          base::Unretained(this), /*can_show_bubble=*/false));
+   UpdateFullscreenAllowedFromPolicy(CanFullscreen());
+ 
+   WebUIContentsPreloadManager::GetInstance()->WarmupForBrowser(browser_.get());
+--- a/chrome/browser/ui/views/location_bar/BUILD.gn
++++ b/chrome/browser/ui/views/location_bar/BUILD.gn
+@@ -144,6 +144,7 @@ source_set("impl") {
+       "//chrome/browser/ui/webui/cr_components/composebox",
+       "//chrome/browser/web_applications",
+       "//chrome/browser/web_applications:features",
++      "//chrome/common",
+       "//chrome/common/record_replay",
+       "//components/autofill/core/common:features",
+       "//components/commerce/core:feature_list",
+@@ -158,6 +159,7 @@ source_set("impl") {
+       "//components/omnibox/browser:vector_icons",
+       "//components/omnibox/common",
+       "//components/performance_manager",
++      "//components/prefs",
+       "//components/safe_browsing/core/common:features",
+       "//components/search",
+       "//components/security_interstitials/content:security_interstitial_page",
+--- a/chrome/browser/ui/views/location_bar/zoom_bubble_coordinator.cc
++++ b/chrome/browser/ui/views/location_bar/zoom_bubble_coordinator.cc
+@@ -8,6 +8,7 @@
+ 
+ #include "base/check.h"
+ #include "base/types/to_address.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+@@ -18,6 +19,8 @@
+ #include "chrome/browser/ui/views/location_bar/zoom_bubble_view.h"
+ #include "chrome/browser/ui/views/page_action/page_action_view.h"
+ #include "chrome/browser/ui/views/zoom/zoom_view_controller.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
+ #include "components/zoom/zoom_controller.h"
+ #include "extensions/browser/extension_zoom_request_client.h"
+ #include "extensions/common/extension.h"
+@@ -77,6 +80,11 @@ void UpdateBubbleVisibilityState(Browser
+   action_item->SetIsShowingBubble(is_bubble_visible);
+ }
+ 
++bool IsZoomActionEnabled(const BrowserView& browser_view) {
++  return browser_view.browser()->profile()->GetPrefs()->GetBoolean(
++      prefs::kShowZoomAction);
++}
++
+ }  // namespace
+ 
+ DEFINE_USER_DATA(ZoomBubbleCoordinator);
+@@ -119,6 +127,11 @@ void ZoomBubbleCoordinator::Show(
+     return;
+   }
+ 
++  if (!IsZoomActionEnabled(*browser_view_)) {
++    Hide();
++    return;
++  }
++
+   if (RefreshIfShowing(contents)) {
+     return;
+   }
+@@ -184,6 +197,11 @@ void ZoomBubbleCoordinator::Hide() {
+ }
+ 
+ bool ZoomBubbleCoordinator::RefreshIfShowing(content::WebContents* contents) {
++  if (!IsZoomActionEnabled(*browser_view_)) {
++    Hide();
++    return false;
++  }
++
+   if (!CanRefresh(bubble(), contents)) {
+     return false;
+   }
+--- a/chrome/browser/ui/views/page_action/BUILD.gn
++++ b/chrome/browser/ui/views/page_action/BUILD.gn
+@@ -111,6 +111,7 @@ source_set("impl") {
+     "//chrome/browser/ui/views/toolbar",
+     "//chrome/browser/ui/web_applications",
+     "//chrome/browser/user_education",
++    "//chrome/common",
+     "//components/feature_engagement/public",
+     "//components/lens",
+     "//components/omnibox/browser:vector_icons",
+--- a/chrome/browser/ui/views/page_action/zoom_view.cc
++++ b/chrome/browser/ui/views/page_action/zoom_view.cc
+@@ -6,14 +6,17 @@
+ 
+ #include "base/i18n/number_formatting.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/location_bar/zoom_bubble_coordinator.h"
+ #include "chrome/browser/ui/views/location_bar/zoom_bubble_view.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/omnibox/browser/location_bar_model.h"
++#include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/zoom/zoom_controller.h"
+ #include "ui/accessibility/ax_node_data.h"
+@@ -39,6 +42,20 @@ ZoomBubbleCoordinator* GetZoomBubbleCoor
+   return ZoomBubbleCoordinator::From(bwi);
+ }
+ 
++bool IsZoomActionEnabled(content::WebContents* web_contents) {
++  if (!web_contents) {
++    return false;
++  }
++
++  auto* tab_interface = tabs::TabInterface::GetFromContents(web_contents);
++  CHECK(tab_interface);
++
++  return tab_interface->GetBrowserWindowInterface()
++      ->GetProfile()
++      ->GetPrefs()
++      ->GetBoolean(prefs::kShowZoomAction);
++}
++
+ }  // namespace
+ 
+ ZoomView::ZoomView(IconLabelBubbleView::Delegate* icon_label_bubble_delegate,
+@@ -66,6 +83,10 @@ bool ZoomView::ShouldBeVisible(bool can_
+     return false;
+   }
+ 
++  if (!IsZoomActionEnabled(GetWebContents())) {
++    return false;
++  }
++
+   if (can_show_bubble) {
+     return true;
+   }
+--- a/chrome/browser/ui/views/zoom/BUILD.gn
++++ b/chrome/browser/ui/views/zoom/BUILD.gn
+@@ -15,12 +15,14 @@ source_set("impl") {
+ 
+   deps = [
+     ":zoom",
++    "//chrome/common",
+     "//chrome/browser/ui",
+     "//chrome/browser/ui:ui_features",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/views/frame:toolbar_button_provider",
+     "//chrome/browser/ui/views/location_bar",
+     "//chrome/browser/ui/views/page_action",
++    "//components/prefs",
+     "//components/zoom",
+   ]
+ }
+--- a/chrome/browser/ui/views/zoom/zoom_view_controller.h
++++ b/chrome/browser/ui/views/zoom/zoom_view_controller.h
+@@ -7,6 +7,7 @@
+ 
+ #include "components/tabs/public/tab_interface.h"
+ 
++class PrefService;
+ class ZoomBubbleCoordinator;
+ 
+ namespace content {
+@@ -26,7 +27,8 @@ class ZoomViewController {
+  public:
+   explicit ZoomViewController(
+       tabs::TabInterface& tab_interface,
+-      page_actions::PageActionController& page_action_controller);
++      page_actions::PageActionController& page_action_controller,
++      const PrefService& pref_service);
+ 
+   ZoomViewController(const ZoomViewController&) = delete;
+   ZoomViewController& operator=(const ZoomViewController&) = delete;
+@@ -76,6 +78,9 @@ class ZoomViewController {
+   // Unowned reference to the page action controller that will coordinate
+   // requests from this object.
+   const raw_ref<page_actions::PageActionController> page_action_controller_;
++
++  // Unowned reference to the profile prefs. The profile outlives tab features.
++  const raw_ref<const PrefService> pref_service_;
+ };
+ 
+ }  // namespace zoom
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -520,6 +520,7 @@ void AddAppearanceStrings(content::WebUI
+       {"cycleTabsInMRUOrder", IDS_SETTINGS_CYCLE_TABS_IN_MRU_ORDER},
+       {"roundedFrame", IDS_SETTINGS_ROUNDED_FRAME},
+       {"showHomeButton", IDS_SETTINGS_SHOW_HOME_BUTTON},
++      {"showZoomAction", IDS_SETTINGS_SHOW_ZOOM_ACTION},
+       {"showBookmarksBar", IDS_SETTINGS_SHOW_BOOKMARKS_BAR},
+       {"showTabSearchButton", IDS_SETTINGS_SHOW_TAB_SEARCH_BUTTON},
+       {"showProjectsPanelButton", IDS_SETTINGS_SHOW_PROJECTS_PANEL_BUTTON},
