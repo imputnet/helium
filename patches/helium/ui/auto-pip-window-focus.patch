@@ -1,3 +1,129 @@
+--- a/chrome/browser/picture_in_picture/BUILD.gn
++++ b/chrome/browser/picture_in_picture/BUILD.gn
+@@ -36,0 +37 @@
++      "auto_picture_in_picture_display_helper.h",
+@@ -144,0 +146,3 @@
++  }
++  if (is_mac) {
++    sources += [ "auto_picture_in_picture_display_helper_mac.mm" ]
+--- /dev/null
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_display_helper.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_DISPLAY_HELPER_H_
++#define CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_DISPLAY_HELPER_H_
++
++#include <stdint.h>
++
++#include <optional>
++
++namespace picture_in_picture {
++
++std::optional<int64_t> GetFocusedApplicationDisplayId();
++
++}  // namespace picture_in_picture
++
++#endif  // CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_DISPLAY_HELPER_H_
+--- /dev/null
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_display_helper_mac.mm
+@@ -0,0 +1,94 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/picture_in_picture/auto_picture_in_picture_display_helper.h"
++
++#import <AppKit/AppKit.h>
++#include <ApplicationServices/ApplicationServices.h>
++
++#include "base/apple/scoped_cftyperef.h"
++#include "base/process/process_handle.h"
++#include "ui/display/display.h"
++#include "ui/display/screen.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace picture_in_picture {
++
++std::optional<int64_t> GetFocusedApplicationDisplayId() {
++  NSRunningApplication* frontmost_application =
++      NSWorkspace.sharedWorkspace.frontmostApplication;
++  if (!frontmost_application) {
++    return std::nullopt;
++  }
++
++  const pid_t frontmost_process_id = frontmost_application.processIdentifier;
++  if (!frontmost_process_id ||
++      frontmost_process_id == base::GetCurrentProcId()) {
++    return std::nullopt;
++  }
++
++  auto* screen = display::Screen::Get();
++  if (!screen) {
++    return std::nullopt;
++  }
++
++  base::apple::ScopedCFTypeRef<CFArrayRef> window_infos(
++      CGWindowListCopyWindowInfo(
++          kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
++          kCGNullWindowID));
++  if (!window_infos) {
++    return std::nullopt;
++  }
++
++  const CFIndex count = CFArrayGetCount(window_infos.get());
++  for (CFIndex index = 0; index < count; ++index) {
++    CFDictionaryRef window_info = reinterpret_cast<CFDictionaryRef>(
++        CFArrayGetValueAtIndex(window_infos.get(), index));
++    if (!window_info) {
++      continue;
++    }
++
++    CFNumberRef owner_process_id_ref = reinterpret_cast<CFNumberRef>(
++        CFDictionaryGetValue(window_info, kCGWindowOwnerPID));
++    int owner_process_id = 0;
++    if (!owner_process_id_ref ||
++        !CFNumberGetValue(owner_process_id_ref, kCFNumberIntType,
++                          &owner_process_id) ||
++        owner_process_id != frontmost_process_id) {
++      continue;
++    }
++
++    CFNumberRef layer_ref = reinterpret_cast<CFNumberRef>(
++        CFDictionaryGetValue(window_info, kCGWindowLayer));
++    int layer = 0;
++    if (!layer_ref || !CFNumberGetValue(layer_ref, kCFNumberIntType, &layer) ||
++        layer != 0) {
++      continue;
++    }
++
++    CFDictionaryRef bounds_ref = reinterpret_cast<CFDictionaryRef>(
++        CFDictionaryGetValue(window_info, kCGWindowBounds));
++    CGRect bounds = CGRectZero;
++    if (!bounds_ref ||
++        !CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds) ||
++        CGRectIsEmpty(bounds)) {
++      continue;
++    }
++
++    const gfx::Rect window_bounds(static_cast<int>(bounds.origin.x),
++                                  static_cast<int>(bounds.origin.y),
++                                  static_cast<int>(bounds.size.width),
++                                  static_cast<int>(bounds.size.height));
++    const display::Display display = screen->GetDisplayMatching(window_bounds);
++    if (!display.is_valid()) {
++      continue;
++    }
++
++    return display.id();
++  }
++
++  return std::nullopt;
++}
++
++}  // namespace picture_in_picture
 --- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.cc
 +++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.cc
 @@ -6,0 +7,9 @@
@@ -16,16 +142,12 @@
 +#include "chrome/browser/ui/browser_window.h"
 +#include "chrome/common/pref_names.h"
 +#include "components/prefs/pref_service.h"
-@@ -11,0 +25,119 @@
+@@ -11,0 +25,2 @@
 +#include "ui/display/display.h"
 +#include "ui/display/screen.h"
-+#include "ui/gfx/geometry/rect.h"
-+
+@@ -12,0 +28,84 @@
 +#if BUILDFLAG(IS_MAC)
-+#include <ApplicationServices/ApplicationServices.h>
-+
-+#include "base/apple/scoped_cftyperef.h"
-+#include "base/process/process_handle.h"
++#include "chrome/browser/picture_in_picture/auto_picture_in_picture_display_helper.h"
 +#endif
 +
 +namespace {
@@ -58,73 +180,6 @@
 +  return GetBrowserDisplayId(active_browser);
 +}
 +
-+#if BUILDFLAG(IS_MAC)
-+std::optional<int64_t> GetTopmostOtherApplicationWindowDisplayId() {
-+  auto* screen = display::Screen::Get();
-+  if (!screen) {
-+    return std::nullopt;
-+  }
-+
-+  base::apple::ScopedCFTypeRef<CFArrayRef> window_infos(
-+      CGWindowListCopyWindowInfo(
-+          kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-+          kCGNullWindowID));
-+  if (!window_infos) {
-+    return std::nullopt;
-+  }
-+
-+  const int current_process_id = base::GetCurrentProcId();
-+  const CFIndex count = CFArrayGetCount(window_infos.get());
-+  for (CFIndex index = 0; index < count; ++index) {
-+    CFDictionaryRef window_info = reinterpret_cast<CFDictionaryRef>(
-+        CFArrayGetValueAtIndex(window_infos.get(), index));
-+    if (!window_info) {
-+      continue;
-+    }
-+
-+    CFNumberRef layer_ref = reinterpret_cast<CFNumberRef>(
-+        CFDictionaryGetValue(window_info, kCGWindowLayer));
-+    int layer = 0;
-+    if (!layer_ref || !CFNumberGetValue(layer_ref, kCFNumberIntType, &layer) ||
-+        layer != 0) {
-+      continue;
-+    }
-+
-+    CFNumberRef owner_process_id_ref = reinterpret_cast<CFNumberRef>(
-+        CFDictionaryGetValue(window_info, kCGWindowOwnerPID));
-+    int owner_process_id = 0;
-+    if (!owner_process_id_ref ||
-+        !CFNumberGetValue(owner_process_id_ref, kCFNumberIntType,
-+                          &owner_process_id) ||
-+        owner_process_id == current_process_id) {
-+      continue;
-+    }
-+
-+    CFDictionaryRef bounds_ref = reinterpret_cast<CFDictionaryRef>(
-+        CFDictionaryGetValue(window_info, kCGWindowBounds));
-+    CGRect bounds = CGRectZero;
-+    if (!bounds_ref ||
-+        !CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds) ||
-+        CGRectIsEmpty(bounds)) {
-+      continue;
-+    }
-+
-+    const gfx::Rect window_bounds(static_cast<int>(bounds.origin.x),
-+                                  static_cast<int>(bounds.origin.y),
-+                                  static_cast<int>(bounds.size.width),
-+                                  static_cast<int>(bounds.size.height));
-+    const display::Display display = screen->GetDisplayMatching(window_bounds);
-+    if (!display.is_valid()) {
-+      continue;
-+    }
-+
-+    return display.id();
-+  }
-+
-+  return std::nullopt;
-+}
-+#endif
-+
 +std::optional<int64_t> GetCursorDisplayId() {
 +  auto* screen = display::Screen::Get();
 +  if (!screen) {
@@ -136,7 +191,7 @@
 +  if (!display.is_valid()) {
 +    return std::nullopt;
 +  }
-@@ -12,0 +145,38 @@
++
 +  return display.id();
 +}
 +
@@ -147,7 +202,7 @@
 +  }
 +
 +#if BUILDFLAG(IS_MAC)
-+  focused_display_id = GetTopmostOtherApplicationWindowDisplayId();
++  focused_display_id = picture_in_picture::GetFocusedApplicationDisplayId();
 +  if (focused_display_id) {
 +    return focused_display_id;
 +  }
@@ -175,12 +230,12 @@
 +
 +}  // namespace
 +
-@@ -42,0 +213 @@
+@@ -42,0 +142 @@
 +  BrowserList::AddObserver(this);
-@@ -55,0 +227,2 @@
+@@ -55,0 +156,2 @@
 +  weak_ptr_factory_.InvalidateWeakPtrs();
 +  BrowserList::RemoveObserver(this);
-@@ -90,0 +264,64 @@
+@@ -90,0 +193,64 @@
 +  UpdateAndNotifyIfTabActivationChanged();
 +}
 +
@@ -245,7 +300,7 @@
 +    ObserveTabStripModel(current_tab_strip_model);
 +  }
 +
-@@ -99,0 +337,7 @@
+@@ -99,0 +266,7 @@
 +bool AutoPictureInPictureTabStripObserverHelper::
 +    ShouldIgnoreFocusLossForDifferentDisplay() const {
 +  return AreKnownDifferentDisplays(
@@ -253,7 +308,7 @@
 +      GetFocusedDisplayIdForAutoPipSuppression());
 +}
 +
-@@ -117,0 +362,8 @@
+@@ -117,0 +291,8 @@
 +    Browser* browser = chrome::FindBrowserWithTab(GetObservedWebContents());
 +    if (!browser || !browser->IsActive()) {
 +      is_tab_activated_ = false;
@@ -385,15 +440,9 @@
 +
 --- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
 +++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
-@@ -211,6 +211,8 @@
-   (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
-       settings_api::PrefType::kBoolean;
-   (*s_allowlist)[::prefs::kHeliumMinimalLocationBar] =
-       settings_api::PrefType::kBoolean;
-+  (*s_allowlist)[::prefs::kHeliumAutoPictureInPictureOnFocusLoss] =
+@@ -213,0 +214,2 @@
 +      settings_api::PrefType::kBoolean;
-   (*s_allowlist)[::prefs::kHeliumZenMode] = settings_api::PrefType::kBoolean;
-   (*s_allowlist)[::prefs::kHeliumZenModeSidebarPinned] =
++  (*s_allowlist)[::prefs::kHeliumAutoPictureInPictureOnFocusLoss] =
 --- a/chrome/app/settings_strings.grdp
 +++ b/chrome/app/settings_strings.grdp
 @@ -315,0 +316,3 @@
