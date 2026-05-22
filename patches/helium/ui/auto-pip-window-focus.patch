@@ -1,34 +1,180 @@
 --- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.cc
 +++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.cc
-@@ -6,6 +6,7 @@
- 
- #include "chrome/browser/ui/browser.h"
- #include "chrome/browser/ui/browser_finder.h"
+@@ -6,0 +7,8 @@
++#include <stdint.h>
++
++#include <optional>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "build/build_config.h"
+@@ -8,0 +17 @@
 +#include "chrome/browser/ui/browser_list.h"
- #include "chrome/browser/ui/browser_tab_strip_tracker.h"
- #include "components/tabs/public/split_tab_data.h"
- #include "components/tabs/public/tab_interface.h"
-@@ -40,6 +41,7 @@ void AutoPictureInPictureTabStripObserverHelper::StartObserving() {
-   auto* tab_strip_model = GetCurrentTabStripModel();
-   UpdateIsTabActivated(tab_strip_model);
- 
+@@ -9,0 +19 @@
++#include "chrome/browser/ui/browser_window.h"
+@@ -11,0 +22,113 @@
++#include "ui/display/display.h"
++#include "ui/display/screen.h"
++#include "ui/gfx/geometry/rect.h"
++
++#if BUILDFLAG(IS_MAC)
++#include <ApplicationServices/ApplicationServices.h>
++
++#include "base/apple/scoped_cftyperef.h"
++#include "base/process/process_handle.h"
++#endif
++
++namespace {
++
++std::optional<int64_t> GetBrowserDisplayId(Browser* browser) {
++  if (!browser || !browser->window()) {
++    return std::nullopt;
++  }
++
++  auto* screen = display::Screen::Get();
++  if (!screen) {
++    return std::nullopt;
++  }
++
++  const display::Display display =
++      screen->GetDisplayNearestWindow(browser->window()->GetNativeWindow());
++  if (!display.is_valid()) {
++    return std::nullopt;
++  }
++
++  return display.id();
++}
++
++std::optional<int64_t> GetActiveBrowserDisplayId() {
++  Browser* active_browser = chrome::FindLastActive();
++  if (!active_browser || !active_browser->IsActive()) {
++    return std::nullopt;
++  }
++
++  return GetBrowserDisplayId(active_browser);
++}
++
++#if BUILDFLAG(IS_MAC)
++std::optional<int64_t> GetTopmostOtherApplicationWindowDisplayId() {
++  auto* screen = display::Screen::Get();
++  if (!screen) {
++    return std::nullopt;
++  }
++
++  base::apple::ScopedCFTypeRef<CFArrayRef> window_infos(
++      CGWindowListCopyWindowInfo(
++          kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
++          kCGNullWindowID));
++  if (!window_infos) {
++    return std::nullopt;
++  }
++
++  const int current_process_id = base::GetCurrentProcId();
++  const CFIndex count = CFArrayGetCount(window_infos.get());
++  for (CFIndex index = 0; index < count; ++index) {
++    CFDictionaryRef window_info = reinterpret_cast<CFDictionaryRef>(
++        CFArrayGetValueAtIndex(window_infos.get(), index));
++    if (!window_info) {
++      continue;
++    }
++
++    CFNumberRef layer_ref = reinterpret_cast<CFNumberRef>(
++        CFDictionaryGetValue(window_info, kCGWindowLayer));
++    int layer = 0;
++    if (!layer_ref || !CFNumberGetValue(layer_ref, kCFNumberIntType, &layer) ||
++        layer != 0) {
++      continue;
++    }
++
++    CFNumberRef owner_process_id_ref = reinterpret_cast<CFNumberRef>(
++        CFDictionaryGetValue(window_info, kCGWindowOwnerPID));
++    int owner_process_id = 0;
++    if (!owner_process_id_ref ||
++        !CFNumberGetValue(owner_process_id_ref, kCFNumberIntType,
++                          &owner_process_id) ||
++        owner_process_id == current_process_id) {
++      continue;
++    }
++
++    CFDictionaryRef bounds_ref = reinterpret_cast<CFDictionaryRef>(
++        CFDictionaryGetValue(window_info, kCGWindowBounds));
++    CGRect bounds = CGRectZero;
++    if (!bounds_ref ||
++        !CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds) ||
++        CGRectIsEmpty(bounds)) {
++      continue;
++    }
++
++    const gfx::Rect window_bounds(static_cast<int>(bounds.origin.x),
++                                  static_cast<int>(bounds.origin.y),
++                                  static_cast<int>(bounds.size.width),
++                                  static_cast<int>(bounds.size.height));
++    const display::Display display = screen->GetDisplayMatching(window_bounds);
++    if (!display.is_valid()) {
++      continue;
++    }
++
++    return display.id();
++  }
++
++  return std::nullopt;
++}
++#endif
++
++std::optional<int64_t> GetCursorDisplayId() {
++  auto* screen = display::Screen::Get();
++  if (!screen) {
++    return std::nullopt;
++  }
+@@ -12,0 +136,33 @@
++  const display::Display display =
++      screen->GetDisplayNearestPoint(screen->GetCursorScreenPoint());
++  if (!display.is_valid()) {
++    return std::nullopt;
++  }
++
++  return display.id();
++}
++
++std::optional<int64_t> GetFocusedDisplayIdForAutoPipSuppression() {
++  std::optional<int64_t> focused_display_id = GetActiveBrowserDisplayId();
++  if (focused_display_id) {
++    return focused_display_id;
++  }
++
++#if BUILDFLAG(IS_MAC)
++  focused_display_id = GetTopmostOtherApplicationWindowDisplayId();
++  if (focused_display_id) {
++    return focused_display_id;
++  }
++#endif
++
++  return GetCursorDisplayId();
++}
++
++bool AreKnownDifferentDisplays(std::optional<int64_t> first_display_id,
++                               std::optional<int64_t> second_display_id) {
++  return first_display_id && second_display_id &&
++         *first_display_id != *second_display_id;
++}
++
++}  // namespace
++
+@@ -42,0 +199 @@
 +  BrowserList::AddObserver(this);
-   ObserveTabStripModel(tab_strip_model);
- }
- 
-@@ -53,6 +55,7 @@ void AutoPictureInPictureTabStripObserverHelper::StopObserving() {
-     observed_tab_strip_model_->RemoveObserver(this);
-     observed_tab_strip_model_ = nullptr;
-   }
+@@ -55,0 +213,2 @@
++  weak_ptr_factory_.InvalidateWeakPtrs();
 +  BrowserList::RemoveObserver(this);
-   browser_tab_strip_tracker_.reset();
- }
- 
-@@ -88,6 +91,37 @@ void AutoPictureInPictureTabStripObserverHelper::OnTabStripModelChanged(
-     return;
-   }
- 
+@@ -90,0 +250,60 @@
 +  UpdateAndNotifyIfTabActivationChanged();
++}
++
++void AutoPictureInPictureTabStripObserverHelper::OnBrowserRemoved(
++    Browser* browser) {
++  if (IsActivationChangeForObservedTab(browser)) {
++    weak_ptr_factory_.InvalidateWeakPtrs();
++  }
 +}
 +
 +void AutoPictureInPictureTabStripObserverHelper::OnBrowserSetLastActive(
@@ -38,14 +184,36 @@
 +
 +void AutoPictureInPictureTabStripObserverHelper::OnBrowserNoLongerActive(
 +    Browser* browser) {
-+  UpdateAndNotifyIfBrowserActivationChanged(browser);
++  if (!IsActivationChangeForObservedTab(browser)) {
++    return;
++  }
++
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&AutoPictureInPictureTabStripObserverHelper::
++                         UpdateAndNotifyIfFocusLossShouldTriggerAutoPip,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++bool AutoPictureInPictureTabStripObserverHelper::
++    IsActivationChangeForObservedTab(Browser* browser) const {
++  auto* current_tab_strip_model = GetCurrentTabStripModel();
++  return browser->tab_strip_model() == observed_tab_strip_model_ ||
++         browser->tab_strip_model() == current_tab_strip_model;
 +}
 +
 +void AutoPictureInPictureTabStripObserverHelper::
 +    UpdateAndNotifyIfBrowserActivationChanged(Browser* browser) {
-+  auto* current_tab_strip_model = GetCurrentTabStripModel();
-+  if (browser->tab_strip_model() != observed_tab_strip_model_ &&
-+      browser->tab_strip_model() != current_tab_strip_model) {
++  if (!IsActivationChangeForObservedTab(browser)) {
++    return;
++  }
++
++  UpdateAndNotifyIfTabActivationChanged();
++}
++
++void AutoPictureInPictureTabStripObserverHelper::
++    UpdateAndNotifyIfFocusLossShouldTriggerAutoPip() {
++  if (ShouldIgnoreFocusLossForDifferentDisplay()) {
 +    return;
 +  }
 +
@@ -59,13 +227,15 @@
 +    ObserveTabStripModel(current_tab_strip_model);
 +  }
 +
-   const bool old_is_tab_activated = is_tab_activated_;
-   UpdateIsTabActivated(current_tab_strip_model);
-   if (is_tab_activated_ == old_is_tab_activated) {
-@@ -115,6 +149,14 @@ void AutoPictureInPictureTabStripObserverHelper::UpdateIsTabActivated(
-     const tabs::TabInterface* active_tab = tab_strip_model->GetActiveTab();
-     const tabs::TabInterface* observed_tab =
-         tabs::TabInterface::GetFromContents(GetObservedWebContents());
+@@ -99,0 +319,7 @@
++bool AutoPictureInPictureTabStripObserverHelper::
++    ShouldIgnoreFocusLossForDifferentDisplay() const {
++  return AreKnownDifferentDisplays(
++      GetBrowserDisplayId(chrome::FindBrowserWithTab(GetObservedWebContents())),
++      GetFocusedDisplayIdForAutoPipSuppression());
++}
++
+@@ -117,0 +344,8 @@
 +    Browser* browser = chrome::FindBrowserWithTab(GetObservedWebContents());
 +    if (!browser || !browser->IsActive()) {
 +      is_tab_activated_ = false;
@@ -74,58 +244,38 @@
 +
 +    // Treat a tab as active only while its browser window is active, so Auto PiP
 +    // uses the same path for tab, window, and application focus changes.
-     is_tab_activated_ =
-         (tab_strip_model->GetActiveWebContents() == GetObservedWebContents()) ||
-         (active_tab->IsSplit() &&
 --- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.h
 +++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.h
-@@ -9,6 +9,7 @@
- 
- #include "base/functional/callback.h"
- #include "chrome/browser/picture_in_picture/auto_picture_in_picture_tab_observer_helper_base.h"
+@@ -10,0 +11 @@
++#include "base/memory/weak_ptr.h"
+@@ -11,0 +13 @@
 +#include "chrome/browser/ui/browser_list_observer.h"
- #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
- 
- namespace content {
-@@ -24,6 +25,7 @@ class BrowserTabStripTracker;
- // and vice versa.
- class AutoPictureInPictureTabStripObserverHelper final
-     : public AutoPictureInPictureTabObserverHelperBase,
+@@ -26,0 +29 @@
 +      public BrowserListObserver,
-       public TabStripModelObserver {
-  public:
-   AutoPictureInPictureTabStripObserverHelper(content::WebContents* web_contents,
-@@ -39,6 +41,10 @@ class AutoPictureInPictureTabStripObserverHelper final
-   void StopObserving() override;
-   content::WebContents* GetActiveWebContents() const override;
- 
+@@ -41,0 +45,5 @@
 +  // BrowserListObserver:
++  void OnBrowserRemoved(Browser* browser) override;
 +  void OnBrowserSetLastActive(Browser* browser) override;
 +  void OnBrowserNoLongerActive(Browser* browser) override;
 +
-   // TabStripModelObserver:
-   void OnTabStripModelChanged(
-       TabStripModel* tab_strip_model,
-@@ -46,6 +52,10 @@ class AutoPictureInPictureTabStripObserverHelper final
-       const TabStripSelectionChange& selection) override;
- 
-  private:
+@@ -48,0 +57,10 @@
++  bool IsActivationChangeForObservedTab(Browser* browser) const;
++
 +  void UpdateAndNotifyIfBrowserActivationChanged(Browser* browser);
++
++  void UpdateAndNotifyIfFocusLossShouldTriggerAutoPip();
 +
 +  void UpdateAndNotifyIfTabActivationChanged();
 +
-   void UpdateIsTabActivated(const TabStripModel* tab_strip_model);
- 
-   void ObserveTabStripModel(TabStripModel* tab_strip_model);
-@@ -59,7 +69,7 @@ class AutoPictureInPictureTabStripObserverHelper final
- 
-   raw_ptr<TabStripModel> observed_tab_strip_model_ = nullptr;
- 
++  bool ShouldIgnoreFocusLossForDifferentDisplay() const;
++
+@@ -62 +80 @@
 -  // True if the tab is the activated tab on its tab strip.
 +  // True if the tab is the activated tab in the active browser window.
-   bool is_tab_activated_ = false;
- 
-   // True if we're currently observing |web_contents_|'s tabstrip.
+@@ -66,0 +85,3 @@
++
++  base::WeakPtrFactory<AutoPictureInPictureTabStripObserverHelper>
++      weak_ptr_factory_{this};
 --- a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
 +++ b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
 @@ -500,12 +500,8 @@ gfx::Rect PictureInPictureWindowManager::CalculateOuterWindowBounds(
