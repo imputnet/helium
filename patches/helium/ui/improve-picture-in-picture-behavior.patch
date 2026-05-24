@@ -235,7 +235,7 @@
 @@ -55,0 +156,2 @@
 +  weak_ptr_factory_.InvalidateWeakPtrs();
 +  BrowserList::RemoveObserver(this);
-@@ -90,0 +193,64 @@
+@@ -90,0 +193,72 @@
 +  UpdateAndNotifyIfTabActivationChanged();
 +}
 +
@@ -248,7 +248,15 @@
 +
 +void AutoPictureInPictureTabStripObserverHelper::OnBrowserSetLastActive(
 +    Browser* browser) {
-+  UpdateAndNotifyIfBrowserActivationChanged(browser);
++  if (!IsActivationChangeForObservedTab(browser)) {
++    return;
++  }
++
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&AutoPictureInPictureTabStripObserverHelper::
++                         UpdateAndNotifyIfTabActivationChanged,
++                     weak_ptr_factory_.GetWeakPtr()));
 +}
 +
 +void AutoPictureInPictureTabStripObserverHelper::OnBrowserNoLongerActive(
@@ -367,18 +375,21 @@
    return window_bounds;
 --- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
 +++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
-@@ -1816,6 +1816,10 @@ void NativeWidgetNSWindowBridge::SetCanAppearInExistingFullscreenSpaces(
+@@ -1816,6 +1816,13 @@ void NativeWidgetNSWindowBridge::SetCanAppearInExistingFullscreenSpaces(
    if (can_appear_in_existing_fullscreen_spaces) {
      if (@available(macOS 13.0, *)) {
        collectionBehavior &= ~NSWindowCollectionBehaviorPrimary;
 +      collectionBehavior &= ~NSWindowCollectionBehaviorAuxiliary;
++      // `CanJoinAllApplications` depends on activation independence, so
++      // callers that need it must enable activation independence before
++      // enabling fullscreen Spaces behavior.
 +      if ([window_ activationIndependence]) {
 +        collectionBehavior |= NSWindowCollectionBehaviorCanJoinAllApplications;
 +      }
      }
      collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
      collectionBehavior &= ~NSWindowCollectionBehaviorFullScreenPrimary;
-@@ -1822,4 +1824,6 @@ void NativeWidgetNSWindowBridge::SetCanAppearInExistingFullscreenSpaces(
+@@ -1822,5 +1827,7 @@ void NativeWidgetNSWindowBridge::SetCanAppearInExistingFullscreenSpaces(
      if (@available(macOS 13.0, *)) {
        collectionBehavior |= NSWindowCollectionBehaviorPrimary;
 +      collectionBehavior &= ~NSWindowCollectionBehaviorAuxiliary;
@@ -388,19 +399,22 @@
      collectionBehavior &= ~NSWindowCollectionBehaviorFullScreenAuxiliary;
 --- a/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
 +++ b/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
-@@ -402,4 +402,10 @@ std::unique_ptr<VideoOverlayWindowViews> VideoOverlayWindowViews::Create(
+@@ -402,4 +402,13 @@ std::unique_ptr<VideoOverlayWindowViews> VideoOverlayWindowViews::Create(
    overlay_window->Init(std::move(params));
    overlay_window->OnRootViewReady();
 -
 +
 +#if BUILDFLAG(IS_MAC)
++  // Establish the macOS PiP Space flags before the first show. ShowInactive()
++  // reapplies them on every show because the calls are idempotent and future
++  // show paths should not lose fullscreen Space eligibility.
 +  overlay_window->SetActivationIndependence(true);
 +  // Make PiP eligible for macOS fullscreen app Spaces, not only desktop Spaces.
 +  overlay_window->SetCanAppearInExistingFullscreenSpaces(true);
 +#endif
 +
  #if BUILDFLAG(IS_WIN)
-@@ -543,12 +548,8 @@ gfx::Rect VideoOverlayWindowViews::CalculateAndUpdateWindowBounds() {
+@@ -543,12 +551,8 @@ gfx::Rect VideoOverlayWindowViews::CalculateAndUpdateWindowBounds() {
    int window_diff_width = work_area.right() - window_size.width();
    int window_diff_height = work_area.bottom() - window_size.height();
  
@@ -414,16 +428,16 @@
  
    if (has_been_shown_) {
      // Make sure window is displayed entirely in the work area.
-@@ -1765,4 +1767,8 @@ void VideoOverlayWindowViews::ShowInactive() {
- #endif
--
-+
+@@ -1767,4 +1772,9 @@ void VideoOverlayWindowViews::ShowInactive() {
    views::Widget::SetVisibleOnAllWorkspaces(true);
 +#if BUILDFLAG(IS_MAC)
++  // Keep later show paths aligned with the first-show setup in Create().
 +  SetActivationIndependence(true);
 +  SetCanAppearInExistingFullscreenSpaces(true);
 +#endif
  #if BUILDFLAG(IS_CHROMEOS)
+   non_client_view()->frame_view()->UpdateWindowRoundedCorners();
+ #endif
 --- a/chrome/common/pref_names.h
 +++ b/chrome/common/pref_names.h
 @@ -862,0 +863,5 @@
