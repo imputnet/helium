@@ -1,6 +1,14 @@
 --- a/chrome/browser/ui/views/frame/browser_view.cc
 +++ b/chrome/browser/ui/views/frame/browser_view.cc
-@@ -323,6 +323,7 @@
+@@ -126,6 +126,7 @@
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/toasts/toast_view.h"
+ #include "chrome/browser/ui/toolbar/app_menu_model.h"
+ #include "chrome/browser/ui/toolbar/chrome_labs/chrome_labs_utils.h"
+ #include "chrome/browser/ui/toolbar/pinned_toolbar/tab_search_toolbar_button_controller.h"
+@@ -323,6 +324,7 @@
  #include "ui/events/event_handler.h"
  #include "ui/events/event_utils.h"
  #include "ui/events/keycodes/keyboard_codes.h"
@@ -8,7 +16,7 @@
  #include "ui/gfx/animation/animation_runner.h"
  #include "ui/gfx/canvas.h"
  #include "ui/gfx/color_utils.h"
-@@ -416,6 +417,14 @@ namespace {
+@@ -416,6 +418,14 @@ namespace {
  // The visible height of the shadow above the tabs. Clicks in this area are
  // treated as clicks to the frame, rather than clicks to the tab.
  const int kTabShadowSize = 2;
@@ -23,7 +31,7 @@
  
  #if BUILDFLAG(IS_CHROMEOS)
  // UMA histograms that record animation smoothness for tab loading animation.
-@@ -961,7 +970,9 @@ BrowserView::BrowserView(Browser* browse
+@@ -961,7 +971,9 @@ BrowserView::BrowserView(Browser* browse
            std::make_unique<ExclusiveAccessContextImpl>(*this)),
        browser_(browser),
        accessibility_mode_observer_(
@@ -34,7 +42,7 @@
    if (auto* manager = InitialWebUIWindowMetricsManager::From(browser_.get())) {
      manager->OnBrowserWindowCreated();
    }
-@@ -989,6 +1000,14 @@ BrowserView::BrowserView(Browser* browse
+@@ -989,6 +1001,14 @@ BrowserView::BrowserView(Browser* browse
    }
  
    SetProperty(views::kElementIdentifierKey, kBrowserViewElementId);
@@ -49,7 +57,7 @@
  
    browser_->tab_strip_model()->AddObserver(this);
  
-@@ -1132,6 +1151,14 @@ BrowserView::BrowserView(Browser* browse
+@@ -1132,6 +1152,14 @@ BrowserView::BrowserView(Browser* browse
        prefs::kFullscreenAllowed,
        base::BindRepeating(&BrowserView::UpdateFullscreenAllowedFromPolicy,
                            base::Unretained(this), CanFullscreen()));
@@ -64,7 +72,7 @@
    UpdateFullscreenAllowedFromPolicy(CanFullscreen());
  
    WebUIContentsPreloadManager::GetInstance()->WarmupForBrowser(browser_.get());
-@@ -1197,6 +1224,8 @@ BrowserView::~BrowserView() {
+@@ -1197,6 +1225,8 @@ BrowserView::~BrowserView() {
    // Stop the animation timer explicitly here to avoid running it in a nested
    // message loop, which may run by Browser destructor.
    loading_animation_timer_.Stop();
@@ -73,7 +81,7 @@
  
    // Reset autofill bubble handler to make sure it does not out-live toolbar,
    // since it is responsible for showing autofill related bubbles from toolbar's
-@@ -1415,6 +1444,13 @@ bool BrowserView::GetTabStripVisible() c
+@@ -1415,6 +1445,13 @@ bool BrowserView::GetTabStripVisible() c
      return false;
    }
  
@@ -87,7 +95,7 @@
    // In non-fullscreen the tabstrip should always be visible.
    auto* const immersive_mode_controller =
        ImmersiveModeController::From(browser());
-@@ -1606,6 +1642,56 @@ float BrowserView::GetTopControlsSlideBe
+@@ -1606,6 +1643,56 @@ float BrowserView::GetTopControlsSlideBe
    return 1.f;
  }
  
@@ -144,7 +152,7 @@
  views::Widget* BrowserView::GetWidgetForAnchoring() {
  #if BUILDFLAG(IS_MAC)
    if (UsesImmersiveFullscreenMode()) {
-@@ -1640,6 +1726,7 @@ void BrowserView::OnVerticalTabStripMode
+@@ -1640,6 +1727,7 @@ void BrowserView::OnVerticalTabStripMode
    const bool should_be_vertical = controller->ShouldDisplayVerticalTabs();
    if (vertical_initialized == should_be_vertical) {
      // Mode is unchanged; just re-layout so alignment-dependent views update.
@@ -152,16 +160,16 @@
      InvalidateLayout();
      return;
    }
-@@ -1679,10 +1766,409 @@ void BrowserView::OnToolbarTabStripState
+@@ -1679,10 +1767,421 @@ void BrowserView::OnToolbarTabStripState
      toolbar_->UpdateToolbarLayout();
    }
  
 +  UpdateZenModeState();
    UpdateTabSearchBubbleHost();
 +  UpdateZenCollapseButtonVisibility();
-+  InvalidateLayout();
-+}
-+
+   InvalidateLayout();
+ }
+ 
 +void BrowserView::OnZenModeSideChromePinnedPrefChanged() {
 +  if (!zen_mode_enabled_) {
 +    return;
@@ -188,9 +196,9 @@
 +    multi_contents_view_->MaybeUpdateContentsBorderAndOverlay();
 +  }
 +  UpdateZenCollapseButtonVisibility();
-   InvalidateLayout();
- }
- 
++  InvalidateLayout();
++}
++
 +void BrowserView::OnZenModeTopChromePinnedPrefChanged() {
 +  if (!zen_mode_enabled_) {
 +    return;
@@ -463,14 +471,26 @@
 +  if (!widget || widget->IsClosed() || !widget->IsVisible()) {
 +    return false;
 +  }
++
 +  views::WidgetDelegate* widget_delegate = widget->widget_delegate();
 +  if (!widget_delegate) {
 +    return false;
 +  }
++
 +  auto* bubble_delegate = widget_delegate->AsBubbleDialogDelegate();
 +  if (!bubble_delegate) {
 +    return false;
 +  }
++
++  // Toasts are anchored to the top container, but since they're passive
++  // notifications, such as link copy success, we ignore them.
++  views::View* contents_view = bubble_delegate->GetContentsView();
++  if (contents_view &&
++      contents_view->GetProperty(views::kElementIdentifierKey) ==
++          toasts::ToastView::kToastViewId) {
++    return false;
++  }
++
 +  views::View* anchor_view = bubble_delegate->GetAnchorView();
 +  return anchor_view && anchor_root->Contains(anchor_view);
 +}
@@ -562,7 +582,7 @@
  void BrowserView::OnProjectsPanelStateChanged(
      ProjectsPanelStateController* controller) {
    projects_panel_container_->OnProjectsPanelStateChanged(controller);
-@@ -2437,10 +2923,17 @@ void BrowserView::FullscreenStateChanged
+@@ -2437,10 +2936,17 @@ void BrowserView::FullscreenStateChanged
                      !GetFocusManager()->GetFocusedView());
      }
    }
@@ -580,7 +600,7 @@
    // Recreate the autofill bubble handler when toolbar button provider changes.
    autofill_bubble_handler_ =
        std::make_unique<autofill::AutofillBubbleHandlerImpl>(
-@@ -2489,6 +2982,13 @@ void BrowserView::SetFocusToLocationBar(
+@@ -2489,6 +2995,13 @@ void BrowserView::SetFocusToLocationBar(
      return;
    }
  
@@ -594,7 +614,7 @@
    LocationBar* location_bar = GetLocationBar();
    location_bar->FocusLocation(is_user_initiated,
                                /*clear_focus_if_failed=*/true);
-@@ -3245,7 +3745,7 @@ bool BrowserView::IsToolbarVisible() con
+@@ -3245,7 +3758,7 @@ bool BrowserView::IsToolbarVisible() con
  }
  
  bool BrowserView::IsToolbarShowing() const {
@@ -603,7 +623,7 @@
  }
  
  bool BrowserView::IsLocationBarVisible() const {
-@@ -4449,6 +4949,11 @@ void BrowserView::OnWidgetActivationChan
+@@ -4449,6 +4962,11 @@ void BrowserView::OnWidgetActivationChan
      }
    }
  
@@ -615,7 +635,7 @@
    browser_->GetFeatures()
        .extension_keybinding_registry()
        ->OnHostActivationChanged(active);
-@@ -5294,6 +5799,8 @@ void BrowserView::AddedToWidget() {
+@@ -5294,6 +5812,8 @@ void BrowserView::AddedToWidget() {
              base::BindRepeating(&BrowserView::OnToolbarTabStripStateChanged,
                                  base::Unretained(this)));
      OnToolbarTabStripStateChanged(helium_layout_controller);
@@ -624,7 +644,7 @@
    }
  
    UpdateTabSearchBubbleHost();
-@@ -5443,6 +5950,7 @@ void BrowserView::AddedToWidget() {
+@@ -5443,6 +5963,7 @@ void BrowserView::AddedToWidget() {
  }
  
  void BrowserView::RemovedFromWidget() {
@@ -632,7 +652,7 @@
    CHECK(GetFocusManager());
    focus_manager_observation_.Reset();
  }
-@@ -5471,6 +5979,14 @@ void BrowserView::OnThemeChanged() {
+@@ -5471,6 +5992,14 @@ void BrowserView::OnThemeChanged() {
    }
  
    FrameColorsChanged();
@@ -647,7 +667,7 @@
  }
  
  bool BrowserView::GetDropFormats(
-@@ -5809,6 +6325,9 @@ void BrowserView::UpdateFastResizeForCon
+@@ -5809,6 +6338,9 @@ void BrowserView::UpdateFastResizeForCon
  }
  
  int BrowserView::GetClientAreaTop() {
@@ -657,7 +677,7 @@
    views::View* top_view = toolbar_;
  #if BUILDFLAG(ENABLE_WEBUI_TAB_STRIP)
    // If webui_tab_strip is displayed, the client area starts at its top,
-@@ -6406,6 +6925,55 @@ void BrowserView::OnWillChangeFocus(View
+@@ -6406,6 +6938,55 @@ void BrowserView::OnWillChangeFocus(View
  }
  void BrowserView::OnDidChangeFocus(View* focused_before, View* focused_now) {
    UpdateAccessibleNameForRootView();
@@ -2363,20 +2383,38 @@
  #include "chrome/browser/ui/incognito_allowed_url.h"
  #include "chrome/browser/ui/location_bar/location_bar.h"
  #include "chrome/browser/ui/singleton_tabs.h"
-@@ -41,6 +43,8 @@
+@@ -41,6 +43,9 @@
  #include "chrome/browser/ui/tabs/split_tab_metrics.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
 +#include "chrome/browser/ui/toasts/api/toast_id.h"
 +#include "chrome/browser/ui/toasts/toast_controller.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/web_applications/app_browser_controller.h"
  #include "chrome/browser/ui/web_applications/web_app_tabbed_utils.h"
  #include "chrome/browser/web_applications/web_app_helpers.h"
-@@ -143,6 +147,43 @@ bool IncognitoModeForced(const Profile*
+@@ -143,6 +148,64 @@ bool IncognitoModeForced(const Profile*
           policy::IncognitoModeAvailability::kForced;
  }
  
-+bool IsNavigationOpeningNewTabInZenMode(const NavigateParams& params) {
++bool IsTabChromeRevealedInZenMode(
++    const HeliumLayoutStateController& layout_controller,
++    const NavigateParams& params) {
++  BrowserView* const browser_view =
++      BrowserView::GetBrowserViewForBrowser(params.browser);
++  if (!browser_view) {
++    return false;
++  }
++
++  // In vertical layout, tabs are in side chrome. In all other layouts,
++  // tabs are in top chrome.
++  if (layout_controller.IsVerticalLayout()) {
++    return browser_view->GetSideChromeRevealRatio() > 0.0f;
++  }
++  return browser_view->GetTopChromeRevealRatio() > 0.0f;
++}
++
++bool ShouldShowNewTabToastInZenMode(const NavigateParams& params) {
 +  // Only show the toast when a new browser tab is created.
 +  if (params.disposition != WindowOpenDisposition::NEW_FOREGROUND_TAB &&
 +      params.disposition != WindowOpenDisposition::NEW_BACKGROUND_TAB) {
@@ -2396,12 +2434,16 @@
 +    return false;
 +  }
 +
++  // Don't show the toast if zen mode is disabled or if chrome with tabs
++  // is revealed. The user can already see the tab strip update in either
++  // of those cases.
 +  auto* layout_controller = HeliumLayoutStateController::From(params.browser);
-+  return layout_controller && layout_controller->IsZenModeEnabled();
++  return layout_controller && layout_controller->IsZenModeEnabled() &&
++         !IsTabChromeRevealedInZenMode(*layout_controller, params);
 +}
 +
 +void MaybeShowZenModeNewTabCreatedToast(const NavigateParams& params) {
-+  if (!IsNavigationOpeningNewTabInZenMode(params)) {
++  if (!ShouldShowNewTabToastInZenMode(params)) {
 +    return;
 +  }
 +
@@ -2416,7 +2458,7 @@
  // Change some of the navigation parameters based on the particular URL.
  // Returns true on success. Otherwise, if changing params leads the browser
  // into an erroneous state, returns false.
-@@ -902,6 +943,7 @@ base::WeakPtr<content::NavigationHandle>
+@@ -902,6 +965,7 @@ base::WeakPtr<content::NavigationHandle>
      params->browser->GetBrowserForMigrationOnly()->tab_strip_model()->AddTab(
          std::move(tab_to_insert), params->tabstrip_index, params->transition,
          params->tabstrip_add_types, params->group);
