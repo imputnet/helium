@@ -37,7 +37,6 @@ and published on GitHub.
 
 ### Web services and Kaguya components
 - [Kaguya services](https://github.com/iceice666/kaguya-services)
-- [Kaguya onboarding](https://github.com/iceice666/kaguya-onboarding)
 - [Kaguya fork of uBlock Origin](https://github.com/iceice666/uBlock)
 
 ## Development

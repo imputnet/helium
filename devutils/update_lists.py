@@ -77,11 +77,6 @@ PRUNING_EXCLUDE_PATTERNS = [
     'third_party/ublock/lib/lz4/lz4-block-codec.wasm',
     'third_party/ublock/lib/publicsuffixlist/wasm/publicsuffixlist.wasm',
     'third_party/ublock/web_accessible_resources/noop-1s.mp4',
-    # Exclusions for Kaguya onboarding
-    'components/kaguya_onboarding/node_modules/@esbuild/*/bin/esbuild',
-    'components/kaguya_onboarding/node_modules/@esbuild/*/esbuild.exe',
-    'components/kaguya_onboarding/node_modules/@rollup/*/rollup.*.node',
-    'components/kaguya_onboarding/node_modules/fsevents/fsevents.node',
     # Exclusions for safe file extensions
     '*.avif',
     '*.ttf',
@@ -142,7 +137,6 @@ DOMAIN_EXCLUDE_PREFIXES = [
     'extensions/browser/updater/safe_manifest_parser.cc',
     # Kaguya components
     'third_party/ublock/',
-    'components/kaguya_onboarding/',
 ]
 
 # pylint: enable=line-too-long
