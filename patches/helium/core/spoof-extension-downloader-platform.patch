@@ -41,23 +41,137 @@
        return kWebView;
 --- a/chrome/browser/extensions/updater/chrome_extension_downloader_factory.cc
 +++ b/chrome/browser/extensions/updater/chrome_extension_downloader_factory.cc
-@@ -46,7 +46,7 @@ ChromeExtensionDownloaderFactory::Create
+@@ -14,6 +14,8 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/signin/identity_manager_factory.h"
+ #include "components/crx_file/crx_verifier.h"
++#include "components/helium_services/helium_services_helpers.h"
++#include "components/prefs/pref_service.h"
+ #include "components/signin/public/identity_manager/identity_manager.h"
+ #include "components/update_client/update_query_params.h"
+ #include "content/public/browser/storage_partition.h"
+@@ -29,6 +31,19 @@ using extensions::ExtensionDownloader;
+ using extensions::ExtensionDownloaderDelegate;
+ using update_client::UpdateQueryParams;
+ 
++namespace {
++
++std::string GetManifestQueryParams(UpdateQueryParams::ProdId prod) {
++  std::string manifest_query_params = UpdateQueryParams::Get(prod);
++  base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(extensions::kSwitchTestRequestParam)) {
++    manifest_query_params += "&testrequest=1";
++  }
++  return manifest_query_params;
++}
++
++}  // namespace
++
+ std::unique_ptr<ExtensionDownloader>
+ ChromeExtensionDownloaderFactory::CreateForURLLoaderFactory(
+     scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory,
+@@ -45,14 +60,8 @@ ChromeExtensionDownloaderFactory::Create
+     downloader->set_brand_code(brand);
    }
  #endif  // BUILDFLAG(GOOGLE_CHROME_BRANDING)
-   std::string manifest_query_params =
+-  std::string manifest_query_params =
 -      UpdateQueryParams::Get(UpdateQueryParams::CRX);
-+      UpdateQueryParams::Get(UpdateQueryParams::CRX_DUMMY);
-   base::CommandLine* command_line =
-       base::CommandLine::ForCurrentProcess();
-   if (command_line->HasSwitch(extensions::kSwitchTestRequestParam)) {
+-  base::CommandLine* command_line =
+-      base::CommandLine::ForCurrentProcess();
+-  if (command_line->HasSwitch(extensions::kSwitchTestRequestParam)) {
+-    manifest_query_params += "&testrequest=1";
+-  }
+-  downloader->set_manifest_query_params(manifest_query_params);
++  downloader->set_manifest_query_params(
++      GetManifestQueryParams(UpdateQueryParams::CRX_DUMMY));
+   downloader->set_ping_enabled_domain("helium.computer");
+   return downloader;
+ }
+@@ -65,6 +74,14 @@ ChromeExtensionDownloaderFactory::Create
+       profile->GetDefaultStoragePartition()
+           ->GetURLLoaderFactoryForBrowserProcess(),
+       delegate, extensions::GetPolicyVerifierFormat(), profile->GetPath());
++  const bool should_access_webstore_directly =
++      helium::ShouldAccessChromeWebStoreDirectly();
++  downloader->set_manifest_query_params(
++      GetManifestQueryParams(should_access_webstore_directly
++                                 ? UpdateQueryParams::CRX
++                                 : UpdateQueryParams::CRX_DUMMY));
++  downloader->set_ping_enabled_domain(
++      should_access_webstore_directly ? "google.com" : "helium.computer");
+ 
+   // NOTE: It is not obvious why it is OK to pass raw pointers to the token
+   // service and identity manager here. The logic is as follows:
 --- a/extensions/browser/webstore_installer.cc
 +++ b/extensions/browser/webstore_installer.cc
-@@ -211,7 +211,7 @@ GURL WebstoreInstaller::GetWebstoreInsta
+@@ -29,10 +29,10 @@
+ #include "base/time/time.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
+-#include "chrome/browser/profiles/profile.h"
+ #include "components/crx_file/id_util.h"
+ #include "components/download/public/common/download_url_parameters.h"
+ #include "components/helium_services/helium_services_helpers.h"
++#include "components/prefs/pref_service.h"
+ #include "components/update_client/update_query_params.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -174,7 +174,8 @@ std::string GetErrorMessageForDownloadIn
+ 
+ GURL BuildWebstoreInstallURL(const std::string& extension_id,
+                              WebstoreInstaller::InstallSource source,
+-                             const GURL& update_url) {
++                             const GURL& update_url,
++                             update_client::UpdateQueryParams::ProdId prod) {
+   std::string install_source;
+   switch (source) {
+     case WebstoreInstaller::INSTALL_SOURCE_INLINE:
+@@ -207,8 +208,7 @@ GURL BuildWebstoreInstallURL(const std::
+ 
    GURL url(
        url_string + "?response=redirect&" +
-       update_client::UpdateQueryParams::Get(
+-      update_client::UpdateQueryParams::Get(
 -          update_client::UpdateQueryParams::CRX) +
-+          update_client::UpdateQueryParams::CRX_DUMMY) +
++      update_client::UpdateQueryParams::Get(prod) +
        "&x=" + base::EscapeQueryParamValue(base::JoinString(params, "&"), true));
    DCHECK(url.is_valid());
  
+@@ -220,18 +220,31 @@ GURL BuildWebstoreInstallURL(const std::
+ GURL WebstoreInstaller::GetWebstoreInstallURL(const std::string& extension_id,
+                                               InstallSource source) {
+   return BuildWebstoreInstallURL(extension_id, source,
+-                                 extension_urls::GetWebstoreUpdateUrl());
++                                 extension_urls::GetWebstoreUpdateUrl(),
++                                 update_client::UpdateQueryParams::CRX);
+ }
+ 
+ GURL WebstoreInstaller::GetWebstoreInstallURLForCurrentProfile(
+     const std::string& extension_id,
+     InstallSource source) {
+-  Profile* profile = Profile::FromBrowserContext(browser_context_);
+-  PrefService* prefs = profile->GetPrefs();
+-  GURL update_url = helium::ShouldAccessExtensionService(*prefs)
+-                        ? helium::GetExtensionUpdateURL(*prefs)
+-                        : extension_urls::GetOriginalWebstoreUpdateUrl();
+-  return BuildWebstoreInstallURL(extension_id, source, update_url);
++  PrefService* prefs =
++      ExtensionsBrowserClient::Get()->GetPrefServiceForContext(
++          browser_context_);
++  const bool should_access_extension_service =
++      prefs && helium::ShouldAccessExtensionService(*prefs);
++  const bool should_access_webstore_directly =
++      helium::ShouldAccessChromeWebStoreDirectly();
++  update_client::UpdateQueryParams::ProdId prod =
++      should_access_webstore_directly
++          ? update_client::UpdateQueryParams::CRX
++          : update_client::UpdateQueryParams::CRX_DUMMY;
++  GURL update_url = extension_urls::GetDefaultWebstoreUpdateUrl();
++  if (should_access_webstore_directly) {
++    update_url = extension_urls::GetOriginalWebstoreUpdateUrl();
++  } else if (should_access_extension_service) {
++    update_url = helium::GetExtensionUpdateURL(*prefs);
++  }
++  return BuildWebstoreInstallURL(extension_id, source, update_url, prod);
+ }
+ 
+ // static
