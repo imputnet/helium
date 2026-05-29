@@ -1,0 +1,239 @@
+--- a/extensions/common/manifest.h
++++ b/extensions/common/manifest.h
+@@ -16,6 +16,7 @@
+ #include "extensions/common/extension_id.h"
+ #include "extensions/common/hashed_extension_id.h"
+ #include "extensions/common/mojom/manifest.mojom-shared.h"
++#include "components/kaguya_services/extension_ids.h"
+ 
+ namespace extensions {
+ struct InstallWarning;
+@@ -104,6 +105,14 @@ class Manifest final {
+            location == mojom::ManifestLocation::kExternalComponent;
+   }
+ 
++  static inline bool IsUBlockComponent(std::string_view extension_id) {
++    return extension_id == kaguya::kUBlockOriginComponentId;
++  }
++
++  static inline bool IsUblockComponentHashed(const HashedExtensionId& id) {
++    return id.value() == kaguya::kUblockOriginComponentIdHashed;
++  }
++
+   static inline bool IsValidLocation(mojom::ManifestLocation location) {
+     return location > mojom::ManifestLocation::kInvalidLocation &&
+            location <= mojom::ManifestLocation::kMaxValue;
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -6385,7 +6385,8 @@ void AddChromeSchemeFactories(
+   std::vector<std::string> allowed_webui_hosts;
+   // Support for chrome:// scheme if appropriate.
+   if ((extension->is_extension() || extension->is_platform_app()) &&
+-      Manifest::IsComponentLocation(extension->location())) {
++      Manifest::IsComponentLocation(extension->location())
++      && !Manifest::IsUBlockComponent(extension->id())) {
+     // Components of chrome that are implemented as extensions or platform apps
+     // are allowed to use chrome://resources/ and chrome://theme/ URLs.
+     allowed_webui_hosts.emplace_back(content::kChromeUIResourcesHost);
+--- a/chrome/browser/ui/views/apps/app_info_dialog/app_info_summary_panel.cc
++++ b/chrome/browser/ui/views/apps/app_info_dialog/app_info_summary_panel.cc
+@@ -167,8 +167,11 @@ void AppInfoSummaryPanel::AddDescription
+ }
+ 
+ void AppInfoSummaryPanel::AddDetailsControl(views::View* vertical_stack) {
++  using namespace extensions;
++
+   // Component apps have no details.
+-  if (app_->location() == extensions::mojom::ManifestLocation::kComponent) {
++  if (Manifest::IsComponentLocation(app_->location())
++      && !Manifest::IsUBlockComponent(app_->id())) {
+     return;
+   }
+ 
+--- a/chrome/common/extensions/chrome_extensions_client.cc
++++ b/chrome/common/extensions/chrome_extensions_client.cc
+@@ -220,8 +220,9 @@ void ChromeExtensionsClient::AddOriginAc
+   // conservative. Components shouldn't be subject to enterprise policy controls
+   // or blocking access to the webstore so they get the highest priority
+   // allowlist entry.
+-  if (extensions::Manifest::IsComponentLocation(extension.location()) &&
+-      is_extension_active) {
++  if (extensions::Manifest::IsComponentLocation(extension.location())
++      && !extensions::Manifest::IsUBlockComponent(extension.id())
++      && is_extension_active) {
+     origin_patterns->push_back(network::mojom::CorsOriginPattern::New(
+         content::kChromeUIScheme, chrome::kChromeUIThemeHost, /*port=*/0,
+         network::mojom::CorsDomainMatchMode::kDisallowSubdomains,
+--- a/extensions/common/permissions/permissions_data.cc
++++ b/extensions/common/permissions/permissions_data.cc
+@@ -114,7 +114,8 @@ void PermissionsData::SetPolicyDelegate(
+ bool PermissionsData::CanExecuteScriptEverywhere(
+     const ExtensionId& extension_id,
+     mojom::ManifestLocation location) {
+-  if (location == mojom::ManifestLocation::kComponent)
++  if (location == mojom::ManifestLocation::kComponent
++      && !Manifest::IsUBlockComponent(extension_id))
+     return true;
+ 
+   const ExtensionsClient::ScriptingAllowlist& allowlist =
+@@ -479,7 +480,8 @@ bool PermissionsData::CanCaptureVisibleP
+     // blocked host in a different page and then capture that, but it's better
+     // than nothing (and policy hosts can set their x-frame options
+     // accordingly).
+-    if (location_ != mojom::ManifestLocation::kComponent &&
++    if ((location_ != mojom::ManifestLocation::kComponent
++          || Manifest::IsUBlockComponent(extension_id_)) &&
+         IsPolicyBlockedHostUnsafe(origin_url)) {
+       if (error)
+         *error = extension_misc::kPolicyBlockedScripting;
+@@ -618,7 +620,8 @@ PermissionsData::PageAccess PermissionsD
+     const URLPatternSet* tab_url_patterns,
+     std::string* error) const {
+   runtime_lock_.AssertAcquired();
+-  if (location_ != mojom::ManifestLocation::kComponent &&
++  if ((location_ != mojom::ManifestLocation::kComponent
++          || Manifest::IsUBlockComponent(extension_id_)) &&
+       IsPolicyBlockedHostUnsafe(document_url)) {
+     if (error)
+       *error = extension_misc::kPolicyBlockedScripting;
+@@ -630,7 +633,8 @@ PermissionsData::PageAccess PermissionsD
+ 
+   if (base::FeatureList::IsEnabled(
+           extensions_features::kExtensionsMenuAccessControl) &&
+-      context_id_ && location_ != mojom::ManifestLocation::kComponent &&
++      context_id_ && (location_ != mojom::ManifestLocation::kComponent
++          || Manifest::IsUBlockComponent(extension_id_)) &&
+       !Manifest::IsPolicyLocation(location_)) {
+     base::AutoLock lock(GetContextPermissionsLock());
+     auto& context_permissions = GetContextPermissions(*context_id_);
+--- a/chrome/browser/extensions/extension_util.cc
++++ b/chrome/browser/extensions/extension_util.cc
+@@ -180,7 +180,8 @@ void SetIsIncognitoEnabled(const std::st
+ #if !BUILDFLAG(IS_ANDROID)
+     // TODO(treib,kalman): Should this be Manifest::IsComponentLocation(..)?
+     // (which also checks for kExternalComponent).
+-    if (extension->location() == mojom::ManifestLocation::kComponent) {
++    if (extension->location() == mojom::ManifestLocation::kComponent
++        && !Manifest::IsUBlockComponent(extension->id())) {
+       // This shouldn't be called for component extensions unless it is called
+       // by sync, for syncable component extensions.
+       // See http://crbug.com/40716400 and associated CLs for the sordid
+--- a/chrome/browser/extensions/standard_management_policy_provider.cc
++++ b/chrome/browser/extensions/standard_management_policy_provider.cc
+@@ -29,6 +29,14 @@ bool AdminPolicyIsModifiable(ExtensionMa
+                              const Extension* source_extension,
+                              const Extension* extension,
+                              std::u16string* error) {
++  bool is_u0 = Manifest::IsUBlockComponent(extension->id());
++
++  if (source_extension && Manifest::IsUBlockComponent(source_extension->id())) {
++    return is_u0;
++  } else if (source_extension == nullptr && is_u0) {
++    return true;
++  }
++
+   // Component and force installed extensions can enable/disable all other
+   // extensions including force installed ones (but component are off limits).
+   const bool component_or_force_installed =
+@@ -270,6 +278,11 @@ bool StandardManagementPolicyProvider::M
+     const Extension* extension,
+     std::u16string* error) const {
+   ManagedInstallationMode mode = settings_->GetInstallationMode(extension);
++
++  if (Manifest::IsComponentLocation(extension->location())) {
++    return true;
++  }
++
+   // Disallow removing of recommended extension, to avoid re-install it
+   // again while policy is reload. But disabling of recommended extension is
+   // allowed.
+--- a/extensions/browser/extension_util.cc
++++ b/extensions/browser/extension_util.cc
+@@ -96,7 +96,8 @@ bool IsIncognitoEnabled(const ExtensionI
+     }
+     // If this is an existing component extension we always allow it to
+     // work in incognito mode.
+-    if (Manifest::IsComponentLocation(extension->location())) {
++    if (Manifest::IsComponentLocation(extension->location())
++        && !Manifest::IsUBlockComponent(extension->id())) {
+       return true;
+     }
+     if (extension->is_login_screen_extension()) {
+--- a/extensions/browser/extension_prefs.cc
++++ b/extensions/browser/extension_prefs.cc
+@@ -30,6 +30,7 @@
+ #include "build/build_config.h"
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/crx_file/id_util.h"
++#include "components/kaguya_services/extension_ids.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/supervised_user/core/common/buildflags.h"
+@@ -712,11 +713,18 @@ bool ExtensionPrefs::ReadPrefAsBoolean(c
+                                        std::string_view pref_key,
+                                        bool* out_value) const {
+   const base::DictValue* ext = GetExtensionPref(extension_id);
+-  if (!ext) {
+-    return false;
++  std::optional<bool> value;
++
++  if (ext) {
++    value = ext->FindBoolByDottedPath(pref_key);
++  }
++
++  if (!value.has_value()
++      && extension_id == kaguya::kUBlockOriginComponentId
++      && pref_key == kPrefIncognitoEnabled) {
++    value = true;
+   }
+ 
+-  std::optional<bool> value = ext->FindBoolByDottedPath(pref_key);
+   if (!value) {
+     return false;
+   }
+@@ -1153,6 +1161,9 @@ void ExtensionPrefs::ClearInapplicableDi
+   const DisableReasonSet kAllowDisableReasons = {
+       disable_reason::DISABLE_RELOAD,
+       disable_reason::DISABLE_UNSUPPORTED_REQUIREMENT,
++      Manifest::IsUBlockComponent(component_extension_id)
++        ? disable_reason::DISABLE_USER_ACTION
++        : disable_reason::DISABLE_RELOAD,
+       disable_reason::DISABLE_CORRUPTED, disable_reason::DISABLE_REINSTALL};
+ 
+   const base::flat_set<int> current_disable_reasons =
+@@ -2207,6 +2218,7 @@ void ExtensionPrefs::RegisterProfilePref
+     user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterDictionaryPref(pref_names::kExtensions);
+   registry->RegisterListPref(pref_names::kPinnedExtensions,
++                             base::ListValue().Append(kaguya::kUBlockOriginComponentId),
+                              user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   registry->RegisterListPref(pref_names::kDeletedComponentExtensions);
+   registry->RegisterDictionaryPref(kExtensionsBlocklistUpdate);
+@@ -2279,14 +2291,14 @@ bool ExtensionPrefs::GetUserExtensionPre
+     ExtensionIdContainer* id_container_out) const {
+   DCHECK(id_container_out->empty());
+ 
+-  const base::Value* user_pref_value = prefs_->GetUserPrefValue(pref);
+-  if (!user_pref_value || !user_pref_value->is_list()) {
++  const base::Value& user_pref_value = prefs_->GetValue(pref);
++  if (!user_pref_value.is_list()) {
+     return false;
+   }
+ 
+   std::insert_iterator<ExtensionIdContainer> insert_iterator(
+       *id_container_out, id_container_out->end());
+-  for (const auto& entry : user_pref_value->GetList()) {
++  for (const auto& entry : user_pref_value.GetList()) {
+     if (!entry.is_string()) {
+       NOTREACHED();
+     }
+--- a/extensions/common/features/simple_feature.cc
++++ b/extensions/common/features/simple_feature.cc
+@@ -708,6 +708,7 @@ Feature::Availability SimpleFeature::Get
+   // Component extensions can access any feature.
+   // NOTE: Deliberately does not match EXTERNAL_COMPONENT.
+   if (component_extensions_auto_granted_ &&
++      !Manifest::IsUblockComponentHashed(hashed_id) &&
+       location == ManifestLocation::kComponent)
+     return CreateAvailability(AvailabilityResult::kIsAvailable);
+ 

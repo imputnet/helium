@@ -1,12 +1,12 @@
-# Contributing to Helium
+# Contributing to Kaguya
 
-This repository contains Helium's shared Chromium patches, resources, and
+This repository contains Kaguya's shared Chromium patches, resources, and
 development tooling. Platform-specific packaging and build environments live in
 the platform repositories:
 
-- [Helium for macOS](https://github.com/imputnet/helium-macos)
-- [Helium for Linux](https://github.com/imputnet/helium-linux)
-- [Helium for Windows](https://github.com/imputnet/helium-windows)
+- [Kaguya for macOS](https://github.com/iceice666/kaguya-macos)
+- [Kaguya for Linux](https://github.com/iceice666/kaguya-linux)
+- Kaguya for Windows — planned, not yet available
 
 The same contribution guidelines apply to all platform repos.
 
@@ -37,13 +37,13 @@ The same contribution guidelines apply to all platform repos.
   output. We will permanently ban you if you spam our repos with AI slop.
 
 ## Development
-macOS is our primary development platform, so it's the recommended
-development environment for community contributions.
+Linux is our active development platform, so it's the recommended
+environment for community contributions.
 
-Linux packaging includes a similar development script, so the same guide
+macOS packaging includes a similar development script, so the same guide
 can be applied there too.
 
-[> See development docs in macOS repo][macos-guide]
+[> See development docs in the Linux repo][linux-guide]
 
 ## Working with patches
 
@@ -69,37 +69,35 @@ When working in a platform repository, the usual workflow is:
 ## Code style
 
 - Follow Chromium style and conventions.
-- Prefer existing Chromium or Helium patterns over introducing new abstractions.
+- Prefer existing Chromium or Kaguya patterns over introducing new abstractions.
 - Keep changes focused and minimal.
 - Proofread surrounding code before submitting.
-- When adding new Helium-authored files to the Chromium tree, include the Helium
+- When adding new Kaguya-authored files to the Chromium tree, include the Kaguya
   copyright header used in other patches.
-- Refer to existing Helium patches for guidance if necessary.
+- Refer to existing Kaguya patches for guidance if necessary.
 
 ## Git style
 
 ### Clean commit messages
 
-We use commit titles that are similar to [Linux Kernel Style][linux-style],
-but with a more flexible scope-first format. And without the email prefix,
-obviously.
+We use [Conventional Commits][conventional-commits]: a `type:` (optionally with a
+`(scope)`) followed by a short, specific description.
 
 Examples of titles from recent history as of writing:
 
 ```
-- helium/ui/layout: add a ⌘+S shortcut to toggle vertical tabs
-- helium/ui/pdf-viewer: fix stuck width when sidebar's collapsed
-- deps: update ublock to 1.70.0
-- merge: update to chromium 146.0.7680.75
-- helium/core/keyboard-shortcuts: update command state correctly
+- feat: add vim mode patch stack
+- feat(branding): generate Kaguya icons
+- fix: keyboard normal mode command state
+- docs: add agents guide
+- chore: rebrand helium to kaguya
 ```
 
-The part before the colon should describe the area being changed (scope),
-and the part after the colon should explain the change itself.
+Common types: `feat`, `fix`, `docs`, `chore`, `build`, `refactor`. Add a scope in
+parentheses when it helps locate the change (`feat(ui): ...`).
 
-1. Pick the most helpful scope for the change.
-1. Do not use generic scopes like "feat" or "chore".
-1. Keep titles specific and meaningful rather than generic.
+1. Pick the most accurate type, and an optional scope that points at the area.
+1. Keep the description specific and meaningful rather than generic.
 1. If the change needs extra context, add a body explaining why it was
    made and what changed.
 
@@ -112,7 +110,7 @@ in most places (such as GitHub). For example, this final commit title is
 exactly 72 characters long:
 
 ```
-helium/ui/customize: add change wallpaper button, fix visibility (#1053)
+feat(ui/customize): add change wallpaper button, fix visibility (#1053)
 ```
 
 If a multi-commit pull request contains uninformative or malformed commit
@@ -154,9 +152,9 @@ changes into several follow-up PRs if necessary.
 
 ## Licensing
 
-By contributing to Helium, you agree that your changes will be licensed under
+By contributing to Kaguya, you agree that your changes will be licensed under
 the repository's existing licensing terms.
 
 <!-- Long referenced links -->
-[macos-guide]: https://github.com/imputnet/helium-macos/blob/main/docs/building.md#development-build-and-environment
-[linux-style]: https://docs.kernel.org/process/submitting-patches.html#the-canonical-patch-format
+[linux-guide]: https://github.com/iceice666/kaguya-linux#readme
+[conventional-commits]: https://www.conventionalcommits.org/en/v1.0.0/

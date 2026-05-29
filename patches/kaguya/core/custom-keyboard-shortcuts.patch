@@ -1,0 +1,2132 @@
+--- a/chrome/browser/browser_features.cc
++++ b/chrome/browser/browser_features.cc
+@@ -66,6 +66,10 @@ BASE_FEATURE(kCertVerificationNetworkTim
+ BASE_FEATURE(kClearUserDataUponProfileDestruction,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++// Enables the desktop Settings page and browser-window registration path for
++// user-customizable browser keyboard shortcuts.
++BASE_FEATURE(kCustomizableBrowserShortcuts, base::FEATURE_ENABLED_BY_DEFAULT);
++
+ #if BUILDFLAG(IS_LINUX)
+ // Enables usage of os_crypt_async::SecretPortalKeyProvider.  Once
+ // `kSecretPortalKeyProviderUseForEncryption` is enabled, this flag cannot be
+--- a/chrome/browser/browser_features.h
++++ b/chrome/browser/browser_features.h
+@@ -40,6 +40,7 @@ BASE_DECLARE_FEATURE(kBookmarkTriggerFor
+ BASE_DECLARE_FEATURE(kCertificateTransparencyAskBeforeEnabling);
+ BASE_DECLARE_FEATURE(kCertVerificationNetworkTime);
+ BASE_DECLARE_FEATURE(kClearUserDataUponProfileDestruction);
++BASE_DECLARE_FEATURE(kCustomizableBrowserShortcuts);
+ 
+ #if BUILDFLAG(IS_LINUX)
+ BASE_DECLARE_FEATURE(kDbusSecretPortal);
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_prefs.h
+@@ -0,0 +1,19 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PREFS_H_
++#define CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PREFS_H_
++
++class PrefRegistrySimple;
++
++namespace browser_shortcuts::prefs {
++
++inline constexpr char kCustomAccelerators[] =
++    "kaguya.browser.custom_accelerators";
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry);
++
++}  // namespace browser_shortcuts::prefs
++
++#endif  // CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PREFS_H_
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_prefs.cc
+@@ -0,0 +1,15 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_prefs.h"
++
++#include "components/prefs/pref_registry_simple.h"
++
++namespace browser_shortcuts::prefs {
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterDictionaryPref(kCustomAccelerators);
++}
++
++}  // namespace browser_shortcuts::prefs
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_METADATA_H_
++#define CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_METADATA_H_
++
++#include <optional>
++#include <string>
++#include <vector>
++
++class PrefService;
++
++namespace browser_shortcuts {
++
++struct BrowserShortcutCommandLabel {
++  int message_id = 0;
++  std::optional<std::u16string> replacement;
++};
++
++// Returns the localized string id for a browser command exposed by
++// chrome/browser/ui/accelerator_table.cc. This is intentionally switch-based so
++// new accelerator-table commands fail loudly until they receive a user-visible
++// label.
++std::optional<BrowserShortcutCommandLabel> GetBrowserShortcutCommandLabel(
++    int command_id,
++    const PrefService* prefs);
++
++// Commands that should be user-assignable even though they do not have a
++// direct default accelerator in chrome/browser/ui/accelerator_table.cc.
++std::vector<int> GetBrowserShortcutCommandsWithoutDefault(
++    const PrefService* prefs);
++
++bool IsBrowserShortcutDefaultUserModifiable(int command_id);
++
++}  // namespace browser_shortcuts
++
++#endif  // CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_METADATA_H_
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+@@ -0,0 +1,260 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h"
++
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/check.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/kaguya/kaguya_layout_state_controller.h"
++#include "chrome/browser/ui/tabs/features.h"
++#include "chrome/common/pref_names.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_service.h"
++#include "ui/strings/grit/ui_strings.h"
++
++namespace browser_shortcuts {
++
++namespace {
++
++bool ShouldUseVerticalCollapseLabel(const PrefService* prefs) {
++  return prefs && tabs::IsVerticalTabsFeatureEnabled() &&
++         prefs->GetBoolean(prefs::kVerticalCollapseShortcut) &&
++         prefs->GetInteger(prefs::kKaguyaLayout) ==
++             std::to_underlying(KaguyaLayoutType::kVertical);
++}
++
++bool ShouldUseCopyPageUrlLabel(const PrefService* prefs) {
++  return prefs && prefs->GetBoolean(prefs::kCopyPageUrlShortcut);
++}
++
++bool ShouldHideBrowserShortcutCommand(int command_id) {
++  switch (command_id) {
++    case IDC_COPY:
++    case IDC_CUT:
++    case IDC_DEBUG_TOGGLE_TABLET_MODE:
++    case IDC_DEBUG_PRINT_VIEW_TREE:
++    case IDC_DEBUG_PRINT_VIEW_TREE_DETAILS:
++    case IDC_EXIT:
++    case IDC_HELP_PAGE_VIA_MENU:
++    case IDC_HIDE_APP:
++    case IDC_MINIMIZE_WINDOW:
++    case IDC_OPTIONS:
++    case IDC_PASTE:
++    case IDC_TOGGLE_FULLSCREEN_TOOLBAR:
++    case IDC_WEB_APP_SETTINGS:
++    case IDC_CONTENT_CONTEXT_COPY:
++    case IDC_CONTENT_CONTEXT_CUT:
++    case IDC_CONTENT_CONTEXT_PASTE:
++    case IDC_CONTENT_CONTEXT_PASTE_AND_MATCH_STYLE:
++    case IDC_CONTENT_CONTEXT_REDO:
++    case IDC_CONTENT_CONTEXT_SELECTALL:
++    case IDC_CONTENT_CONTEXT_UNDO:
++      return true;
++    default:
++      return false;
++  }
++}
++
++BrowserShortcutCommandLabel Label(int message_id) {
++  return {message_id, std::nullopt};
++}
++
++BrowserShortcutCommandLabel Label(int message_id, std::u16string replacement) {
++  return {message_id, std::move(replacement)};
++}
++
++}  // namespace
++
++std::optional<BrowserShortcutCommandLabel> GetBrowserShortcutCommandLabel(
++    int command_id,
++    const PrefService* prefs) {
++  if (ShouldHideBrowserShortcutCommand(command_id)) {
++    return std::nullopt;
++  }
++
++  switch (command_id) {
++    case IDC_BACK:
++      return Label(IDS_SHORTCUT_COMMAND_BACK);
++    case IDC_FORWARD:
++      return Label(IDS_SHORTCUT_COMMAND_FORWARD);
++    case IDC_HOME:
++      return Label(IDS_SHORTCUT_COMMAND_HOME);
++    case IDC_RELOAD:
++      return Label(IDS_APP_MENU_RELOAD);
++    case IDC_RELOAD_BYPASSING_CACHE:
++      return Label(IDS_RELOAD_MENU_HARD_RELOAD_ITEM);
++    case IDC_STOP:
++      return Label(IDS_TOOLTIP_STOP);
++    case IDC_NEW_WINDOW:
++      return Label(IDS_NEW_WINDOW);
++    case IDC_NEW_INCOGNITO_WINDOW:
++      return Label(IDS_NEW_INCOGNITO_WINDOW);
++    case IDC_NEW_TAB:
++      return Label(IDS_NEW_TAB);
++    case IDC_NEW_SPLIT_TAB:
++      return Label(IDS_SHORTCUT_COMMAND_NEW_SPLIT_TAB);
++    case IDC_CLOSE_TAB:
++      return Label(IDS_TAB_SEARCH_CLOSE_TAB);
++    case IDC_CLOSE_WINDOW:
++      return Label(IDS_CLOSE_WARNING_FOR_CLEAR_COOKIES_ON_EXIT_CLOSE);
++    case IDC_RESTORE_TAB:
++      return Label(IDS_RESTORE_TAB);
++    case IDC_SELECT_NEXT_TAB:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_NEXT_TAB);
++    case IDC_SELECT_PREVIOUS_TAB:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_PREVIOUS_TAB);
++    case IDC_SELECT_LAST_TAB:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_LAST_TAB);
++    case IDC_SELECT_TAB_0:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_TAB, u"1");
++    case IDC_SELECT_TAB_1:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_TAB, u"2");
++    case IDC_SELECT_TAB_2:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_TAB, u"3");
++    case IDC_SELECT_TAB_3:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_TAB, u"4");
++    case IDC_SELECT_TAB_4:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_TAB, u"5");
++    case IDC_SELECT_TAB_5:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_TAB, u"6");
++    case IDC_SELECT_TAB_6:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_TAB, u"7");
++    case IDC_SELECT_TAB_7:
++      return Label(IDS_SHORTCUT_COMMAND_SELECT_TAB, u"8");
++    case IDC_MOVE_TAB_NEXT:
++      return Label(IDS_SHORTCUT_COMMAND_MOVE_TAB_NEXT);
++    case IDC_MOVE_TAB_PREVIOUS:
++      return Label(IDS_SHORTCUT_COMMAND_MOVE_TAB_PREVIOUS);
++    case IDC_ADD_NEW_TAB_TO_GROUP:
++      return Label(IDS_TAB_GROUP_HEADER_CXMENU_NEW_TAB_IN_GROUP);
++    case IDC_CREATE_NEW_TAB_GROUP:
++      return Label(IDS_NEW_TAB_GROUP);
++    case IDC_FOCUS_NEXT_TAB_GROUP:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_NEXT_TAB_GROUP);
++    case IDC_FOCUS_PREV_TAB_GROUP:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_PREVIOUS_TAB_GROUP);
++    case IDC_CLOSE_TAB_GROUP:
++      return Label(IDS_SHORTCUT_COMMAND_CLOSE_TAB_GROUP);
++    case IDC_TAB_SEARCH:
++      return Label(IDS_TAB_SEARCH_MENU);
++    case IDC_BOOKMARK_THIS_TAB:
++      return Label(IDS_BOOKMARK_THIS_TAB);
++    case IDC_BOOKMARK_ALL_TABS:
++      return Label(IDS_BOOKMARK_ALL_TABS);
++    case IDC_SHOW_BOOKMARK_BAR:
++      return Label(IDS_SHOW_BOOKMARK_BAR);
++    case IDC_SHOW_BOOKMARK_MANAGER:
++      return Label(IDS_BOOKMARK_MANAGER);
++    case IDC_FOCUS_BOOKMARKS:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_BOOKMARKS);
++    case IDC_SHOW_HISTORY:
++      return Label(IDS_HISTORY_MENU);
++    case IDC_SHOW_DOWNLOADS:
++      return Label(IDS_SHOW_DOWNLOADS);
++    case IDC_OPEN_FILE:
++      return Label(IDS_OPEN_FILE_DIALOG_TITLE);
++    case IDC_SAVE_PAGE:
++      return Label(IDS_SAVE_PAGE);
++    case IDC_CTRL_S_SHORTCUT:
++      return Label(ShouldUseVerticalCollapseLabel(prefs)
++                       ? IDS_SHORTCUT_COMMAND_TOGGLE_VERTICAL_TABS
++                       : IDS_SAVE_PAGE);
++    case IDC_PRINT:
++      return Label(IDS_CONTENT_CONTEXT_PRINT);
++    case IDC_BASIC_PRINT:
++      return Label(IDS_PRINT_PREVIEW_SYSTEM_DIALOG_OPTION, u"");
++    case IDC_FIND:
++      return Label(IDS_FIND);
++    case IDC_FIND_NEXT:
++      return Label(IDS_SHORTCUT_COMMAND_FIND_NEXT);
++    case IDC_FIND_PREVIOUS:
++      return Label(IDS_SHORTCUT_COMMAND_FIND_PREVIOUS);
++    case IDC_CLOSE_FIND_OR_STOP:
++      return Label(IDS_SHORTCUT_COMMAND_CLOSE_FIND_OR_STOP);
++    case IDC_FOCUS_LOCATION:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_LOCATION);
++    case IDC_FOCUS_SEARCH:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_SEARCH);
++    case IDC_FOCUS_NEXT_PANE:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_NEXT_PANE);
++    case IDC_FOCUS_PREVIOUS_PANE:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_PREVIOUS_PANE);
++    case IDC_FOCUS_WEB_CONTENTS_PANE:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_WEB_CONTENTS_PANE);
++    case IDC_FOCUS_MENU_BAR:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_MENU_BAR);
++    case IDC_FOCUS_TOOLBAR:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_TOOLBAR);
++    case IDC_FOCUS_INACTIVE_POPUP_FOR_ACCESSIBILITY:
++      return Label(IDS_SHORTCUT_COMMAND_FOCUS_INACTIVE_POPUP);
++    case IDC_ZOOM_PLUS:
++      return Label(IDS_ZOOM_PLUS);
++    case IDC_ZOOM_MINUS:
++      return Label(IDS_ZOOM_MINUS);
++    case IDC_ZOOM_NORMAL:
++      return Label(IDS_ZOOM_NORMAL);
++    case IDC_FULLSCREEN:
++      return Label(IDS_FULLSCREEN);
++    case IDC_SHOW_AVATAR_MENU:
++      return Label(IDS_SHORTCUT_COMMAND_SHOW_AVATAR_MENU);
++    case IDC_SHOW_APP_MENU:
++      return Label(IDS_SHORTCUT_COMMAND_SHOW_APP_MENU);
++    case IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN:
++      return Label(IDS_SHORTCUT_COMMAND_TOGGLE_ZEN_MODE_TOP_CHROME_PIN);
++    case IDC_CARET_BROWSING_TOGGLE:
++      return Label(IDS_SETTINGS_ENABLE_CARET_BROWSING_TITLE);
++    case IDC_CLEAR_BROWSING_DATA:
++      return Label(IDS_CLEAR_BROWSING_DATA);
++    case IDC_HELP_PAGE_VIA_KEYBOARD:
++      return Label(IDS_HELP_PAGE);
++    case IDC_TASK_MANAGER_SHORTCUT:
++      return Label(IDS_TASK_MANAGER);
++    case IDC_FEEDBACK:
++      return Label(IDS_FEEDBACK);
++    case IDC_SHOW_READING_MODE_KEYBOARD:
++      return Label(IDS_READING_MODE_TITLE);
++    case IDC_DEV_TOOLS_TOGGLE:
++      return Label(IDS_SHORTCUT_COMMAND_TOGGLE_DEV_TOOLS);
++    case IDC_DEV_TOOLS:
++      return Label(IDS_DEV_TOOLS);
++    case IDC_DEV_TOOLS_CONSOLE:
++      return Label(IDS_DEV_TOOLS_CONSOLE);
++    case IDC_DEV_TOOLS_INSPECT:
++      return Label(IDS_DEV_TOOLS_ELEMENTS);
++    case IDC_COPY_URL:
++      return Label(IDS_COPY_URL);
++    case IDC_COPY_OR_INSPECT_SHORTCUT:
++      return Label(ShouldUseCopyPageUrlLabel(prefs) ? IDS_COPY_URL
++                                                    : IDS_DEV_TOOLS_ELEMENTS);
++    case IDC_VIEW_SOURCE:
++      return Label(IDS_VIEW_SOURCE);
++  }
++
++  DCHECK(false) << "Missing browser shortcut label for command id "
++                << command_id;
++  return std::nullopt;
++}
++
++std::vector<int> GetBrowserShortcutCommandsWithoutDefault(
++    const PrefService* prefs) {
++  std::vector<int> commands;
++  if (ShouldUseVerticalCollapseLabel(prefs)) {
++    commands.push_back(IDC_SAVE_PAGE);
++  }
++
++  commands.push_back(ShouldUseCopyPageUrlLabel(prefs) ? IDC_DEV_TOOLS_INSPECT
++                                                      : IDC_COPY_URL);
++  return commands;
++}
++
++bool IsBrowserShortcutDefaultUserModifiable(int command_id) {
++  return GetBrowserShortcutCommandLabel(command_id, nullptr).has_value();
++}
++
++}  // namespace browser_shortcuts
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_serialization.cc
+@@ -0,0 +1,334 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_serialization.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/fixed_flat_map.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "build/build_config.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/strings/grit/ui_strings.h"
++
++namespace browser_shortcuts {
++
++namespace {
++
++constexpr int kStoredModifierMask = ui::EF_SHIFT_DOWN | ui::EF_CONTROL_DOWN |
++                                    ui::EF_ALT_DOWN | ui::EF_COMMAND_DOWN;
++
++constexpr auto kCodeToKey =
++    base::MakeFixedFlatMap<std::string_view, ui::KeyboardCode>({
++        {"Backquote", ui::VKEY_OEM_3},
++        {"Backslash", ui::VKEY_OEM_5},
++        {"Backspace", ui::VKEY_BACK},
++        {"BracketLeft", ui::VKEY_OEM_4},
++        {"BracketRight", ui::VKEY_OEM_6},
++        {"Comma", ui::VKEY_OEM_COMMA},
++        {"Delete", ui::VKEY_DELETE},
++        {"End", ui::VKEY_END},
++        {"Enter", ui::VKEY_RETURN},
++        {"Equal", ui::VKEY_OEM_PLUS},
++        {"Escape", ui::VKEY_ESCAPE},
++        {"Home", ui::VKEY_HOME},
++        {"Insert", ui::VKEY_INSERT},
++        {"Minus", ui::VKEY_OEM_MINUS},
++        {"Numpad0", ui::VKEY_NUMPAD0},
++        {"Numpad1", ui::VKEY_NUMPAD1},
++        {"Numpad2", ui::VKEY_NUMPAD2},
++        {"Numpad3", ui::VKEY_NUMPAD3},
++        {"Numpad4", ui::VKEY_NUMPAD4},
++        {"Numpad5", ui::VKEY_NUMPAD5},
++        {"Numpad6", ui::VKEY_NUMPAD6},
++        {"Numpad7", ui::VKEY_NUMPAD7},
++        {"Numpad8", ui::VKEY_NUMPAD8},
++        {"Numpad9", ui::VKEY_NUMPAD9},
++        {"NumpadAdd", ui::VKEY_ADD},
++        {"NumpadDecimal", ui::VKEY_DECIMAL},
++        {"NumpadDivide", ui::VKEY_DIVIDE},
++        {"NumpadMultiply", ui::VKEY_MULTIPLY},
++        {"NumpadSubtract", ui::VKEY_SUBTRACT},
++        {"PageDown", ui::VKEY_NEXT},
++        {"PageUp", ui::VKEY_PRIOR},
++        {"Period", ui::VKEY_OEM_PERIOD},
++        {"Quote", ui::VKEY_OEM_7},
++        {"Semicolon", ui::VKEY_OEM_1},
++        {"Slash", ui::VKEY_OEM_2},
++        {"Space", ui::VKEY_SPACE},
++        {"Tab", ui::VKEY_TAB},
++        {"ArrowDown", ui::VKEY_DOWN},
++        {"ArrowLeft", ui::VKEY_LEFT},
++        {"ArrowRight", ui::VKEY_RIGHT},
++        {"ArrowUp", ui::VKEY_UP},
++    });
++
++std::optional<int> FunctionKeyNumber(ui::KeyboardCode key_code) {
++  if (key_code < ui::VKEY_F1 || key_code > ui::VKEY_F24) {
++    return std::nullopt;
++  }
++  return key_code - ui::VKEY_F1 + 1;
++}
++
++std::optional<ui::KeyboardCode> CodeToKey(std::string_view code) {
++  // Serialized shortcuts use DOM KeyboardEvent.code names so user prefs stay
++  // tied to a physical key position instead of the character produced by the
++  // current keyboard layout. ui::Accelerator ultimately dispatches through
++  // ui::KeyboardCode, so deserialize the small synthetic families first.
++  if (code.size() == 4 && code.starts_with("Key") && code[3] >= 'A' &&
++      code[3] <= 'Z') {
++    return static_cast<ui::KeyboardCode>(ui::VKEY_A + code[3] - 'A');
++  }
++  if (code.size() == 6 && code.starts_with("Digit") && code[5] >= '0' &&
++      code[5] <= '9') {
++    return static_cast<ui::KeyboardCode>(ui::VKEY_0 + code[5] - '0');
++  }
++
++  // Function keys are encoded directly as F1..F24, matching DOM code names and
++  // avoiding a long static table for a contiguous KeyboardCode range.
++  if (code.size() >= 2 && code.starts_with("F")) {
++    int number = 0;
++    if (base::StringToInt(code.substr(1), &number) && number >= 1 &&
++        number <= 24) {
++      return static_cast<ui::KeyboardCode>(ui::VKEY_F1 + number - 1);
++    }
++  }
++
++  // Remaining codes are either punctuation/navigation keys or numpad keys.
++  // Several DOM codes intentionally collapse to one ui::KeyboardCode where
++  // Chromium does not distinguish the physical key at accelerator dispatch.
++  const auto value = kCodeToKey.find(code);
++  if (value != kCodeToKey.end()) {
++    return value->second;
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> KeyToCode(ui::KeyboardCode key_code) {
++  if (key_code >= ui::VKEY_A && key_code <= ui::VKEY_Z) {
++    std::string code = "Key";
++    code.push_back(static_cast<char>('A' + key_code - ui::VKEY_A));
++    return code;
++  }
++  if (key_code >= ui::VKEY_0 && key_code <= ui::VKEY_9) {
++    std::string code = "Digit";
++    code.push_back(static_cast<char>('0' + key_code - ui::VKEY_0));
++    return code;
++  }
++  if (std::optional<int> number = FunctionKeyNumber(key_code)) {
++    return std::string("F") + base::NumberToString(*number);
++  }
++  for (const auto& [code, value] : kCodeToKey) {
++    if (value == key_code) {
++      return std::string(code);
++    }
++  }
++  return std::nullopt;
++}
++
++std::u16string FunctionKeyToDisplayString(ui::KeyboardCode key_code) {
++  std::optional<int> number = FunctionKeyNumber(key_code);
++  if (!number) {
++    return std::u16string();
++  }
++  return base::UTF8ToUTF16(std::string("F") + base::NumberToString(*number));
++}
++
++std::u16string ClearKeyDisplayString(ui::KeyboardCode key_code) {
++  switch (key_code) {
++    case ui::VKEY_OEM_PLUS:
++    case ui::VKEY_ADD:
++      return l10n_util::GetStringUTF16(IDS_APP_PLUS_KEY);
++    default:
++      return std::u16string();
++  }
++}
++
++std::u16string NumpadKeyDisplayString(ui::KeyboardCode key_code) {
++  std::u16string key;
++  if (key_code >= ui::VKEY_NUMPAD0 && key_code <= ui::VKEY_NUMPAD9) {
++    key = base::NumberToString16(key_code - ui::VKEY_NUMPAD0);
++  } else if (key_code == ui::VKEY_ADD) {
++    key = l10n_util::GetStringUTF16(IDS_APP_PLUS_KEY);
++  }
++  return key.empty() ? std::u16string()
++                     : l10n_util::GetStringFUTF16(IDS_APP_NUMPAD_KEY, key);
++}
++
++std::vector<std::u16string> ModifierDisplayStrings(int modifiers) {
++  std::vector<std::u16string> parts;
++  if (modifiers & ui::EF_COMMAND_DOWN) {
++#if BUILDFLAG(IS_MAC)
++    parts.push_back(u"⌘");
++#elif BUILDFLAG(IS_WIN)
++    parts.push_back(l10n_util::GetStringUTF16(IDS_APP_WINDOWS_KEY));
++#elif BUILDFLAG(IS_LINUX)
++    parts.push_back(l10n_util::GetStringUTF16(IDS_APP_SUPER_KEY));
++#endif
++  }
++  if (modifiers & ui::EF_ALT_DOWN) {
++#if BUILDFLAG(IS_MAC)
++    parts.push_back(u"⌥");
++#else
++    parts.push_back(l10n_util::GetStringUTF16(IDS_APP_ALT_KEY));
++#endif
++  }
++  if (modifiers & ui::EF_CONTROL_DOWN) {
++#if BUILDFLAG(IS_MAC)
++    parts.push_back(u"⌃");
++#else
++    parts.push_back(l10n_util::GetStringUTF16(IDS_APP_CTRL_KEY));
++#endif
++  }
++  if (modifiers & ui::EF_SHIFT_DOWN) {
++#if BUILDFLAG(IS_MAC)
++    parts.push_back(u"⇧");
++#else
++    parts.push_back(l10n_util::GetStringUTF16(IDS_APP_SHIFT_KEY));
++#endif
++  }
++  return parts;
++}
++
++std::u16string JoinDisplayShortcutParts(
++    const std::vector<std::u16string>& parts) {
++#if BUILDFLAG(IS_MAC)
++  return base::JoinString(parts, u"");
++#else
++  return base::JoinString(parts, u"+");
++#endif
++}
++
++std::u16string FunctionAcceleratorToDisplayString(
++    const ui::Accelerator& accelerator) {
++  std::u16string key = FunctionKeyToDisplayString(accelerator.key_code());
++  if (key.empty()) {
++    return std::u16string();
++  }
++
++  std::vector<std::u16string> parts =
++      ModifierDisplayStrings(accelerator.modifiers());
++  parts.push_back(std::move(key));
++  return JoinDisplayShortcutParts(parts);
++}
++
++bool AddModifier(int* modifiers, int modifier) {
++  if (*modifiers & modifier) {
++    return false;
++  }
++  *modifiers |= modifier;
++  return true;
++}
++
++}  // namespace
++
++std::optional<ui::Accelerator> AcceleratorFromString(
++    const std::string& serialized) {
++  int modifiers = ui::EF_NONE;
++  std::optional<ui::KeyboardCode> key_code;
++  for (std::string_view part : base::SplitStringPiece(
++           serialized, "+", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    if (part == "Shift") {
++      if (!AddModifier(&modifiers, ui::EF_SHIFT_DOWN)) {
++        return std::nullopt;
++      }
++    } else if (part == "Control") {
++      if (!AddModifier(&modifiers, ui::EF_CONTROL_DOWN)) {
++        return std::nullopt;
++      }
++    } else if (part == "Alt") {
++      if (!AddModifier(&modifiers, ui::EF_ALT_DOWN)) {
++        return std::nullopt;
++      }
++    } else if (part == "Meta") {
++      if (!AddModifier(&modifiers, ui::EF_COMMAND_DOWN)) {
++        return std::nullopt;
++      }
++    } else if (!key_code) {
++      key_code = CodeToKey(part);
++    } else {
++      return std::nullopt;
++    }
++  }
++  if (!key_code) {
++    return std::nullopt;
++  }
++  return ui::Accelerator(*key_code, modifiers);
++}
++
++std::string AcceleratorToString(const ui::Accelerator& accelerator) {
++  std::vector<std::string> parts;
++  const int modifiers = accelerator.modifiers() & kStoredModifierMask;
++  if (modifiers & ui::EF_CONTROL_DOWN) {
++    parts.push_back("Control");
++  }
++  if (modifiers & ui::EF_ALT_DOWN) {
++    parts.push_back("Alt");
++  }
++  if (modifiers & ui::EF_SHIFT_DOWN) {
++    parts.push_back("Shift");
++  }
++  if (modifiers & ui::EF_COMMAND_DOWN) {
++    parts.push_back("Meta");
++  }
++  std::optional<std::string> code = KeyToCode(accelerator.key_code());
++  if (!code) {
++    return std::string();
++  }
++  parts.push_back(*code);
++
++  return base::JoinString(parts, "+");
++}
++
++std::u16string AcceleratorToDisplayString(const ui::Accelerator& accelerator) {
++  std::u16string clear_key_text =
++      NumpadKeyDisplayString(accelerator.key_code());
++  if (clear_key_text.empty()) {
++    clear_key_text = ClearKeyDisplayString(accelerator.key_code());
++  }
++  if (!clear_key_text.empty()) {
++    std::vector<std::u16string> parts =
++        ModifierDisplayStrings(accelerator.modifiers());
++    parts.push_back(std::move(clear_key_text));
++    return JoinDisplayShortcutParts(parts);
++  }
++
++  std::u16string text = accelerator.GetShortcutText();
++  std::u16string function_key_text =
++      FunctionAcceleratorToDisplayString(accelerator);
++  if (!function_key_text.empty() &&
++      text.find(FunctionKeyToDisplayString(accelerator.key_code())) ==
++          std::u16string::npos) {
++    return function_key_text;
++  }
++  return text;
++}
++
++std::optional<std::string> NormalizeAcceleratorString(
++    const std::string& serialized) {
++  std::optional<ui::Accelerator> accelerator =
++      AcceleratorFromString(serialized);
++  if (!accelerator) {
++    return std::nullopt;
++  }
++  std::string normalized = AcceleratorToString(*accelerator);
++  if (normalized.empty()) {
++    return std::nullopt;
++  }
++  return normalized;
++}
++
++bool IsValidAcceleratorString(const std::string& serialized) {
++  return NormalizeAcceleratorString(serialized).has_value();
++}
++
++}  // namespace browser_shortcuts
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_serialization.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERIALIZATION_H_
++#define CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERIALIZATION_H_
++
++#include <optional>
++#include <string>
++
++#include "ui/base/accelerators/accelerator.h"
++
++namespace browser_shortcuts {
++
++std::optional<ui::Accelerator> AcceleratorFromString(
++    const std::string& serialized);
++
++std::string AcceleratorToString(const ui::Accelerator& accelerator);
++
++std::u16string AcceleratorToDisplayString(const ui::Accelerator& accelerator);
++
++std::optional<std::string> NormalizeAcceleratorString(
++    const std::string& serialized);
++
++bool IsValidAcceleratorString(const std::string& serialized);
++
++}  // namespace browser_shortcuts
++
++#endif  // CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERIALIZATION_H_
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_service.cc
+@@ -0,0 +1,586 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service.h"
++
++#include <algorithm>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/check.h"
++#include "base/containers/flat_set.h"
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
++#include "build/build_config.h"
++#include "chrome/browser/ui/accelerator_table.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_prefs.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_serialization.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/gfx/text_utils.h"
++
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.h"
++#endif
++
++namespace browser_shortcuts {
++
++namespace {
++
++constexpr char kAddedKey[] = "added";
++constexpr char kRemovedKey[] = "removed";
++
++std::string CommandIdToPrefKey(int command_id) {
++  return base::NumberToString(command_id);
++}
++
++std::optional<int> PrefKeyToCommandId(std::string_view key) {
++  int command_id = 0;
++  if (!base::StringToInt(key, &command_id)) {
++    return std::nullopt;
++  }
++  return command_id;
++}
++
++bool ContainsAccelerator(
++    const std::vector<BrowserShortcutService::AcceleratorEntry>& entries,
++    const ui::Accelerator& accelerator) {
++  auto it = std::ranges::lower_bound(
++      entries, accelerator, std::ranges::less(),
++      &BrowserShortcutService::AcceleratorEntry::accelerator);
++  return it != entries.end() && it->accelerator == accelerator;
++}
++
++bool InsertEntrySorted(
++    std::vector<BrowserShortcutService::AcceleratorEntry>& entries,
++    BrowserShortcutService::AcceleratorEntry entry) {
++  auto it = std::ranges::lower_bound(
++      entries, entry.accelerator, std::ranges::less(),
++      &BrowserShortcutService::AcceleratorEntry::accelerator);
++  if (it != entries.end() && it->accelerator == entry.accelerator) {
++    return false;
++  }
++  entries.insert(it, std::move(entry));
++  return true;
++}
++
++std::optional<BrowserShortcutService::AcceleratorEntry> EntryFromString(
++    const std::string& serialized,
++    bool user_modifiable) {
++  std::optional<ui::Accelerator> accelerator =
++      AcceleratorFromString(serialized);
++  if (!accelerator) {
++    return std::nullopt;
++  }
++  if (AcceleratorToString(*accelerator).empty()) {
++    return std::nullopt;
++  }
++  return BrowserShortcutService::AcceleratorEntry{*accelerator,
++                                                  user_modifiable};
++}
++
++std::string EntryToString(
++    const BrowserShortcutService::AcceleratorEntry& entry) {
++  return AcceleratorToString(entry.accelerator);
++}
++
++std::u16string GetCommandDisplayName(const BrowserShortcutCommandLabel& label) {
++  std::u16string display_name = gfx::RemoveAccelerator(
++      label.replacement.has_value()
++          ? l10n_util::GetStringFUTF16(label.message_id, *label.replacement)
++          : l10n_util::GetStringUTF16(label.message_id));
++  base::TrimWhitespace(display_name, base::TRIM_TRAILING, &display_name);
++  if (display_name.ends_with(u"...")) {
++    display_name.resize(display_name.size() - 3);
++  } else if (!display_name.empty() && display_name.back() == 0x2026) {
++    display_name.pop_back();
++  }
++  return display_name;
++}
++
++}  // namespace
++
++BrowserShortcutService::BrowserShortcutService(PrefService* prefs)
++    : prefs_(prefs) {
++  pref_change_registrar_.Init(prefs_);
++  const auto on_label_pref_changed = base::BindRepeating(
++      &BrowserShortcutService::OnCommandLabelsChanged, base::Unretained(this));
++  pref_change_registrar_.Add(::prefs::kCopyPageUrlShortcut,
++                             on_label_pref_changed);
++  pref_change_registrar_.Add(::prefs::kKaguyaLayout, on_label_pref_changed);
++  pref_change_registrar_.Add(::prefs::kVerticalCollapseShortcut,
++                             on_label_pref_changed);
++
++  LoadFromPrefs();
++  RebuildCommandCache();
++}
++
++BrowserShortcutService::~BrowserShortcutService() = default;
++
++const std::vector<CommandInfo>& BrowserShortcutService::GetCommands() const {
++  return command_cache_;
++}
++
++std::vector<std::pair<ui::Accelerator, int>>
++BrowserShortcutService::GetAcceleratorMap() const {
++  std::vector<std::pair<ui::Accelerator, int>> map;
++  for (const auto& [command_id, entries] : current_) {
++    for (const AcceleratorEntry& entry : entries) {
++      map.emplace_back(entry.accelerator, command_id);
++    }
++  }
++  return map;
++}
++
++bool BrowserShortcutService::HasCommand(int command_id) const {
++  return defaults_.contains(command_id);
++}
++
++bool BrowserShortcutService::HasDefaultAccelerator(
++    int command_id,
++    const ui::Accelerator& accelerator) const {
++  const auto it = defaults_.find(command_id);
++  return it != defaults_.end() && ContainsAccelerator(it->second, accelerator);
++}
++
++AssignmentResult BrowserShortcutService::AssignAcceleratorToCommand(
++    int command_id,
++    const std::string& serialized) {
++  if (!HasCommand(command_id)) {
++    return AssignmentResult::kUnknownCommand;
++  }
++  std::optional<AcceleratorEntry> entry = EntryFromString(serialized, true);
++  if (!entry) {
++    return AssignmentResult::kInvalidAccelerator;
++  }
++  return AssignAcceleratorToCommand(command_id, std::move(*entry));
++}
++
++AssignmentResult BrowserShortcutService::AssignAcceleratorToCommand(
++    int command_id,
++    AcceleratorEntry entry) {
++  if (!HasCommand(command_id)) {
++    return AssignmentResult::kUnknownCommand;
++  }
++  if (IsAcceleratorLocked(entry.accelerator, command_id)) {
++    return AssignmentResult::kShortcutLocked;
++  }
++
++  const bool removed_conflict =
++      RemoveConflictingAccelerators(entry.accelerator, command_id);
++  const bool inserted =
++      InsertEntrySorted(current_[command_id], std::move(entry));
++  if (!removed_conflict && !inserted) {
++    return AssignmentResult::kSuccess;
++  }
++
++  PersistToPrefs();
++  RebuildCommandCache();
++  NotifyChanged();
++  return AssignmentResult::kSuccess;
++}
++
++bool BrowserShortcutService::UnassignAcceleratorFromCommand(
++    int command_id,
++    const std::string& serialized) {
++  std::optional<AcceleratorEntry> removed_entry =
++      EntryFromString(serialized, true);
++  if (!removed_entry) {
++    return false;
++  }
++  return UnassignAcceleratorFromCommand(command_id, removed_entry->accelerator);
++}
++
++bool BrowserShortcutService::UnassignAcceleratorFromCommand(
++    int command_id,
++    const ui::Accelerator& accelerator) {
++  std::vector<AcceleratorEntry>* entries = FindMutableEntries(command_id);
++  if (!entries) {
++    return false;
++  }
++  const size_t old_size = entries->size();
++  std::erase_if(*entries, [&](const AcceleratorEntry& entry) {
++    return entry.user_modifiable && entry.accelerator == accelerator;
++  });
++  if (entries->size() == old_size) {
++    return false;
++  }
++  PersistToPrefs();
++  RebuildCommandCache();
++  NotifyChanged();
++  return true;
++}
++
++bool BrowserShortcutService::ResetAcceleratorsForCommand(int command_id) {
++  const auto defaults_it = defaults_.find(command_id);
++  if (defaults_it == defaults_.end()) {
++    return false;
++  }
++  current_[command_id] = defaults_it->second;
++  for (const AcceleratorEntry& entry : defaults_it->second) {
++    RemoveConflictingAccelerators(entry.accelerator, command_id);
++  }
++  PersistToPrefs();
++  RebuildCommandCache();
++  NotifyChanged();
++  return true;
++}
++
++void BrowserShortcutService::ResetAccelerators() {
++  current_ = defaults_;
++  PersistToPrefs(/*preserve_inactive_deltas=*/false);
++  RebuildCommandCache();
++  NotifyChanged();
++}
++
++std::optional<int> BrowserShortcutService::FindCommandForAccelerator(
++    const std::string& serialized) const {
++  std::optional<AcceleratorEntry> search_entry =
++      EntryFromString(serialized, true);
++  if (!search_entry) {
++    return std::nullopt;
++  }
++  return FindCommandForAccelerator(search_entry->accelerator);
++}
++
++std::optional<int> BrowserShortcutService::FindCommandForAccelerator(
++    const ui::Accelerator& accelerator) const {
++  for (const auto& [command_id, entries] : current_) {
++    for (const AcceleratorEntry& entry : entries) {
++      if (entry.accelerator == accelerator) {
++        return command_id;
++      }
++    }
++  }
++  return std::nullopt;
++}
++
++bool BrowserShortcutService::IsAcceleratorLocked(
++    const std::string& serialized,
++    int command_id_to_ignore) const {
++  std::optional<AcceleratorEntry> search_entry =
++      EntryFromString(serialized, true);
++  if (!search_entry) {
++    return false;
++  }
++  return IsAcceleratorLocked(search_entry->accelerator, command_id_to_ignore);
++}
++
++bool BrowserShortcutService::IsAcceleratorLocked(
++    const ui::Accelerator& accelerator,
++    int command_id_to_ignore) const {
++#if BUILDFLAG(IS_MAC)
++  for (const auto& platform_default : GetPlatformDefaultAccelerators()) {
++    if (platform_default.command_id != command_id_to_ignore &&
++        !platform_default.user_modifiable &&
++        platform_default.accelerator == accelerator) {
++      return true;
++    }
++  }
++#endif
++
++  for (const auto& [command_id, entries] : current_) {
++    if (command_id == command_id_to_ignore) {
++      continue;
++    }
++    for (const AcceleratorEntry& entry : entries) {
++      if (!entry.user_modifiable && entry.accelerator == accelerator) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++void BrowserShortcutService::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void BrowserShortcutService::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void BrowserShortcutService::LoadFromPrefs() {
++  defaults_ = BuildCurrentDefaults();
++  current_ = defaults_;
++
++  bool pref_needs_cleanup = false;
++  for (const auto& [command_id, delta] :
++       ReadAcceleratorDeltasPref(&pref_needs_cleanup)) {
++    auto current_it = current_.find(command_id);
++    if (current_it == current_.end()) {
++      continue;
++    }
++
++    for (const AcceleratorEntry& entry : delta.removed) {
++      const size_t erased = std::erase_if(
++          current_it->second, [&](const AcceleratorEntry& current) {
++            return current.user_modifiable &&
++                   current.accelerator == entry.accelerator;
++          });
++      pref_needs_cleanup = pref_needs_cleanup || erased == 0;
++    }
++
++    for (const AcceleratorEntry& entry : delta.added) {
++      if (IsAcceleratorLocked(entry.accelerator, command_id)) {
++        pref_needs_cleanup = true;
++        continue;
++      }
++      RemoveConflictingAccelerators(entry.accelerator, command_id);
++      const bool inserted = InsertEntrySorted(current_it->second, entry);
++      pref_needs_cleanup = pref_needs_cleanup || !inserted;
++    }
++  }
++
++  if (pref_needs_cleanup) {
++    PersistToPrefs();
++  }
++}
++
++void BrowserShortcutService::PersistToPrefs(bool preserve_inactive_deltas) {
++  base::DictValue pref;
++  const base::DictValue& existing_pref =
++      prefs_->GetDict(prefs::kCustomAccelerators);
++
++  if (preserve_inactive_deltas) {
++    for (auto [command_key, value] : existing_pref) {
++      std::optional<int> command_id = PrefKeyToCommandId(command_key);
++      if (command_id && !defaults_.contains(*command_id) && value.is_dict() &&
++          GetBrowserShortcutCommandLabel(*command_id, prefs_).has_value()) {
++        pref.Set(command_key, value.Clone());
++      }
++    }
++  }
++
++  for (const auto& [command_id, entries] : current_) {
++    const auto defaults_it = defaults_.find(command_id);
++    if (defaults_it == defaults_.end()) {
++      continue;
++    }
++
++    base::ListValue added;
++    for (const AcceleratorEntry& entry : entries) {
++      if (!ContainsAccelerator(defaults_it->second, entry.accelerator)) {
++        added.Append(EntryToString(entry));
++      }
++    }
++
++    base::ListValue removed;
++    for (const AcceleratorEntry& entry : defaults_it->second) {
++      if (entry.user_modifiable &&
++          !ContainsAccelerator(entries, entry.accelerator)) {
++        removed.Append(EntryToString(entry));
++      }
++    }
++
++    if (added.empty() && removed.empty()) {
++      continue;
++    }
++
++    base::DictValue delta;
++    if (!added.empty()) {
++      delta.Set(kAddedKey, std::move(added));
++    }
++    if (!removed.empty()) {
++      delta.Set(kRemovedKey, std::move(removed));
++    }
++    pref.Set(CommandIdToPrefKey(command_id), std::move(delta));
++  }
++
++  if (pref.empty()) {
++    prefs_->ClearPref(prefs::kCustomAccelerators);
++    return;
++  }
++
++  prefs_->SetDict(prefs::kCustomAccelerators, std::move(pref));
++}
++
++void BrowserShortcutService::RebuildCommandCache() {
++  command_cache_.clear();
++  for (const auto& [command_id, entries] : current_) {
++    std::optional<BrowserShortcutCommandLabel> label =
++        GetBrowserShortcutCommandLabel(command_id, prefs_);
++    if (!label.has_value()) {
++      continue;
++    }
++    CommandInfo command;
++    command.command_id = command_id;
++    command.name = GetCommandDisplayName(*label);
++    command.modified = !HasDefaultEquivalent(command_id);
++    for (const AcceleratorEntry& entry : entries) {
++      std::string serialized = EntryToString(entry);
++      if (serialized.empty()) {
++        continue;
++      }
++      command.accelerators.push_back(
++          {serialized, AcceleratorToDisplayString(entry.accelerator),
++           entry.user_modifiable});
++    }
++    command_cache_.push_back(std::move(command));
++  }
++}
++
++void BrowserShortcutService::NotifyChanged() {
++  for (Observer& observer : observers_) {
++    observer.OnBrowserShortcutsChanged();
++  }
++}
++
++void BrowserShortcutService::OnCommandLabelsChanged() {
++  LoadFromPrefs();
++  RebuildCommandCache();
++  NotifyChanged();
++}
++
++BrowserShortcutService::CommandAccelerators
++BrowserShortcutService::BuildCurrentDefaults() const {
++  CommandAccelerators defaults;
++  base::flat_set<ui::Accelerator> seen_accelerators;
++  auto insert_default = [&](int command_id,
++                            const ui::Accelerator& ui_accelerator,
++                            bool user_modifiable, bool reserve_unlabeled) {
++    std::string serialized = AcceleratorToString(ui_accelerator);
++    if (serialized.empty()) {
++      return;
++    }
++    const bool has_label =
++        GetBrowserShortcutCommandLabel(command_id, prefs_).has_value();
++    if (!has_label && !reserve_unlabeled) {
++      return;
++    }
++    if (!seen_accelerators.insert(ui_accelerator).second) {
++      return;
++    }
++    if (!has_label) {
++      // Keep the accelerator reserved even though this Settings page cannot
++      // display the owning command.
++      return;
++    }
++    AcceleratorEntry entry = {ui_accelerator, user_modifiable};
++    InsertEntrySorted(defaults[command_id], std::move(entry));
++  };
++
++#if BUILDFLAG(IS_MAC)
++  for (const BrowserShortcutPlatformDefaultAccelerator& accelerator :
++       GetPlatformDefaultAccelerators()) {
++    // Reserve unlabeled platform shortcuts too, so visible commands cannot
++    // claim macOS defaults that are dispatched outside this Settings surface.
++    insert_default(accelerator.command_id, accelerator.accelerator,
++                   accelerator.user_modifiable,
++                   /*reserve_unlabeled=*/true);
++  }
++#endif
++
++  for (const AcceleratorMapping& accelerator : GetAcceleratorList()) {
++    ui::Accelerator ui_accelerator(accelerator.keycode, accelerator.modifiers);
++    // Browser accelerator dispatch can only route one command per accelerator.
++    // Locked platform defaults are inserted first, so they own conflicts with
++    // user-modifiable accelerator-table defaults.
++    insert_default(
++        accelerator.command_id, ui_accelerator,
++        IsBrowserShortcutDefaultUserModifiable(accelerator.command_id),
++        /*reserve_unlabeled=*/false);
++  }
++  for (int command_id : GetBrowserShortcutCommandsWithoutDefault(prefs_)) {
++    defaults.try_emplace(command_id);
++  }
++  return defaults;
++}
++
++BrowserShortcutService::CommandAcceleratorDeltas
++BrowserShortcutService::ReadAcceleratorDeltasPref(
++    bool* pref_needs_cleanup) const {
++  CommandAcceleratorDeltas result;
++  const base::DictValue& pref = prefs_->GetDict(prefs::kCustomAccelerators);
++  for (auto [command_key, value] : pref) {
++    std::optional<int> command_id = PrefKeyToCommandId(command_key);
++    const base::DictValue* delta = value.GetIfDict();
++    if (!command_id || !delta) {
++      *pref_needs_cleanup = true;
++      continue;
++    }
++    if (!defaults_.contains(*command_id)) {
++      continue;
++    }
++    AcceleratorDelta parsed_delta;
++    parsed_delta.added =
++        ReadAcceleratorDeltaList(*delta, kAddedKey, pref_needs_cleanup);
++    parsed_delta.removed =
++        ReadAcceleratorDeltaList(*delta, kRemovedKey, pref_needs_cleanup);
++    if (parsed_delta.added.empty() && parsed_delta.removed.empty()) {
++      *pref_needs_cleanup = true;
++      continue;
++    }
++    result.emplace(*command_id, std::move(parsed_delta));
++  }
++  return result;
++}
++
++std::vector<BrowserShortcutService::AcceleratorEntry>
++BrowserShortcutService::ReadAcceleratorDeltaList(
++    const base::DictValue& pref,
++    std::string_view key,
++    bool* pref_needs_cleanup) const {
++  std::vector<AcceleratorEntry> entries;
++  const base::ListValue* accelerators = pref.FindList(key);
++  if (!accelerators) {
++    return entries;
++  }
++  for (const base::Value& item : *accelerators) {
++    const std::string* item_string = item.GetIfString();
++    if (!item_string) {
++      *pref_needs_cleanup = true;
++      continue;
++    }
++    std::optional<AcceleratorEntry> entry = EntryFromString(*item_string, true);
++    if (!entry) {
++      *pref_needs_cleanup = true;
++      continue;
++    }
++    if (!InsertEntrySorted(entries, std::move(*entry))) {
++      *pref_needs_cleanup = true;
++    }
++  }
++  return entries;
++}
++
++bool BrowserShortcutService::RemoveConflictingAccelerators(
++    const ui::Accelerator& accelerator,
++    int command_id_to_keep) {
++  bool removed = false;
++  for (auto& [command_id, entries] : current_) {
++    if (command_id == command_id_to_keep) {
++      continue;
++    }
++    const size_t erased =
++        std::erase_if(entries, [&](const AcceleratorEntry& entry) {
++          return entry.user_modifiable && entry.accelerator == accelerator;
++        });
++    removed = removed || erased > 0;
++  }
++  return removed;
++}
++
++std::vector<BrowserShortcutService::AcceleratorEntry>*
++BrowserShortcutService::FindMutableEntries(int command_id) {
++  const auto it = current_.find(command_id);
++  return it == current_.end() ? nullptr : &it->second;
++}
++
++bool BrowserShortcutService::HasDefaultEquivalent(int command_id) const {
++  const auto defaults_it = defaults_.find(command_id);
++  const auto current_it = current_.find(command_id);
++  if (defaults_it == defaults_.end() || current_it == current_.end()) {
++    return false;
++  }
++  return defaults_it->second == current_it->second;
++}
++
++}  // namespace browser_shortcuts
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_service.h
+@@ -0,0 +1,132 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERVICE_H_
++#define CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERVICE_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/observer_list.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "ui/base/accelerators/accelerator.h"
++
++namespace base {
++class DictValue;
++}
++
++class PrefService;
++
++namespace browser_shortcuts {
++
++struct ShortcutInfo {
++  std::string serialized;
++  std::u16string display_text;
++  bool user_modifiable = true;
++};
++
++struct CommandInfo {
++  int command_id = 0;
++  std::u16string name;
++  bool modified = false;
++  std::vector<ShortcutInfo> accelerators;
++};
++
++enum class AssignmentResult {
++  kSuccess,
++  kInvalidAccelerator,
++  kUnknownCommand,
++  kShortcutLocked,
++};
++
++class BrowserShortcutService : public KeyedService {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnBrowserShortcutsChanged() = 0;
++  };
++
++  explicit BrowserShortcutService(PrefService* prefs);
++  BrowserShortcutService(const BrowserShortcutService&) = delete;
++  BrowserShortcutService& operator=(const BrowserShortcutService&) = delete;
++  ~BrowserShortcutService() override;
++
++  const std::vector<CommandInfo>& GetCommands() const;
++  std::vector<std::pair<ui::Accelerator, int>> GetAcceleratorMap() const;
++  bool HasCommand(int command_id) const;
++  bool HasDefaultAccelerator(int command_id,
++                             const ui::Accelerator& accelerator) const;
++
++  AssignmentResult AssignAcceleratorToCommand(int command_id,
++                                              const std::string& serialized);
++  bool UnassignAcceleratorFromCommand(int command_id,
++                                      const std::string& serialized);
++  bool ResetAcceleratorsForCommand(int command_id);
++  void ResetAccelerators();
++
++  std::optional<int> FindCommandForAccelerator(
++      const std::string& serialized) const;
++  bool IsAcceleratorLocked(const std::string& serialized,
++                           int command_id_to_ignore) const;
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++  struct AcceleratorEntry {
++    ui::Accelerator accelerator;
++    bool user_modifiable = true;
++
++    bool operator==(const AcceleratorEntry&) const = default;
++  };
++
++ private:
++  using CommandAccelerators = std::map<int, std::vector<AcceleratorEntry>>;
++  struct AcceleratorDelta {
++    std::vector<AcceleratorEntry> added;
++    std::vector<AcceleratorEntry> removed;
++  };
++  using CommandAcceleratorDeltas = std::map<int, AcceleratorDelta>;
++
++  void LoadFromPrefs();
++  void PersistToPrefs(bool preserve_inactive_deltas = true);
++  void RebuildCommandCache();
++  void NotifyChanged();
++  void OnCommandLabelsChanged();
++
++  CommandAccelerators BuildCurrentDefaults() const;
++  CommandAcceleratorDeltas ReadAcceleratorDeltasPref(
++      bool* pref_needs_cleanup) const;
++  std::vector<AcceleratorEntry> ReadAcceleratorDeltaList(
++      const base::DictValue& pref,
++      std::string_view key,
++      bool* pref_needs_cleanup) const;
++  AssignmentResult AssignAcceleratorToCommand(int command_id,
++                                              AcceleratorEntry entry);
++  bool UnassignAcceleratorFromCommand(int command_id,
++                                      const ui::Accelerator& accelerator);
++  std::optional<int> FindCommandForAccelerator(
++      const ui::Accelerator& accelerator) const;
++  bool IsAcceleratorLocked(const ui::Accelerator& accelerator,
++                           int command_id_to_ignore) const;
++  bool RemoveConflictingAccelerators(const ui::Accelerator& accelerator,
++                                     int command_id_to_keep);
++  std::vector<AcceleratorEntry>* FindMutableEntries(int command_id);
++  bool HasDefaultEquivalent(int command_id) const;
++
++  raw_ptr<PrefService> prefs_;
++  PrefChangeRegistrar pref_change_registrar_;
++  CommandAccelerators defaults_;
++  CommandAccelerators current_;
++  std::vector<CommandInfo> command_cache_;
++  base::ObserverList<Observer> observers_;
++};
++
++}  // namespace browser_shortcuts
++
++#endif  // CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERVICE_H_
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.h"
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_selections.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service.h"
++
++namespace browser_shortcuts {
++
++// static
++BrowserShortcutService* BrowserShortcutServiceFactory::GetForProfile(
++    Profile* profile) {
++  return static_cast<BrowserShortcutService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++// static
++BrowserShortcutServiceFactory* BrowserShortcutServiceFactory::GetInstance() {
++  static base::NoDestructor<BrowserShortcutServiceFactory> instance;
++  return instance.get();
++}
++
++BrowserShortcutServiceFactory::BrowserShortcutServiceFactory()
++    : ProfileKeyedServiceFactory(
++          "BrowserShortcutService",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kRedirectedToOriginal)
++              .WithGuest(ProfileSelection::kNone)
++              .WithSystem(ProfileSelection::kNone)
++              .WithAshInternals(ProfileSelection::kNone)
++              .Build()) {}
++
++std::unique_ptr<KeyedService>
++BrowserShortcutServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  Profile* profile = Profile::FromBrowserContext(context);
++  return std::make_unique<BrowserShortcutService>(profile->GetPrefs());
++}
++
++}  // namespace browser_shortcuts
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERVICE_FACTORY_H_
++#define CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERVICE_FACTORY_H_
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace content {
++class BrowserContext;
++}
++
++namespace browser_shortcuts {
++
++class BrowserShortcutService;
++
++class BrowserShortcutServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  static BrowserShortcutService* GetForProfile(Profile* profile);
++  static BrowserShortcutServiceFactory* GetInstance();
++
++ private:
++  friend base::NoDestructor<BrowserShortcutServiceFactory>;
++
++  BrowserShortcutServiceFactory();
++  ~BrowserShortcutServiceFactory() override = default;
++
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++};
++
++}  // namespace browser_shortcuts
++
++#endif  // CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_SERVICE_FACTORY_H_
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1097,6 +1097,16 @@ static_library("ui") {
+       "accelerator_table.h",
+       "breadcrumb_manager_browser_agent.cc",
+       "breadcrumb_manager_browser_agent.h",
++      "browser_shortcuts/browser_shortcut_metadata.cc",
++      "browser_shortcuts/browser_shortcut_metadata.h",
++      "browser_shortcuts/browser_shortcut_prefs.cc",
++      "browser_shortcuts/browser_shortcut_prefs.h",
++      "browser_shortcuts/browser_shortcut_serialization.cc",
++      "browser_shortcuts/browser_shortcut_serialization.h",
++      "browser_shortcuts/browser_shortcut_service.cc",
++      "browser_shortcuts/browser_shortcut_service.h",
++      "browser_shortcuts/browser_shortcut_service_factory.cc",
++      "browser_shortcuts/browser_shortcut_service_factory.h",
+       "browser.cc",
+       "browser.h",
+       "browser_action_prefs_listener.cc",
+@@ -1495,6 +1505,8 @@ static_library("ui") {
+ 
+     if (is_mac) {
+       sources += [
++        "browser_shortcuts/browser_shortcut_platform_mac.h",
++        "browser_shortcuts/browser_shortcut_platform_mac.mm",
+         "webui/settings/brave_full_disk_access_confirm_dialog_delegate.h",
+         "webui/settings/brave_full_disk_access_confirm_dialog_delegate_mac.mm",
+       ]
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -1786,6 +1786,96 @@ are declared in tools/grit/grit_args.gni
+       <message name="IDS_CHROME_WHATS_NEW" desc="The text label of the Help menu item which takes the user to the Chrome What's New page.">
+         What's New
+       </message>
++      <message name="IDS_SHORTCUT_COMMAND_SELECT_NEXT_TAB" desc="Command name shown on the Settings shortcuts page for selecting the next tab.">
++        Next tab
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_SELECT_PREVIOUS_TAB" desc="Command name shown on the Settings shortcuts page for selecting the previous tab.">
++        Previous tab
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_LOCATION" desc="Command name shown on the Settings shortcuts page for focusing the address bar.">
++        Focus address bar
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FIND_NEXT" desc="Command name shown on the Settings shortcuts page for finding the next match in the current page.">
++        Find next
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FIND_PREVIOUS" desc="Command name shown on the Settings shortcuts page for finding the previous match in the current page.">
++        Find previous
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_BACK" desc="Command name shown on the Settings shortcuts page for navigating back.">
++        Back
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FORWARD" desc="Command name shown on the Settings shortcuts page for navigating forward.">
++        Forward
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_HOME" desc="Command name shown on the Settings shortcuts page for opening the home page.">
++        Home
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_NEW_SPLIT_TAB" desc="Command name shown on the Settings shortcuts page for opening a new split tab.">
++        New split tab
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_SELECT_LAST_TAB" desc="Command name shown on the Settings shortcuts page for selecting the last tab.">
++        Last tab
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_SELECT_TAB" desc="Command name shown on the Settings shortcuts page for selecting a tab by number.">
++        Tab <ph name="TAB_NUMBER">$1<ex>1</ex></ph>
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_MOVE_TAB_NEXT" desc="Command name shown on the Settings shortcuts page for moving the current tab to the right.">
++        Move tab right
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_MOVE_TAB_PREVIOUS" desc="Command name shown on the Settings shortcuts page for moving the current tab to the left.">
++        Move tab left
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_NEXT_TAB_GROUP" desc="Command name shown on the Settings shortcuts page for focusing the next tab group.">
++        Next tab group
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_PREVIOUS_TAB_GROUP" desc="Command name shown on the Settings shortcuts page for focusing the previous tab group.">
++        Previous tab group
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_CLOSE_TAB_GROUP" desc="Command name shown on the Settings shortcuts page for closing the current tab group.">
++        Close tab group
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_BOOKMARKS" desc="Command name shown on the Settings shortcuts page for focusing the bookmarks bar.">
++        Focus bookmarks bar
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_TOGGLE_VERTICAL_TABS" desc="Command name shown on the Settings shortcuts page for toggling vertical tabs with the Ctrl+S shortcut when vertical layout is active.">
++        Toggle vertical tabs
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_CLOSE_FIND_OR_STOP" desc="Command name shown on the Settings shortcuts page for closing the find bar or stopping page loading.">
++        Close find bar or stop loading
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_SEARCH" desc="Command name shown on the Settings shortcuts page for focusing search.">
++        Focus search
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_NEXT_PANE" desc="Command name shown on the Settings shortcuts page for focusing the next browser pane.">
++        Focus next pane
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_PREVIOUS_PANE" desc="Command name shown on the Settings shortcuts page for focusing the previous browser pane.">
++        Focus previous pane
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_WEB_CONTENTS_PANE" desc="Command name shown on the Settings shortcuts page for focusing page content.">
++        Focus page content
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_MENU_BAR" desc="Command name shown on the Settings shortcuts page for focusing the menu bar.">
++        Focus menu bar
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_TOOLBAR" desc="Command name shown on the Settings shortcuts page for focusing the toolbar.">
++        Focus toolbar
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_FOCUS_INACTIVE_POPUP" desc="Command name shown on the Settings shortcuts page for focusing an inactive popup for accessibility.">
++        Focus inactive popup
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_SHOW_AVATAR_MENU" desc="Command name shown on the Settings shortcuts page for opening the profile menu.">
++        Profile menu
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_SHOW_APP_MENU" desc="Command name shown on the Settings shortcuts page for opening the app menu.">
++        App menu
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_TOGGLE_ZEN_MODE_TOP_CHROME_PIN" desc="Command name shown on the Settings shortcuts page for pinning or unpinning the top toolbar in zen mode.">
++        Pin top toolbar
++      </message>
++      <message name="IDS_SHORTCUT_COMMAND_TOGGLE_DEV_TOOLS" desc="Command name shown on the Settings shortcuts page for toggling Developer Tools.">
++        Toggle developer tools
++      </message>
+       <if expr="not use_titlecase">
+         <message name="IDS_IMPORT_SETTINGS_MENU_LABEL" desc="In sentence case: The app menu label to import bookmarks and settings.">
+           Import bookmarks and settings...
+--- a/ui/strings/ui_strings.grd
++++ b/ui/strings/ui_strings.grd
+@@ -758,6 +758,12 @@ need to be translated for each locale.--
+       <message name="IDS_APP_PERIOD_KEY" desc="Period key, which is used to denote the end of a sentence (and not an interval of time).">
+         Period
+       </message>
++      <message name="IDS_APP_PLUS_KEY" desc="Plus key, which is the key labelled with a plus sign.">
++        Plus
++      </message>
++      <message name="IDS_APP_NUMPAD_KEY" desc="Label for a key located on the numeric keypad. $1 is a localized key name or a digit, for example '1' or 'Plus'.">
++        Numpad <ph name="KEY_NAME">$1<ex>1</ex></ph>
++      </message>
+       <message name="IDS_APP_MEDIA_NEXT_TRACK_KEY" desc="Media next track key">
+         Media Next Track
+       </message>
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -81,6 +81,7 @@
+ #include "chrome/browser/subscription_eligibility/subscription_eligibility_prefs.h"
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/tracing/chrome_tracing_delegate.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_prefs.h"
+ #include "chrome/browser/ui/browser_ui_prefs.h"
+ #include "chrome/browser/ui/network_profile_bubble.h"
+ #include "chrome/browser/ui/performance_controls/performance_controls_metrics.h"
+@@ -1744,6 +1745,7 @@ void RegisterProfilePrefs(user_prefs::Pr
+   PushMessagingUnsubscribedEntry::RegisterProfilePrefs(registry);
+   QuietNotificationPermissionUiState::RegisterProfilePrefs(registry);
+   regional_capabilities::prefs::RegisterProfilePrefs(registry);
++  browser_shortcuts::prefs::RegisterProfilePrefs(registry);
+   RegisterBrowserUserPrefs(registry);
+   RegisterGeminiSettingsPrefs(registry);
+   RegisterPrefersDefaultScrollbarStylesPrefs(registry);
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -600,6 +600,7 @@
+ #if defined(TOOLKIT_VIEWS)
+ #include "chrome/browser/bookmarks/bookmark_expanded_state_tracker_factory.h"
+ #include "chrome/browser/bookmarks/bookmark_merged_surface_service_factory.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.h"
+ #endif
+ 
+ #if BUILDFLAG(USE_NSS_CERTS)
+@@ -793,6 +794,9 @@ void ChromeBrowserMainExtraPartsProfiles
+   browser_switcher::BrowserSwitcherServiceFactory::GetInstance();
+ #endif
+   browser_sync::UserEventServiceFactory::GetInstance();
++#if defined(TOOLKIT_VIEWS)
++  browser_shortcuts::BrowserShortcutServiceFactory::GetInstance();
++#endif
+ #if !BUILDFLAG(IS_ANDROID)
+   BrowserManagerServiceFactory::GetInstance();
+ #endif
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -79,7 +79,7 @@ bool MatchesEventForKeyboardShortcut(con
+ }
+ 
+ const std::vector<KeyboardShortcutData>&
+-GetDelayedShortcutsNotPresentInMainMenu() {
++GetDelayedShortcutsNotPresentInMainMenuImpl() {
+   // clang-format off
+   static base::NoDestructor<std::vector<KeyboardShortcutData>> keys({
+     // cmd    shift  cntrl  option vkeycode               command
+@@ -183,6 +183,39 @@ const std::vector<KeyboardShortcutData>&
+   return *keys;
+ }
+ 
++namespace {
++
++const std::vector<KeyboardShortcutData>&
++GetShortcutsNotPresentInMainMenuForShortcutSettings() {
++  static const base::NoDestructor<std::vector<KeyboardShortcutData>> keys([]() {
++    std::vector<KeyboardShortcutData> result =
++        GetShortcutsNotPresentInMainMenu();
++    const std::vector<KeyboardShortcutData>& delayed_shortcuts =
++        GetDelayedShortcutsNotPresentInMainMenuImpl();
++    result.insert(result.end(), delayed_shortcuts.begin(),
++                  delayed_shortcuts.end());
++    return result;
++  }());
++  return *keys;
++}
++
++}  // namespace
++
++const std::vector<KeyboardShortcutAcceleratorData>&
++GetShortcutSettingsAcceleratorsNotPresentInMainMenu() {
++  static const base::NoDestructor<std::vector<KeyboardShortcutAcceleratorData>>
++      accelerators([]() {
++        std::vector<KeyboardShortcutAcceleratorData> result;
++        for (const KeyboardShortcutData& shortcut :
++             GetShortcutsNotPresentInMainMenuForShortcutSettings()) {
++          result.push_back(
++              {shortcut.chrome_command, AcceleratorFromShortcut(shortcut)});
++        }
++        return result;
++      }());
++  return *accelerators;
++}
++
+ const std::vector<NSMenuItem*>& GetMenuItemsNotPresentInMainMenu() {
+   static base::NoDestructor<std::vector<NSMenuItem*>> menu_items([]() {
+     std::vector<NSMenuItem*> menu_items;
+@@ -241,7 +274,7 @@ int DelayedWebContentsCommandForKeyEvent
+ 
+   // Scan through keycodes and see if it corresponds to one of the non-menu
+   // shortcuts.
+-  for (const auto& shortcut : GetDelayedShortcutsNotPresentInMainMenu()) {
++  for (const auto& shortcut : GetDelayedShortcutsNotPresentInMainMenuImpl()) {
+     if (MatchesEventForKeyboardShortcut(shortcut, cmdKey, shiftKey, cntrlKey,
+                                         optKey, keyCode)) {
+       return shortcut.chrome_command;
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PLATFORM_MAC_H_
++#define CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PLATFORM_MAC_H_
++
++#include <utility>
++#include <vector>
++
++#include "ui/base/accelerators/accelerator.h"
++
++namespace browser_shortcuts {
++
++struct BrowserShortcutPlatformDefaultAccelerator {
++  int command_id = 0;
++  ui::Accelerator accelerator;
++  bool user_modifiable = false;
++};
++
++std::vector<BrowserShortcutPlatformDefaultAccelerator>
++GetPlatformDefaultAccelerators();
++
++void UpdatePlatformMenuAccelerators(
++    const std::vector<std::pair<ui::Accelerator, int>>& accelerators);
++
++}  // namespace browser_shortcuts
++
++#endif  // CHROME_BROWSER_UI_BROWSER_SHORTCUTS_BROWSER_SHORTCUT_PLATFORM_MAC_H_
+--- /dev/null
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.mm
+@@ -0,0 +1,265 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.h"
++
++#import <AppKit/AppKit.h>
++
++#include <map>
++#include <optional>
++
++#include "base/containers/flat_set.h"
++#include "base/no_destructor.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/global_keyboard_shortcuts_mac.h"
++#include "chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h"
++#include "chrome/browser/ui/cocoa/accelerators_cocoa.h"
++#include "ui/base/accelerators/platform_accelerator_cocoa.h"
++#include "ui/events/cocoa/cocoa_event_utils.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/keycodes/keyboard_code_conversion_mac.h"
++
++namespace browser_shortcuts {
++
++namespace {
++
++using AcceleratorsByCommandId = std::map<int, ui::Accelerator>;
++
++bool KeyEquivalentRequiresShift(unichar key_equivalent) {
++  if (key_equivalent >= 'A' && key_equivalent <= 'Z') {
++    return true;
++  }
++
++  // Mirrors the shifted U.S. punctuation pairs accepted by
++  // ui::KeyboardCodeFromCharCode().
++  switch (key_equivalent) {
++    case ':':
++    case '+':
++    case '<':
++    case '_':
++    case '>':
++    case '?':
++    case '~':
++    case '{':
++    case '|':
++    case '}':
++    case '"':
++      return true;
++    default:
++      return false;
++  }
++}
++
++std::optional<ui::Accelerator> AcceleratorFromMenuItem(NSMenuItem* item) {
++  NSString* key_equivalent = item.keyEquivalent;
++  if (key_equivalent.length == 0) {
++    return std::nullopt;
++  }
++
++  unichar key = [key_equivalent characterAtIndex:0];
++  // This covers Chromium's standard menu accelerators and typical macOS App
++  // Shortcut remaps. AppKit key equivalents outside Chromium's character map
++  // are ignored here and may still be reserved by static non-menu shortcuts.
++  ui::KeyboardCode key_code = ui::KeyboardCodeFromCharCode(key);
++  if (key_code == ui::VKEY_UNKNOWN) {
++    return std::nullopt;
++  }
++
++  int modifiers = ui::EventFlagsFromModifiers(item.keyEquivalentModifierMask);
++  if (item.keyEquivalentModifierMask & NSEventModifierFlagFunction) {
++    modifiers |= ui::EF_FUNCTION_DOWN;
++  }
++  if (KeyEquivalentRequiresShift(key)) {
++    modifiers |= ui::EF_SHIFT_DOWN;
++  }
++  return ui::Accelerator(key_code, modifiers);
++}
++
++int CommandIdFromMenuItem(NSMenuItem* item) {
++  SEL action = [item action];
++  if ((action == @selector(commandDispatch:) ||
++       action == @selector(commandDispatchUsingKeyModifiers:)) &&
++      [item tag] > 0) {
++    return [item tag];
++  }
++  if (action == @selector(performClose:)) {
++    return IDC_CLOSE_WINDOW;
++  }
++  if (action == @selector(terminate:)) {
++    return IDC_EXIT;
++  }
++  return NO_COMMAND;
++}
++
++base::flat_set<int>& KaguyaManagedMenuCommandIds() {
++  static base::NoDestructor<base::flat_set<int>> command_ids;
++  return *command_ids;
++}
++
++bool IsDynamicCloseCommand(int command_id) {
++  // AppController swaps Cmd+W/Cmd+Shift+W between Close Tab and Close Window at
++  // runtime based on the active window. Kaguya can expose these commands for
++  // additional shortcuts, but should not rewrite their menu-owned defaults.
++  return command_id == IDC_CLOSE_TAB || command_id == IDC_CLOSE_WINDOW;
++}
++
++bool IsMenuCommandKaguyaModifiable(
++    int command_id,
++    const std::optional<ui::Accelerator>& accelerator) {
++  if (IsDynamicCloseCommand(command_id)) {
++    return false;
++  }
++
++  const ui::Accelerator* default_accelerator =
++      AcceleratorsCocoa::GetInstance()->GetAcceleratorForCommand(command_id);
++  if (!default_accelerator) {
++    return false;
++  }
++
++  if (!KaguyaManagedMenuCommandIds().contains(command_id) &&
++      (!accelerator.has_value() || *default_accelerator != *accelerator)) {
++    return false;
++  }
++
++  return IsBrowserShortcutDefaultUserModifiable(command_id);
++}
++
++void AppendMenuItems(
++    NSMenu* menu,
++    std::vector<BrowserShortcutPlatformDefaultAccelerator>* defaults,
++    base::flat_set<int>* live_menu_command_ids) {
++  if (menu == NSApp.servicesMenu) {
++    return;
++  }
++
++  for (NSMenuItem* item in menu.itemArray) {
++    int command_id = CommandIdFromMenuItem(item);
++    if (command_id != NO_COMMAND) {
++      live_menu_command_ids->insert(command_id);
++    }
++    std::optional<ui::Accelerator> accelerator = AcceleratorFromMenuItem(item);
++    if (command_id != NO_COMMAND) {
++      const bool user_modifiable =
++          IsMenuCommandKaguyaModifiable(command_id, accelerator);
++      const ui::Accelerator* default_accelerator =
++          user_modifiable
++              ? AcceleratorsCocoa::GetInstance()->GetAcceleratorForCommand(
++                    command_id)
++              : nullptr;
++      if (default_accelerator) {
++        defaults->push_back(
++            {command_id, *default_accelerator, user_modifiable});
++      } else if (accelerator.has_value()) {
++        defaults->push_back({command_id, *accelerator, user_modifiable});
++      }
++    }
++
++    if (item.submenu) {
++      AppendMenuItems(item.submenu, defaults, live_menu_command_ids);
++    }
++  }
++}
++
++void AppendShortcutData(
++    const std::vector<KeyboardShortcutAcceleratorData>& shortcuts,
++    std::vector<BrowserShortcutPlatformDefaultAccelerator>* defaults) {
++  for (const KeyboardShortcutAcceleratorData& shortcut : shortcuts) {
++    defaults->push_back({shortcut.chrome_command, shortcut.accelerator,
++                         /*user_modifiable=*/false});
++  }
++}
++
++bool ShouldManageMenuItem(NSMenuItem* item, int command_id) {
++  if (IsDynamicCloseCommand(command_id)) {
++    return false;
++  }
++
++  if (KaguyaManagedMenuCommandIds().contains(command_id)) {
++    return true;
++  }
++
++  return IsMenuCommandKaguyaModifiable(command_id, AcceleratorFromMenuItem(item));
++}
++
++void ApplyMenuItemAccelerator(
++    NSMenuItem* item,
++    const AcceleratorsByCommandId& accelerators_by_command_id,
++    int command_id) {
++  auto accelerator_it = accelerators_by_command_id.find(command_id);
++  if (accelerator_it == accelerators_by_command_id.end()) {
++    item.keyEquivalent = @"";
++    item.keyEquivalentModifierMask = 0;
++    return;
++  }
++
++  KeyEquivalentAndModifierMask* equivalent =
++      ui::GetKeyEquivalentAndModifierMaskFromAccelerator(
++          accelerator_it->second);
++  item.keyEquivalent = equivalent.keyEquivalent;
++  item.keyEquivalentModifierMask = equivalent.modifierMask;
++}
++
++void UpdateMenuItems(
++    NSMenu* menu,
++    const AcceleratorsByCommandId& accelerators_by_command_id) {
++  if (menu == NSApp.servicesMenu) {
++    return;
++  }
++
++  for (NSMenuItem* item in menu.itemArray) {
++    const int command_id = CommandIdFromMenuItem(item);
++    if (command_id != NO_COMMAND && ShouldManageMenuItem(item, command_id)) {
++      ApplyMenuItemAccelerator(item, accelerators_by_command_id, command_id);
++      KaguyaManagedMenuCommandIds().insert(command_id);
++    }
++
++    if (item.submenu) {
++      UpdateMenuItems(item.submenu, accelerators_by_command_id);
++    }
++  }
++}
++
++}  // namespace
++
++std::vector<BrowserShortcutPlatformDefaultAccelerator>
++GetPlatformDefaultAccelerators() {
++  std::vector<BrowserShortcutPlatformDefaultAccelerator> defaults;
++  base::flat_set<int> live_menu_command_ids;
++
++  // The app menu is macOS' runtime shortcut owner, including user-remapped App
++  // Shortcuts. Static Chromium defaults below are only a fallback for commands
++  // missing from the live menu plus shortcuts dispatched outside the menu path.
++  if (NSApp.mainMenu) {
++    AppendMenuItems(NSApp.mainMenu, &defaults, &live_menu_command_ids);
++  }
++
++  AcceleratorsCocoa* accelerators = AcceleratorsCocoa::GetInstance();
++  for (auto it = accelerators->begin(); it != accelerators->end(); ++it) {
++    if (live_menu_command_ids.contains(it->first)) {
++      continue;
++    }
++    defaults.push_back({it->first, it->second, /*user_modifiable=*/false});
++  }
++
++  AppendShortcutData(GetShortcutSettingsAcceleratorsNotPresentInMainMenu(),
++                     &defaults);
++
++  return defaults;
++}
++
++void UpdatePlatformMenuAccelerators(
++    const std::vector<std::pair<ui::Accelerator, int>>& accelerators) {
++  if (!NSApp.mainMenu) {
++    return;
++  }
++
++  std::map<int, ui::Accelerator> accelerators_by_command_id;
++  for (const auto& [accelerator, command_id] : accelerators) {
++    accelerators_by_command_id.try_emplace(command_id, accelerator);
++  }
++
++  UpdateMenuItems(NSApp.mainMenu, accelerators_by_command_id);
++}
++
++}  // namespace browser_shortcuts
+--- a/chrome/browser/global_keyboard_shortcuts_mac.h
++++ b/chrome/browser/global_keyboard_shortcuts_mac.h
+@@ -9,14 +9,12 @@
+ 
+ #include <vector>
+ 
++#include "ui/base/accelerators/accelerator.h"
++
+ #if defined(__OBJC__)
+ @class NSEvent;
+ #endif  // __OBJC__
+ 
+-namespace ui {
+-class Accelerator;
+-}
+-
+ constexpr int NO_COMMAND = -1;
+ 
+ struct KeyboardShortcutData {
+@@ -29,6 +27,11 @@ struct KeyboardShortcutData {
+   int chrome_command;  // The chrome command # to execute for this shortcut.
+ };
+ 
++struct KeyboardShortcutAcceleratorData {
++  int chrome_command;
++  ui::Accelerator accelerator;
++};
++
+ struct CommandForKeyEventResult {
+   bool found() { return chrome_command != NO_COMMAND; }
+ 
+@@ -83,4 +86,8 @@ bool GetDefaultMacAcceleratorForCommandI
+ // For testing purposes.
+ const std::vector<KeyboardShortcutData>& GetShortcutsNotPresentInMainMenu();
+ 
++// Shortcuts dispatched outside the main menu, converted for Settings display.
++const std::vector<KeyboardShortcutAcceleratorData>&
++GetShortcutSettingsAcceleratorsNotPresentInMainMenu();
++
+ #endif  // CHROME_BROWSER_GLOBAL_KEYBOARD_SHORTCUTS_MAC_H_

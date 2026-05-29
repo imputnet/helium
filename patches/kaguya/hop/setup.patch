@@ -1,0 +1,219 @@
+--- a/chrome/browser/policy/chrome_browser_policy_connector.cc
++++ b/chrome/browser/policy/chrome_browser_policy_connector.cc
+@@ -30,6 +30,7 @@
+ #include "components/policy/core/common/cloud/user_cloud_policy_manager.h"
+ #include "components/policy/core/common/command_line_policy_provider.h"
+ #include "components/policy/core/common/configuration_policy_provider.h"
++#include "components/policy/core/common/kaguya_opinionated_policy_provider.h"
+ #include "components/policy/core/common/local_test_policy_provider.h"
+ #include "components/policy/core/common/policy_logger.h"
+ #include "components/policy/core/common/policy_map.h"
+@@ -284,6 +285,12 @@ void ChromeBrowserPolicyConnector::SetDe
+ std::vector<std::unique_ptr<policy::ConfigurationPolicyProvider>>
+ ChromeBrowserPolicyConnector::CreatePolicyProviders() {
+   auto providers = BrowserPolicyConnector::CreatePolicyProviders();
++
++  auto hop_provider = std::make_unique<HopProvider>();
++  hop_provider_ = hop_provider.get();
++
++  providers.insert(providers.begin(), std::move(hop_provider));
++
+   std::unique_ptr<ConfigurationPolicyProvider> platform_provider =
+       CreatePlatformProvider();
+   if (platform_provider) {
+--- a/chrome/browser/policy/chrome_browser_policy_connector.h
++++ b/chrome/browser/policy/chrome_browser_policy_connector.h
+@@ -114,6 +114,10 @@ class ChromeBrowserPolicyConnector : pub
+     return command_line_provider_;
+   }
+ 
++  ConfigurationPolicyProvider* hop_provider() {
++    return hop_provider_;
++  }
++
+   // Set ProxyPolicyProvider for testing, caller needs to init and shutdown the
+   // provider.
+   void SetProxyPolicyProviderForTesting(
+@@ -188,6 +192,9 @@ class ChromeBrowserPolicyConnector : pub
+   // Owned by base class.
+   raw_ptr<ConfigurationPolicyProvider> command_line_provider_ = nullptr;
+ 
++  // Owned by base class.
++  raw_ptr<ConfigurationPolicyProvider> hop_provider_ = nullptr;
++
+   raw_ptr<ConfigurationPolicyProvider> local_test_provider_for_testing_ =
+       nullptr;
+   std::unique_ptr<LocalTestPolicyProvider> local_test_provider_;
+--- a/chrome/browser/policy/profile_policy_connector.cc
++++ b/chrome/browser/policy/profile_policy_connector.cc
+@@ -498,6 +498,10 @@ void ProfilePolicyConnector::Init(
+   if (connector->command_line_policy_provider()) {
+     policy_providers_.push_back(connector->command_line_policy_provider());
+   }
++
++  if (connector->hop_provider()) {
++    policy_providers_.push_back(connector->hop_provider());
++  }
+ #endif
+ 
+     local_test_policy_provider_ = connector->local_test_policy_provider();
+--- a/components/policy/core/common/BUILD.gn
++++ b/components/policy/core/common/BUILD.gn
+@@ -155,6 +155,8 @@ source_set("internal") {
+     "external_data_manager.h",
+     "features.cc",
+     "features.h",
++    "kaguya_opinionated_policy_provider.cc",
++    "kaguya_opinionated_policy_provider.h",
+     "json_schema_constants.cc",
+     "json_schema_constants.h",
+     "local_test_policy_loader.cc",
+--- /dev/null
++++ b/components/policy/core/common/kaguya_opinionated_policy_provider.cc
+@@ -0,0 +1,32 @@
++// Copyright 2025 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/policy/core/common/kaguya_opinionated_policy_provider.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/memory/ptr_util.h"
++#include "build/build_config.h"
++#include "components/policy/core/common/policy_bundle.h"
++#include "components/policy/core/common/policy_types.h"
++#include "components/policy/policy_constants.h"
++
++namespace policy {
++void Set(PolicyMap& map, const std::string& name, PolicyLevel level, base::Value value) {
++  map.Set(name, level, POLICY_SCOPE_MACHINE, POLICY_SOURCE_HOP, std::move(value), nullptr);
++}
++
++void HopProvider::RefreshPolicies(PolicyFetchReason reason) {
++  PolicyBundle bundle;
++  PolicyMap& policy_map = bundle.Get(PolicyNamespace(POLICY_DOMAIN_CHROME, std::string()));
++
++  UpdatePolicy(std::move(bundle));
++}
++
++HopProvider::HopProvider() {
++  RefreshPolicies(PolicyFetchReason::kBrowserStart);
++}
++
++}  // namespace policy
+--- /dev/null
++++ b/components/policy/core/common/kaguya_opinionated_policy_provider.h
+@@ -0,0 +1,25 @@
++// Copyright 2025 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_POLICY_CORE_COMMON_KAGUYA_OPINIONATED_POLICY_PROVIDER_H_
++#define COMPONENTS_POLICY_CORE_COMMON_KAGUYA_OPINIONATED_POLICY_PROVIDER_H_
++
++#include "components/policy/core/common/configuration_policy_provider.h"
++#include "components/policy/policy_export.h"
++
++namespace policy {
++
++class POLICY_EXPORT HopProvider
++    : public ConfigurationPolicyProvider {
++public:
++  HopProvider();
++  HopProvider(const HopProvider&) = delete;
++  HopProvider& operator=(const HopProvider&) = delete;
++
++  void RefreshPolicies(PolicyFetchReason reason) override;
++};
++
++}  // namespace policy
++
++#endif  // COMPONENTS_POLICY_CORE_COMMON_KAGUYA_OPINIONATED_POLICY_PROVIDER_H_
+--- a/components/policy/core/common/policy_statistics_collector.cc
++++ b/components/policy/core/common/policy_statistics_collector.cc
+@@ -46,6 +46,7 @@ SimplePolicySource SimplifyPolicySource(
+     case POLICY_SOURCE_CLOUD:
+     case POLICY_SOURCE_CLOUD_FROM_ASH:
+       return kCloud;
++    case POLICY_SOURCE_HOP:
+     case POLICY_SOURCE_PLATFORM:
+     case POLICY_SOURCE_ACTIVE_DIRECTORY:
+       // Adjust for enrollment policies which can never be set from cloud.
+--- a/components/policy/core/common/policy_types.h
++++ b/components/policy/core/common/policy_types.h
+@@ -73,6 +73,9 @@ enum PolicySource {
+   // policy. This source should be kept as highest priority source.
+   POLICY_SOURCE_RESTRICTED_MANAGED_GUEST_SESSION_OVERRIDE,
+ 
++  // Kaguya opinionated policies
++  POLICY_SOURCE_HOP,
++
+   // Number of source types. Has to be the last element.
+   POLICY_SOURCE_COUNT
+ };
+@@ -111,6 +114,10 @@ enum PolicyPriorityBrowser {
+   // raised above that of platform and cloud machine policies.
+   kCloudUserDoubleRaised,
+ 
++  // The policy is configured as a HOP, which takes precedence over
++  // everything else.
++  kKaguyaOpionatedPolicy,
++
+   // The policy coming from multiple sources and its value has been merged.
+   kMerged,
+ };
+--- a/components/enterprise/browser/reporting/policy_info.cc
++++ b/components/enterprise/browser/reporting/policy_info.cc
+@@ -49,6 +49,7 @@ em::Policy_PolicyScope GetScope(const ba
+ em::Policy_PolicySource GetSource(const base::Value& policy) {
+   switch (
+       static_cast<policy::PolicySource>(*policy.GetDict().FindInt("source"))) {
++    case policy::POLICY_SOURCE_HOP:
+     case policy::POLICY_SOURCE_ENTERPRISE_DEFAULT:
+       return em::Policy_PolicySource_SOURCE_ENTERPRISE_DEFAULT;
+     case policy::POLICY_SOURCE_COMMAND_LINE:
+--- a/components/policy/core/common/policy_map.cc
++++ b/components/policy/core/common/policy_map.cc
+@@ -75,6 +75,8 @@ PolicyPriorityBrowser GetPriority(
+       return PolicyPriorityBrowser::kEnterpriseDefault;
+     case POLICY_SOURCE_COMMAND_LINE:
+       return PolicyPriorityBrowser::kCommandLine;
++    case POLICY_SOURCE_HOP:
++      return PolicyPriorityBrowser::kKaguyaOpionatedPolicy;
+     case POLICY_SOURCE_CLOUD:
+       if (scope == POLICY_SCOPE_MACHINE) {
+         // Raise the priority of cloud machine policies only when the metapolicy
+--- a/chrome/browser/ui/webui/policy/policy_ui.cc
++++ b/chrome/browser/ui/webui/policy/policy_ui.cc
+@@ -235,6 +235,7 @@ void CreateAndAddPolicyUIHtmlSource(Prof
+         {"sourceCloudFromAsh", IDS_POLICY_SOURCE_CLOUD_FROM_ASH},
+         {"sourceRestrictedManagedGuestSessionOverride",
+          IDS_POLICY_SOURCE_RESTRICTED_MANAGED_GUEST_SESSION_OVERRIDE},
++        {"sourceHop", IDS_POLICY_SOURCE_HOP},
+     };
+ 
+     source->AddLocalizedStrings(kPolicyTestTypes);
+--- a/components/policy/core/browser/policy_conversions.h
++++ b/components/policy/core/browser/policy_conversions.h
+@@ -40,6 +40,7 @@ inline constexpr auto kPolicySources =
+         {"cloud_from_ash", IDS_POLICY_SOURCE_CLOUD_FROM_ASH},
+         {"restrictedManagedGuestSessionOverride",
+          IDS_POLICY_SOURCE_RESTRICTED_MANAGED_GUEST_SESSION_OVERRIDE},
++        {"hop", IDS_POLICY_SOURCE_HOP},
+     });
+ 
+ inline constexpr char kIdKey[] = "id";
+--- a/components/policy_strings.grdp
++++ b/components/policy_strings.grdp
+@@ -711,6 +711,9 @@ Additional details:
+   <message name="IDS_POLICY_SOURCE_RESTRICTED_MANAGED_GUEST_SESSION_OVERRIDE" desc="Indicates that the policy originates from the restricted managed guest session override.">
+     Restricted managed guest session override
+   </message>
++  <message name="IDS_POLICY_SOURCE_HOP" desc="Indicates that the policy originates from Kaguya defaults.">
++    Kaguya defaults
++  </message>
+   <message name="IDS_POLICY_SOURCE_ACTIVE_DIRECTORY" desc="Indicates that the policy originates from a local server, e.g. Samba or Active Directory.">
+     <ph name="MICROSOFT_ACTIVE_DIRECTORY">Local Server</ph>
+   </message>

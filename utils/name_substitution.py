@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-# Copyright 2025 The Helium Authors
+# Copyright 2025 The Kaguya Authors
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
-"""Script to replace instances of Chrome/Chromium with Helium"""
+"""Script to replace instances of Chrome/Chromium with Kaguya"""
 
 from concurrent.futures import ProcessPoolExecutor
 from tarfile import TarInfo
@@ -21,16 +21,16 @@ IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios', 'testdata
 def replacement_sanity():
     """Sanity check to ensure replacement regexes are working as intended"""
     before_after = [
-        ('chrome://about', 'helium://about'),
+        ('chrome://about', 'kaguya://about'),
         ('Chrome Root Program', 'Chrome Root Program'),
-        (' Chrome  ', ' Helium  '),
+        (' Chrome  ', ' Kaguya  '),
         ('Chrome Web Store', 'Chrome Web Store'),
         ('Chromium Web Store', 'Chromium Web Store'),
         ('Chrome Remote Desktop', 'Chrome Remote Desktop'),
-        ('Google Chrome', 'Helium'),
-        ('Chrome Google Chrome Chrome Chromium', 'Helium Helium Helium Helium'),
-        ('Chrome', 'Helium'),
-        ('Chromium', 'Helium'),
+        ('Google Chrome', 'Kaguya'),
+        ('Chrome Google Chrome Chrome Chromium', 'Kaguya Kaguya Kaguya Kaguya'),
+        ('Chrome', 'Kaguya'),
+        ('Chromium', 'Kaguya'),
     ]
 
     for source, expected in before_after:

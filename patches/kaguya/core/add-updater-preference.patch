@@ -1,0 +1,148 @@
+--- a/components/kaguya_services/pref_names.h
++++ b/components/kaguya_services/pref_names.h
+@@ -33,6 +33,9 @@ inline constexpr char kKaguyaExtProxyEna
+ inline constexpr char kKaguyaBangsEnabled[] =
+     "kaguya.services.bangs";
+ 
++inline constexpr char kKaguyaUpdateFetchingEnabled[] =
++    "kaguya.services.browser_updates";
++
+ inline constexpr char kKaguyaSpellcheckEnabled[] =
+     "kaguya.services.spellcheck_files";
+ 
+--- a/components/kaguya_services/kaguya_services_helpers.h
++++ b/components/kaguya_services/kaguya_services_helpers.h
+@@ -22,11 +22,13 @@ bool ShouldAccessServices(const PrefServ
+ 
+ COMPONENT_EXPORT(KAGUYA) bool ShouldFetchBangs(const PrefService& prefs);
+ COMPONENT_EXPORT(KAGUYA) bool ShouldAccessExtensionService(const PrefService& prefs);
++COMPONENT_EXPORT(KAGUYA) bool ShouldAccessUpdateService(const PrefService& prefs);
+ COMPONENT_EXPORT(KAGUYA) GURL GetServicesBaseURL(const PrefService& prefs);
+ COMPONENT_EXPORT(KAGUYA) GURL GetDummyURL();
+ COMPONENT_EXPORT(KAGUYA) GURL GetExtensionUpdateURL(const PrefService& prefs);
+ COMPONENT_EXPORT(KAGUYA) GURL GetWebstoreSnippetURL(const PrefService& prefs, std::string_view id);
+ COMPONENT_EXPORT(KAGUYA) GURL GetSpellcheckURL(const PrefService& prefs);
++COMPONENT_EXPORT(KAGUYA) GURL GetBrowserUpdateURL(const PrefService& prefs);
+ COMPONENT_EXPORT(KAGUYA) std::optional<GURL> GetValidUserOverridenURL(std::string_view user_url_);
+ COMPONENT_EXPORT(KAGUYA) void ConfigurePrefChangeRegistrarFor(std::string_view pref_name,
+                             PrefChangeRegistrar& registrar, const base::RepeatingClosure& observer);
+--- a/components/kaguya_services/kaguya_services_helpers.cc
++++ b/components/kaguya_services/kaguya_services_helpers.cc
+@@ -16,6 +16,14 @@
+ 
+ namespace kaguya {
+ 
++#if BUILDFLAG(IS_MAC)
++#if defined(ARCH_CPU_ARM_FAMILY)
++constexpr std::string cpu_arch = "arm64";
++#else
++constexpr std::string cpu_arch = "x86_64";
++#endif
++#endif
++
+ std::optional<GURL> GetValidUserOverridenURL(std::string_view user_url_) {
+     if (user_url_.empty()) {
+         return std::nullopt;
+@@ -73,6 +81,11 @@ bool ShouldFetchBangs(const PrefService&
+             prefs.GetBoolean(prefs::kKaguyaBangsEnabled);
+ }
+ 
++bool ShouldAccessUpdateService(const PrefService& prefs) {
++    return ShouldAccessServices(prefs) &&
++            prefs.GetBoolean(prefs::kKaguyaUpdateFetchingEnabled);
++}
++
+ GURL GetExtensionUpdateURL(const PrefService& prefs) {
+     if (!ShouldAccessExtensionService(prefs)) {
+         return GetDummyURL();
+@@ -98,6 +111,20 @@ GURL GetSpellcheckURL(const PrefService&
+     return GetServicesBaseURL(prefs).Resolve("/dict/");
+ }
+ 
++GURL GetBrowserUpdateURL(const PrefService& prefs) {
++    if (!ShouldAccessUpdateService(prefs)) {
++        return GetDummyURL();
++    }
++
++#if BUILDFLAG(IS_MAC)
++    std::string path = base::StringPrintf(
++        "/updates/mac/appcast-%s.xml", cpu_arch);
++    return GetServicesBaseURL(prefs).Resolve(path);
++#else
++    return GetDummyURL();
++#endif
++}
++
+ void ConfigurePrefChangeRegistrarFor(std::string_view pref_name,
+     PrefChangeRegistrar& registrar, const base::RepeatingClosure& observer) {
+   registrar.Add(prefs::kKaguyaServicesEnabled, observer);
+--- a/chrome/browser/resources/settings/privacy_page/services_page.html
++++ b/chrome/browser/resources/settings/privacy_page/services_page.html
+@@ -99,6 +99,11 @@
+                     sub-label="$i18n{kaguyaSpellcheckToggleDescription}">
+                 </settings-toggle-button>
+             </if>
++            <settings-toggle-button id="updatesToggleButton"
++                pref="{{prefs.kaguya.services.browser_updates}}"
++                label="$i18n{kaguyaUpdatesToggle}"
++                sub-label="$i18n{kaguyaUpdatesToggleDescription}">
++            </settings-toggle-button>
+         </cr-collapse>
+     </div>
+     </template>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -2253,6 +2253,10 @@ void AddPrivacyStrings(content::WebUIDat
+       {"kaguyaSpellcheckToggle", IDS_SETTINGS_KAGUYA_SERVICES_SPELLCHECK_TOGGLE},
+       {"kaguyaSpellcheckToggleDescription",
+         IDS_SETTINGS_KAGUYA_SERVICES_SPELLCHECK_TOGGLE_DESCRIPTION},
++      {"kaguyaUpdatesToggle",
++        IDS_SETTINGS_KAGUYA_SERVICES_UPDATE},
++      {"kaguyaUpdatesToggleDescription",
++        IDS_SETTINGS_KAGUYA_SERVICES_UPDATE_DESCRIPTION},
+       {"kaguyaOriginOverride", IDS_SETTINGS_KAGUYA_SERVICES_OVERRIDE},
+       {"kaguyaOriginOverrideDescription",
+         IDS_SETTINGS_KAGUYA_SERVICES_OVERRIDE_DESCRIPTION},
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -403,6 +403,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kKaguyaSpellcheckEnabled] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kKaguyaUpdateFetchingEnabled] =
++      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kKaguyaServicesOrigin] =
+       settings_api::PrefType::kString;
+   (*s_allowlist)[::prefs::kKaguyaServicesConsented] =
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -229,6 +229,7 @@ void RegisterBrowserUserPrefs(user_prefs
+     registry->RegisterStringPref(prefs::kKaguyaServicesOrigin, "");
+     registry->RegisterBooleanPref(prefs::kKaguyaDidOnboarding, false);
+     registry->RegisterBooleanPref(prefs::kKaguyaServicesConsented, false);
++    registry->RegisterBooleanPref(prefs::kKaguyaUpdateFetchingEnabled, true);
+   }
+ 
+   registry->RegisterBooleanPref(
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -2014,6 +2014,19 @@
+   <message name="IDS_SETTINGS_KAGUYA_SERVICES_SPELLCHECK_TOGGLE_DESCRIPTION" desc="Description of the for enabling/disabling of downloading spellcheck files">
+     Kaguya will fetch dictionary files used for spell checking when requested. When disabled, spell checking will not work.
+   </message>
++  <message name="IDS_SETTINGS_KAGUYA_SERVICES_UPDATE" desc="Toggle for automatic update downloads">
++    Allow automatic browser and component updates
++  </message>
++  <if expr="is_macosx">
++    <message name="IDS_SETTINGS_KAGUYA_SERVICES_UPDATE_DESCRIPTION" desc="Description of the toggle for automatic update downloads">
++      Kaguya will automatically download and install browser and component updates as they become available. We recommend keeping this setting enabled to ensure you get the latest features and security updates.
++    </message>
++  </if>
++  <if expr="not is_macosx">
++    <message name="IDS_SETTINGS_KAGUYA_SERVICES_UPDATE_DESCRIPTION" desc="Description of the toggle for automatic update downloads">
++      Kaguya will automatically download and install browser and component updates as they become available. We recommend keeping this setting enabled to ensure you get the latest features and security updates. Automatic core browser updates are not available on this platform yet, but component updates are. Please use external software to keep Kaguya up to date.
++    </message>
++  </if>
+   <message name="IDS_SETTINGS_KAGUYA_SERVICES_OVERRIDE" desc="Text input for overriding the Kaguya services server">
+     Use your own instance of Kaguya services
+   </message>

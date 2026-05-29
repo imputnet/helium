@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2026 The Helium Authors
+# Copyright 2026 The Kaguya Authors
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """
@@ -20,7 +20,7 @@ OUT_PATH = REPO_ROOT / 'i18n' / 'source.gen.json'
 
 def parse_args():
     """CLI arg parsing"""
-    parser = argparse.ArgumentParser(description='i18n tooling for Helium')
+    parser = argparse.ArgumentParser(description='i18n tooling for Kaguya')
     subparsers = parser.add_subparsers(dest='command', required=True)
     base = subparsers.add_parser('generate', help='Extract translatable strings from patches')
     base.add_argument('-p',

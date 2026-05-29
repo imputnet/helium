@@ -1,0 +1,748 @@
+--- a/components/kaguya_services/pref_names.h
++++ b/components/kaguya_services/pref_names.h
+@@ -13,12 +13,20 @@ inline constexpr char kKaguyaSchemaVersi
+ inline constexpr char kKaguyaDisableSchemaAlerts[] =
+     "kaguya.services.disable_schema_alerts";
+ 
++inline constexpr char kKaguyaPrefPrefix[] = "kaguya.";
++
+ inline constexpr char kKaguyaServicesEnabled[] =
+     "kaguya.services.enabled";
+ 
+ inline constexpr char kKaguyaServicesOrigin[] =
+     "kaguya.services.origin_override";
+ 
++inline constexpr char kKaguyaServicesConsented[] =
++    "kaguya.services.user_consented";
++
++inline constexpr char kKaguyaDidOnboarding[] =
++    "kaguya.completed_onboarding";
++
+ }  // namespace prefs
+ 
+ #endif  // COMPONENTS_KAGUYA_SERVICES_PREF_NAMES_H_
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -220,6 +220,8 @@ void RegisterBrowserUserPrefs(user_prefs
+     registry->RegisterBooleanPref(prefs::kKaguyaDisableSchemaAlerts, false);
+     registry->RegisterBooleanPref(prefs::kKaguyaServicesEnabled, true);
+     registry->RegisterStringPref(prefs::kKaguyaServicesOrigin, "");
++    registry->RegisterBooleanPref(prefs::kKaguyaDidOnboarding, false);
++    registry->RegisterBooleanPref(prefs::kKaguyaServicesConsented, false);
+   }
+ 
+   registry->RegisterBooleanPref(
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -61,6 +61,7 @@
+ #include "chrome/common/pref_names.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "components/custom_handlers/protocol_handler_registry.h"
++#include "components/kaguya_services/pref_names.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/signin/public/base/signin_switches.h"
+ #include "content/public/browser/child_process_security_policy.h"
+@@ -579,6 +580,15 @@ StartupBrowserCreatorImpl::DetermineStar
+   LaunchResult launch_result =
+       tabs.empty() ? LaunchResult::kNormally : LaunchResult::kWithGivenUrls;
+ 
++  bool no_first_run =
++      base::CommandLine::ForCurrentProcess()->HasSwitch(switches::kNoFirstRun);
++  if (!is_incognito_or_guest && !no_first_run) {
++    if (!profile_->GetPrefs()->GetBoolean(prefs::kKaguyaDidOnboarding)) {
++      UrlsToTabs({GURL(chrome::kKaguyaSetupURL)}, &tabs);
++      return {tabs, LaunchResult::kWithGivenUrls};
++    }
++  }
++
+   if (whats_new_enabled && (launch_result == LaunchResult::kWithGivenUrls ||
+                             is_incognito_or_guest || is_post_crash_launch)) {
+     whats_new::LogStartupType(whats_new::StartupType::kIneligible);
+--- a/tools/gritsettings/resource_ids.spec
++++ b/tools/gritsettings/resource_ids.spec
+@@ -1293,6 +1293,10 @@
+     "META": {"sizes": {"includes": [10]}},
+     "includes": [7495],
+   },
++  "<(SHARED_INTERMEDIATE_DIR)/components/kaguya_onboarding/resources.grd": {
++   "META": {"sizes": {"includes": [48],}},
++    "includes": [7510],
++  },
+   # END components/ section.
+ 
+   # START ios/ section.
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -7772,6 +7772,7 @@ group("browser_generated_files") {
+     "//chrome/browser/ui/webui/user_education_internals:mojo_bindings",
+     "//chrome/browser/web_applications/mojom:mojom_web_apps_enum",
+     "//chrome/common/request_header_integrity:buildflags",
++    "//components/kaguya_onboarding:generated_resources",
+     "//components/autofill/core/browser/ml_model/logging:mojo_bindings",
+     "//components/enterprise/connectors:mojom",
+     "//components/webui/chrome_urls/mojom:mojo_bindings",
+--- a/chrome/chrome_paks.gni
++++ b/chrome/chrome_paks.gni
+@@ -487,11 +487,13 @@ template("chrome_extra_paks") {
+         "$root_gen_dir/chrome/default_browser_modal_resources.pak",
+         "$root_gen_dir/chrome/intro_resources.pak",
+         "$root_gen_dir/chrome/profile_picker_resources.pak",
++        "$root_gen_dir/components/kaguya_onboarding/resources/kaguya_onboarding_generated.pak",
+       ]
+       deps += [
+         "//chrome/browser/resources/default_browser/default_browser_modal:resources",
+         "//chrome/browser/resources/intro:resources",
+         "//chrome/browser/resources/signin/profile_picker:resources",
++        "//components/kaguya_onboarding:generated_resources",
+       ]
+     }
+ 
+--- a/chrome/common/webui_url_constants.cc
++++ b/chrome/common/webui_url_constants.cc
+@@ -168,6 +168,7 @@ base::span<const base::cstring_view> Chr
+       kChromeUIPrefsInternalsHost,
+       kChromeUIProfileInternalsHost,
+       content::kChromeUIQuotaInternalsHost,
++      kKaguyaSetupHost,
+ #if !BUILDFLAG(IS_ANDROID)
+       kChromeUIWebUIToolbarHost,
+ #endif
+--- a/chrome/common/webui_url_constants.h
++++ b/chrome/common/webui_url_constants.h
+@@ -490,6 +490,8 @@ inline constexpr char kChromeUIProfilePi
+ inline constexpr char kChromeUIProfilePickerStartupQuery[] = "startup";
+ inline constexpr char kChromeUIProfilePickerGlicQuery[] = "glic";
+ inline constexpr char kChromeUIProfilePickerUrl[] = "chrome://profile-picker/";
++inline constexpr char kKaguyaSetupHost[] = "setup";
++inline constexpr char kKaguyaSetupURL[] = "chrome://setup";
+ inline constexpr char kChromeUIHistorySyncOptinHost[] = "history-sync-optin";
+ inline constexpr char kChromeUIHistorySyncOptinURL[] =
+     "chrome://history-sync-optin/";
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -162,6 +162,10 @@ static_library("ui") {
+     "webui/net_internals/net_internals_ui.h",
+     "webui/ntp_tiles_internals_ui.cc",
+     "webui/ntp_tiles_internals_ui.h",
++    "webui/onboarding/onboarding_handler.cc",
++    "webui/onboarding/onboarding_handler.h",
++    "webui/onboarding/onboarding_page_ui.cc",
++    "webui/onboarding/onboarding_page_ui.h",
+     "webui/omnibox/omnibox_page_handler.cc",
+     "webui/omnibox/omnibox_page_handler.h",
+     "webui/omnibox/omnibox_ui.cc",
+--- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
++++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+@@ -44,6 +44,7 @@
+ #include "chrome/browser/ui/webui/net_internals/net_internals_ui.h"
+ #include "chrome/browser/ui/webui/ntp_tiles_internals_ui.h"
+ #include "chrome/browser/ui/webui/omnibox/omnibox_ui.h"
++#include "chrome/browser/ui/webui/onboarding/onboarding_page_ui.h"
+ #include "chrome/browser/ui/webui/policy/policy_ui.h"
+ #include "chrome/browser/ui/webui/predictors/predictors_ui.h"
+ #include "chrome/browser/ui/webui/privacy_sandbox/privacy_sandbox_internals_ui.h"
+@@ -448,6 +449,7 @@ void RegisterChromeWebUIConfigs() {
+   map.AddWebUIConfig(std::make_unique<DefaultBrowserModalUIConfig>());
+   map.AddWebUIConfig(std::make_unique<ManagedUserProfileNoticeUIConfig>());
+   map.AddWebUIConfig(std::make_unique<IntroUIConfig>());
++  map.AddWebUIConfig(std::make_unique<KaguyaOnboardingPageConfig>());
+   map.AddWebUIConfig(std::make_unique<ProfileCustomizationUIConfig>());
+   map.AddWebUIConfig(std::make_unique<ProfilePickerUIConfig>());
+   map.AddWebUIConfig(std::make_unique<SigninErrorUIConfig>());
+--- /dev/null
++++ b/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
+@@ -0,0 +1,46 @@
++// Copyright 2025 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/onboarding/onboarding_page_ui.h"
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/webui/onboarding/onboarding_handler.h"
++#include "chrome/browser/ui/webui/settings/brave_import_data_handler.h"
++#include "chrome/browser/ui/webui/settings/search_engines_handler.h"
++#include "chrome/browser/ui/webui/settings/settings_default_browser_handler.h"
++#include "chrome/common/webui_url_constants.h"
++#include "components/kaguya_onboarding/resources/grit/kaguya_onboarding_generated.h"
++#include "components/kaguya_onboarding/resources/grit/kaguya_onboarding_generated_map.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_ui_controller.h"
++#include "content/public/browser/web_ui_data_source.h"
++#include "ui/webui/webui_util.h"
++
++KaguyaOnboardingPage::KaguyaOnboardingPage(content::WebUI* web_ui)
++    : WebUIController(web_ui) {
++  content::BrowserContext* browser_context =
++      web_ui->GetWebContents()->GetBrowserContext();
++  Profile* profile = Profile::FromBrowserContext(browser_context);
++  content::WebUIDataSource* source =
++      content::WebUIDataSource::CreateAndAdd(profile, chrome::kKaguyaSetupHost);
++
++  webui::SetupWebUIDataSource(source, kKaguyaOnboardingGenerated,
++                              IDR_KAGUYA_ONBOARDING_INDEX_HTML);
++
++  // TODO: remove this call once the following issue/s are resolved:
++  // https://github.com/sveltejs/svelte/issues/10826
++  // https://github.com/sveltejs/svelte/issues/14438
++  source->DisableTrustedTypesCSP();
++
++  web_ui->AddMessageHandler(
++      std::make_unique<OnboardingMessageHandler>(browser_context));
++  web_ui->AddMessageHandler(
++      std::make_unique<settings::SearchEnginesHandler>(profile));
++  web_ui->AddMessageHandler(
++      std::make_unique<settings::DefaultBrowserHandler>());
++  web_ui->AddMessageHandler(
++      std::make_unique<settings::BraveImportDataHandler>());
++}
++
++KaguyaOnboardingPage::~KaguyaOnboardingPage() = default;
+--- /dev/null
++++ b/chrome/browser/ui/webui/onboarding/onboarding_page_ui.h
+@@ -0,0 +1,31 @@
++// Copyright 2025 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_PAGE_UI_H_
++#define CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_PAGE_UI_H_
++
++#include "chrome/common/webui_url_constants.h"
++#include "content/public/browser/web_ui_controller.h"
++#include "content/public/browser/webui_config.h"
++
++class KaguyaOnboardingPage;
++
++class KaguyaOnboardingPageConfig
++    : public content::DefaultWebUIConfig<KaguyaOnboardingPage> {
++ public:
++  KaguyaOnboardingPageConfig()
++      : DefaultWebUIConfig(content::kChromeUIScheme, chrome::kKaguyaSetupHost) {
++  }
++};
++
++class KaguyaOnboardingPage : public content::WebUIController {
++ public:
++  explicit KaguyaOnboardingPage(content::WebUI* web_ui);
++
++  KaguyaOnboardingPage(const KaguyaOnboardingPage&) = delete;
++  KaguyaOnboardingPage& operator=(const KaguyaOnboardingPage&) = delete;
++  ~KaguyaOnboardingPage() override;
++};
++
++#endif  // CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_PAGE_UI_H_
+--- /dev/null
++++ b/chrome/browser/ui/webui/onboarding/onboarding_handler.cc
+@@ -0,0 +1,281 @@
++// Copyright 2025 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/onboarding/onboarding_handler.h"
++
++#include "base/functional/bind.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/extensions/webstore_install_with_prompt.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profiles_state.h"
++#include "chrome/common/extensions/webstore_install_result.h"
++#include "components/kaguya_services/pref_names.h"
++#include "components/kaguya_services/schema.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_ui.h"
++#include "extensions/browser/extension_registrar.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/common/extension.h"
++
++OnboardingMessageHandler::OnboardingMessageHandler(
++    content::BrowserContext* browser_context)
++    : browser_context_(browser_context),
++      profile_(Profile::FromBrowserContext(browser_context)),
++      pref_service_(profile_->GetPrefs()) {
++  pref_change_registrar_.Init(pref_service_);
++
++  for (const auto [key, _] : GetPreferencesDict()) {
++    pref_change_registrar_.Add(
++        prefs::kKaguyaPrefPrefix + key,
++        base::BindRepeating(&OnboardingMessageHandler::OnPreferencesChanged,
++                            base::Unretained(this)));
++  }
++}
++
++OnboardingMessageHandler::~OnboardingMessageHandler() = default;
++
++base::DictValue OnboardingMessageHandler::GetPreferencesDict() {
++  std::vector<PrefService::PreferenceValueAndStore> values =
++      pref_service_->GetPreferencesValueAndStore();
++  base::DictValue output;
++
++  for (const auto& [name, value, _] : values) {
++    if (!base::StartsWith(name, prefs::kKaguyaPrefPrefix,
++                          base::CompareCase::SENSITIVE)) {
++      continue;
++    }
++
++    output.Set(name.substr(sizeof(prefs::kKaguyaPrefPrefix) - 1),
++               value.Clone());
++  }
++
++  return output;
++}
++
++void OnboardingMessageHandler::OnPreferencesChanged() {
++  AllowJavascript();
++  FireWebUIListener("kaguya-prefs-changed", GetPreferencesDict());
++}
++
++void OnboardingMessageHandler::OnExtensionLoaded(
++    content::BrowserContext*,
++    const extensions::Extension* extension) {
++  AllowJavascript();
++  FireWebUIListener("extension-state-changed",
++                    base::DictValue().Set(extension->id(), true));
++}
++
++void OnboardingMessageHandler::OnExtensionUnloaded(
++    content::BrowserContext*,
++    const extensions::Extension* extension,
++    extensions::UnloadedExtensionReason reason) {
++  using extensions::UnloadedExtensionReason;
++  if (reason != UnloadedExtensionReason::DISABLE &&
++      reason != UnloadedExtensionReason::UNINSTALL) {
++    return;
++  }
++
++  AllowJavascript();
++  FireWebUIListener("extension-state-changed",
++                    base::DictValue().Set(extension->id(), false));
++}
++
++void OnboardingMessageHandler::RegisterMessages() {
++  web_ui()->RegisterMessageCallback(
++      "getPrefs",
++      base::BindRepeating(&OnboardingMessageHandler::HandleGetPreferences,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "setPref",
++      base::BindRepeating(&OnboardingMessageHandler::HandleSetPreference,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "acceptLatestSchema",
++      base::BindRepeating(&OnboardingMessageHandler::HandleAcceptSchema,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "getProfileName",
++      base::BindRepeating(&OnboardingMessageHandler::HandleGetProfileName,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "setProfileName",
++      base::BindRepeating(&OnboardingMessageHandler::HandleSetProfileName,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "getExtensions",
++      base::BindRepeating(&OnboardingMessageHandler::HandleGetExtensions,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "installExtension",
++      base::BindRepeating(&OnboardingMessageHandler::HandleInstallExtension,
++                          base::Unretained(this)));
++}
++
++void OnboardingMessageHandler::HandleGetExtensions(
++    const base::ListValue& args) {
++  CHECK_EQ(1U, args.size());
++  const auto& callback_id = args[0].GetString();
++  auto* registry = extensions::ExtensionRegistry::Get(browser_context_);
++
++  base::DictValue filtered_extension_data;
++  for (const auto& extension : registry->enabled_extensions()) {
++    filtered_extension_data.Set(extension->id(), true);
++  }
++
++  for (const auto& extension : registry->disabled_extensions()) {
++    filtered_extension_data.Set(extension->id(), false);
++  }
++
++  // If no one asked for a list of extensions yet, they probably don't
++  // care about extension changes, so we defer the observer init to here
++  // to avoid sending useless events.
++  if (!extension_registry_observation_.IsObserving()) {
++    extension_registry_observation_.Observe(registry);
++  }
++
++  AllowJavascript();
++  ResolveJavascriptCallback(base::Value(std::move(callback_id)),
++                            std::move(filtered_extension_data));
++}
++
++void OnboardingMessageHandler::HandleInstallExtension(
++    const base::ListValue& args) {
++  CHECK_EQ(2U, args.size());
++  const auto& callback_id = args[0].GetString();
++  const auto& extension_id = args[1].GetString();
++
++  // If the extension is already installed, but disabled, enable it.
++  const auto* registry = extensions::ExtensionRegistry::Get(browser_context_);
++  if (const auto* extension = registry->GetInstalledExtension(extension_id)) {
++    DoEnableExtension(callback_id, extension->id());
++    return;
++  }
++
++  // Otherwise, do the whole dance of installing an extension.
++  DoInstallExtension(callback_id, extension_id);
++}
++
++void OnboardingMessageHandler::DoEnableExtension(
++    const std::string& callback_id,
++    const std::string& extension_id) {
++  extensions::ExtensionRegistrar::Get(browser_context_)
++      ->EnableExtension(extension_id);
++  AllowJavascript();
++  ResolveJavascriptCallback(base::Value(callback_id), base::Value());
++}
++
++void OnboardingMessageHandler::DoInstallExtension(
++    const std::string& callback_id,
++    const std::string& extension_id) {
++  gfx::NativeWindow window =
++      web_ui()->GetWebContents()->GetTopLevelNativeWindow();
++
++  // Pass a weak_ptr for the callback, as WebstoreInstallWithPrompt is
++  // ref-counted and might outlive OnboardingMessageHandler.
++  auto installer = base::MakeRefCounted<extensions::WebstoreInstallWithPrompt>(
++      extension_id, profile_, window,
++      base::BindOnce(&OnboardingMessageHandler::OnExtensionInstallFinished,
++                     weak_ptr_factory_.GetWeakPtr(), callback_id));
++
++  installer->BeginInstall();
++}
++
++void OnboardingMessageHandler::OnExtensionInstallFinished(
++    std::string callback_id,
++    bool success,
++    const std::string& error,
++    extensions::webstore_install::Result result) {
++  AllowJavascript();
++  if (success) {
++    ResolveJavascriptCallback(base::Value(callback_id), base::Value());
++    return;
++  }
++
++  RejectJavascriptCallback(
++      base::Value(callback_id),
++      base::DictValue().Set("error", error).Set("code", result));
++}
++
++void OnboardingMessageHandler::HandleGetPreferences(
++    const base::ListValue& args) {
++  CHECK_EQ(1U, args.size());
++  const auto& callback_id = args[0].GetString();
++
++  AllowJavascript();
++  ResolveJavascriptCallback(base::Value(callback_id),
++                            base::Value(GetPreferencesDict()));
++}
++
++void OnboardingMessageHandler::HandleGetProfileName(
++    const base::ListValue& args) {
++  CHECK_EQ(1U, args.size());
++  const auto& callback_id = args[0].GetString();
++
++  ProfileAttributesEntry* entry =
++      g_browser_process->profile_manager()
++          ->GetProfileAttributesStorage()
++          .GetProfileAttributesWithPath(profile_->GetPath());
++
++  if (!entry) {
++    return RejectJavascriptCallback(callback_id, "entry not found");
++  }
++
++  AllowJavascript();
++  ResolveJavascriptCallback(base::Value(callback_id),
++                            base::Value(entry->GetLocalProfileName()));
++}
++
++void OnboardingMessageHandler::HandleSetProfileName(
++    const base::ListValue& args) {
++  CHECK_EQ(1U, args.size());
++  std::u16string new_name = base::UTF8ToUTF16(args[0].GetString());
++  base::TrimWhitespace(new_name, base::TRIM_ALL, &new_name);
++
++  if (!new_name.empty()) {
++    profiles::UpdateProfileName(profile_, new_name);
++  }
++}
++
++void OnboardingMessageHandler::HandleSetPreference(
++    const base::ListValue& args) {
++  if (args.size() == 0) {
++    return;
++  }
++
++  AllowJavascript();
++
++  const auto& callback_id = args[0].GetString();
++  if (args.size() != 3) {
++    return RejectJavascriptCallback(callback_id, "invalid arguments");
++  }
++
++  if (!args[1].is_string()) {
++    return RejectJavascriptCallback(callback_id, "pref is not a string");
++  }
++
++  const auto& pref_name = prefs::kKaguyaPrefPrefix + args[1].GetString();
++  auto* pref = pref_service_->FindPreference(pref_name);
++  if (!pref) {
++    return RejectJavascriptCallback(callback_id, pref_name + " does not exist");
++  }
++
++  if (args[2].type() != pref->GetType()) {
++    return RejectJavascriptCallback(callback_id, "invalid value type");
++  }
++
++  pref_service_->Set(pref_name, args[2].Clone());
++
++  ResolveJavascriptCallback(callback_id, {});
++}
++
++void OnboardingMessageHandler::HandleAcceptSchema(const base::ListValue&) {
++  kaguya::AcceptCurrentSchema(*pref_service_);
++}
+--- /dev/null
++++ b/chrome/browser/ui/webui/onboarding/onboarding_handler.h
+@@ -0,0 +1,76 @@
++// Copyright 2025 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_HANDLER_H_
++#define CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_HANDLER_H_
++
++#include <optional>
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/values.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/extensions/webstore_install_result.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_ui_message_handler.h"
++#include "extensions/browser/extension_registry_observer.h"
++
++namespace content {
++class BrowserContext;
++}
++
++class OnboardingMessageHandler : public content::WebUIMessageHandler,
++                                 public extensions::ExtensionRegistryObserver {
++ public:
++  explicit OnboardingMessageHandler(content::BrowserContext* browser_context);
++  OnboardingMessageHandler(const OnboardingMessageHandler&) = delete;
++  OnboardingMessageHandler& operator=(const OnboardingMessageHandler&) = delete;
++  ~OnboardingMessageHandler() override;
++
++  void RegisterMessages() override;
++
++ private:
++  base::DictValue GetPreferencesDict();
++  void HandleGetPreferences(const base::ListValue& args);
++  void HandleAcceptSchema(const base::ListValue& args);
++  void HandleSetPreference(const base::ListValue& args);
++  void HandleGetProfileName(const base::ListValue& args);
++  void HandleSetProfileName(const base::ListValue& args);
++  void HandleGetExtensions(const base::ListValue& args);
++  void HandleInstallExtension(const base::ListValue& args);
++  void OnPreferencesChanged();
++
++  void DoInstallExtension(const std::string& callback_id,
++                          const std::string& extension_id);
++  void DoEnableExtension(const std::string& callback_id,
++                         const std::string& extension_id);
++  void OnExtensionInstallFinished(std::string callback_id,
++                                  bool success,
++                                  const std::string& error,
++                                  extensions::webstore_install::Result);
++
++  // extensions::ExtensionRegistryObserver:
++  void OnExtensionLoaded(content::BrowserContext*,
++                         const extensions::Extension*) override;
++  void OnExtensionUnloaded(content::BrowserContext*,
++                           const extensions::Extension*,
++                           extensions::UnloadedExtensionReason) override;
++
++  raw_ptr<content::BrowserContext> browser_context_ = nullptr;
++  raw_ptr<Profile> profile_ = nullptr;
++  raw_ptr<PrefService> pref_service_ = nullptr;
++  PrefChangeRegistrar pref_change_registrar_;
++
++  base::WeakPtrFactory<OnboardingMessageHandler> weak_ptr_factory_{this};
++
++  // extensions:ExtensionRegistryObserver:
++  base::ScopedObservation<extensions::ExtensionRegistry,
++                          extensions::ExtensionRegistryObserver>
++      extension_registry_observation_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_HANDLER_H_
+--- a/components/kaguya_services/kaguya_services_helpers.cc
++++ b/components/kaguya_services/kaguya_services_helpers.cc
+@@ -53,12 +53,14 @@ GURL GetDummyURL() {
+ }
+ 
+ bool ShouldAccessServices(const PrefService& prefs) {
+-    return prefs.GetBoolean(prefs::kKaguyaServicesEnabled);
++    return prefs.GetBoolean(prefs::kKaguyaServicesEnabled) &&
++           prefs.GetBoolean(prefs::kKaguyaServicesConsented);
+ }
+ 
+ void ConfigurePrefChangeRegistrarFor(std::string_view pref_name,
+     PrefChangeRegistrar& registrar, const base::RepeatingClosure& observer) {
+   registrar.Add(prefs::kKaguyaServicesEnabled, observer);
++  registrar.Add(prefs::kKaguyaServicesConsented, observer);
+   registrar.Add(prefs::kKaguyaServicesOrigin, observer);
+   registrar.Add(prefs::kKaguyaSchemaVersion, observer);
+   registrar.Add(pref_name, observer);
+--- a/chrome/browser/ui/incognito_allowed_url.cc
++++ b/chrome/browser/ui/incognito_allowed_url.cc
+@@ -52,7 +52,8 @@ bool IsHostAllowedInIncognito(const GURL
+          host != chrome::kChromeUIHelpHost &&
+          host != chrome::kChromeUIHistoryHost &&
+          host != chrome::kChromeUIExtensionsHost &&
+-         host != password_manager::kChromeUIPasswordManagerHost;
++         host != password_manager::kChromeUIPasswordManagerHost &&
++         host != chrome::kKaguyaSetupHost;
+ }
+ 
+ }  // namespace
+--- a/chrome/browser/ui/webui/settings/search_engines_handler.cc
++++ b/chrome/browser/ui/webui/settings/search_engines_handler.cc
+@@ -392,7 +392,9 @@ void SearchEnginesHandler::HandleSetDefa
+   CHECK(choice_made_location ==
+             search_engines::ChoiceMadeLocation::kSearchSettings ||
+         choice_made_location ==
+-            search_engines::ChoiceMadeLocation::kSearchEngineSettings);
++            search_engines::ChoiceMadeLocation::kSearchEngineSettings ||
++        choice_made_location ==
++            search_engines::ChoiceMadeLocation::kChoiceScreen);
+   list_controller_.MakeDefaultTemplateURL(id, choice_made_location);
+   base::RecordAction(base::UserMetricsAction("Options_SearchEngineSetDefault"));
+ 
+--- a/chrome/browser/favicon/favicon_utils.cc
++++ b/chrome/browser/favicon/favicon_utils.cc
+@@ -189,6 +189,7 @@ bool ShouldThemifyFavicon(GURL url) {
+          url.host() != chrome::kChromeUIVersionHost &&
+          url.host() != chrome::kChromeUINetExportHost &&
+          url.host() != chrome::kChromeUINewTabHost &&
++         url.host() != chrome::kKaguyaSetupHost &&
+          url.host() != chrome::kChromeUIContextualTasksHost &&
+          url.host() != password_manager::kChromeUIPasswordManagerHost;
+ }
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -1965,6 +1965,12 @@
+   <message name="IDS_SETTINGS_KAGUYA_SCHEMA_IGNORE" desc="Checkbox label to ignore any future services change alerts">
+     Don't notify me again
+   </message>
++  <message name="IDS_SETTINGS_KAGUYA_SERVICES_SETUP_PENDING_TEXT" desc="Description shown in services settings when user has not completed onboarding">
++    Kaguya services are not available until setup is complete to ensure your privacy and consent.
++  </message>
++  <message name="IDS_SETTINGS_KAGUYA_SERVICES_SETUP_PENDING_BUTTON" desc="Button label directing user to complete onboarding">
++    Complete setup
++  </message>
+   <message name="IDS_SETTINGS_KAGUYA_SERVICES_TOGGLE" desc="Global toggle for enabling/disabling of all Kaguya services">
+     Allow connecting to Kaguya services
+   </message>
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -399,6 +399,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kKaguyaServicesOrigin] =
+       settings_api::PrefType::kString;
++  (*s_allowlist)[::prefs::kKaguyaServicesConsented] =
++      settings_api::PrefType::kBoolean;
+ 
+   // Privacy Guide
+   (*s_allowlist)[::prefs::kPrivacyGuideViewed] =
+--- a/chrome/browser/resources/settings/privacy_page/services_page.ts
++++ b/chrome/browser/resources/settings/privacy_page/services_page.ts
+@@ -94,6 +94,10 @@ export class SettingsKaguyaServicesPageE
+ 
+     this.setPrefValue('kaguya.services.origin_override', target.value);
+   }
++
++  private onServicesPendingButtonClick_() {
++    window.open('chrome://setup', '_blank');
++  }
+ }
+ 
+ declare global {
+--- a/chrome/browser/resources/settings/privacy_page/services_page.html
++++ b/chrome/browser/resources/settings/privacy_page/services_page.html
+@@ -25,10 +25,37 @@
+         margin-top: var(--cr-changelog-padding);
+         padding-top: calc(var(--cr-changelog-padding) / 2);
+     }
++
++    #onboarding-text {
++        display: flex;
++        align-items: center;
++        max-width: 350px;
++        gap: calc(var(--cr-section-padding) * 0.8);
++    }
++
++    #onboarding-notice {
++        padding: calc(var(--cr-section-padding) / 2) var(--cr-section-padding);
++        justify-content: space-between;
++    }
+ </style>
+ 
+ <settings-subpage page-title="$i18n{kaguyaServicesTitle}" route-path$="[[routePath]]">
+ <div class="cr-col first">
++    <template is="dom-if" if="[[!prefs.kaguya.services.user_consented.value]]">
++        <div class="cr-row" id="onboarding-notice">
++            <div id="onboarding-text">
++                  <cr-icon icon="cr:security" aria-hidden="true"></cr-icon>
++                  <span>$i18n{kaguyaServicesSetupPendingText}</span>
++            </div>
++            <cr-button
++                class="action-button"
++                on-click="onServicesPendingButtonClick_">
++                $i18n{kaguyaServicesSetupPendingButton}
++            </cr-button>
++        </div>
++    </template>
++
++    <template is="dom-if" if="[[prefs.kaguya.services.user_consented.value]]">
+         <template is="dom-if" if="[[changes_.length]]">
+           <div id="changelog-notice">
+             <div id="changelog-title">$i18n{kaguyaSchemaUpdatedTitle}</div>
+@@ -57,6 +84,7 @@
+         <cr-collapse id="servicesCollapse" opened="[[prefs.kaguya.services.enabled.value]]">
+         </cr-collapse>
+     </div>
++    </template>
+ </div>
+ 
+ 
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -2232,6 +2232,8 @@ void AddPrivacyStrings(content::WebUIDat
+       {"securityPageDescription", IDS_SETTINGS_SECURITY_DESCRIPTION},
+       {"kaguyaServicesTitle", IDS_SETTINGS_KAGUYA_SERVICES},
+       {"kaguyaServicesDescription", IDS_SETTINGS_KAGUYA_SERVICES_DESCRIPTION},
++      {"kaguyaServicesSetupPendingText", IDS_SETTINGS_KAGUYA_SERVICES_SETUP_PENDING_TEXT},
++      {"kaguyaServicesSetupPendingButton", IDS_SETTINGS_KAGUYA_SERVICES_SETUP_PENDING_BUTTON},
+       {"kaguyaServicesToggle", IDS_SETTINGS_KAGUYA_SERVICES_TOGGLE},
+       {"kaguyaServicesToggleDescription",
+         IDS_SETTINGS_KAGUYA_SERVICES_TOGGLE_DESCRIPTION},

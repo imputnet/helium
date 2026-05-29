@@ -9,9 +9,8 @@ For your pull request to not get closed without review, please confirm that:
       organization if I lied by checking any of these checkboxes.
 
 Tested on (check one or more):
-- [ ] Windows
-- [ ] macOS
 - [ ] Linux
+- [ ] macOS
 
 ---
 

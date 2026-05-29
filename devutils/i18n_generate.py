@@ -1,8 +1,8 @@
-# Copyright 2026 The Helium Authors
+# Copyright 2026 The Kaguya Authors
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """
-String extraction from Helium patches for translation.
+String extraction from Kaguya patches for translation.
 """
 
 import subprocess
@@ -14,7 +14,7 @@ from third_party import unidiff
 import utils.name_substitution_utils as namesub # pylint: disable=wrong-import-order
 
 PLATFORMS = ("windows", "macos", "linux")
-REPO_URL = "https://github.com/imputnet/helium-{platform}.git"
+REPO_URL = "https://github.com/iceice666/kaguya-{platform}.git"
 
 
 def prep_platform_repos(platforms_dir):

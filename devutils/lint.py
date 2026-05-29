@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-# Copyright 2025 The Helium Authors
+# Copyright 2025 The Kaguya Authors
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
-"""Script to run sanity checks against the Helium patchset."""
+"""Script to run sanity checks against the Kaguya patchset."""
 
 import sys
 import inspect

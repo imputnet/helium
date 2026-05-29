@@ -1,0 +1,845 @@
+# Some files in this patch are sourced from Chromium. They were
+# heavily modified to fit Kaguya's needs.
+#
+# Chromium's license header is maintained wherever applicable to 
+# respect the original authorship of code.
+#
+# Chromium LICENSE:
+#
+# Copyright 2015 The Chromium Authors
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#
+#    * Redistributions of source code must retain the above copyright
+# notice, this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above
+# copyright notice, this list of conditions and the following disclaimer
+# in the documentation and/or other materials provided with the
+# distribution.
+#    * Neither the name of Google LLC nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+--- a/chrome/browser/kaguya_flag_choices.h
++++ b/chrome/browser/kaguya_flag_choices.h
+@@ -29,6 +29,7 @@ namespace kaguya {
+   constexpr const char kDisableEchCommandLine[] = "disable-ech";
+ 
+   constexpr const char kKaguyaNoiseCommandLine[] = "kaguya-noise";
++  constexpr const char kKaguyaNoiseCanvasCommandLine[] = "kaguya-noise-canvas";
+ 
+ }  // namespace kaguya
+ 
+--- a/chrome/browser/kaguya_flag_entries.h
++++ b/chrome/browser/kaguya_flag_entries.h
+@@ -20,4 +20,8 @@
+      "Kaguya Noise",
+      "Kaguya's anti-fingerprinting functionality. Adds insignificant noise to various features to deceive fingerprinting scripts. Enabled by default, must be enabled for other anti-fingerprinting features to work. Kaguya flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kKaguyaNoise)},
++    {kaguya::kKaguyaNoiseCanvasCommandLine,
++     "[Kaguya Noise] Canvas pixel noising",
++     "Adds insignificant noise to canvas pixels during readback to deceive canvas-based fingerprinting. Kaguya flag.",
++     kOsAll, FEATURE_VALUE_TYPE(blink::features::kKaguyaNoiseCanvas)},
+ #endif  /* CHROME_BROWSER_KAGUYA_FLAG_ENTRIES_H_ */
+--- a/third_party/blink/common/features.cc
++++ b/third_party/blink/common/features.cc
+@@ -43,6 +43,10 @@ const base::FeatureParam<std::string> kS
+ BASE_FEATURE(kKaguyaNoise,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++// Canvas noise for fingerprinting protection.
++BASE_FEATURE(kKaguyaNoiseCanvas,
++             base::FEATURE_ENABLED_BY_DEFAULT);
++
+ // Controls whether to include information about the page's open popup in
+ // AIPageContent.
+ BASE_FEATURE(kAIPageContentIncludePopupWindows,
+--- a/third_party/blink/public/common/features.h
++++ b/third_party/blink/public/common/features.h
+@@ -41,6 +41,7 @@ BLINK_COMMON_EXPORT extern const base::F
+ // on the identifier name of the generated feature.
+ 
+ BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kKaguyaNoise);
++BLINK_COMMON_EXPORT BASE_DECLARE_FEATURE(kKaguyaNoiseCanvas);
+ 
+ // Controls whether to include information about the page's open popup in
+ // AIPageContent.
+--- /dev/null
++++ b/third_party/blink/renderer/core/kaguya_noise/canvas_noising_helper.cc
+@@ -0,0 +1,635 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++// -----------------------------------------------------------------------
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/core/kaguya_noise/canvas_noising_helper.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <optional>
++#include <vector>
++
++#include "base/check_op.h"
++#include "base/containers/span.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/numerics/safe_conversions.h"
++#include "third_party/blink/public/common/features.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/kaguya_noise/kaguya_noise_hash.h"
++#include "third_party/blink/renderer/core/html/canvas/image_data.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
++#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
++#include "third_party/skia/src/base/SkHalf.h"
++#include "third_party/skia/src/base/SkVx.h"
++#include "ui/gfx/skia_span_util.h"
++
++namespace blink {
++
++namespace {
++
++// Tuning parameters.
++constexpr int kMaxSharedRgbNoise = 1;
++constexpr int kMaxIndependentRgbNoise = 1;
++constexpr int kMaxAlphaNoise = 1;
++// Treat a 3x3 neighborhood as smooth when every RGB channel stays within this
++// range. Smooth regions show structured noise much more readily than edges.
++constexpr uint8_t kSmoothNeighborhoodRgbRange = 2u;
++// Smooth RGB noise is sparse: 4 means roughly one in four smooth pixels is
++// changed. Lower values are stronger; higher values are less visible.
++constexpr int kSmoothRgbNoiseFrequency = 4;
++
++// Pixel layout and derived constants.
++constexpr uint8_t kChannelsPerPixel = 4u;
++constexpr size_t kRgbChannelsPerPixel = 3u;
++using RgbBytes = std::array<uint8_t, kRgbChannelsPerPixel>;
++using RgbNoise = std::array<int, kRgbChannelsPerPixel>;
++constexpr std::array<uint8_t, 4u> kEmptyPixel({0, 0, 0, 0});
++constexpr RgbBytes kMinRgbInitialValue = {255u, 255u, 255u};
++constexpr RgbBytes kMaxRgbInitialValue = {0u, 0u, 0u};
++constexpr float kFloatChannelScale = 1.0f / 255.0f;
++
++int GetSignedNoiseValue(KaguyaNoiseHash& token_hash, int max_abs_noise) {
++  if (max_abs_noise <= 0) {
++    return 0;
++  }
++  return token_hash.GetValueBelow(max_abs_noise * 2 + 1) - max_abs_noise;
++}
++
++int GetNonZeroSignedNoiseValue(KaguyaNoiseHash& token_hash) {
++  return token_hash.GetValueBelow(2) == 0 ? -1 : 1;
++}
++
++RgbNoise GetSmoothRgbNoiseVector(KaguyaNoiseHash& content_hash,
++                                 KaguyaNoiseHash& coordinate_hash) {
++  // Dense per-channel noise is visible on flat fills and slow gradients. For
++  // those pixels, only change one RGB channel on a sparse coordinate-selected
++  // subset.
++  if (coordinate_hash.GetValueBelow(kSmoothRgbNoiseFrequency) != 0) {
++    return {0, 0, 0};
++  }
++
++  RgbNoise noise = {0, 0, 0};
++  noise[content_hash.GetValueBelow(3)] =
++      GetNonZeroSignedNoiseValue(content_hash);
++  return noise;
++}
++
++RgbNoise GetFullRgbNoiseVector(KaguyaNoiseHash& content_hash,
++                               KaguyaNoiseHash& coordinate_hash) {
++  RgbNoise noise = {0, 0, 0};
++  for (int& channel_noise : noise) {
++    channel_noise =
++        GetNonZeroSignedNoiseValue(content_hash) +
++        GetSignedNoiseValue(coordinate_hash, kMaxIndependentRgbNoise);
++  }
++  return noise;
++}
++
++RgbNoise GetRgbNoiseVector(KaguyaNoiseHash& content_hash,
++                           KaguyaNoiseHash& coordinate_hash,
++                           bool smooth_neighborhood) {
++  return smooth_neighborhood
++             ? GetSmoothRgbNoiseVector(content_hash, coordinate_hash)
++             : GetFullRgbNoiseVector(content_hash, coordinate_hash);
++}
++
++uint64_t MixCanvasCoordinateSeed(uint64_t value) {
++  // SplitMix64 finalizer. This is not cryptographic; it just avalanches nearby
++  // coordinates so low-amplitude noise does not form visible axis-aligned
++  // bands.
++  value ^= value >> 30;
++  value *= 0xbf58476d1ce4e5b9ULL;
++  value ^= value >> 27;
++  value *= 0x94d049bb133111ebULL;
++  value ^= value >> 31;
++  return value;
++}
++
++size_t CheckedPixelStorageSize(const int width,
++                               const int height,
++                               const size_t bytes_per_channel) {
++  base::CheckedNumeric<size_t> size = base::checked_cast<size_t>(width);
++  size *= base::checked_cast<size_t>(height);
++  size *= kChannelsPerPixel;
++  size *= bytes_per_channel;
++  return size.ValueOrDie();
++}
++
++void KaguyaNoisePixel(base::span<uint8_t, kChannelsPerPixel> pixel,
++                      KaguyaNoiseHash& coordinate_hash,
++                      const RgbNoise& rgb_noise) {
++  for (size_t i = 0; i < kChannelsPerPixel; ++i) {
++    int channel_value = pixel[i];
++
++    const bool is_alpha = i == kChannelsPerPixel - 1;
++
++    // Keep alpha limits stable.
++    if (is_alpha && (channel_value == 0 || channel_value == 255)) {
++      pixel[i] = base::checked_cast<uint8_t>(channel_value);
++      continue;
++    }
++
++    const int maxNoisePerChannel =
++        is_alpha ? kMaxAlphaNoise
++                 : kMaxSharedRgbNoise + kMaxIndependentRgbNoise;
++
++    // Clamp min- and maxNoisedVal to [0, 255] and [1, 255] for the alpha
++    // channel if it was non-zero before.
++    const int lowerLimit = (is_alpha && channel_value > 0) ? 1 : 0;
++    int minNoisedVal = std::max(lowerLimit, channel_value - maxNoisePerChannel);
++    int maxNoisedVal = std::min(255, channel_value + maxNoisePerChannel);
++
++    int noise = 0;
++    if (is_alpha) {
++      noise = GetSignedNoiseValue(coordinate_hash, kMaxAlphaNoise);
++    } else {
++      noise = rgb_noise[i];
++    }
++
++    const int noised_value =
++        std::clamp(channel_value + noise, minNoisedVal, maxNoisedVal);
++    pixel[i] = base::checked_cast<uint8_t>(noised_value);
++  }
++}
++
++uint8_t QuantizeFloatChannel(float channel_value) {
++  if (!std::isfinite(channel_value)) {
++    return 0;
++  }
++
++  return base::checked_cast<uint8_t>(
++      std::clamp(std::lround(channel_value * 255.0f), 0L, 255L));
++}
++
++std::array<uint8_t, 4u> QuantizeFloatPixel(
++    base::span<const float, kChannelsPerPixel> pixel) {
++  return {QuantizeFloatChannel(pixel[0]), QuantizeFloatChannel(pixel[1]),
++          QuantizeFloatChannel(pixel[2]), QuantizeFloatChannel(pixel[3])};
++}
++
++uint32_t QuantizedFloatPixelValue(
++    base::span<const float, kChannelsPerPixel> pixel) {
++  std::array<uint8_t, kChannelsPerPixel> quantized_pixel =
++      QuantizeFloatPixel(pixel);
++  return base::U32FromLittleEndian(base::span(quantized_pixel));
++}
++
++void KaguyaNoiseFloatPixel(base::span<float, kChannelsPerPixel> pixel,
++                           KaguyaNoiseHash& coordinate_hash,
++                           const RgbNoise& rgb_noise) {
++  for (size_t i = 0; i < kChannelsPerPixel; ++i) {
++    float channel_value = pixel[i];
++    if (!std::isfinite(channel_value)) {
++      continue;
++    }
++
++    const bool is_alpha = i == kChannelsPerPixel - 1;
++
++    // Keep alpha limits stable.
++    if (is_alpha && (channel_value <= 0.0f || channel_value >= 1.0f)) {
++      pixel[i] = std::clamp(channel_value, 0.0f, 1.0f);
++      continue;
++    }
++
++    int noise = 0;
++    if (is_alpha) {
++      noise = GetSignedNoiseValue(coordinate_hash, kMaxAlphaNoise);
++    } else {
++      noise = rgb_noise[i];
++    }
++
++    const float lower_limit =
++        is_alpha && channel_value > 0.0f ? kFloatChannelScale : 0.0f;
++    const float upper_limit =
++        is_alpha ? 1.0f : std::numeric_limits<float>::max();
++    pixel[i] = std::clamp(channel_value + noise * kFloatChannelScale,
++                          lower_limit, upper_limit);
++  }
++}
++
++template <typename T>
++base::span<T, kChannelsPerPixel> GetPixelAt(const int x,
++                                            const int y,
++                                            const int width,
++                                            const base::span<T> pixels) {
++  return pixels
++      .subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++      .template first<kChannelsPerPixel>();
++}
++
++std::array<float, kChannelsPerPixel>
++LoadHalfFloatPixel(base::span<const SkHalf> pixels, int x, int y, int width) {
++  auto pixel =
++      pixels.subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++          .first<kChannelsPerPixel>();
++  skvx::half4 half_pixel = {pixel[0], pixel[1], pixel[2], pixel[3]};
++  skvx::float4 float_pixel = skvx::from_half(half_pixel);
++  return {float_pixel[0], float_pixel[1], float_pixel[2], float_pixel[3]};
++}
++
++void StoreHalfFloatPixel(base::span<SkHalf> pixels,
++                         int x,
++                         int y,
++                         int width,
++                         const std::array<float, kChannelsPerPixel>& pixel) {
++  auto destination =
++      pixels.subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++          .first<kChannelsPerPixel>();
++  skvx::float4 float_pixel = {std::isnan(pixel[0]) ? 0.0f : pixel[0],
++                              std::isnan(pixel[1]) ? 0.0f : pixel[1],
++                              std::isnan(pixel[2]) ? 0.0f : pixel[2],
++                              std::isnan(pixel[3]) ? 0.0f : pixel[3]};
++  skvx::half4 half_pixel = skvx::to_half(float_pixel);
++  for (size_t i = 0; i < kChannelsPerPixel; ++i) {
++    destination[i] = std::isnan(pixel[i]) ? SK_HalfNaN : half_pixel[i];
++  }
++}
++
++template <typename LoadPixel>
++bool UpdateHashAndCheckSmoothPixelNeighborhood(KaguyaNoiseHash& hash,
++                                               int x,
++                                               int y,
++                                               int width,
++                                               int height,
++                                               LoadPixel load_pixel) {
++  // Use one 3x3 pass both to feed local content into the stable hash and to
++  // decide whether this pixel sits in a visually smooth area. The smoothness
++  // decision must use the source pixels, not already-noised output.
++  RgbBytes min_rgb = kMinRgbInitialValue;
++  RgbBytes max_rgb = kMaxRgbInitialValue;
++  for (int dy = -1; dy <= 1; ++dy) {
++    const int sample_y = std::clamp(y + dy, 0, height - 1);
++    for (int dx = -1; dx <= 1; ++dx) {
++      const int sample_x = std::clamp(x + dx, 0, width - 1);
++      const auto sample_pixel = load_pixel(sample_x, sample_y);
++      hash.Update(sample_pixel.hash_value);
++      for (size_t channel = 0; channel < sample_pixel.rgb.size(); ++channel) {
++        min_rgb[channel] =
++            std::min(min_rgb[channel], sample_pixel.rgb[channel]);
++        max_rgb[channel] =
++            std::max(max_rgb[channel], sample_pixel.rgb[channel]);
++      }
++    }
++  }
++  for (size_t channel = 0; channel < min_rgb.size(); ++channel) {
++    if (max_rgb[channel] - min_rgb[channel] > kSmoothNeighborhoodRgbRange) {
++      return false;
++    }
++  }
++  return true;
++}
++
++struct NeighborhoodPixel {
++  uint32_t hash_value;
++  RgbBytes rgb;
++};
++
++// The stable content component keeps repeated copies from averaging back to raw
++// pixels. A separate coordinate component keeps a copied calibration sample
++// from subtracting that stable component perfectly.
++bool UpdateHashAndCheckSmoothBytePixelNeighborhood(
++    KaguyaNoiseHash& hash,
++    int x,
++    int y,
++    int width,
++    int height,
++    base::span<const uint8_t> pixels) {
++  return UpdateHashAndCheckSmoothPixelNeighborhood(
++      hash, x, y, width, height, [width, pixels](int sample_x, int sample_y) {
++        auto sample_pixel = GetPixelAt(sample_x, sample_y, width, pixels);
++        return NeighborhoodPixel{
++            base::U32FromLittleEndian(sample_pixel),
++            {sample_pixel[0], sample_pixel[1], sample_pixel[2]}};
++      });
++}
++
++bool UpdateHashAndCheckSmoothQuantizedPixelNeighborhood(
++    KaguyaNoiseHash& hash,
++    int x,
++    int y,
++    int width,
++    int height,
++    base::span<const uint32_t> quantized_pixels) {
++  return UpdateHashAndCheckSmoothPixelNeighborhood(
++      hash, x, y, width, height,
++      [width, quantized_pixels](int sample_x, int sample_y) {
++        const uint32_t sample_pixel =
++            quantized_pixels[sample_x + sample_y * width];
++        return NeighborhoodPixel{
++            sample_pixel,
++            {static_cast<uint8_t>(sample_pixel & 0xffu),
++             static_cast<uint8_t>((sample_pixel >> 8) & 0xffu),
++             static_cast<uint8_t>((sample_pixel >> 16) & 0xffu)}};
++      });
++}
++
++void UpdateHashWithPixelCoordinates(KaguyaNoiseHash& hash,
++                                    int x,
++                                    int y,
++                                    int x_offset,
++                                    int y_offset) {
++  const uint64_t packed_coordinate =
++      (static_cast<uint64_t>(static_cast<uint32_t>(y + y_offset)) << 32) |
++      static_cast<uint32_t>(x + x_offset);
++  // Adjacent packed coordinates can otherwise produce visible axis-aligned
++  // patterns on flat fills, so avalanche them before updating the hash.
++  hash.Update(MixCanvasCoordinateSeed(packed_coordinate));
++}
++
++// Adds noise to the provided pixels in place, using |token_hash| as the
++// source for pseudo-randomness. This function assumes that there are 4
++// channels per pixel.
++void KaguyaNoisePixels(const KaguyaNoiseHash& token_hash,
++                       base::span<uint8_t> pixels,
++                       const int width,
++                       const int height,
++                       const int x_offset,
++                       const int y_offset) {
++  CHECK_EQ(pixels.size(),
++           CheckedPixelStorageSize(width, height, sizeof(uint8_t)));
++
++  std::vector<uint8_t> source_pixel_storage(pixels.begin(), pixels.end());
++  base::span<const uint8_t> source_pixels(source_pixel_storage);
++
++  for (int y = 0; y < height; ++y) {
++    for (int x = 0; x < width; ++x) {
++      auto source_pixel = GetPixelAt(x, y, width, source_pixels);
++      if (source_pixel == kEmptyPixel) {
++        continue;
++      }
++      auto pixel = GetPixelAt(x, y, width, pixels);
++      pixel.copy_from(source_pixel);
++
++      KaguyaNoiseHash content_hash = token_hash;
++      content_hash.Update(base::U32FromLittleEndian(source_pixel));
++      const bool smooth_neighborhood =
++          UpdateHashAndCheckSmoothBytePixelNeighborhood(
++              content_hash, x, y, width, height, source_pixels);
++      KaguyaNoiseHash coordinate_hash = token_hash;
++      UpdateHashWithPixelCoordinates(coordinate_hash, x, y, x_offset, y_offset);
++      coordinate_hash.Update(base::U32FromLittleEndian(source_pixel));
++      RgbNoise rgb_noise =
++          GetRgbNoiseVector(content_hash, coordinate_hash, smooth_neighborhood);
++      KaguyaNoisePixel(pixel, coordinate_hash, rgb_noise);
++    }
++  }
++}
++
++void KaguyaNoiseFloatPixels(const KaguyaNoiseHash& token_hash,
++                            base::span<float> pixels,
++                            const int width,
++                            const int height,
++                            const int x_offset,
++                            const int y_offset) {
++  CHECK_EQ(
++      pixels.size(),
++      CheckedPixelStorageSize(width, height, sizeof(float)) / sizeof(float));
++
++  std::vector<float> source_pixel_storage(pixels.begin(), pixels.end());
++  base::span<const float> source_pixels(source_pixel_storage);
++  std::vector<uint32_t> quantized_source_pixels;
++  quantized_source_pixels.reserve(base::checked_cast<size_t>(width) *
++                                  base::checked_cast<size_t>(height));
++  for (int y = 0; y < height; ++y) {
++    for (int x = 0; x < width; ++x) {
++      quantized_source_pixels.push_back(
++          QuantizedFloatPixelValue(GetPixelAt(x, y, width, source_pixels)));
++    }
++  }
++
++  for (int y = 0; y < height; ++y) {
++    for (int x = 0; x < width; ++x) {
++      auto source_pixel = GetPixelAt(x, y, width, source_pixels);
++      uint32_t quantized_source_pixel = quantized_source_pixels[x + y * width];
++      if (quantized_source_pixel == 0u) {
++        continue;
++      }
++      auto pixel = GetPixelAt(x, y, width, pixels);
++      pixel.copy_from(source_pixel);
++
++      KaguyaNoiseHash content_hash = token_hash;
++      content_hash.Update(quantized_source_pixel);
++      const bool smooth_neighborhood =
++          UpdateHashAndCheckSmoothQuantizedPixelNeighborhood(
++              content_hash, x, y, width, height, quantized_source_pixels);
++      KaguyaNoiseHash coordinate_hash = token_hash;
++      UpdateHashWithPixelCoordinates(coordinate_hash, x, y, x_offset, y_offset);
++      coordinate_hash.Update(quantized_source_pixel);
++      RgbNoise rgb_noise =
++          GetRgbNoiseVector(content_hash, coordinate_hash, smooth_neighborhood);
++      KaguyaNoiseFloatPixel(pixel, coordinate_hash, rgb_noise);
++    }
++  }
++}
++
++void KaguyaNoiseHalfFloatPixels(const KaguyaNoiseHash& token_hash,
++                                base::span<SkHalf> pixels,
++                                const int width,
++                                const int height,
++                                const int x_offset,
++                                const int y_offset) {
++  CHECK_EQ(
++      pixels.size(),
++      CheckedPixelStorageSize(width, height, sizeof(SkHalf)) / sizeof(SkHalf));
++
++  std::vector<SkHalf> source_pixel_storage(pixels.begin(), pixels.end());
++  std::vector<uint32_t> quantized_source_pixels;
++  quantized_source_pixels.reserve(base::checked_cast<size_t>(width) *
++                                  base::checked_cast<size_t>(height));
++  for (int y = 0; y < height; ++y) {
++    for (int x = 0; x < width; ++x) {
++      std::array<float, kChannelsPerPixel> source_pixel =
++          LoadHalfFloatPixel(source_pixel_storage, x, y, width);
++      quantized_source_pixels.push_back(
++          QuantizedFloatPixelValue(base::span(source_pixel)));
++    }
++  }
++  for (int y = 0; y < height; ++y) {
++    for (int x = 0; x < width; ++x) {
++      uint32_t quantized_source_pixel = quantized_source_pixels[x + y * width];
++      if (quantized_source_pixel == 0u) {
++        continue;
++      }
++      std::array<float, kChannelsPerPixel> source_pixel =
++          LoadHalfFloatPixel(source_pixel_storage, x, y, width);
++      std::array<float, kChannelsPerPixel> pixel = source_pixel;
++
++      KaguyaNoiseHash content_hash = token_hash;
++      content_hash.Update(quantized_source_pixel);
++      const bool smooth_neighborhood =
++          UpdateHashAndCheckSmoothQuantizedPixelNeighborhood(
++              content_hash, x, y, width, height, quantized_source_pixels);
++      KaguyaNoiseHash coordinate_hash = token_hash;
++      UpdateHashWithPixelCoordinates(coordinate_hash, x, y, x_offset, y_offset);
++      coordinate_hash.Update(quantized_source_pixel);
++      RgbNoise rgb_noise =
++          GetRgbNoiseVector(content_hash, coordinate_hash, smooth_neighborhood);
++      KaguyaNoiseFloatPixel(base::span(pixel), coordinate_hash, rgb_noise);
++
++      StoreHalfFloatPixel(pixels, x, y, width, pixel);
++    }
++  }
++}
++
++std::optional<KaguyaNoiseHash> GetCanvasTokenHash(
++    ExecutionContext* execution_context) {
++  if (!base::FeatureList::IsEnabled(blink::features::kKaguyaNoiseCanvas)) {
++    return std::nullopt;
++  }
++
++  if (!execution_context || !execution_context->GetKaguyaNoiseTokens().contains(
++                                KaguyaNoiseFeature::kCanvas)) {
++    return std::nullopt;
++  }
++
++  return KaguyaNoiseHash(execution_context->GetKaguyaNoiseTokens().at(
++      KaguyaNoiseFeature::kCanvas));
++}
++
++bool IsSupportedNoisingColorType(SkColorType color_type) {
++  switch (color_type) {
++    case kRGBA_8888_SkColorType:
++    case kBGRA_8888_SkColorType:
++    case kRGBA_F16_SkColorType:
++    case kRGBA_F32_SkColorType:
++      return true;
++    default:
++      return false;
++  }
++}
++
++bool KaguyaNoisePixelBuffer(const KaguyaNoiseHash& token_hash,
++                            SkColorType color_type,
++                            base::span<uint8_t> pixels,
++                            int width,
++                            int height,
++                            int x_offset,
++                            int y_offset) {
++  switch (color_type) {
++    case kRGBA_8888_SkColorType:
++    case kBGRA_8888_SkColorType:
++      KaguyaNoisePixels(token_hash, pixels, width, height, x_offset, y_offset);
++      return true;
++    case kRGBA_F16_SkColorType: {
++      CHECK_EQ(pixels.size(),
++               CheckedPixelStorageSize(width, height, sizeof(SkHalf)));
++      auto half_pixels = base::span(reinterpret_cast<SkHalf*>(pixels.data()),
++                                    pixels.size() / sizeof(SkHalf));
++
++      KaguyaNoiseHalfFloatPixels(token_hash, half_pixels, width, height,
++                                 x_offset, y_offset);
++      return true;
++    }
++    case kRGBA_F32_SkColorType: {
++      auto float_pixels = base::span(reinterpret_cast<float*>(pixels.data()),
++                                     pixels.size() / sizeof(float));
++      KaguyaNoiseFloatPixels(token_hash, float_pixels, width, height, x_offset,
++                             y_offset);
++      return true;
++    }
++    default:
++      NOTREACHED() << "Unsupported canvas color type for noising: "
++                   << static_cast<int>(color_type);
++  }
++}
++
++}  // namespace
++
++// static
++bool CanvasNoisingHelper::MaybeNoiseSnapshot(
++    ExecutionContext* execution_context,
++    scoped_refptr<StaticBitmapImage>& snapshot) {
++  CHECK(snapshot);
++
++  std::optional<KaguyaNoiseHash> token_hash =
++      GetCanvasTokenHash(execution_context);
++  if (!token_hash) {
++    return false;
++  }
++
++  // Read back unpremultiplied pixels because noising mutates raw channel
++  // values, including alpha for non-transparent/non-opaque pixels. If the
++  // snapshot format does not map to a noising-supported color type, read it
++  // back as RGBA_8888 and noise that representation. RGBA_8888 is the default
++  // ImageData format (see |color_type| in t/b/r/c/html/canvas/image_data.cc).
++  SkColorType color_type =
++      viz::ToClosestSkColorType(snapshot->GetSharedImageFormat());
++  if (!IsSupportedNoisingColorType(color_type)) {
++    color_type = kRGBA_8888_SkColorType;
++  }
++  auto info = SkImageInfo::Make(
++      snapshot->GetSize().width(), snapshot->GetSize().height(), color_type,
++      kUnpremul_SkAlphaType, snapshot->GetColorSpace().ToSkColorSpace());
++  SkBitmap bm;
++  if (!bm.tryAllocPixels(info)) {
++    return false;
++  }
++
++  // Copy the original pixels from snapshot to the modifiable SkPixmap. SkBitmap
++  // should already allocate the correct amount of pixels, so this shouldn't
++  // fail because of memory allocation.
++  auto pixmap_to_noise = bm.pixmap();
++  PaintImage paint_image = snapshot->PaintImageForCurrentFrame();
++  if (!paint_image.readPixels(bm.info(), pixmap_to_noise.writable_addr(),
++                              bm.rowBytes(), 0, 0)) {
++    return false;
++  }
++
++  base::span<uint8_t> modify_pixels =
++      gfx::SkPixmapToWritableSpan(pixmap_to_noise);
++
++  if (!KaguyaNoisePixelBuffer(*token_hash, pixmap_to_noise.colorType(),
++                              modify_pixels, pixmap_to_noise.width(),
++                              pixmap_to_noise.height(), 0, 0)) {
++    return false;
++  }
++
++  auto noised_image = bm.asImage();
++  snapshot = blink::UnacceleratedStaticBitmapImage::Create(
++      std::move(noised_image), snapshot->Orientation());
++
++  return true;
++}
++
++// static
++bool CanvasNoisingHelper::MaybeNoiseImageData(
++    ExecutionContext* execution_context,
++    ImageData* image_data,
++    int source_x,
++    int source_y) {
++  CHECK(image_data);
++
++  std::optional<KaguyaNoiseHash> token_hash =
++      GetCanvasTokenHash(execution_context);
++  if (!token_hash) {
++    return false;
++  }
++
++  base::span<uint8_t> pixels = image_data->RawByteSpan();
++  SkColorType color_type = image_data->GetSkColorType();
++  if (!IsSupportedNoisingColorType(color_type)) {
++    // ImageData creation currently only exposes RGBA_8888, RGBA_F16, and
++    // RGBA_F32. If a future ImageData format reaches this path before noising
++    // support is added, avoid both renderer crashes and unnoised readback.
++    DCHECK(false) << "Trying to noise unsupported color type: " << color_type;
++    std::ranges::fill(pixels, 0u);
++    return true;
++  }
++
++  return KaguyaNoisePixelBuffer(*token_hash, color_type, pixels,
++                                image_data->width(), image_data->height(),
++                                source_x, source_y);
++}
++
++}  // namespace blink
+--- /dev/null
++++ b/third_party/blink/renderer/core/kaguya_noise/canvas_noising_helper.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++// -----------------------------------------------------------------------
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_KAGUYA_NOISE_CANVAS_NOISING_HELPER_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_KAGUYA_NOISE_CANVAS_NOISING_HELPER_H_
++
++#include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
++
++namespace blink {
++
++class ImageData;
++
++class CORE_EXPORT CanvasNoisingHelper {
++ public:
++  // If allowed, performs noising on a copy of the snapshot StaticBitmapImage
++  // and modifies it in place. Returns true if noise was applied.
++  static bool MaybeNoiseSnapshot(ExecutionContext* execution_context,
++                                 scoped_refptr<StaticBitmapImage>& snapshot);
++
++  // If allowed, performs noising in place on RGBA ImageData readbacks.
++  // Returns true if noise was applied.
++  static bool MaybeNoiseImageData(ExecutionContext* execution_context,
++                                  ImageData* image_data,
++                                  int source_x,
++                                  int source_y);
++
++ private:
++  CanvasNoisingHelper() = delete;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_KAGUYA_NOISE_CANVAS_NOISING_HELPER_H_
+--- a/third_party/blink/renderer/core/kaguya_noise/build.gni
++++ b/third_party/blink/renderer/core/kaguya_noise/build.gni
+@@ -5,4 +5,6 @@
+ blink_core_sources_kaguya_noise = [
+   "kaguya_noise_hash.cc",
+   "kaguya_noise_hash.h",
++  "canvas_noising_helper.cc",
++  "canvas_noising_helper.h",
+ ]
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -73,6 +73,7 @@
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/geometry/dom_matrix.h"
++#include "third_party/blink/renderer/core/kaguya_noise/canvas_noising_helper.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_draw_listener.h"
+@@ -1308,6 +1309,9 @@ String HTMLCanvasElement::ToDataURLInter
+ 
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
+   if (image_bitmap) {
++    CanvasNoisingHelper::MaybeNoiseSnapshot(GetExecutionContext(),
++                                            image_bitmap);
++
+     std::unique_ptr<ImageDataBuffer> data_buffer =
+         ImageDataBuffer::Create(image_bitmap);
+     if (!data_buffer)
+@@ -1419,6 +1423,9 @@ void HTMLCanvasElement::toBlob(V8BlobCal
+   CanvasAsyncBlobCreator* async_creator = nullptr;
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(kBackBuffer);
+   if (image_bitmap) {
++    CanvasNoisingHelper::MaybeNoiseSnapshot(GetExecutionContext(),
++                                            image_bitmap);
++
+     auto* options = ImageEncodeOptions::Create();
+     options->setType(ImageEncoderUtils::MimeTypeName(encoding_mime_type));
+     async_creator = MakeGarbageCollected<CanvasAsyncBlobCreator>(
+--- a/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
++++ b/third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+@@ -22,6 +22,7 @@
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/geometry/dom_matrix.h"
++#include "third_party/blink/renderer/core/kaguya_noise/canvas_noising_helper.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+@@ -423,11 +424,13 @@ ScriptPromise<Blob> OffscreenCanvas::con
+   base::TimeTicks start_time = base::TimeTicks::Now();
+   scoped_refptr<StaticBitmapImage> image_bitmap = context_->GetImage();
+   if (image_bitmap) {
++    auto* execution_context = ExecutionContext::From(script_state);
++    CanvasNoisingHelper::MaybeNoiseSnapshot(execution_context, image_bitmap);
++
+     auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<Blob>>(
+         script_state, exception_state.GetContext());
+     CanvasAsyncBlobCreator::ToBlobFunctionType function_type =
+         CanvasAsyncBlobCreator::kOffscreenCanvasConvertToBlobPromise;
+-    auto* execution_context = ExecutionContext::From(script_state);
+     auto* async_creator = MakeGarbageCollected<CanvasAsyncBlobCreator>(
+         image_bitmap, options, function_type, start_time, execution_context,
+         resolver);
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -48,6 +48,7 @@
+ #include "third_party/blink/renderer/core/event_type_names.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/geometry/dom_matrix.h"
++#include "third_party/blink/renderer/core/kaguya_noise/canvas_noising_helper.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_font_cache.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_performance_monitor.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+@@ -534,6 +535,9 @@ ImageData* BaseRenderingContext2D::getIm
+       SkIRect bounds =
+           snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
+       DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
++    } else {
++      CanvasNoisingHelper::MaybeNoiseImageData(GetExecutionContext(),
++                                               image_data, sx, sy);
+     }
+   }
+ 
