@@ -48,6 +48,8 @@ def parse_args():
                            help='Import translations from a JSON file '
                            'instead of calling the LLM.')
 
+    subparsers.add_parser('clean', help='Clean up stale translation strings')
+
     return parser.parse_args()
 
 
@@ -62,6 +64,10 @@ def main():
     if args.command == 'translate':
         import i18n_translate # pylint: disable=import-outside-toplevel
         return i18n_translate.run(args)
+
+    if args.command == 'clean':
+        import i18n_clean # pylint: disable=import-outside-toplevel
+        return i18n_clean.run()
 
     raise ValueError(f'unknown command: {args.command}')
 
