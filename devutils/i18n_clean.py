@@ -47,7 +47,7 @@ def run():
     for entry in source:
         existing_keys.add((entry['name'], entry['message']))
 
-    for lang in languages.keys():
+    for lang in languages:
         n_filtered = clean_translation_file(lang, existing_keys)
         if n_filtered:
             print(f'{lang}: filtered {n_filtered} string(s)')
