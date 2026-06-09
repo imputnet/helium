@@ -7,6 +7,7 @@ String extraction from Helium patches for translation.
 
 import subprocess
 import json
+import re
 from pathlib import Path
 
 from third_party import unidiff
@@ -15,6 +16,12 @@ import utils.name_substitution_utils as namesub # pylint: disable=wrong-import-o
 
 PLATFORMS = ("windows", "macos", "linux")
 REPO_URL = "https://github.com/imputnet/helium-{platform}.git"
+
+
+def get_xml_attr(text, attr):
+    """Extract an XML attribute from an opening tag."""
+    match = re.search(rf'{attr}="([^"]*)"', text)
+    return match.group(1) if match else None
 
 
 def prep_platform_repos(platforms_dir):
@@ -71,7 +78,7 @@ def extract_strings_from_hunk(hunk):
     - broken chunks of untouched, pre-existing units
     - units that were added in a different patch (avoiding duplication)
     """
-    name, message, desc = None, '', None
+    name, message, desc, meaning = None, '', None, None
     meta_acc = ''
     had_any_additive = False
 
@@ -87,15 +94,16 @@ def extract_strings_from_hunk(hunk):
             meta_acc += line
         elif line.startswith('</message>'):
             if name and message and had_any_additive:
-                yield name, desc, message
-            name, message, desc = None, '', None
+                yield name, desc, meaning, message
+            name, message, desc, meaning = None, '', None, None
             had_any_additive = False
         elif name:
             message += line
 
         if meta_acc and line.endswith('>'):
-            name = meta_acc.split('name="')[1].split('"')[0]
-            desc = meta_acc.split('desc="')[1].split('"')[0]
+            name = get_xml_attr(meta_acc, 'name')
+            desc = get_xml_attr(meta_acc, 'desc')
+            meaning = get_xml_attr(meta_acc, 'meaning')
             meta_acc = ''
 
         had_any_additive |= bool(name) and is_additive
@@ -105,16 +113,19 @@ def extract_strings(repo_root, platforms_dir):
     """Generate strings to be translated for all grit strings in patches."""
     for patch in get_relevant_patches(repo_root, platforms_dir):
         for hunk in patch:
-            for name, desc, message in extract_strings_from_hunk(hunk):
+            for name, desc, meaning, message in extract_strings_from_hunk(hunk):
                 context = namesub.replace_text(desc)[0]
                 message = namesub.replace_text(message)[0]
 
-                yield {
+                entry = {
                     'name': name,
                     'source': patch.path,
                     'context': context,
-                    'message': message,
                 }
+                if meaning:
+                    entry['meaning'] = namesub.replace_text(meaning)[0]
+                entry['message'] = message
+                yield entry
 
 
 def run(args, repo_root):
