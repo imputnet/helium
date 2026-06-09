@@ -68,20 +68,21 @@
    declare private searchEngine_: string;
    declare private keyword_: string;
    declare private queryUrl_: string;
-@@ -114,8 +116,10 @@ export class SettingsSearchEngineEditDia
+@@ -114,8 +116,11 @@ export class SettingsSearchEngineEditDia
        this.queryUrl_ = this.model.url;
        this.suggestionsUrl_ = this.model.suggestionsUrl;
      } else {
 -      this.dialogTitle_ = loadTimeData.getString('searchEnginesAddSiteSearch');
 -      this.actionButtonText_ = loadTimeData.getString('add');
 +      this.dialogTitle_ = loadTimeData.getString(
-+        this.isNewPrimary ? 'searchEnginesAddSearchEngine' : 'searchEnginesAddSiteSearch');
-+      this.actionButtonText_ = loadTimeData.getString(
-+        this.isNewPrimary ? 'addAsDefault' : 'add');
++          this.isNewPrimary ? 'searchEnginesAddSearchEngine' :
++                              'searchEnginesAddSiteSearch');
++      this.actionButtonText_ =
++          loadTimeData.getString(this.isNewPrimary ? 'addAsDefault' : 'add');
        this.readonly_ = false;
        this.showPolicySubtitle_ = false;
      }
-@@ -194,7 +198,28 @@ export class SettingsSearchEngineEditDia
+@@ -194,7 +199,23 @@ export class SettingsSearchEngineEditDia
      this.browserProxy_.searchEngineEditCompleted(
          this.searchEngine_, this.keyword_, this.queryUrl_,
          this.suggestionsUrl_);
@@ -93,24 +94,29 @@
 +
 +    this.browserProxy_.getSearchEnginesList()
 +      .then(engines => {
-+        const engine = engines.actives.find(
-+          e => e.keyword === this.keyword_
-+        );
++        const engine = engines.actives.find(e => e.keyword === this.keyword_);
 +
-+        if (!engine) {
++        if (!engine || !engine.canBeDefault) {
 +          return;
 +        }
 +
 +        this.browserProxy_.setDefaultSearchEngine(
-+          engine.id,
-+          ChoiceMadeLocation.SEARCH_ENGINE_SETTINGS,
-+          null
-+        );
++            engine.id, ChoiceMadeLocation.SEARCH_ENGINE_SETTINGS, null);
 +      })
 +      .finally(done);
    }
  
    private validateElement_(inputElement: CrInputElement) {
+@@ -214,7 +235,8 @@ export class SettingsSearchEngineEditDia
+     }
+ 
+     this.browserProxy_
+-        .validateSearchEngineInput(inputElement.id, inputElement.value)
++        .validateSearchEngineInput(
++            inputElement.id, inputElement.value, this.isNewPrimary)
+         .then(isValid => {
+           inputElement.invalid = !isValid;
+           this.updateActionButtonState_();
 --- a/chrome/browser/resources/settings/search_page/search_engines_page.html
 +++ b/chrome/browser/resources/settings/search_page/search_engines_page.html
 @@ -47,6 +47,11 @@
@@ -160,8 +166,8 @@
  
    private openEditDialog_(
 -      searchEngine: SearchEngine|null, anchorElement: HTMLElement) {
-+      searchEngine: SearchEngine|null,
-+      anchorElement: HTMLElement, primary = false) {
++      searchEngine: SearchEngine|null, anchorElement: HTMLElement,
++      primary = false) {
      this.dialogModel_ = searchEngine;
      this.dialogAnchorElement_ = anchorElement;
 +    this.isNewPrimary_ = primary;
@@ -181,3 +187,164 @@
    private onAddSearchEngineClick_(e: Event) {
      e.preventDefault();
      this.openEditDialog_(
+--- a/components/search_engines/util.cc
++++ b/components/search_engines/util.cc
+@@ -307,7 +307,8 @@ std::string GetFixedUpSearchEngineUrl(
+ 
+ bool IsSearchEngineURLValidToUse(const std::string& url_input,
+                                  const TemplateURLService* service,
+-                                 const TemplateURL* existing_url) {
++                                 const TemplateURL* existing_url,
++                                 bool is_new_primary) {
+   std::string url =
+       GetFixedUpSearchEngineUrl(url_input, service->search_terms_data());
+   if (url.empty()) {
+@@ -328,8 +329,12 @@ bool IsSearchEngineURLValidToUse(const s
+ 
+   // If this is going to be the default search engine, it must support
+   // replacement.
++  is_new_primary =
++      is_new_primary ||
++      (existing_url && existing_url == service->GetDefaultSearchProvider());
++
+   if (!template_ref.SupportsReplacement(service->search_terms_data()) &&
+-      existing_url && existing_url == service->GetDefaultSearchProvider()) {
++      is_new_primary) {
+     return false;
+   }
+ 
+--- a/chrome/browser/ui/search_engines/edit_search_engine_controller.cc
++++ b/chrome/browser/ui/search_engines/edit_search_engine_controller.cc
+@@ -32,15 +32,17 @@ bool EditSearchEngineController::IsTitle
+   return IsSearchEngineNameValidToUse(title_input);
+ }
+ 
+-bool EditSearchEngineController::IsURLValid(
+-    const std::string& url_input) const {
++bool EditSearchEngineController::IsURLValid(const std::string& url_input,
++                                            const bool is_new_primary) const {
+   TemplateURLService* service =
+       TemplateURLServiceFactory::GetForProfile(profile_);
+-  return IsSearchEngineURLValidToUse(url_input, service, template_url_);
++  return IsSearchEngineURLValidToUse(url_input, service, template_url_,
++                                     is_new_primary);
+ }
+ 
+ bool EditSearchEngineController::IsSuggestionsURLValid(
+-    const std::string& suggestions_url_input) const {
++    const std::string& suggestions_url_input,
++    const bool is_new_primary) const {
+   TemplateURLService* template_url_service =
+       TemplateURLServiceFactory::GetForProfile(profile_);
+   std::string suggestions_url =
+@@ -49,7 +51,7 @@ bool EditSearchEngineController::IsSugge
+   if (suggestions_url.empty())
+     return true;
+ 
+-  return IsURLValid(suggestions_url);
++  return IsURLValid(suggestions_url, is_new_primary);
+ }
+ 
+ bool EditSearchEngineController::IsKeywordValid(
+--- a/chrome/browser/resources/settings/search_page/search_engines_browser_proxy.ts
++++ b/chrome/browser/resources/settings/search_page/search_engines_browser_proxy.ts
+@@ -116,8 +116,9 @@ export interface SearchEnginesBrowserPro
+ 
+   getSaveGuestChoice(): Promise<boolean|null>;
+ 
+-  validateSearchEngineInput(fieldName: string, fieldValue: string):
+-      Promise<boolean>;
++  validateSearchEngineInput(
++      fieldName: string, fieldValue: string,
++      isNewPrimary: boolean): Promise<boolean>;
+ 
+   /**
+    * Helper function that calls recordHistogram for the
+@@ -178,9 +179,10 @@ export class SearchEnginesBrowserProxyIm
+     return sendWithPromise<boolean|null>('getSaveGuestChoice');
+   }
+ 
+-  validateSearchEngineInput(fieldName: string, fieldValue: string) {
++  validateSearchEngineInput(
++      fieldName: string, fieldValue: string, isNewPrimary: boolean) {
+     return sendWithPromise<boolean>(
+-        'validateSearchEngineInput', fieldName, fieldValue);
++        'validateSearchEngineInput', fieldName, fieldValue, isNewPrimary);
+   }
+ 
+   recordSearchEnginesPageHistogram(interaction: SearchEnginesInteractions) {
+--- a/chrome/browser/ui/webui/settings/search_engines_handler.cc
++++ b/chrome/browser/ui/webui/settings/search_engines_handler.cc
+@@ -504,17 +504,19 @@ void SearchEnginesHandler::OnEditedKeywo
+ 
+ void SearchEnginesHandler::HandleValidateSearchEngineInput(
+     const base::ListValue& args) {
+-  CHECK_EQ(3U, args.size());
++  CHECK_EQ(4U, args.size());
+ 
+   const base::Value& callback_id = args[0];
+   const std::string& field_name = args[1].GetString();
+   const std::string& field_value = args[2].GetString();
++  const bool is_new_primary = args[3].GetBool();
+   ResolveJavascriptCallback(
+-      callback_id, base::Value(CheckFieldValidity(field_name, field_value)));
++      callback_id, base::Value(CheckFieldValidity(field_name, field_value, is_new_primary)));
+ }
+ 
+ bool SearchEnginesHandler::CheckFieldValidity(const std::string& field_name,
+-                                              const std::string& field_value) {
++                                              const std::string& field_value,
++                                              const bool is_new_primary) {
+   if (!edit_controller_.get()) {
+     return false;
+   }
+@@ -525,9 +527,9 @@ bool SearchEnginesHandler::CheckFieldVal
+   } else if (field_name.compare(kKeywordField) == 0) {
+     is_valid = edit_controller_->IsKeywordValid(base::UTF8ToUTF16(field_value));
+   } else if (field_name.compare(kQueryUrlField) == 0) {
+-    is_valid = edit_controller_->IsURLValid(field_value);
++    is_valid = edit_controller_->IsURLValid(field_value, is_new_primary);
+   } else if (field_name.compare(kSuggestionsUrlField) == 0) {
+-    is_valid = edit_controller_->IsSuggestionsURLValid(field_value);
++    is_valid = edit_controller_->IsSuggestionsURLValid(field_value, is_new_primary);
+   } else {
+     NOTREACHED();
+   }
+--- a/chrome/browser/ui/search_engines/edit_search_engine_controller.h
++++ b/chrome/browser/ui/search_engines/edit_search_engine_controller.h
+@@ -52,9 +52,9 @@ class EditSearchEngineController {
+   // URL. The URL is valid if it contains no search terms and is a valid
+   // url, or if it contains a search term and replacing that search term with a
+   // character results in a valid url.
+-  bool IsURLValid(const std::string& url_input) const;
++  bool IsURLValid(const std::string& url_input, bool is_new_primary = false) const;
+ 
+-  bool IsSuggestionsURLValid(const std::string& suggestions_url_input) const;
++  bool IsSuggestionsURLValid(const std::string& suggestions_url_input, bool is_new_primary = false) const;
+ 
+   // Returns true if the value of |keyword_input| represents a valid keyword.
+   // The keyword is valid if it is non-empty and does not conflict with an
+--- a/chrome/browser/ui/webui/settings/search_engines_handler.h
++++ b/chrome/browser/ui/webui/settings/search_engines_handler.h
+@@ -87,7 +87,8 @@ class SearchEnginesHandler : public Sett
+   // Checks whether the given user input field (searchEngine, keyword, queryUrl,
+   // suggestionsUrl) is populated with a valid value.
+   bool CheckFieldValidity(const std::string& field_name,
+-                          const std::string& field_value);
++                          const std::string& field_value,
++                          const bool is_new_primary = false);
+ 
+   // Called when an edit is canceled.
+   // Called from WebUI.
+--- a/components/search_engines/util.h
++++ b/components/search_engines/util.h
+@@ -269,7 +269,8 @@ bool IsSearchEngineKeywordValidToUse(con
+ // new one.
+ bool IsSearchEngineURLValidToUse(const std::string& url_input,
+                                  const TemplateURLService* service,
+-                                 const TemplateURL* existing_url);
++                                 const TemplateURL* existing_url,
++                                 const bool is_new_primary);
+ 
+ // Fixes up and returns the URL. The returned URL is suitable for use by
+ // TemplateURL.
