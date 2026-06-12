@@ -17,7 +17,8 @@ The same contribution guidelines apply to all platform repos.
 - For platform-specific issues or features, open the issue or PR in the
   related platform repository instead of this one.
 - Do not use AI to generate issue or PR descriptions. You will get banned
-  for spam without review. We want contributions from people, not bots.
+  for spam without review. We want contributions from people, not bots. Hard
+  work matters more.
 
 ### Issues
 
@@ -98,9 +99,9 @@ The part before the colon should describe the area being changed (scope),
 and the part after the colon should explain the change itself.
 
 1. Pick the most helpful scope for the change.
-1. Do not use generic scopes like "feat" or "chore".
-1. Keep titles specific and meaningful rather than generic.
-1. If the change needs extra context, add a body explaining why it was
+2. Do not use generic scopes like "feat" or "chore". Keep titles specific and meaningful
+   rather than generic.
+4. If the change needs extra context, add a body explaining why it was
    made and what changed.
 
 Make sure that the title is 65 chars long or shorter. This is needed for
