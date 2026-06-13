@@ -25,9 +25,13 @@ SOURCE_PATH = I18N_DIR / 'source.gen.json'
 TRANSLATIONS_DIR = I18N_DIR / 'translations'
 
 
-def get_id(name, context, text):
+def get_id(name, context, text, meaning):
     """Compute the fingerprint ID for a GRD message element."""
-    message = xml.fromstring(f'<message name="{name}" desc="{context}">{text}</message>')
+    message = xml.fromstring(f'<message>{text}</message>')
+    message.set('name', name)
+    message.set('desc', context)
+    if meaning:
+        message.set('meaning', meaning)
     return namesub.compute_fp(message)
 
 
@@ -142,7 +146,7 @@ def merge_into_xtb(xtb_path, source_entries, trans_by_key):
         trans = trans_by_key.get(key)
         if not trans:
             continue
-        msg_id = get_id(src['name'], src['context'], src['message'])
+        msg_id = get_id(src['name'], src['context'], src['message'], src.get('meaning'))
         if msg_id in seen_ids:
             continue
         seen_ids.add(msg_id)
