@@ -38,6 +38,10 @@ def get_id(name, context, text, meaning):
 def find_parent_grd(tree, grdp_path):
     """Find the parent GRD that includes a GRDP via <part file="...">."""
     grdp_name = Path(grdp_path).name
+
+    if grdp_name == 'helium_onboarding_strings.grdp':
+        return tree / 'chrome/app/generated_resources.grd'
+
     grd_dir = tree / Path(grdp_path).parent
     for grd_file in grd_dir.glob('*.grd'):
         root = xml.parse(grd_file).getroot()
