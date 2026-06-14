@@ -18,6 +18,7 @@ from multiprocessing import Pool
 from pathlib import Path
 
 import name_substitution_utils as namesub
+from i18n_titlecase import build_title_case_aliases, source_key, translation_key
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 I18N_DIR = REPO_ROOT / 'i18n'
@@ -136,13 +137,13 @@ def resolve_xtb(src, lang_code, xtb_index):
     return xtb_map.get(xtb_lang)
 
 
-def merge_into_xtb(xtb_path, source_entries, trans_by_key):
+def merge_into_xtb(xtb_path, source_entries, trans_by_key, source_aliases):
     """Merge translations for matching source entries into a single XTB file."""
     # TODO: handle feminine/masculine variants via <branch> elements
     seen_ids = set()
     entries = []
     for src in source_entries:
-        key = (src['name'], src['message'])
+        key = source_key(src, source_aliases)
         trans = trans_by_key.get(key)
         if not trans:
             continue
@@ -159,7 +160,7 @@ def merge_into_xtb(xtb_path, source_entries, trans_by_key):
 
 def apply_language(task):
     """Apply translations for a single language into XTB files."""
-    lang_code, source, xtb_index = task
+    lang_code, source, xtb_index, source_aliases, translation_aliases = task
     trans_path = TRANSLATIONS_DIR / f'{lang_code}.json'
     if not trans_path.exists():
         print(f'{lang_code}: no translations found, skipping', file=sys.stderr)
@@ -170,8 +171,11 @@ def apply_language(task):
 
     trans_by_key = {}
     for trans in translations:
-        if trans:
-            trans_by_key[(trans['name'], trans['source'])] = trans
+        if not trans:
+            continue
+        key = translation_key(trans, translation_aliases)
+        if key not in trans_by_key or trans['source'] == key[1]:
+            trans_by_key[key] = trans
 
     # group source entries by target XTB file
     by_xtb = defaultdict(list)
@@ -184,7 +188,7 @@ def apply_language(task):
 
     total = 0
     for xtb_path, source_entries in by_xtb.items():
-        total += merge_into_xtb(xtb_path, source_entries, trans_by_key)
+        total += merge_into_xtb(xtb_path, source_entries, trans_by_key, source_aliases)
 
     print(f'{lang_code}: applied {total} translations to {len(by_xtb)} XTB files')
 
@@ -198,8 +202,12 @@ def apply_translations(tree):
 
     namesub.add_grit_to_path(tree)
     xtb_index = build_xtb_index(source, tree)
+    source_aliases, translation_aliases = build_title_case_aliases(source)
 
-    tasks = [(code, source, xtb_index) for code in languages]
+    tasks = [
+        (code, source, xtb_index, source_aliases, translation_aliases)
+        for code in languages
+    ]
     with Pool(min(32, os.cpu_count() or 1)) as pool:
         pool.map(apply_language, tasks)
 

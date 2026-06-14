@@ -13,6 +13,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(1, str(REPO_ROOT / 'utils'))
 
 PLATFORMS_DIR = Path(__file__).resolve().parent / "i18n-data"
 OUT_PATH = REPO_ROOT / 'i18n' / 'source.gen.json'
