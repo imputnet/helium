@@ -7,15 +7,21 @@ String extraction from Helium patches for translation.
 
 import subprocess
 import json
+import sys
 import re
 from pathlib import Path
 
 from third_party import unidiff
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'utils'))
+
+from downloads import DownloadInfo # pylint: disable=wrong-import-order
 import utils.name_substitution_utils as namesub # pylint: disable=wrong-import-order
 
 PLATFORMS = ("windows", "macos", "linux")
-REPO_URL = "https://github.com/imputnet/helium-{platform}.git"
+REPO_URL = "https://github.com/imputnet/helium-{repo}.git"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+ONBOARDING_VERSION = DownloadInfo([ROOT_DIR / "deps.ini"])['onboarding'].version
 
 
 def get_xml_attr(text, attr):
@@ -28,16 +34,19 @@ def prep_platform_repos(platforms_dir):
     """Clone and update platform repos into the given directory."""
     platforms_dir.mkdir(parents=True, exist_ok=True)
 
-    for platform in PLATFORMS:
-        dest = platforms_dir / platform
+    for repo in list(PLATFORMS) + ["onboarding"]:
+        dest = platforms_dir / repo
         if not dest.is_dir():
             subprocess.run(
-                ["git", "clone", REPO_URL.format(platform=platform),
+                ["git", "clone", REPO_URL.format(repo=repo),
                  str(dest)],
                 check=True,
             )
-        subprocess.check_call(["git", "-C", str(dest), "checkout", "main"])
-        subprocess.check_call(["git", "-C", str(dest), "pull"])
+        subprocess.check_call(["git", "-C", str(dest), "fetch"])
+        subprocess.check_call([
+            "git", "-C",
+            str(dest), "checkout", ONBOARDING_VERSION if repo == "onboarding" else "origin/main"
+        ])
 
 
 def get_patch_paths(repo_root, platforms_dir):
@@ -65,9 +74,9 @@ def get_relevant_patches(repo_root, platforms_dir):
                 yield file
 
 
-def extract_strings_from_hunk(hunk):
+def extract_strings_from_hunk(hunk, clean=False):
     """
-    Parse a diff hunk and generate (name, desc, message)
+    Parse a diff hunk and generate (name, desc, meaning, message)
     for added GRD message elements.
 
     What we want:
@@ -83,7 +92,7 @@ def extract_strings_from_hunk(hunk):
     had_any_additive = False
 
     for line in str(hunk).split('\n'):
-        is_additive = line.startswith('+')
+        is_additive = line.startswith('+') or clean
         is_subtractive = line.startswith('-')
         line = line.lstrip('+').strip()
 
@@ -109,23 +118,35 @@ def extract_strings_from_hunk(hunk):
         had_any_additive |= bool(name) and is_additive
 
 
+def to_source_format(path, name, desc, meaning, message):
+    """Takes an extracted XML tuple and converts it to the JSON format."""
+    context = namesub.replace_text(desc)[0]
+    message = namesub.replace_text(message)[0]
+
+    entry = {
+        'name': name,
+        'source': path,
+        'context': context,
+    }
+    if meaning:
+        entry['meaning'] = namesub.replace_text(meaning)[0]
+    entry['message'] = message
+    yield entry
+
+
 def extract_strings(repo_root, platforms_dir):
     """Generate strings to be translated for all grit strings in patches."""
     for patch in get_relevant_patches(repo_root, platforms_dir):
         for hunk in patch:
-            for name, desc, meaning, message in extract_strings_from_hunk(hunk):
-                context = namesub.replace_text(desc)[0]
-                message = namesub.replace_text(message)[0]
+            for source in extract_strings_from_hunk(hunk):
+                yield from to_source_format(patch.path, *source)
 
-                entry = {
-                    'name': name,
-                    'source': patch.path,
-                    'context': context,
-                }
-                if meaning:
-                    entry['meaning'] = namesub.replace_text(meaning)[0]
-                entry['message'] = message
-                yield entry
+    onboarding_path = platforms_dir / "onboarding" / "helium_onboarding_strings.grdp"
+    if onboarding_path.exists():
+        onboarding_text = onboarding_path.read_text()
+        for source in extract_strings_from_hunk(onboarding_text, True):
+            yield from to_source_format(
+                'components/helium_onboarding/helium_onboarding_strings.grdp', *source)
 
 
 def run(args, repo_root):
