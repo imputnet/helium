@@ -55,6 +55,13 @@ def parse_args():
 
     subparsers.add_parser('clean', help='Clean up stale translation strings')
 
+    forage = subparsers.add_parser('forage', help='Find existing translation strings in Chromium')
+    forage.add_argument('-t',
+                        '--tree',
+                        type=Path,
+                        required=True,
+                        help='Path to Chromium source tree')
+
     return parser.parse_args()
 
 
@@ -73,6 +80,10 @@ def main():
     if args.command == 'clean':
         import i18n_clean # pylint: disable=import-outside-toplevel
         return i18n_clean.run()
+
+    if args.command == 'forage':
+        import i18n_forage # pylint: disable=import-outside-toplevel
+        return i18n_forage.run(args)
 
     raise ValueError(f'unknown command: {args.command}')
 
