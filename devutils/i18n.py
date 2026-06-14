@@ -47,6 +47,11 @@ def parse_args():
                            type=Path,
                            help='Import translations from a JSON file '
                            'instead of calling the LLM.')
+    translate.add_argument('--cmd',
+                           help='Run translations through this command instead of '
+                           'the LLM completions API. The filled prompt is appended '
+                           'as the final argument and the JSON payload is passed '
+                           'on stdin.')
 
     subparsers.add_parser('clean', help='Clean up stale translation strings')
 
