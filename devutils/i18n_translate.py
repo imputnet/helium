@@ -2,17 +2,21 @@
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """
-Translation of Helium strings using a completions API.
+Translation of Helium strings using an LLM backend.
 """
 
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-I18N_DIR = Path(__file__).resolve().parent.parent / 'i18n'
+REPO_ROOT = Path(__file__).resolve().parent.parent
+I18N_DIR = REPO_ROOT / 'i18n'
 SOURCE_PATH = I18N_DIR / 'source.gen.json'
 TRANSLATIONS_DIR = I18N_DIR / 'translations'
 
@@ -55,6 +59,49 @@ def llm_chat(prompt, data):
         body = json.loads(resp.read())
 
     return body['choices'][0]['message']['content']
+
+
+def run_command(cmd, data):
+    """Run a non-interactive CLI backend."""
+    with tempfile.TemporaryDirectory(prefix='helium-i18n-cmd-') as cwd:
+        try:
+            proc = subprocess.run(cmd,
+                                  input=data,
+                                  text=True,
+                                  capture_output=True,
+                                  check=True,
+                                  cwd=cwd)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f'{cmd[0]} executable not found') from exc
+        except subprocess.CalledProcessError as exc:
+            details = []
+            if exc.stderr:
+                details.append(exc.stderr.strip())
+            if exc.stdout:
+                details.append(f'stdout:\n{exc.stdout.strip()}')
+            message = f'{cmd[0]} failed'
+            if details:
+                message += ':\n' + '\n'.join(details)
+            raise RuntimeError(message) from exc
+
+    return proc.stdout
+
+
+def command_chat(prompt, data, command):
+    """Send a translation request through a provided command."""
+    cmd = shlex.split(command)
+    if not cmd:
+        raise ValueError('--cmd must not be empty')
+
+    cmd.append(prompt)
+    return run_command(cmd, data)
+
+
+def translate_with_backend(prompt, data, command=None):
+    """Send a translation request to the selected backend."""
+    if command:
+        return command_chat(prompt, data, command)
+    return llm_chat(prompt, data)
 
 
 def load_existing(lang_code):
@@ -247,8 +294,10 @@ def save_translations(lang_code, source, existing, response, dedup_map):
         file.write('\n')
 
 
-def translate_language(lang_code, lang_name, source, prompt_template, from_file=None):
+# pylint: disable-next=too-many-locals
+def translate_language(language, source, prompt_template, from_file=None, command=None):
     """Run translation for a single language."""
+    lang_code, lang_name = language
     existing = load_existing(lang_code)
     untranslated = find_untranslated(source, existing)
 
@@ -269,7 +318,7 @@ def translate_language(lang_code, lang_name, source, prompt_template, from_file=
     else:
         prompt = fill_prompt(prompt_template, lang_name, lang_code)
         data = json.dumps(payload, ensure_ascii=False)
-        raw = llm_chat(prompt, data)
+        raw = translate_with_backend(prompt, data, command)
 
     response = parse_response(raw, expected_names)
 
@@ -287,15 +336,20 @@ def run(args):
     prompt_template = (I18N_DIR / 'prompt.md').read_text(encoding='utf-8')
     TRANSLATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+    language = getattr(args, 'language', None)
     from_file = getattr(args, 'from_file', None)
+    command = getattr(args, 'cmd', None)
 
-    if args.language:
-        for code in args.language:
+    if not command:
+        command = os.environ.get('I18N_TRANSLATE_CMD')
+
+    if language:
+        for code in language:
             if code not in languages:
                 raise ValueError(f'unknown language code: {code}')
-            translate_language(code, languages[code], source, prompt_template, from_file)
+            translate_language((code, languages[code]), source, prompt_template, from_file, command)
     else:
         if from_file:
             raise ValueError('--from-file requires --language')
         for code, name in languages.items():
-            translate_language(code, name, source, prompt_template)
+            translate_language((code, name), source, prompt_template, command=command)
