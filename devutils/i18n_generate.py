@@ -94,20 +94,22 @@ def extract_strings_from_hunk(hunk, clean=False):
     for line in str(hunk).split('\n'):
         is_additive = line.startswith('+') or clean
         is_subtractive = line.startswith('-')
-        line = line.lstrip('+').strip()
+        line = line.lstrip('+')
 
         if is_subtractive:
             continue
+        if not name:
+            line = line.strip()
 
         if line.startswith('<message') or meta_acc:
             meta_acc += line
-        elif line.startswith('</message>'):
+        elif '</message>' in line:
             if name and message and had_any_additive:
-                yield name, desc, meaning, message
+                yield name, desc, meaning, message.strip()
             name, message, desc, meaning = None, '', None, None
             had_any_additive = False
         elif name:
-            message += line
+            message += line + '\n'
 
         if meta_acc and line.endswith('>'):
             name = get_xml_attr(meta_acc, 'name')
