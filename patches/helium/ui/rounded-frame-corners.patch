@@ -205,15 +205,28 @@
    }
 --- a/chrome/browser/ui/views/frame/multi_contents_view.h
 +++ b/chrome/browser/ui/views/frame/multi_contents_view.h
-@@ -171,6 +171,7 @@ class MultiContentsView
+@@ -171,8 +171,11 @@ class MultiContentsView
  
    bool IsDragAndDropEnabled() const;
    void OnDragAndDropPrefStateChange();
 +  void OnRoundedFramePrefStateChange();
  
    void SetShouldShowTopSeparator(bool should_show);
++  void SetAttachedSideChromeVisibility(bool leading_attached,
++                                       bool trailing_attached);
    void SetSplitViewInsets(const gfx::Insets& insets);
-@@ -262,6 +263,8 @@ class MultiContentsView
+   const gfx::Insets& split_view_insets_for_testing() const {
+     return split_view_insets_;
+@@ -220,6 +223,8 @@ class MultiContentsView
+     raw_ptr<CustomFloatingCorner> corner_separator = nullptr;
+ 
+     bool should_show_top = false;
++    bool leading_side_chrome_attached = false;
++    bool trailing_side_chrome_attached = false;
+   };
+ 
+   static constexpr int kMinWebContentsSize = 200;
+@@ -262,6 +267,8 @@ class MultiContentsView
    // `MultiContentsView`. Returns 0 if not in a split view.
    int GetMinViewSize(gfx::Rect available_space) const;
  
@@ -222,7 +235,7 @@
    void UpdateContentsBorderAndOverlay();
  
    double CalculateRatioWithSnapPoints(double start_size,
-@@ -325,6 +328,7 @@ class MultiContentsView
+@@ -325,6 +332,7 @@ class MultiContentsView
    // Tracks and handles drag and drop settings change.
    PrefChangeRegistrar pref_change_registrar_;
    bool is_drag_drop_pref_enabled_ = false;
@@ -232,7 +245,16 @@
    // for split tabs, some of these webviews are part of the focus helper for the
 --- a/chrome/browser/ui/views/frame/multi_contents_view.cc
 +++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
-@@ -160,15 +160,23 @@ MultiContentsView::MultiContentsView(
+@@ -63,6 +63,8 @@ void MultiContentsView::ContentsSeparato
+   leading_separator = nullptr;
+   trailing_separator = nullptr;
+   corner_separator = nullptr;
++  leading_side_chrome_attached = false;
++  trailing_side_chrome_attached = false;
+ }
+ 
+ MultiContentsView::MultiContentsView(
+@@ -160,15 +162,23 @@ MultiContentsView::MultiContentsView(
      }
    }
  
@@ -259,7 +281,7 @@
  }
  
  MultiContentsView::~MultiContentsView() {
-@@ -420,6 +428,7 @@ void MultiContentsView::OnThemeChanged()
+@@ -420,6 +430,7 @@ void MultiContentsView::OnThemeChanged()
  
  void MultiContentsView::OnFullscreenStateChanged() {
    UpdateContentsBorderAndOverlay();
@@ -267,7 +289,7 @@
  }
  
  int MultiContentsView::GetInactiveIndex() const {
-@@ -488,8 +497,10 @@ views::ProposedLayout MultiContentsView:
+@@ -488,8 +499,10 @@ views::ProposedLayout MultiContentsView:
  
    gfx::Rect available_space = gfx::Rect(width, height);
  
@@ -279,16 +301,25 @@
    layouts.child_layouts.emplace_back(background_view_.get(), show_background,
                                       available_space);
  
-@@ -501,7 +512,7 @@ views::ProposedLayout MultiContentsView:
-   available_space =
-       CalculateSeparatorLayouts(available_space, layouts.child_layouts);
+@@ -503,6 +516,17 @@ views::ProposedLayout MultiContentsView:
  
--  if (IsInSplitView()) {
-+  if (IsInSplitView() || should_use_rounded_frame) {
+   if (IsInSplitView()) {
      available_space.Inset(split_view_insets_);
++  } else if (should_use_rounded_frame) {
++    gfx::Insets single_insets(kSplitViewContentInset);
++    single_insets.set_top(
++        contents_separators_.should_show_top ? 0 : kSplitViewContentInset);
++    single_insets.set_left(contents_separators_.leading_side_chrome_attached
++                               ? 0
++                               : kSplitViewContentInset);
++    single_insets.set_right(contents_separators_.trailing_side_chrome_attached
++                                ? 0
++                                : kSplitViewContentInset);
++    available_space.Inset(single_insets);
    }
    ViewSizes sizes = GetViewSizes(available_space);
-@@ -631,7 +642,7 @@ gfx::Rect MultiContentsView::CalculateDr
+ 
+@@ -631,7 +655,7 @@ gfx::Rect MultiContentsView::CalculateDr
  gfx::Rect MultiContentsView::CalculateSeparatorLayouts(
      const gfx::Rect& available_space,
      std::vector<views::ChildLayout>& child_layouts) const {
@@ -297,7 +328,7 @@
      child_layouts.emplace_back(contents_separators_.top_separator.get(), false,
                                 gfx::Rect());
      child_layouts.emplace_back(contents_separators_.leading_separator.get(),
-@@ -769,29 +780,47 @@ int MultiContentsView::GetMinViewSize(gf
+@@ -769,29 +793,47 @@ int MultiContentsView::GetMinViewSize(gf
                    std::max(kConstrainedMinWebContentsSize, min_percentage));
  }
  
@@ -348,7 +379,7 @@
          is_active && active_contents_view_highlighted_,
          use_system_bottom_left_radius && is_first_view,
          use_system_bottom_right_radius && is_last_view);
-@@ -832,12 +861,20 @@ void MultiContentsView::OnDragAndDropPre
+@@ -832,12 +874,38 @@ void MultiContentsView::OnDragAndDropPre
    InvalidateLayout();
  }
  
@@ -358,6 +389,7 @@
 +          prefs::kHeliumRoundedFrame);
 +  UpdateContentsBorderAndOverlay();
 +  InvalidateLayout();
++  browser_view_->InvalidateLayout();
 +}
 +
  void MultiContentsView::SetShouldShowTopSeparator(bool should_show) {
@@ -367,10 +399,27 @@
    contents_separators_.should_show_top = should_show;
 -  if (IsInSplitView()) {
 +  if (IsInSplitView() || ShouldUseRoundedFrame()) {
++    UpdateContentsBorderAndOverlay();
++  }
++  // This can be called during BrowserView layout, so protect against creating a
++  // layout loop.
++  InvalidateLayout(/*avoid_propagate_during_layout=*/true);
++}
++
++void MultiContentsView::SetAttachedSideChromeVisibility(
++    bool leading_attached,
++    bool trailing_attached) {
++  if (contents_separators_.leading_side_chrome_attached == leading_attached &&
++      contents_separators_.trailing_side_chrome_attached == trailing_attached) {
++    return;
++  }
++  contents_separators_.leading_side_chrome_attached = leading_attached;
++  contents_separators_.trailing_side_chrome_attached = trailing_attached;
++  if (IsInSplitView() || ShouldUseRoundedFrame()) {
      UpdateContentsBorderAndOverlay();
    }
    // This can be called during BrowserView layout, so protect against creating a
-@@ -850,7 +887,7 @@ void MultiContentsView::SetSplitViewInse
+@@ -850,7 +918,7 @@ void MultiContentsView::SetSplitViewInse
      return;
    }
    split_view_insets_ = insets;
