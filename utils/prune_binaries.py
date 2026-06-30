@@ -43,6 +43,7 @@ CONTINGENT_PATHS = (
     'third_party/updater/chrome_linux64_sans_iid/cipd/',
     'third_party/updater/chromium_linux64/',
     'third_party/updater/chromium_linux64_sans_iid/cipd/',
+    'third_party/webpagereplay/third_party/golang/',
     'tools/luci-go/',
     'tools/resultdb/',
     'tools/skia_goldctl/',
