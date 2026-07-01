@@ -39,6 +39,7 @@ CONTINGENT_PATHS = (
     'third_party/ninja/',
     'third_party/openscreen/src/third_party/ninja/',
     'third_party/siso/cipd/',
+    'third_party/typescript/',
     'third_party/updater/chrome_linux64/',
     'third_party/updater/chrome_linux64_sans_iid/cipd/',
     'third_party/updater/chromium_linux64/',
@@ -55,6 +56,7 @@ CONTINGENT_PATHS = (
     'third_party/openscreen/src/third_party/llvm-build/Release+Asserts/',
     'third_party/opus/tests/resources/',
     'third_party/subresource-filter-ruleset/data/',
+    'third_party/webpagereplay/buildtools/',
     'tools/perf/page_sets/maps_perf_test/dataset/',
     # Sysroots(GCS), include all arches the clone script is able to obtain
     'build/linux/debian_bullseye_amd64-sysroot/',
