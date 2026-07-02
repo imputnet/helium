@@ -1,0 +1,135 @@
+--- a/components/captive_portal/content/BUILD.gn
++++ b/components/captive_portal/content/BUILD.gn
+@@ -33,6 +33,7 @@ source_set("content") {
+ 
+   deps = [
+     "//components/embedder_support",
++    "//components/helium_services",
+     "//content/public/browser",
+     "//third_party/blink/public/common",
+   ]
+--- a/components/captive_portal/content/captive_portal_service.cc
++++ b/components/captive_portal/content/captive_portal_service.cc
+@@ -14,6 +14,7 @@
+ #include "build/build_config.h"
+ #include "components/captive_portal/core/captive_portal_types.h"
+ #include "components/embedder_support/pref_names.h"
++#include "components/helium_services/helium_services_helpers.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -63,10 +64,11 @@ CaptivePortalService::CaptivePortalServi
+     const base::TickClock* clock_for_testing,
+     network::mojom::URLLoaderFactory* loader_factory_for_testing)
+     : browser_context_(browser_context),
++      pref_service_(pref_service),
+       state_(STATE_IDLE),
+       enabled_(false),
+       last_detection_result_(RESULT_INTERNET_CONNECTED),
+-      test_url_(CaptivePortalDetector::GetDefaultUrl()),
++      test_url_(helium::GetConnectivityCheckURL(*pref_service)),
+       tick_clock_for_testing_(clock_for_testing) {
+   network::mojom::URLLoaderFactory* loader_factory;
+   if (loader_factory_for_testing) {
+@@ -87,6 +89,11 @@ CaptivePortalService::CaptivePortalServi
+       embedder_support::kAlternateErrorPagesEnabled, pref_service,
+       base::BindRepeating(&CaptivePortalService::UpdateEnabledState,
+                           base::Unretained(this)));
++  helium_services_pref_change_registrar_.Init(pref_service);
++  helium::ConfigurePrefChangeRegistrarForServices(
++      helium_services_pref_change_registrar_,
++      base::BindRepeating(&CaptivePortalService::UpdateTestURL,
++                          base::Unretained(this)));
+   ResetBackoffEntry(last_detection_result_);
+ 
+   UpdateEnabledState();
+@@ -260,6 +267,10 @@ void CaptivePortalService::UpdateEnabled
+   }
+ }
+ 
++void CaptivePortalService::UpdateTestURL() {
++  test_url_ = helium::GetConnectivityCheckURL(*pref_service_);
++}
++
+ base::TimeTicks CaptivePortalService::GetCurrentTimeTicks() const {
+   if (tick_clock_for_testing_)
+     return tick_clock_for_testing_->NowTicks();
+--- a/components/captive_portal/content/captive_portal_service.h
++++ b/components/captive_portal/content/captive_portal_service.h
+@@ -15,6 +15,7 @@
+ #include "components/captive_portal/core/captive_portal_detector.h"
+ #include "components/captive_portal/core/captive_portal_types.h"
+ #include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_member.h"
+ #include "net/base/backoff_entry.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+@@ -33,6 +34,7 @@ class URLLoaderFactory;
+ class Browser;
+ class CaptivePortalBrowserTest;
+ class HttpsUpgradesBrowserTest;
++class PrefService;
+ 
+ namespace captive_portal {
+ 
+@@ -164,6 +166,9 @@ class CaptivePortalService : public Keye
+   //               Android, since it lacks the Browser class.
+   void UpdateEnabledState();
+ 
++  // Updates |test_url_| from the active Helium services settings.
++  void UpdateTestURL();
++
+   base::TimeTicks GetCurrentTimeTicks() const;
+ 
+   bool DetectionInProgress() const;
+@@ -180,6 +185,10 @@ class CaptivePortalService : public Keye
+   // The BrowserContext that owns this CaptivePortalService.
+   const raw_ptr<content::BrowserContext> browser_context_;
+ 
++  // Owned by the same BrowserContext/Profile that owns this KeyedService and
++  // outlives it.
++  const raw_ptr<PrefService> pref_service_;
++
+   State state_;
+ 
+   scoped_refptr<network::SharedURLLoaderFactory> shared_url_loader_factory_;
+@@ -211,6 +220,8 @@ class CaptivePortalService : public Keye
+   // URL that returns a 204 response code when connected to the Internet.
+   GURL test_url_;
+ 
++  PrefChangeRegistrar helium_services_pref_change_registrar_;
++
+   // The pref member for whether navigation errors should be resolved with a web
+   // service.  Actually called "alternate_error_pages", since it's also used for
+   // the Link Doctor.
+--- a/components/helium_services/helium_services_helpers.cc
++++ b/components/helium_services/helium_services_helpers.cc
+@@ -56,6 +56,18 @@ bool ShouldAccessServices(const PrefServ
+     return prefs.GetBoolean(prefs::kHeliumServicesEnabled);
+ }
+ 
++GURL GetConnectivityCheckURL(const PrefService& prefs) {
++    if (!ShouldAccessServices(prefs)) {
++        return GetDummyURL();
++    }
++
++    GURL::Replacements replacements;
++    replacements.SetSchemeStr(url::kHttpScheme);
++    return GetServicesBaseURL(prefs)
++        .ReplaceComponents(replacements)
++        .Resolve("/connectivitycheck");
++}
++
+ void ConfigurePrefChangeRegistrarForServices(
+     PrefChangeRegistrar& registrar, const base::RepeatingClosure& observer) {
+   registrar.Add(prefs::kHeliumServicesEnabled, observer);
+--- a/components/helium_services/helium_services_helpers.h
++++ b/components/helium_services/helium_services_helpers.h
+@@ -22,6 +22,7 @@ bool ShouldAccessServices(const PrefServ
+ 
+ COMPONENT_EXPORT(HELIUM) GURL GetServicesBaseURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetDummyURL();
++COMPONENT_EXPORT(HELIUM) GURL GetConnectivityCheckURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) std::optional<GURL> GetValidUserOverridenURL(std::string_view user_url_);
+ COMPONENT_EXPORT(HELIUM) void ConfigurePrefChangeRegistrarForServices(
+                             PrefChangeRegistrar& registrar, const base::RepeatingClosure& observer);
