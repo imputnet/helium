@@ -1,0 +1,139 @@
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h"
+ 
++#include <algorithm>
+ #include <optional>
+ #include <string>
+ 
+@@ -177,7 +178,7 @@ VerticalTabView::VerticalTabView(TabColl
+                      /*expand=*/false),
+       TabChildConfig(icon_, kIconDesignWidth, kHorizontalInset,
+                      /*align_leading=*/true,
+-                     /*expand=*/false),
++                     /*expand=*/false, /*decorate_on_collapse=*/true),
+       TabChildConfig(alert_indicator_, kIconDesignWidth, kDefaultPadding,
+                      /*align_leading=*/true,
+                      /*expand=*/false, /*decorate_on_collapse=*/true),
+@@ -766,6 +767,10 @@ gfx::Rect VerticalTabView::GetChildBound
+ 
+ bool VerticalTabView::IsChildVisible(const views::View* child_view,
+                                      const int width) const {
++  const bool use_compact_media_badge =
++      (collapsed_ && !IsInExpandOnHover(width)) ||
++      width < UncollapsedMinWidth();
++
+   if (child_view == title_) {
+     // Pinned titles should be visible in the expand on hover state when the
+     // width is sufficient to show the title.
+@@ -783,11 +788,23 @@ bool VerticalTabView::IsChildVisible(con
+   }
+ 
+   if (child_view == icon_) {
++    const bool has_compact_media_badge =
++        use_compact_media_badge && IsChildVisible(alert_indicator_, width);
+     const bool should_hide_icon_for_alert = pinned_ || collapsed_;
+-    return !should_hide_icon_for_alert || !IsChildVisible(alert_indicator_, width);
++    // Narrow media tabs layer the favicon and alert indicator. Tabs with
++    // sufficient space retain their existing media-indicator behavior.
++    return has_compact_media_badge || !should_hide_icon_for_alert ||
++           !IsChildVisible(alert_indicator_, width);
+   }
+ 
+   if (child_view == close_button_) {
++    const bool has_compact_media_badge =
++        use_compact_media_badge && IsChildVisible(alert_indicator_, width);
++    // Reserve both compact slots for the favicon and its media indicator.
++    if (has_compact_media_badge) {
++      return false;
++    }
++
+     if (pinned_) {
+       return false;
+     }
+@@ -827,22 +844,43 @@ views::ProposedLayout VerticalTabView::C
+   gfx::Rect bounds_remaining = gfx::Rect(0, 0, width, height);
+   bounds_remaining.Inset(gfx::Insets::VH(0, kHorizontalInset));
+ 
+-  // If the tab is collapsed but animating with a wider width then we shouldn't
+-  // center the contents.
+-  const bool is_centered = (pinned_ || collapsed_) && !IsInExpandOnHover(width);
++  // Preserve the standard layout. Only narrow media tabs opt into the layered
++  // favicon treatment.
++  const bool use_compact_media_badge =
++      ((collapsed_ && !IsInExpandOnHover(width)) ||
++       width < UncollapsedMinWidth()) &&
++      IsChildVisible(alert_indicator_, width);
++  const bool is_centered =
++      ((pinned_ || collapsed_) && !IsInExpandOnHover(width)) ||
++      use_compact_media_badge;
+ 
+   int placed_children = 0;
+   for (const auto& child : tab_children_configs_) {
+     const bool can_render_child =
+         is_centered
+-            ? (placed_children == 0)
++            ? (placed_children < (use_compact_media_badge ? 2 : 1))
+             : (child.min_width + child.padding < bounds_remaining.width() ||
+-               placed_children < 2);
++               placed_children < (use_compact_media_badge ? 2 : 1));
+     const bool is_child_visible = IsChildVisible(child.view, width);
+     if (is_child_visible && can_render_child) {
++      gfx::Rect child_bounds =
++          GetChildBounds(bounds_remaining, child, is_centered);
++      if (use_compact_media_badge && child.view == alert_indicator_) {
++        // Keep the favicon centered and layer the native-size media glyph over
++        // its upper-right quadrant. Clamp it inside the rounded tab bounds so
++        // neither the glyph nor its click target is clipped.
++        constexpr int kCompactAlertIndicatorSize = kIconDesignWidth;
++        constexpr int kCompactAlertIndicatorInset = 2;
++        child_bounds = gfx::Rect(
++            std::min(width / 2 - 1,
++                     width - kCompactAlertIndicatorSize -
++                         kCompactAlertIndicatorInset),
++            std::max(kCompactAlertIndicatorInset,
++                     height / 2 - kCompactAlertIndicatorSize),
++            kCompactAlertIndicatorSize, kCompactAlertIndicatorSize);
++      }
+       layouts.child_layouts.emplace_back(
+-          child.view.get(), is_child_visible,
+-          GetChildBounds(bounds_remaining, child, is_centered));
++          child.view.get(), is_child_visible, child_bounds);
+ 
+       if (!is_centered) {
+         bounds_remaining.Inset(
+@@ -872,10 +910,8 @@ bool VerticalTabView::GetHitTestMask(SkP
+ }
+ 
+ bool VerticalTabView::ShouldEnableMuteToggle(int required_width) {
+-  // The mute toggle interferes with the click target of the
+-  // collapsed tab, so we disable click-to-mute for it.
+   if (collapsed_) {
+-    return false;
++    return alert_indicator_->GetVisible();
+   }
+ 
+   if (active_) {
+@@ -1061,7 +1097,17 @@ void VerticalTabView::UpdateTabData(cons
+   icon_->SetAttention(TabIcon::AttentionType::kTabWantsAttentionStatus,
+                       tab_data_.needs_attention);
+   UpdateTitle(tab_data_.title, tab_data_.should_render_loading_title);
+-  alert_indicator_->TransitionToAlertState(tab_data_.alert_state);
++
++  // The regular audio-playing alert expires after a tab is muted. In a compact
++  // vertical tab that would also remove the only control that can unmute it.
++  // Keep an audio-muted badge available for compact and pinned tabs so its
++  // click target remains available until the tab is unmuted.
++  std::optional<tabs::TabAlert> alert_state = tab_data_.alert_state;
++  if (!alert_state && (collapsed_ || pinned_) &&
++      tab->GetContents()->IsAudioMuted()) {
++    alert_state = tabs::TabAlert::kAudioMuting;
++  }
++  alert_indicator_->TransitionToAlertState(alert_state);
+   SetHoverCardDataFrom(tab_data_);
+ }
+ 
