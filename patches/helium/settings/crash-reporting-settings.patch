@@ -1,0 +1,247 @@
+--- a/chrome/browser/resources/settings/privacy_page/services_page.html
++++ b/chrome/browser/resources/settings/privacy_page/services_page.html
+@@ -112,6 +112,14 @@
+         </cr-collapse>
+     </div>
+     </template>
++    <settings-toggle-button id="crashReportingControl"
++        class="hr"
++        pref="[[crashReportingPref_]]"
++        label="Always send crash reports"
++        sub-label="Automatically send diagnostic reports after a crash. Reports may contain portions of process memory."
++        no-set-pref
++        on-settings-boolean-control-change="onCrashReportingChange_">
++    </settings-toggle-button>
+ </div>
+ 
+ 
+--- a/chrome/browser/resources/settings/privacy_page/services_page.ts
++++ b/chrome/browser/resources/settings/privacy_page/services_page.ts
+@@ -14,14 +14,23 @@ import {PrefsMixin} from '/shared/settin
+ import {HelpBubbleMixin} from 'chrome://resources/cr_components/help_bubble/help_bubble_mixin.js';
+ import type {CrInputElement} from 'chrome://resources/cr_elements/cr_input/cr_input.js';
+ import {I18nMixin} from 'chrome://resources/cr_elements/i18n_mixin.js';
++import {WebUiListenerMixin} from 'chrome://resources/cr_elements/web_ui_listener_mixin.js';
++import {sendWithPromise} from 'chrome://resources/js/cr.js';
+ import {PolymerElement} from 'chrome://resources/polymer/v3_0/polymer/polymer_bundled.min.js';
+ 
++import type {SettingsToggleButtonElement} from '../controls/settings_toggle_button.js';
+ import type {HeliumServicesChangeHandler} from './changelog_proxy.js';
+ import {HeliumServicesChangeHandlerImpl} from './changelog_proxy.js';
+ import {getTemplate} from './services_page.html.js';
+ 
+ const SettingsHeliumServicesPageElementBase =
+-    HelpBubbleMixin(I18nMixin(PrefsMixin(PolymerElement)));
++    HelpBubbleMixin(WebUiListenerMixin(
++        I18nMixin(PrefsMixin(PolymerElement))));
++
++interface HeliumCrashReportingState {
++  enabled: boolean;
++  managed: boolean;
++}
+ 
+ export class SettingsHeliumServicesPageElement extends
+     SettingsHeliumServicesPageElementBase {
+@@ -40,10 +49,20 @@ export class SettingsHeliumServicesPageE
+     return {
+       ignoreChecked_: Boolean,
+       changes_: Array,
++      crashReportingPref_: {
++        type: Object,
++        value: () => ({
++          key: '',
++          type: chrome.settingsPrivate.PrefType.BOOLEAN,
++          value: false,
++        }),
++      },
+     };
+   }
+ 
+   declare private changes_: string[];
++  declare private crashReportingPref_:
++      chrome.settingsPrivate.PrefObject<boolean>;
+   declare private ignoreChecked_: boolean;
+ 
+   private toOrigin(thing: string) {
+@@ -71,6 +90,31 @@ export class SettingsHeliumServicesPageE
+   override ready() {
+     super.ready();
+     this.requestChangelog();
++    const update = (state: HeliumCrashReportingState) =>
++        this.setCrashReportingState_(state);
++    this.addWebUiListener('helium-crash-reporting-change', update);
++    sendWithPromise<HeliumCrashReportingState>('getHeliumCrashReporting')
++        .then(update);
++  }
++
++  private setCrashReportingState_(state: HeliumCrashReportingState) {
++    const pref: chrome.settingsPrivate.PrefObject<boolean> = {
++      key: '',
++      type: chrome.settingsPrivate.PrefType.BOOLEAN,
++      value: state.enabled,
++    };
++    if (state.managed) {
++      pref.enforcement = chrome.settingsPrivate.Enforcement.ENFORCED;
++      pref.controlledBy = chrome.settingsPrivate.ControlledBy.USER_POLICY;
++    }
++    this.crashReportingPref_ = pref;
++  }
++
++  private onCrashReportingChange_() {
++    const control =
++        this.shadowRoot!.querySelector<SettingsToggleButtonElement>(
++            '#crashReportingControl');
++    chrome.send('setHeliumCrashReportingEnabled', [control?.checked ?? false]);
+   }
+ 
+   protected onOriginOverrideKeydown_(event: KeyboardEvent) {
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/helium_crash_reporting_handler.cc
+@@ -0,0 +1,76 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/settings/helium_crash_reporting_handler.h"
++
++#include "base/functional/bind.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/ui/startup/helium_crash_infobar_delegate.h"
++#include "chrome/common/pref_names.h"
++#include "components/crash/core/app/crashpad.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_ui.h"
++
++namespace settings {
++
++HeliumCrashReportingHandler::HeliumCrashReportingHandler() = default;
++HeliumCrashReportingHandler::~HeliumCrashReportingHandler() = default;
++
++void HeliumCrashReportingHandler::RegisterMessages() {
++  web_ui()->RegisterMessageCallback(
++      "getHeliumCrashReporting",
++      base::BindRepeating(&HeliumCrashReportingHandler::HandleGetState,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "setHeliumCrashReportingEnabled",
++      base::BindRepeating(&HeliumCrashReportingHandler::HandleSetEnabled,
++                          base::Unretained(this)));
++}
++
++void HeliumCrashReportingHandler::OnJavascriptAllowed() {
++  pref_member_ = std::make_unique<BooleanPrefMember>();
++  pref_member_->Init(
++      prefs::kHeliumAlwaysSendCrashReports, g_browser_process->local_state(),
++      base::BindRepeating(&HeliumCrashReportingHandler::OnPrefChanged,
++                          base::Unretained(this)));
++}
++
++void HeliumCrashReportingHandler::OnJavascriptDisallowed() {
++  pref_member_.reset();
++}
++
++base::DictValue HeliumCrashReportingHandler::CreateState() {
++  const bool disabled_by_policy = crash_reporter::UploadsDisabledByPolicy();
++
++  base::DictValue state;
++  state.Set("enabled",
++            !disabled_by_policy &&
++                g_browser_process->local_state()->GetBoolean(
++                    prefs::kHeliumAlwaysSendCrashReports));
++  state.Set("managed", disabled_by_policy);
++  return state;
++}
++
++void HeliumCrashReportingHandler::HandleGetState(
++    const base::ListValue& args) {
++  AllowJavascript();
++  CHECK_GT(args.size(), 0u);
++  ResolveJavascriptCallback(args[0], CreateState());
++}
++
++void HeliumCrashReportingHandler::HandleSetEnabled(
++    const base::ListValue& args) {
++  CHECK_GT(args.size(), 0u);
++  const bool disabled_by_policy = crash_reporter::UploadsDisabledByPolicy();
++  SetHeliumCrashReportingEnabled(!disabled_by_policy && args[0].GetBool());
++}
++
++void HeliumCrashReportingHandler::OnPrefChanged(
++    const std::string& pref_name) {
++  DCHECK_EQ(prefs::kHeliumAlwaysSendCrashReports, pref_name);
++  FireWebUIListener("helium-crash-reporting-change", CreateState());
++}
++
++}  // namespace settings
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/helium_crash_reporting_handler.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SETTINGS_HELIUM_CRASH_REPORTING_HANDLER_H_
++#define CHROME_BROWSER_UI_WEBUI_SETTINGS_HELIUM_CRASH_REPORTING_HANDLER_H_
++
++#include <memory>
++#include <string>
++
++#include "chrome/browser/ui/webui/settings/settings_page_ui_handler.h"
++#include "components/prefs/pref_member.h"
++
++namespace settings {
++
++class HeliumCrashReportingHandler : public SettingsPageUIHandler {
++ public:
++  HeliumCrashReportingHandler();
++  HeliumCrashReportingHandler(const HeliumCrashReportingHandler&) = delete;
++  HeliumCrashReportingHandler& operator=(const HeliumCrashReportingHandler&) =
++      delete;
++  ~HeliumCrashReportingHandler() override;
++
++  void RegisterMessages() override;
++  void OnJavascriptAllowed() override;
++  void OnJavascriptDisallowed() override;
++
++ private:
++  base::DictValue CreateState();
++  void HandleGetState(const base::ListValue& args);
++  void HandleSetEnabled(const base::ListValue& args);
++  void OnPrefChanged(const std::string& pref_name);
++
++  std::unique_ptr<BooleanPrefMember> pref_member_;
++};
++
++}  // namespace settings
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SETTINGS_HELIUM_CRASH_REPORTING_HANDLER_H_
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -71,6 +71,7 @@
+ #include "chrome/browser/ui/webui/settings/font_handler.h"
+ #include "chrome/browser/ui/webui/settings/glic_handler.h"
+ #include "chrome/browser/ui/webui/settings/hats_handler.h"
++#include "chrome/browser/ui/webui/settings/helium_crash_reporting_handler.h"
+ #include "chrome/browser/ui/webui/settings/import_data_handler.h"
+ #include "chrome/browser/ui/webui/settings/metrics_reporting_handler.h"
+ #include "chrome/browser/ui/webui/settings/on_startup_handler.h"
+@@ -264,6 +265,7 @@ SettingsUI::SettingsUI(content::WebUI* w
+ 
+   AddSettingsPageUIHandler(
+       std::make_unique<MediaDevicesSelectionHandler>(profile));
++  AddSettingsPageUIHandler(std::make_unique<HeliumCrashReportingHandler>());
+ #if BUILDFLAG(GOOGLE_CHROME_BRANDING) && !BUILDFLAG(IS_CHROMEOS)
+   AddSettingsPageUIHandler(std::make_unique<MetricsReportingHandler>());
+ #endif
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1293,6 +1293,8 @@ static_library("ui") {
+       "webui/settings/glic_handler.h",
+       "webui/settings/hats_handler.cc",
+       "webui/settings/hats_handler.h",
++      "webui/settings/helium_crash_reporting_handler.cc",
++      "webui/settings/helium_crash_reporting_handler.h",
+       "webui/settings/import_data_handler.cc",
+       "webui/settings/import_data_handler.h",
+       "webui/settings/languages_handler.cc",

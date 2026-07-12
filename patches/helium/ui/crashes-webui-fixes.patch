@@ -1,0 +1,169 @@
+--- a/chrome/browser/ui/webui/crashes/crashes_ui.cc
++++ b/chrome/browser/ui/webui/crashes/crashes_ui.cc
+@@ -17,19 +17,23 @@
+ #include "base/values.h"
+ #include "base/version_info/version_info.h"
+ #include "build/build_config.h"
++#include "chrome/browser/browser_process.h"
+ #include "chrome/browser/crash_upload_list/crash_upload_list.h"
+ #include "chrome/browser/metrics/chrome_metrics_service_accessor.h"
+ #include "chrome/browser/metrics/metrics_reporting_state.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/signin/identity_manager_factory.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "chrome/grit/branded_strings.h"
++#include "components/crash/core/app/crashpad.h"
+ #include "components/crash/core/browser/crashes_ui_util.h"
+ #include "components/grit/components_scaled_resources.h"
+ #include "components/grit/crashes_resources.h"
+ #include "components/grit/crashes_resources_map.h"
+ #include "components/signin/public/base/consent_level.h"
+ #include "components/signin/public/identity_manager/identity_manager.h"
++#include "components/prefs/pref_service.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_ui.h"
+ #include "content/public/browser/web_ui_data_source.h"
+@@ -52,6 +56,10 @@ using content::WebUIMessageHandler;
+ 
+ namespace {
+ 
++bool CrashUploadsDisabledByPolicy() {
++  return crash_reporter::UploadsDisabledByPolicy();
++}
++
+ void CreateAndAddCrashesUIHTMLSource(Profile* profile) {
+   content::WebUIDataSource* source = content::WebUIDataSource::CreateAndAdd(
+       profile, chrome::kChromeUICrashesHost);
+@@ -179,7 +187,9 @@ void CrashesDOMHandler::OnUploadListAvai
+ 
+ void CrashesDOMHandler::UpdateUI() {
+   bool crash_reporting_enabled =
+-      ChromeMetricsServiceAccessor::IsMetricsAndCrashReportingEnabled();
++      g_browser_process->local_state()->GetBoolean(
++          prefs::kHeliumAlwaysSendCrashReports) &&
++      !CrashUploadsDisabledByPolicy();
+ 
+   bool system_crash_reporter = false;
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -203,23 +213,21 @@ void CrashesDOMHandler::UpdateUI() {
+ #endif
+   bool allow_manual_uploads =
+       manual_uploads_supported &&
+-      (crash_reporting_enabled || !metrics::IsMetricsReportingPolicyManaged());
++      !CrashUploadsDisabledByPolicy();
+ 
+   // Show crash reports regardless of |crash_reporting_enabled| when it is
+   // possible to manually upload reports.
+-  bool upload_list = manual_uploads_supported || crash_reporting_enabled;
+-
+   base::ListValue crash_list;
+-  if (upload_list) {
+-    crash_reporter::UploadListToValue(upload_list_.get(), &crash_list);
+-  }
++  crash_reporter::UploadListToValue(upload_list_.get(), &crash_list);
+ 
+   base::DictValue result;
+   result.Set("enabled", crash_reporting_enabled);
++  result.Set("reportingAvailable",
++             crash_reporting_enabled || allow_manual_uploads);
+   result.Set("dynamicBackend", system_crash_reporter);
+   result.Set("manualUploads", allow_manual_uploads);
+   result.Set("crashes", std::move(crash_list));
+-  result.Set("version", version_info::GetVersionNumber());
++  result.Set("version", version_info::GetHeliumVersionNumber());
+   result.Set("os", base::SysInfo::OperatingSystemName() + " " +
+                        base::SysInfo::OperatingSystemVersion());
+   result.Set("isGoogleAccount", is_internal);
+@@ -229,8 +237,7 @@ void CrashesDOMHandler::UpdateUI() {
+ void CrashesDOMHandler::HandleRequestSingleCrashUpload(
+     const base::ListValue& args) {
+   // Only allow manual uploads if crash uploads aren’t disabled by policy.
+-  if (!ChromeMetricsServiceAccessor::IsMetricsAndCrashReportingEnabled() &&
+-      metrics::IsMetricsReportingPolicyManaged()) {
++  if (CrashUploadsDisabledByPolicy()) {
+     return;
+   }
+ 
+--- a/components/crash/core/browser/resources/crashes.ts
++++ b/components/crash/core/browser/resources/crashes.ts
+@@ -62,6 +62,7 @@ interface CrashData {
+ 
+ interface UpdateCrashListParams {
+   enabled: boolean;
++  reportingAvailable: boolean;
+   dynamicBackend: boolean;
+   manualUploads: boolean;
+   crashes: CrashData[];
+@@ -75,6 +76,7 @@ interface UpdateCrashListParams {
+  */
+ function updateCrashList({
+   enabled,
++  reportingAvailable,
+   dynamicBackend,
+   manualUploads,
+   crashes,
+@@ -87,7 +89,7 @@ function updateCrashList({
+ 
+   const crashList = getRequiredElement('crashList');
+ 
+-  getRequiredElement('disabledMode').hidden = enabled;
++  getRequiredElement('disabledMode').hidden = reportingAvailable;
+   getRequiredElement('crashUploadStatus').hidden = !enabled || !dynamicBackend;
+ 
+   const template = crashList.querySelector('template');
+@@ -210,37 +212,18 @@ function updateCrashList({
+  */
+ function fileBug(crashId: string, os: string, version: string) {
+   const commentLines = [
++    `Crash ID: ${crashId}`,
+     'IMPORTANT: Your crash has already been automatically reported ' +
+         'to our crash system. Please file this bug only if you can provide ' +
+         'more information about it.',
+-    '',
+-    '',
+-    'Chrome Version: ' + version,
+-    'Operating System: ' + os,
+-    '',
+-    'URL (if applicable) where crash occurred:',
+-    '',
+-    'Can you reproduce this crash?',
+-    '',
+-    'What steps will reproduce this crash? (If it\'s not ' +
+-        'reproducible, what were you doing just before the crash?)',
+-    '1.',
+-    '2.',
+-    '3.',
+-    '',
+-    '****DO NOT CHANGE BELOW THIS LINE****',
+-    'Crash ID: crash/' + crashId,
+   ];
+   const params: {[key: string]: string} = {
+-    template: 'Crash Report',
+-    comment: commentLines.join('\n'),
+-    // TODO(scottmg): Use add_labels to add 'User-Submitted' rather than
+-    // duplicating the template's labels (the first two) once
+-    // https://bugs.chromium.org/p/monorail/issues/detail?id=1488 is done.
+-    labels:
+-        'Restrict-View-EditIssue,Stability-Crash,User-Submitted,Pri-3,Type-Bug',
++    template: 'bug-report.yml',
++    version,
++    os,
++    additional: commentLines.join('\n'),
+   };
+-  let href = 'https://bugs.chromium.org/p/chromium/issues/entry';
++  let href = 'https://github.com/imputnet/helium/issues/new';
+   for (const param in params) {
+     href = appendParam(href, param, params[param]!);
+   }
+--- a/components/components_chromium_strings.grd
++++ b/components/components_chromium_strings.grd
+@@ -267,7 +267,7 @@
+ 
+       <!-- chrome://crashes strings -->
+       <message name="IDS_CRASH_DISABLED_MESSAGE" desc="The explanatory message for chrome://crashes when crash reporting is disabled">
+-        Crash reporting is not available in Chromium.
++        Crash reporting has been disabled by policy.
+       </message>
+ 
+       <!-- Version UI -->

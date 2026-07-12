@@ -1,0 +1,126 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -727,6 +727,11 @@ inline constexpr char kSplitViewDragAndD
+ // recently used tabs.
+ inline constexpr char kCtrlTabMru[] = "browser.ctrl_tab_mru";
+ 
++// Whether the user explicitly chose to upload future desktop crash reports.
++// This preference is registered in Local State and is shared by all profiles.
++inline constexpr char kHeliumAlwaysSendCrashReports[] =
++    "helium.crash_reporting.always_send";
++
+ // A boolean pref set to true if Gemini integration be enabled. This is managed
+ // by enterprise policy.
+ inline constexpr char kGeminiSettings[] = "browser.gemini_settings";
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -1326,6 +1326,7 @@ void RegisterLocalState(PrefRegistrySimp
+   breadcrumbs::RegisterPrefs(registry);
+   browser_shutdown::RegisterPrefs(registry);
+   BrowserProcessImpl::RegisterPrefs(registry);
++  registry->RegisterBooleanPref(prefs::kHeliumAlwaysSendCrashReports, false);
+   ChromeContentBrowserClient::RegisterLocalStatePrefs(registry);
+ #if BUILDFLAG(CHROME_FOR_TESTING)
+   chrome_for_testing::RegisterPrefs(registry);
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -95,6 +95,7 @@
+ #include "chrome/grit/generated_resources.h"
+ #include "chrome/installer/util/google_update_settings.h"
+ #include "components/color/color_mixers.h"
++#include "components/crash/core/app/crashpad.h"
+ #include "components/device_event_log/device_event_log.h"
+ #include "components/embedder_support/origin_trials/component_updater_utils.h"
+ #include "components/embedder_support/origin_trials/origin_trials_settings_storage.h"
+@@ -1237,6 +1238,9 @@ int ChromeBrowserMainParts::PreCreateThr
+     browser_process_->Init();
+   }
+ 
++  crash_reporter::SetUploadConsentFromUser(
++      local_state->GetBoolean(prefs::kHeliumAlwaysSendCrashReports));
++
+ #if !BUILDFLAG(IS_CHROMEOS)
+   std::optional<std::string> managed_by =
+       policy::GetManagedBy(browser_process_->browser_policy_connector()
+--- a/components/crash/core/app/crash_reporter_client.cc
++++ b/components/crash/core/app/crash_reporter_client.cc
+@@ -146,8 +146,8 @@ void CrashReporterClient::GetSanitizatio
+ #endif
+ 
+ std::string CrashReporterClient::GetUploadUrl() {
+-#if BUILDFLAG(GOOGLE_CHROME_BRANDING) && defined(OFFICIAL_BUILD)
+-  return kDefaultUploadURL;
++#if defined(OFFICIAL_BUILD)
++  return "https://crash.helium.computer/crash";
+ #else
+   return std::string();
+ #endif
+--- a/components/crash/core/app/crashpad.cc
++++ b/components/crash/core/app/crashpad.cc
+@@ -247,26 +247,37 @@ void DestroyCrashpadClient() {
+ }
+ 
+ #if !BUILDFLAG(IS_CHROMEOS)
+-void SetUploadConsent(bool consent) {
++namespace {
++
++void ApplyUploadConsent(bool consent) {
+   if (!g_database)
+     return;
+ 
+-  bool enable_uploads = false;
++  bool policy_enabled = true;
+   CrashReporterClient* crash_reporter_client = GetCrashReporterClient();
+-  if (!crash_reporter_client->ReportingIsEnforcedByPolicy(&enable_uploads)) {
+-    // Breakpad provided a --disable-breakpad switch to disable crash dumping
+-    // (not just uploading) here. Crashpad doesn't need it: dumping is enabled
+-    // unconditionally and uploading is gated on consent, which tests/bots
+-    // shouldn't have. As a precaution, uploading is also disabled on bots even
+-    // if consent is present.
+-    enable_uploads = consent && !crash_reporter_client->IsRunningUnattended();
+-  }
++  const bool reporting_disabled_by_policy =
++      crash_reporter_client->ReportingIsEnforcedByPolicy(&policy_enabled) &&
++      !policy_enabled;
+ 
+   crashpad::Settings* settings = g_database->GetSettings();
+-  settings->SetUploadsEnabled(enable_uploads &&
+-                              crash_reporter_client->GetCollectStatsInSample());
++  settings->SetUploadsEnabled(consent && !reporting_disabled_by_policy &&
++                              !crash_reporter_client->IsRunningUnattended());
++}
++
++}  // namespace
++
++void SetUploadConsent(bool) {}
++
++void SetUploadConsentFromUser(bool consent) {
++  ApplyUploadConsent(consent);
+ }
+ 
++bool UploadsDisabledByPolicy() {
++  bool policy_enabled = true;
++  return GetCrashReporterClient()->ReportingIsEnforcedByPolicy(
++             &policy_enabled) &&
++         !policy_enabled;
++}
+ #endif  // !BUILDFLAG(IS_CHROMEOS)
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+--- a/components/crash/core/app/crashpad.h
++++ b/components/crash/core/app/crashpad.h
+@@ -139,6 +139,14 @@ void DestroyCrashpadClient();
+ // running.
+ void SetUploadConsent(bool consent);
+ 
++// Enables or disables uploads in response to Helium's explicit user consent.
++// Unlike SetUploadConsent(), this must only be called from Helium-owned UI.
++void SetUploadConsentFromUser(bool consent);
++
++// Returns true only when policy explicitly disables crash reporting. A policy
++// that enables reporting does not constitute user consent.
++bool UploadsDisabledByPolicy();
++
+ #endif  // !BUILDFLAG(IS_CHROMEOS)
+ 
+ enum class ReportUploadState {
