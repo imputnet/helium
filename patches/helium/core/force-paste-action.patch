@@ -1,0 +1,241 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -172,6 +172,7 @@
+ #define IDC_COPY                        36001
+ #define IDC_PASTE                       36003
+ #define IDC_EDIT_MENU                   36004
++#define IDC_FORCE_PASTE                 36005
+ 
+ // Find-in-page
+ #define IDC_FIND                        37000
+@@ -399,6 +400,7 @@
+ #define IDC_CONTENT_CONTEXT_ROTATECW 50142
+ #define IDC_CONTENT_CONTEXT_ROTATECCW 50143
+ // Edit items.
++#define IDC_CONTENT_CONTEXT_FORCE_PASTE 50149
+ #define IDC_CONTENT_CONTEXT_COPY 50150
+ #define IDC_CONTENT_CONTEXT_CUT 50151
+ #define IDC_CONTENT_CONTEXT_PASTE 50152
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -1441,6 +1441,9 @@ are declared in tools/grit/grit_args.gni
+           <message name="IDS_PASTE" desc="The text label of the Paste menu item" meaning="'Paste' menu command in sentence case">
+             &amp;Paste
+           </message>
++          <message name="IDS_FORCE_PASTE" desc="The label for a command that pastes text without invoking page paste handlers">
++            Force paste
++          </message>
+           <message name="IDS_DELETE" desc="The text label of the Delete menu item (which deletes selected text without copying to clipboard)">
+             &amp;Delete
+           </message>
+@@ -1586,6 +1589,9 @@ are declared in tools/grit/grit_args.gni
+           <message name="IDS_PASTE" desc="In Title Case: The text label of the Paste menu item" meaning="'Paste' menu command for Mac">
+             &amp;Paste
+           </message>
++          <message name="IDS_FORCE_PASTE" desc="In Title Case: The label for a command that pastes text without invoking page paste handlers">
++            Force Paste
++          </message>
+           <message name="IDS_DELETE" desc="In Title Case: The text label of the Delete menu item (which deletes selected text without copying to clipboard)">
+             &amp;Delete
+           </message>
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -617,6 +617,7 @@ const std::map<int, int>& GetIdcToUmaMap
+        {IDC_CONTENT_CONTEXT_LISTEN_TO_THIS_PAGE, 164},
+        {IDC_CONTENT_CONTEXT_DICTATION, 165},
+        {IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST, 166},
++       {IDC_CONTENT_CONTEXT_FORCE_PASTE, 167},
+        // To add new items:
+        //   - Add one more line above this comment block, using the UMA value
+        //     from the line below this comment block.
+@@ -2902,6 +2903,8 @@ void RenderViewContextMenu::AppendOtherE
+     menu_model_.AddItemWithStringId(IDC_CONTENT_CONTEXT_PASTE_AND_MATCH_STYLE,
+                                     IDS_CONTENT_CONTEXT_PASTE_AND_MATCH_STYLE);
+   }
++  menu_model_.AddItemWithStringId(IDC_CONTENT_CONTEXT_FORCE_PASTE,
++                                  IDS_FORCE_PASTE);
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   // Insert a submenu of clipboard history descriptors.
+@@ -3371,6 +3374,7 @@ bool RenderViewContextMenu::IsCommandIdE
+       return IsPasteEnabled();
+ 
+     case IDC_CONTENT_CONTEXT_PASTE_AND_MATCH_STYLE:
++    case IDC_CONTENT_CONTEXT_FORCE_PASTE:
+       return IsPasteAndMatchStyleEnabled();
+ 
+     case IDC_CONTENT_CONTEXT_DELETE:
+@@ -3932,6 +3936,10 @@ void RenderViewContextMenu::ExecuteComma
+       source_web_contents_->PasteAndMatchStyle();
+       break;
+ 
++    case IDC_CONTENT_CONTEXT_FORCE_PASTE:
++      chrome::ForcePaste(source_web_contents_);
++      break;
++
+     case IDC_CONTENT_CONTEXT_DELETE:
+       source_web_contents_->Delete();
+       break;
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -992,6 +992,9 @@ bool BrowserCommandController::ExecuteCo
+       InvokeAction(actions::kActionPaste,
+                    browser_->GetActions()->root_action_item());
+       break;
++    case IDC_FORCE_PASTE:
++      ForcePaste(browser_);
++      break;
+ 
+     // Find-in-page
+     case IDC_FIND:
+@@ -1667,6 +1670,7 @@ void BrowserCommandController::InitComma
+   command_updater_.UpdateCommandEnabled(IDC_SHOW_AI_MODE_OMNIBOX_BUTTON, true);
+ 
+   // Window management commands
++  command_updater_.UpdateCommandEnabled(IDC_FORCE_PASTE, true);
+   command_updater_.UpdateCommandEnabled(IDC_CLOSE_WINDOW, true);
+   command_updater_.UpdateCommandEnabled(
+       IDC_NEW_TAB, !browser_->app_controller() ||
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -181,10 +181,12 @@
+ #include "components/zoom/page_zoom.h"
+ #include "components/zoom/zoom_controller.h"
+ #include "content/public/browser/browsing_data_remover.h"
++#include "content/public/browser/clipboard_types.h"
+ #include "content/public/browser/devtools_agent_host.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/page_navigator.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_view_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/web_contents.h"
+@@ -549,6 +551,19 @@ using content::WebContents;
+ namespace chrome {
+ namespace {
+ 
++void OnForcePasteTextRead(base::WeakPtr<content::WebContents> web_contents,
++                          content::GlobalRenderFrameHostId focused_frame_id,
++                          std::u16string text) {
++  if (!web_contents || text.empty()) {
++    return;
++  }
++
++  content::RenderFrameHost* focused_frame = web_contents->GetFocusedFrame();
++  if (focused_frame && focused_frame->GetGlobalId() == focused_frame_id) {
++    web_contents->InsertText(text);
++  }
++}
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ const extensions::Extension* GetExtensionForBrowser(
+     BrowserWindowInterface* browser) {
+@@ -2667,6 +2682,30 @@ bool CanCopyUrl(BrowserWindowInterface*
+          !sharing_hub::SharingIsDisabledByPolicy(browser->GetProfile());
+ }
+ 
++void ForcePaste(BrowserWindowInterface* browser) {
++  if (!browser) {
++    return;
++  }
++  ForcePaste(browser->GetTabStripModel()->GetActiveWebContents());
++}
++
++void ForcePaste(content::WebContents* web_contents) {
++  if (!web_contents) {
++    return;
++  }
++
++  content::RenderFrameHost* focused_frame = web_contents->GetFocusedFrame();
++  if (!focused_frame) {
++    return;
++  }
++
++  ui::Clipboard::GetForCurrentThread()->ReadText(
++      ui::ClipboardBuffer::kCopyPaste,
++      content::CreateDataEndpoint(*focused_frame),
++      base::BindOnce(&OnForcePasteTextRead, web_contents->GetWeakPtr(),
++                     focused_frame->GetGlobalId()));
++}
++
+ bool IsWebAppOrCustomTab(const BrowserWindowInterface* browser) {
+   return web_app::AppBrowserController::IsWebApp(browser);
+ }
+--- a/chrome/browser/ui/browser_commands.h
++++ b/chrome/browser/ui/browser_commands.h
+@@ -328,6 +328,8 @@ void CopyURL(BrowserWindowInterface* bro
+              content::WebContents* web_contents);
+ void CopyURLs(const std::vector<content::WebContents*>& web_contentses);
+ bool CanCopyUrl(BrowserWindowInterface* browser);
++void ForcePaste(BrowserWindowInterface* browser);
++void ForcePaste(content::WebContents* web_contents);
+ // Returns true if the browser window is for a web app or custom tab.
+ bool IsWebAppOrCustomTab(const BrowserWindowInterface* browser);
+ // Moves the WebContents of a hosted app Browser to a tabbed Browser. Returns
+--- a/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+@@ -83,6 +83,8 @@ std::optional<BrowserShortcutCommandLabe
+       return Label(IDS_SHORTCUT_COMMAND_BACK);
+     case IDC_FORWARD:
+       return Label(IDS_SHORTCUT_COMMAND_FORWARD);
++    case IDC_FORCE_PASTE:
++      return Label(IDS_FORCE_PASTE);
+     case IDC_HOME:
+       return Label(IDS_SHORTCUT_COMMAND_HOME);
+     case IDC_RELOAD:
+@@ -250,6 +252,7 @@ std::vector<int> GetBrowserShortcutComma
+ 
+   commands.push_back(ShouldUseCopyPageUrlLabel(prefs) ? IDC_DEV_TOOLS_INSPECT
+                                                       : IDC_COPY_URL);
++  commands.push_back(IDC_FORCE_PASTE);
+   return commands;
+ }
+ 
+--- a/tools/metrics/histograms/metadata/ui/enums.xml
++++ b/tools/metrics/histograms/metadata/ui/enums.xml
+@@ -367,6 +367,7 @@ chromium-metrics-reviews@google.com.
+   <int value="164" label="IDC_CONTENT_CONTEXT_LISTEN_TO_THIS_PAGE"/>
+   <int value="165" label="IDC_CONTENT_CONTEXT_DICTATION"/>
+   <int value="166" label="IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST"/>
++  <int value="167" label="IDC_CONTENT_CONTEXT_FORCE_PASTE"/>
+ </enum>
+ 
+ <!-- LINT.ThenChange(//chrome/browser/renderer_context_menu/render_view_context_menu.cc:RenderViewContextMenuItem) -->
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -6844,6 +6844,12 @@ void WebContentsImpl::Replace(const std:
+   input_handler->Replace(word);
+ }
+ 
++void WebContentsImpl::InsertText(const std::u16string& text) {
++  OPTIONAL_TRACE_EVENT0("content", "WebContentsImpl::InsertText");
++  last_interaction_time_ = ui::EventTimeForNow();
++  ExecuteEditCommand("InsertText", text);
++}
++
+ void WebContentsImpl::ReplaceMisspelling(const std::u16string& word) {
+   OPTIONAL_TRACE_EVENT0("content", "WebContentsImpl::ReplaceMisspelling");
+   auto* input_handler = GetFocusedFrameWidgetInputHandler();
+--- a/content/browser/web_contents/web_contents_impl.h
++++ b/content/browser/web_contents/web_contents_impl.h
+@@ -534,6 +534,7 @@ class CONTENT_EXPORT WebContentsImpl
+   void ScrollToTopOfDocument() override;
+   void ScrollToBottomOfDocument() override;
+   void Replace(const std::u16string& word) override;
++  void InsertText(const std::u16string& text) override;
+   void ReplaceMisspelling(const std::u16string& word) override;
+   void NotifyContextMenuClosed(
+       const GURL& link_followed,
+--- a/content/public/browser/web_contents.h
++++ b/content/public/browser/web_contents.h
+@@ -1154,6 +1154,9 @@ class WebContents : public PageNavigator
+   // Replaces the currently selected word or a word around the cursor.
+   virtual void Replace(const std::u16string& word) = 0;
+ 
++  // Inserts text at the cursor or replaces the current selection.
++  virtual void InsertText(const std::u16string& text) = 0;
++
+   // Replaces the misspelling in the current selection.
+   virtual void ReplaceMisspelling(const std::u16string& word) = 0;
+ 
