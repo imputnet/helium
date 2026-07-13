@@ -1,0 +1,209 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -12032,6 +12032,12 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_HIBERNATE_OTHER_TABS" desc="The label of the 'Hibernate other tabs' Tab context menu item.">
+           Hibernate other tabs
+         </message>
++        <message name="IDS_TAB_CXMENU_COPY_URL" desc="The label of the 'Copy URL' Tab context menu item.">
++          Copy URL
++        </message>
++        <message name="IDS_TAB_CXMENU_COPY_URLS" desc="The label of the 'Copy URLs' Tab context menu item.">
++          Copy URLs
++        </message>
+         <message name="IDS_TAB_CXMENU_CLOSETAB" desc="The label of the tab context menu item for closing one or more tabs.">
+           Close
+         </message>
+@@ -12157,6 +12163,12 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_HIBERNATE_OTHER_TABS" desc="In Title Case: The label of the 'Hibernate Other Tabs' Tab context menu item.">
+           Hibernate Other Tabs
+         </message>
++        <message name="IDS_TAB_CXMENU_COPY_URL" desc="In Title Case: The label of the 'Copy URL' Tab context menu item.">
++          Copy URL
++        </message>
++        <message name="IDS_TAB_CXMENU_COPY_URLS" desc="In Title Case: The label of the 'Copy URLs' Tab context menu item.">
++          Copy URLs
++        </message>
+         <message name="IDS_TAB_CXMENU_CLOSETAB" desc="In Title Case: The label of the tab context menu item for closing one or more tabs.">
+           Close
+         </message>
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -101,7 +101,7 @@ TabMenuModel::TabMenuModel(ui::SimpleMen
+ TabMenuModel::~TabMenuModel() = default;
+ 
+ void TabMenuModel::BuildForWebApp(int index) {
+-  AddItemWithStringId(TabStripModel::CommandCopyURL, IDS_COPY_URL);
++  AddItemWithStringId(TabStripModel::CommandCopyURL, IDS_TAB_CXMENU_COPY_URL);
+   AddItemWithStringId(TabStripModel::CommandReload, IDS_TAB_CXMENU_RELOAD);
+   AddItemWithStringId(TabStripModel::CommandGoBack, IDS_CONTENT_CONTEXT_BACK);
+ 
+@@ -412,6 +412,11 @@ void TabMenuModel::Build(int index) {
+   }
+ 
+   AddSeparator(ui::NORMAL_SEPARATOR);
++  AddItemWithStringId(TabStripModel::CommandCopyURL,
++                      num_tabs == 1 ? IDS_TAB_CXMENU_COPY_URL
++                                    : IDS_TAB_CXMENU_COPY_URLS);
++
++  AddSeparator(ui::NORMAL_SEPARATOR);
+   AddItemWithStringId(TabStripModel::CommandReload, IDS_TAB_CXMENU_RELOAD);
+ 
+   AddItemWithStringId(TabStripModel::CommandDuplicate,
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -258,6 +258,13 @@ namespace {
+ const char kOsOverrideForTabletSite[] = "Linux; Android 9; Chrome tablet";
+ const char kChPlatformOverrideForTabletSite[] = "Android";
+ 
++std::u16string FormatURLForCopy(content::WebContents* web_contents) {
++  return url_formatter::FormatUrl(web_contents->GetVisibleURL(),
++                                  url_formatter::kFormatReplaceChromeProtocol,
++                                  base::UnescapeRule::NORMAL, nullptr, nullptr,
++                                  nullptr);
++}
++
+ // Creates a new tabbed browser window, with the same size, type and profile as
+ // |original_browser|'s window, inserts |contents| into it, and shows it.
+ void CreateAndShowNewWindowWithContents(
+@@ -2619,11 +2626,7 @@ bool IsDebuggerAttachedToCurrentTab(Brow
+ void CopyURL(BrowserWindowInterface* browser,
+              content::WebContents* web_contents) {
+   ui::ScopedClipboardWriter scw(ui::ClipboardBuffer::kCopyPaste);
+-  const std::u16string formatted_url =
+-      url_formatter::FormatUrl(web_contents->GetVisibleURL(),
+-                               url_formatter::kFormatReplaceChromeProtocol,
+-                               base::UnescapeRule::NORMAL, nullptr,
+-                               nullptr, nullptr);
++  const std::u16string formatted_url = FormatURLForCopy(web_contents);
+   scw.WriteText(formatted_url);
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -2637,6 +2640,28 @@ void CopyURL(BrowserWindowInterface* bro
+ #endif
+ }
+ 
++void CopyURLs(
++    const std::vector<content::WebContents*>& web_contentses) {
++  std::u16string urls;
++  for (content::WebContents* web_contents : web_contentses) {
++    if (!web_contents) {
++      continue;
++    }
++
++    if (!urls.empty()) {
++      urls.push_back(u'\n');
++    }
++    urls.append(FormatURLForCopy(web_contents));
++  }
++
++  if (urls.empty()) {
++    return;
++  }
++
++  ui::ScopedClipboardWriter scw(ui::ClipboardBuffer::kCopyPaste);
++  scw.WriteText(urls);
++}
++
+ bool CanCopyUrl(BrowserWindowInterface* browser) {
+   return IsWebAppOrCustomTab(browser) ||
+          !sharing_hub::SharingIsDisabledByPolicy(browser->GetProfile());
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2589,8 +2589,7 @@ bool TabStripModel::IsContextMenuCommand
+       return true;
+ 
+     case CommandCopyURL:
+-      DCHECK(delegate()->IsForWebApp());
+-      return true;
++      return GetWebContentsAt(context_index) != nullptr;
+ 
+     case CommandGoBack:
+       DCHECK(delegate()->IsForWebApp());
+@@ -3011,10 +3010,14 @@ void TabStripModel::ExecuteContextMenuCo
+     }
+ 
+     case CommandCopyURL: {
++      std::vector<int> indices = GetIndicesForCommand(context_index);
+       base::UmaHistogramCounts1000("Tab.ContextMenu.CopyURL.SelectedTabsCount",
+-                                   selection_model_.size());
++                                   indices.size());
+       base::RecordAction(UserMetricsAction("TabContextMenu_CopyURL"));
+-      delegate()->CopyURL(GetWebContentsAt(context_index));
++
++      std::vector<content::WebContents*> web_contentses =
++          GetWebContentsesByIndices(indices);
++      delegate()->CopyURLs(web_contentses);
+       break;
+     }
+ 
+--- a/chrome/browser/ui/browser_commands.h
++++ b/chrome/browser/ui/browser_commands.h
+@@ -326,6 +326,7 @@ void ClearCache(BrowserWindowInterface*
+ bool IsDebuggerAttachedToCurrentTab(BrowserWindowInterface* browser);
+ void CopyURL(BrowserWindowInterface* browser,
+              content::WebContents* web_contents);
++void CopyURLs(const std::vector<content::WebContents*>& web_contentses);
+ bool CanCopyUrl(BrowserWindowInterface* browser);
+ // Returns true if the browser window is for a web app or custom tab.
+ bool IsWebAppOrCustomTab(const BrowserWindowInterface* browser);
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -370,6 +370,11 @@ void BrowserTabStripModelDelegate::CopyU
+   chrome::CopyURL(browser_, web_contents);
+ }
+ 
++void BrowserTabStripModelDelegate::CopyURLs(
++    const std::vector<content::WebContents*>& web_contentses) {
++  chrome::CopyURLs(web_contentses);
++}
++
+ void BrowserTabStripModelDelegate::GoBack(content::WebContents* web_contents) {
+   chrome::GoBack(web_contents);
+ }
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.h
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.h
+@@ -76,6 +76,8 @@ class BrowserTabStripModelDelegate : pub
+   bool SupportsReadLater() override;
+   bool IsForWebApp() override;
+   void CopyURL(content::WebContents* web_contents) override;
++  void CopyURLs(
++      const std::vector<content::WebContents*>& web_contentses) override;
+   void GoBack(content::WebContents* web_contents) override;
+   bool CanGoBack(content::WebContents* web_contents) override;
+   bool IsNormalWindow() override;
+--- a/chrome/browser/ui/tabs/tab_strip_model_delegate.h
++++ b/chrome/browser/ui/tabs/tab_strip_model_delegate.h
+@@ -195,6 +195,10 @@ class TabStripModelDelegate {
+   // Copies the URL of the given WebContents.
+   virtual void CopyURL(content::WebContents* web_contents) = 0;
+ 
++  // Copies the URLs of the given WebContentses.
++  virtual void CopyURLs(
++      const std::vector<content::WebContents*>& web_contentses) = 0;
++
+   // Navigates the web_contents back to the previous page.
+   virtual void GoBack(content::WebContents* web_contents) = 0;
+ 
+--- a/chrome/browser/ui/tabs/test_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/tabs/test_tab_strip_model_delegate.cc
+@@ -127,6 +127,9 @@ bool TestTabStripModelDelegate::IsForWeb
+ 
+ void TestTabStripModelDelegate::CopyURL(content::WebContents* web_contents) {}
+ 
++void TestTabStripModelDelegate::CopyURLs(
++    const std::vector<content::WebContents*>& web_contentses) {}
++
+ void TestTabStripModelDelegate::GoBack(content::WebContents* web_contents) {}
+ 
+ bool TestTabStripModelDelegate::CanGoBack(content::WebContents* web_contents) {
+--- a/chrome/browser/ui/tabs/test_tab_strip_model_delegate.h
++++ b/chrome/browser/ui/tabs/test_tab_strip_model_delegate.h
+@@ -76,6 +76,8 @@ class TestTabStripModelDelegate : public
+   bool SupportsReadLater() override;
+   bool IsForWebApp() override;
+   void CopyURL(content::WebContents* web_contents) override;
++  void CopyURLs(
++      const std::vector<content::WebContents*>& web_contentses) override;
+   void GoBack(content::WebContents* web_contents) override;
+   bool CanGoBack(content::WebContents* web_contents) override;
+   bool IsNormalWindow() override;
