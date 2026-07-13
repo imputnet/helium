@@ -1,43 +1,53 @@
 --- a/chrome/common/pref_names.h
 +++ b/chrome/common/pref_names.h
-@@ -727,6 +727,11 @@ inline constexpr char kSplitViewDragAndD
+@@ -727,6 +727,12 @@ inline constexpr char kSplitViewDragAndD
  // recently used tabs.
  inline constexpr char kCtrlTabMru[] = "browser.ctrl_tab_mru";
  
-+// Whether the user explicitly chose to upload future desktop crash reports.
-+// This preference is registered in Local State and is shared by all profiles.
-+inline constexpr char kHeliumAlwaysSendCrashReports[] =
-+    "helium.crash_reporting.always_send";
++// Controls whether desktop crash reports are disabled, offered to the user, or
++// uploaded automatically. This preference is registered in Local State and is
++// shared by all profiles.
++inline constexpr char kHeliumCrashReportingMode[] =
++    "helium.crash_reporting.mode";
 +
  // A boolean pref set to true if Gemini integration be enabled. This is managed
  // by enterprise policy.
  inline constexpr char kGeminiSettings[] = "browser.gemini_settings";
 --- a/chrome/browser/prefs/browser_prefs.cc
 +++ b/chrome/browser/prefs/browser_prefs.cc
-@@ -1326,6 +1326,7 @@ void RegisterLocalState(PrefRegistrySimp
+@@ -104,6 +104,7 @@
+ #include "chrome/browser/updates/announcement_notification/announcement_notification_service.h"
+ #include "chrome/browser/webauthn/webauthn_pref_names.h"
+ #include "chrome/common/buildflags.h"
++#include "chrome/common/helium_crash_reporting_mode.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/common/secure_origin_allowlist.h"
+ #include "components/accessibility_annotator/core/prefs.h"
+@@ -1326,6 +1327,9 @@ void RegisterLocalState(PrefRegistrySimp
    breadcrumbs::RegisterPrefs(registry);
    browser_shutdown::RegisterPrefs(registry);
    BrowserProcessImpl::RegisterPrefs(registry);
-+  registry->RegisterBooleanPref(prefs::kHeliumAlwaysSendCrashReports, false);
++  registry->RegisterIntegerPref(
++      prefs::kHeliumCrashReportingMode,
++      static_cast<int>(helium::CrashReportingMode::kAsk));
    ChromeContentBrowserClient::RegisterLocalStatePrefs(registry);
  #if BUILDFLAG(CHROME_FOR_TESTING)
    chrome_for_testing::RegisterPrefs(registry);
 --- a/chrome/browser/chrome_browser_main.cc
 +++ b/chrome/browser/chrome_browser_main.cc
-@@ -95,6 +95,7 @@
- #include "chrome/grit/generated_resources.h"
- #include "chrome/installer/util/google_update_settings.h"
- #include "components/color/color_mixers.h"
-+#include "components/crash/core/app/crashpad.h"
- #include "components/device_event_log/device_event_log.h"
- #include "components/embedder_support/origin_trials/component_updater_utils.h"
- #include "components/embedder_support/origin_trials/origin_trials_settings_storage.h"
-@@ -1237,6 +1238,9 @@ int ChromeBrowserMainParts::PreCreateThr
+@@ -36,6 +36,7 @@
+ #include "chrome/browser/browser_process_impl.h"
+ #include "chrome/browser/chrome_browser_main_extra_parts.h"
+ #include "chrome/browser/component_updater/registration.h"
++#include "chrome/browser/crash_upload_list/helium_crash_reporting.h"
+ #include "chrome/browser/enterprise/browser_management/management_service_factory.h"
+ #include "chrome/browser/enterprise/chrome_browser_main_extra_parts_enterprise.h"
+ #include "chrome/browser/first_run/bookmark_importer.h"
+@@ -1237,6 +1238,8 @@ int ChromeBrowserMainParts::PreCreateThr
      browser_process_->Init();
    }
  
-+  crash_reporter::SetUploadConsentFromUser(
-+      local_state->GetBoolean(prefs::kHeliumAlwaysSendCrashReports));
++  helium::InitializeCrashReportingMode();
 +
  #if !BUILDFLAG(IS_CHROMEOS)
    std::optional<std::string> managed_by =
@@ -124,3 +134,229 @@
  #endif  // !BUILDFLAG(IS_CHROMEOS)
  
  enum class ReportUploadState {
+--- a/chrome/common/BUILD.gn
++++ b/chrome/common/BUILD.gn
+@@ -140,6 +140,7 @@ static_library("common_lib") {
+     "crash_keys.h",
+     "google_url_loader_throttle.cc",
+     "google_url_loader_throttle.h",
++    "helium_crash_reporting_mode.h",
+     "logging_chrome.cc",
+     "logging_chrome.h",
+     "media/cdm_registration.cc",
+--- /dev/null
++++ b/chrome/common/helium_crash_reporting_mode.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_COMMON_HELIUM_CRASH_REPORTING_MODE_H_
++#define CHROME_COMMON_HELIUM_CRASH_REPORTING_MODE_H_
++
++namespace helium {
++
++enum class CrashReportingMode {
++  kDisabled = -1,
++  kAsk = 0,
++  kAutomatic = 1,
++};
++
++constexpr bool IsValidCrashReportingMode(int value) {
++  return value == static_cast<int>(CrashReportingMode::kDisabled) ||
++         value == static_cast<int>(CrashReportingMode::kAsk) ||
++         value == static_cast<int>(CrashReportingMode::kAutomatic);
++}
++
++constexpr CrashReportingMode CrashReportingModeFromInt(int value) {
++  return IsValidCrashReportingMode(value)
++             ? static_cast<CrashReportingMode>(value)
++             : CrashReportingMode::kAsk;
++}
++
++}  // namespace helium
++
++#endif  // CHROME_COMMON_HELIUM_CRASH_REPORTING_MODE_H_
+--- a/chrome/browser/crash_upload_list/BUILD.gn
++++ b/chrome/browser/crash_upload_list/BUILD.gn
+@@ -12,6 +12,8 @@ static_library("crash_upload_list") {
+   sources = [
+     "crash_upload_list.cc",
+     "crash_upload_list.h",
++    "helium_crash_reporting.cc",
++    "helium_crash_reporting.h",
+   ]
+ 
+   if (is_android) {
+@@ -29,10 +31,15 @@ static_library("crash_upload_list") {
+   }
+ 
+   deps = [
++    "//chrome/browser:browser_process",
++    "//chrome/common",
+     "//chrome/common:constants",
+     "//components/crash/core/app",
+     "//components/crash/core/browser",
++    "//components/metrics:metrics_pref_names",
++    "//components/prefs",
+     "//components/upload_list",
++    "//third_party/crashpad/crashpad/client",
+   ]
+ 
+   if (is_android) {
+--- /dev/null
++++ b/chrome/browser/crash_upload_list/helium_crash_reporting.cc
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/crash_upload_list/helium_crash_reporting.h"
++
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/common/pref_names.h"
++#include "components/crash/core/app/crashpad.h"
++#include "components/metrics/metrics_pref_names.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
++#include "third_party/crashpad/crashpad/client/crash_report_database.h"
++
++namespace helium {
++
++namespace {
++
++void DeletePendingReports(bool include_explicitly_requested) {
++  crashpad::CrashReportDatabase* database =
++      crash_reporter::internal::GetCrashReportDatabase();
++  std::vector<crashpad::CrashReportDatabase::Report> reports;
++  if (!database ||
++      database->GetPendingReports(&reports) !=
++          crashpad::CrashReportDatabase::kNoError) {
++    return;
++  }
++
++  for (const auto& report : reports) {
++    if (!include_explicitly_requested && report.upload_explicitly_requested) {
++      continue;
++    }
++
++    crashpad::CrashReportDatabase::OperationStatus skip_status =
++        crashpad::CrashReportDatabase::kNoError;
++    if (report.upload_explicitly_requested) {
++      // Explicit requests bypass the global upload toggle. Clear that state
++      // before deletion so a deletion failure cannot leave the report
++      // uploadable while policy forbids reporting.
++      skip_status = database->SkipReportUpload(
++          report.uuid,
++          crashpad::Metrics::CrashSkippedReason::kUploadsDisabled);
++    }
++
++    const auto delete_status = database->DeleteReport(report.uuid);
++    if (delete_status != crashpad::CrashReportDatabase::kNoError &&
++        delete_status != crashpad::CrashReportDatabase::kReportNotFound) {
++      LOG(ERROR) << "Failed to delete crash report: " << report.uuid.ToString()
++                 << " (delete status " << static_cast<int>(delete_status)
++                 << ", skip status " << static_cast<int>(skip_status) << ")";
++    }
++  }
++}
++
++}  // namespace
++
++void InitializeCrashReportingMode() {
++  PrefService* local_state = g_browser_process->local_state();
++  if (!local_state) {
++    return;
++  }
++
++  static base::NoDestructor<PrefChangeRegistrar> policy_registrar;
++  policy_registrar->Init(local_state);
++  if (!policy_registrar->IsObserved(
++          metrics::prefs::kMetricsReportingEnabled)) {
++    policy_registrar->Add(
++        metrics::prefs::kMetricsReportingEnabled,
++        base::BindRepeating(&helium::InitializeCrashReportingMode));
++  }
++
++  crash_reporter::SetUploadConsentFromUser(false);
++
++  if (crash_reporter::UploadsDisabledByPolicy()) {
++    // Policy overrides the stored mode without changing the user's selection.
++    // Explicit requests bypass Crashpad's global upload toggle, so discard
++    // those reports as well while reporting is forbidden by policy.
++    DeletePendingReports(/*include_explicitly_requested=*/true);
++    return;
++  }
++
++  const CrashReportingMode mode = CrashReportingModeFromInt(
++      local_state->GetInteger(prefs::kHeliumCrashReportingMode));
++  switch (mode) {
++    case CrashReportingMode::kDisabled:
++      // Disabled mode must not retain reports that were never requested.
++      DeletePendingReports(/*include_explicitly_requested=*/false);
++      return;
++    case CrashReportingMode::kAsk:
++      // Leave reports pending so the crash dialog can offer them.
++      return;
++    case CrashReportingMode::kAutomatic:
++      // Allow Crashpad to upload pending reports without prompting.
++      crash_reporter::SetUploadConsentFromUser(true);
++      return;
++  }
++}
++
++void SetCrashReportingMode(CrashReportingMode mode) {
++  PrefService* local_state = g_browser_process->local_state();
++  if (!local_state) {
++    return;
++  }
++
++  // Make mode changes prospective: stop uploads and discard existing
++  // unrequested reports before applying the new mode.
++  crash_reporter::SetUploadConsentFromUser(false);
++  DeletePendingReports(/*include_explicitly_requested=*/false);
++
++  if (crash_reporter::UploadsDisabledByPolicy()) {
++    // Preserve the user's stored selection while policy is enforced.
++    return;
++  }
++
++  local_state->SetInteger(prefs::kHeliumCrashReportingMode,
++                          static_cast<int>(mode));
++  if (mode == CrashReportingMode::kAutomatic) {
++    crash_reporter::SetUploadConsentFromUser(true);
++  }
++}
++
++}  // namespace helium
+--- /dev/null
++++ b/chrome/browser/crash_upload_list/helium_crash_reporting.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_CRASH_UPLOAD_LIST_HELIUM_CRASH_REPORTING_H_
++#define CHROME_BROWSER_CRASH_UPLOAD_LIST_HELIUM_CRASH_REPORTING_H_
++
++#include "chrome/common/helium_crash_reporting_mode.h"
++
++namespace helium {
++
++// Applies the stored mode at startup and discards unrequested reports when
++// reporting is disabled by the user or policy.
++void InitializeCrashReportingMode();
++
++// Disables consent, discards existing unrequested reports, stores `mode`, and
++// then enables consent only when `mode` is automatic. If policy disables crash
++// reporting, the stored mode is preserved.
++void SetCrashReportingMode(CrashReportingMode mode);
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_CRASH_UPLOAD_LIST_HELIUM_CRASH_REPORTING_H_
