@@ -1,13 +1,14 @@
 --- a/chrome/browser/ui/webui/crashes/crashes_ui.cc
 +++ b/chrome/browser/ui/webui/crashes/crashes_ui.cc
-@@ -17,19 +17,23 @@
+@@ -17,17 +17,20 @@
  #include "base/values.h"
  #include "base/version_info/version_info.h"
  #include "build/build_config.h"
 +#include "chrome/browser/browser_process.h"
  #include "chrome/browser/crash_upload_list/crash_upload_list.h"
- #include "chrome/browser/metrics/chrome_metrics_service_accessor.h"
- #include "chrome/browser/metrics/metrics_reporting_state.h"
+-#include "chrome/browser/metrics/chrome_metrics_service_accessor.h"
+-#include "chrome/browser/metrics/metrics_reporting_state.h"
++#include "chrome/browser/crash_upload_list/helium_crash_reporting.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/signin/identity_manager_factory.h"
 +#include "chrome/common/pref_names.h"
@@ -18,13 +19,11 @@
  #include "components/grit/components_scaled_resources.h"
  #include "components/grit/crashes_resources.h"
  #include "components/grit/crashes_resources_map.h"
++#include "components/prefs/pref_service.h"
  #include "components/signin/public/base/consent_level.h"
  #include "components/signin/public/identity_manager/identity_manager.h"
-+#include "components/prefs/pref_service.h"
  #include "content/public/browser/web_contents.h"
- #include "content/public/browser/web_ui.h"
- #include "content/public/browser/web_ui_data_source.h"
-@@ -52,6 +56,10 @@ using content::WebUIMessageHandler;
+@@ -52,6 +55,10 @@ using content::WebUIMessageHandler;
  
  namespace {
  
@@ -35,22 +34,25 @@
  void CreateAndAddCrashesUIHTMLSource(Profile* profile) {
    content::WebUIDataSource* source = content::WebUIDataSource::CreateAndAdd(
        profile, chrome::kChromeUICrashesHost);
-@@ -179,7 +187,9 @@ void CrashesDOMHandler::OnUploadListAvai
+@@ -178,8 +185,11 @@ void CrashesDOMHandler::OnUploadListAvai
+ }
  
  void CrashesDOMHandler::UpdateUI() {
++  const helium::CrashReportingMode crash_reporting_mode =
++      helium::GetCrashReportingMode();
    bool crash_reporting_enabled =
 -      ChromeMetricsServiceAccessor::IsMetricsAndCrashReportingEnabled();
-+      g_browser_process->local_state()->GetBoolean(
-+          prefs::kHeliumAlwaysSendCrashReports) &&
++      crash_reporting_mode == helium::CrashReportingMode::kAutomatic &&
 +      !CrashUploadsDisabledByPolicy();
  
    bool system_crash_reporter = false;
  #if BUILDFLAG(IS_CHROMEOS)
-@@ -203,23 +213,21 @@ void CrashesDOMHandler::UpdateUI() {
+@@ -203,23 +213,22 @@ void CrashesDOMHandler::UpdateUI() {
  #endif
    bool allow_manual_uploads =
        manual_uploads_supported &&
 -      (crash_reporting_enabled || !metrics::IsMetricsReportingPolicyManaged());
++      crash_reporting_mode != helium::CrashReportingMode::kDisabled &&
 +      !CrashUploadsDisabledByPolicy();
  
    // Show crash reports regardless of |crash_reporting_enabled| when it is
@@ -75,13 +77,17 @@
    result.Set("os", base::SysInfo::OperatingSystemName() + " " +
                         base::SysInfo::OperatingSystemVersion());
    result.Set("isGoogleAccount", is_internal);
-@@ -229,8 +237,7 @@ void CrashesDOMHandler::UpdateUI() {
+@@ -228,9 +237,10 @@ void CrashesDOMHandler::UpdateUI() {
+ 
  void CrashesDOMHandler::HandleRequestSingleCrashUpload(
      const base::ListValue& args) {
-   // Only allow manual uploads if crash uploads aren’t disabled by policy.
+-  // Only allow manual uploads if crash uploads aren’t disabled by policy.
 -  if (!ChromeMetricsServiceAccessor::IsMetricsAndCrashReportingEnabled() &&
 -      metrics::IsMetricsReportingPolicyManaged()) {
-+  if (CrashUploadsDisabledByPolicy()) {
++  const helium::CrashReportingMode crash_reporting_mode =
++      helium::GetCrashReportingMode();
++  if (crash_reporting_mode == helium::CrashReportingMode::kDisabled ||
++      CrashUploadsDisabledByPolicy()) {
      return;
    }
  
@@ -116,10 +122,9 @@
   */
  function fileBug(crashId: string, os: string, version: string) {
    const commentLines = [
-+    `Crash ID: ${crashId}`,
-     'IMPORTANT: Your crash has already been automatically reported ' +
-         'to our crash system. Please file this bug only if you can provide ' +
-         'more information about it.',
+-    'IMPORTANT: Your crash has already been automatically reported ' +
+-        'to our crash system. Please file this bug only if you can provide ' +
+-        'more information about it.',
 -    '',
 -    '',
 -    'Chrome Version: ' + version,
@@ -137,6 +142,10 @@
 -    '',
 -    '****DO NOT CHANGE BELOW THIS LINE****',
 -    'Crash ID: crash/' + crashId,
++    `Crash ID: ${crashId}`,
++    'IMPORTANT: Your crash has already been reported to our crash system. ' +
++        'Please file this issue only if you can provide more information ' +
++        'about it.',
    ];
    const params: {[key: string]: string} = {
 -    template: 'Crash Report',
@@ -163,7 +172,20 @@
        <!-- chrome://crashes strings -->
        <message name="IDS_CRASH_DISABLED_MESSAGE" desc="The explanatory message for chrome://crashes when crash reporting is disabled">
 -        Crash reporting is not available in Chromium.
-+        Crash reporting has been disabled by policy.
++        Crash reporting is disabled in Helium settings or by policy.
        </message>
  
        <!-- Version UI -->
+--- a/components/crash_strings.grdp
++++ b/components/crash_strings.grdp
+@@ -43,8 +43,8 @@
+     Size:
+   </message>
+ 
+-  <message name="IDS_CRASH_BUG_LINK_LABEL" desc="Link text for filing a crash bug on chrome://crashes">
+-    Provide additional details
++  <message name="IDS_CRASH_BUG_LINK_LABEL" desc="Link text for creating an issue with additional details in Helium's GitHub repo">
++    Create an issue with details
+   </message>
+   <message name="IDS_CRASH_NO_CRASHES_MESSAGE" desc="The explanatory message for chrome://crashes when there are no crashes">
+     You have no recently reported crashes.  Crashes that occurred when crash reporting was disabled will not appear here.

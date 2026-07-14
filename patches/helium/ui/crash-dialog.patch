@@ -1,0 +1,294 @@
+--- a/chrome/browser/ui/startup/BUILD.gn
++++ b/chrome/browser/ui/startup/BUILD.gn
+@@ -137,8 +137,10 @@ source_set("impl") {
+     "//cc/base",
+     "//chrome/app:branded_strings",
+     "//chrome/app:generated_resources",
++    "//chrome/app/vector_icons",
+     "//chrome/browser:browser_features",
+     "//chrome/browser:browser_process",
++    "//chrome/browser/crash_upload_list",
+     "//chrome/browser:defaults",
+     "//chrome/browser/actor",
+     "//chrome/browser/devtools",
+@@ -160,6 +162,7 @@ source_set("impl") {
+     "//chrome/common:constants",
+     "//chrome/common:non_code_constants",
+     "//components/autofill/core/common",
++    "//components/crash/core/app",
+     "//components/history_clusters/core",
+     "//components/infobars/content",
+     "//components/infobars/core",
+@@ -183,6 +186,8 @@ source_set("impl") {
+     "//services/webnn/public/mojom:features",
+     "//third_party/abseil-cpp:absl",
+     "//third_party/blink/public:runtime_features_for_public",
++    "//third_party/crashpad/crashpad/client",
++    "//third_party/crashpad/crashpad/util",
+     "//ui/base",
+     "//ui/gfx:native_ui_types",
+     "//url",
+@@ -198,6 +203,8 @@ source_set("impl") {
+       "features.cc",
+       "google_api_keys_infobar_delegate.cc",
+       "google_chrome_scheme_util.cc",
++      "helium_crash_dialog_controller.cc",
++      "helium_crash_dialog_controller.h",
+       "infobar_utils.cc",
+       "launch_mode_recorder.cc",
+       "obsolete_system_infobar_delegate.cc",
+--- a/components/new_or_sad_tab_strings.grdp
++++ b/components/new_or_sad_tab_strings.grdp
+@@ -24,6 +24,28 @@
+       <message name="IDS_SAD_TAB_RELOAD_LABEL" desc="Button label in the sad tab page for reloading a page." formatter_data="android_java">
+         Reload
+       </message>
++      <message name="IDS_HELIUM_CRASH_REPORTING_DIALOG_TITLE" desc="Title of the dialog asking whether to send one or more Helium crash reports. The report count is shown for multiple reports. [ICU Syntax]">
++        {COUNT, plural, =1 {Would you like to send a crash report?} other {Would you like to send # crash reports?}}
++      </message>
++      <message name="IDS_HELIUM_CRASH_REPORTING_DIALOG_DESCRIPTION" desc="Introductory paragraph shown when one or more Helium crash reports are available.">
++        Helium closed unexpectedly. A crash report could help us fix the issue you ran into and prevent it from happening again.
++      </message>
++      <message name="IDS_HELIUM_CRASH_REPORTING_DIALOG_PRIVACY" desc="Paragraph warning that a crash report may contain sensitive information from Helium's memory.">
++        A crash report may contain parts of sensitive information from Helium's memory at the moment of crash.
++      </message>
++      <message name="IDS_HELIUM_CRASH_REPORTING_DIALOG_OPTIONAL" desc="Paragraph explaining that no crash report has been sent yet and that sending reports is optional.">
++        Nothing has been sent yet. Sending a crash report is optional.
++      </message>
++      <if expr="use_titlecase">
++        <message name="IDS_HELIUM_CRASH_REPORTING_DIALOG_SEND_REPORT" desc="In Title Case: Button label for sending one or more crash reports. The report count is shown for multiple reports. [ICU Syntax]">
++          {COUNT, plural, =1 {Send Report} other {Send # Reports}}
++        </message>
++      </if>
++      <if expr="not use_titlecase">
++        <message name="IDS_HELIUM_CRASH_REPORTING_DIALOG_SEND_REPORT" desc="Button label for sending one or more crash reports. The report count is shown for multiple reports. [ICU Syntax]">
++          {COUNT, plural, =1 {Send report} other {Send # reports}}
++        </message>
++      </if>
+       <if expr="is_android or is_ios">
+         <message name="IDS_SAD_TAB_SEND_FEEDBACK_LABEL" desc="Button label in the sad tab page for sending feedback. This label replaces the reload button after a crash happens twice in a row." formatter_data="android_java">
+           Send Feedback
+--- /dev/null
++++ b/chrome/browser/ui/startup/helium_crash_dialog_controller.cc
+@@ -0,0 +1,187 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/startup/helium_crash_dialog_controller.h"
++
++#include <memory>
++#include <set>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/i18n/message_formatter.h"
++#include "base/no_destructor.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/crash_upload_list/helium_crash_reporting.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/dialogs/browser_dialogs.h"
++#include "chrome/common/pref_names.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/crash/core/app/crashpad.h"
++#include "components/prefs/pref_service.h"
++#include "components/strings/grit/components_strings.h"
++#include "third_party/crashpad/crashpad/client/crash_report_database.h"
++#include "third_party/crashpad/crashpad/util/misc/uuid.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/mojom/dialog_button.mojom.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/base/models/dialog_model_host.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_id.h"
++
++namespace {
++
++constexpr int kCrashDialogIconSize = 32;
++
++std::set<crashpad::UUID>& ReservedReportIds() {
++  static base::NoDestructor<std::set<crashpad::UUID>> reports;
++  return *reports;
++}
++
++crashpad::CrashReportDatabase* GetDatabase() {
++  return crash_reporter::internal::GetCrashReportDatabase();
++}
++
++class HeliumCrashDialogDelegate : public ui::DialogModelDelegate {
++ public:
++  explicit HeliumCrashDialogDelegate(std::vector<crashpad::UUID> report_ids)
++      : report_ids_(std::move(report_ids)) {}
++
++  HeliumCrashDialogDelegate(const HeliumCrashDialogDelegate&) = delete;
++  HeliumCrashDialogDelegate& operator=(const HeliumCrashDialogDelegate&) =
++      delete;
++  ~HeliumCrashDialogDelegate() override = default;
++
++  void OnDontAskAgain(const ui::Event&) {
++    Resolve(/*upload=*/false);
++    helium::SetCrashReportingMode(helium::CrashReportingMode::kDisabled);
++    dialog_model()->host()->Close();
++  }
++
++  void OnAccepted() { Resolve(/*upload=*/true); }
++
++  void OnDismissed() { Resolve(/*upload=*/false); }
++
++ private:
++  void Resolve(bool upload) {
++    if (resolved_) {
++      return;
++    }
++    resolved_ = true;
++
++    const bool can_upload =
++        upload && !crash_reporter::UploadsDisabledByPolicy();
++    crashpad::CrashReportDatabase* database = GetDatabase();
++    for (const crashpad::UUID& report_id : report_ids_) {
++      ReservedReportIds().erase(report_id);
++      if (!database) {
++        continue;
++      }
++      if (can_upload) {
++        database->RequestUpload(report_id);
++      } else {
++        database->DeleteReport(report_id);
++      }
++    }
++  }
++
++  const std::vector<crashpad::UUID> report_ids_;
++  bool resolved_ = false;
++};
++
++std::u16string FormatPluralString(int message_id, size_t report_count) {
++  return base::i18n::MessageFormatter::FormatWithNamedArgs(
++      l10n_util::GetStringUTF16(message_id), "COUNT",
++      static_cast<int>(report_count));
++}
++
++std::unique_ptr<ui::DialogModel> BuildCrashDialog(
++    std::vector<crashpad::UUID> report_ids) {
++  const size_t report_count = report_ids.size();
++  auto delegate =
++      std::make_unique<HeliumCrashDialogDelegate>(std::move(report_ids));
++  HeliumCrashDialogDelegate* delegate_ptr = delegate.get();
++
++  return ui::DialogModel::Builder(std::move(delegate))
++      .SetTitle(FormatPluralString(IDS_HELIUM_CRASH_REPORTING_DIALOG_TITLE,
++                                   report_count))
++      .SetIcon(ui::ImageModel::FromVectorIcon(
++          kSadTabIcon, ui::kColorIcon, kCrashDialogIconSize))
++      .AddParagraph(ui::DialogModelLabel(
++          IDS_HELIUM_CRASH_REPORTING_DIALOG_DESCRIPTION))
++      .AddParagraph(ui::DialogModelLabel(
++          IDS_HELIUM_CRASH_REPORTING_DIALOG_PRIVACY))
++      .AddParagraph(ui::DialogModelLabel(
++          IDS_HELIUM_CRASH_REPORTING_DIALOG_OPTIONAL))
++      .AddExtraButton(
++          base::BindRepeating(&HeliumCrashDialogDelegate::OnDontAskAgain,
++                              base::Unretained(delegate_ptr)),
++          ui::DialogModel::Button::Params().SetLabel(
++              l10n_util::GetStringUTF16(
++                  IDS_TAB_GROUP_DELETION_DIALOG_DONT_ASK)))
++      .AddCancelButton(
++          base::BindOnce(&HeliumCrashDialogDelegate::OnDismissed,
++                         base::Unretained(delegate_ptr)),
++          ui::DialogModel::Button::Params().SetLabel(
++              l10n_util::GetStringUTF16(IDS_NO_THANKS)))
++      .AddOkButton(base::BindOnce(&HeliumCrashDialogDelegate::OnAccepted,
++                                  base::Unretained(delegate_ptr)),
++                   ui::DialogModel::Button::Params().SetLabel(
++                       FormatPluralString(
++                           IDS_HELIUM_CRASH_REPORTING_DIALOG_SEND_REPORT,
++                           report_count)))
++      .OverrideDefaultButton(ui::mojom::DialogButton::kNone)
++      .OverrideShowCloseButton(/*show_close_button=*/true)
++      .SetCloseActionCallback(
++          base::BindOnce(&HeliumCrashDialogDelegate::OnDismissed,
++                         base::Unretained(delegate_ptr)))
++      .SetDialogDestroyingCallback(
++          base::BindOnce(&HeliumCrashDialogDelegate::OnDismissed,
++                         base::Unretained(delegate_ptr)))
++      .Build();
++}
++
++}  // namespace
++
++void MaybeShowHeliumCrashDialog(BrowserWindowInterface* browser) {
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++      !browser->GetProfile()->IsRegularProfile()) {
++    return;
++  }
++
++  PrefService* local_state = g_browser_process->local_state();
++  if (!local_state) {
++    return;
++  }
++
++  if (crash_reporter::UploadsDisabledByPolicy() ||
++      helium::GetCrashReportingMode() != helium::CrashReportingMode::kAsk) {
++    return;
++  }
++
++  crashpad::CrashReportDatabase* database = GetDatabase();
++  std::vector<crashpad::CrashReportDatabase::Report> reports;
++  if (!database ||
++      database->GetPendingReports(&reports) !=
++          crashpad::CrashReportDatabase::kNoError) {
++    return;
++  }
++  std::vector<crashpad::UUID> report_ids;
++  for (const auto& report : reports) {
++    if (report.upload_explicitly_requested ||
++        !ReservedReportIds().insert(report.uuid).second) {
++      continue;
++    }
++    report_ids.push_back(report.uuid);
++  }
++  if (report_ids.empty()) {
++    return;
++  }
++
++  chrome::ShowBrowserModal(browser->GetBrowserForMigrationOnly(),
++                           BuildCrashDialog(std::move(report_ids)));
++}
+--- /dev/null
++++ b/chrome/browser/ui/startup/helium_crash_dialog_controller.h
+@@ -0,0 +1,12 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_STARTUP_HELIUM_CRASH_DIALOG_CONTROLLER_H_
++#define CHROME_BROWSER_UI_STARTUP_HELIUM_CRASH_DIALOG_CONTROLLER_H_
++
++class BrowserWindowInterface;
++
++void MaybeShowHeliumCrashDialog(BrowserWindowInterface* browser);
++
++#endif  // CHROME_BROWSER_UI_STARTUP_HELIUM_CRASH_DIALOG_CONTROLLER_H_
+--- a/chrome/browser/ui/startup/infobar_utils.cc
++++ b/chrome/browser/ui/startup/infobar_utils.cc
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/ui/startup/bad_flags_prompt.h"
+ #include "chrome/browser/ui/startup/bidding_and_auction_consented_debugging_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/google_api_keys_infobar_delegate.h"
++#include "chrome/browser/ui/startup/helium_crash_dialog_controller.h"
+ #include "chrome/browser/ui/startup/obsolete_system_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/oscryptasync_availability_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+@@ -164,6 +165,8 @@ void AddInfoBarsIfNecessary(BrowserWindo
+     return;
+   }
+ 
++  MaybeShowHeliumCrashDialog(browser);
++
+   // The below info bars are only added to the first profile which is
+   // launched. Other profiles might be restoring the browsing sessions
+   // asynchronously, so we cannot add the info bars to the focused tabs here.
