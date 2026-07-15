@@ -1,0 +1,460 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -669,6 +669,11 @@ inline constexpr char kTabCyclingMRU[] =
+ inline constexpr char kShiftRightClickContextMenu[] =
+     "helium.browser.shift_right_click_context_menu";
+ 
++// A boolean pref set to true if the zoom indicator should be shown in the
++// address bar.
++inline constexpr char kShowZoomIndicator[] =
++    "helium.browser.show_zoom_indicator";
++
+ // A boolean pref set to true if web contents should be shown inside a rounded
+ // frame.
+ inline constexpr char kHeliumRoundedFrame[] = "helium.browser.rounded_frame";
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -125,6 +125,8 @@ void RegisterBrowserUserPrefs(user_prefs
+ 
+   registry->RegisterBooleanPref(prefs::kShiftRightClickContextMenu, true);
+ 
++  registry->RegisterBooleanPref(prefs::kShowZoomIndicator, true);
++
+   registry->RegisterBooleanPref(prefs::kHeliumRoundedFrame, true);
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumNativeFrameMaterials, false);
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -340,7 +340,7 @@ BASE_FEATURE_PARAM(bool,
+                    kPageActionsMigrationZoom,
+                    &kPageActionsMigration,
+                    "zoom",
+-                   false);
++                   true);
+ 
+ BASE_FEATURE_PARAM(bool,
+                    kPageActionsMigrationCookieControls,
+--- a/chrome/browser/ui/browser_actions.cc
++++ b/chrome/browser/ui/browser_actions.cc
+@@ -140,6 +140,7 @@
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/user_prefs/user_prefs.h"
+ #include "components/vector_icons/vector_icons.h"
++#include "components/zoom/page_zoom.h"
+ #include "ui/accessibility/accessibility_features.h"
+ #include "ui/actions/actions.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -567,19 +568,14 @@ void BrowserActions::InitializePageActio
+           base::BindRepeating(
+               [](BrowserWindowInterface* bwi, actions::ActionItem* item,
+                  actions::ActionInvocationContext context) {
+-                bwi->GetActiveTabInterface()
+-                    ->GetTabFeatures()
+-                    ->zoom_view_controller()
+-                    ->UpdateBubbleVisibility(
+-                        /*prefer_to_show_bubble=*/true,
+-                        /*from_user_gesture=*/true);
++                zoom::PageZoom::Zoom(
++                    bwi->GetActiveTabInterface()->GetContents(),
++                    content::PAGE_ZOOM_RESET);
+               },
+               bwi))
+           .SetActionId(kActionZoomNormal)
+           .SetText(l10n_util::GetStringUTF16(IDS_ZOOM_NORMAL))
+           .SetTooltipText(l10n_util::GetStringUTF16(IDS_TOOLTIP_ZOOM))
+-          .SetImage(ui::ImageModel::FromVectorIcon(
+-              features::IsRoundedIconsEnabled() ? kZoomInIcon : kZoomInOldIcon))
+           .Build());
+ 
+   // The action does nothing, but is used to configure the page action, which
+--- a/chrome/browser/ui/views/zoom/zoom_view_controller.cc
++++ b/chrome/browser/ui/views/zoom/zoom_view_controller.cc
+@@ -8,6 +8,7 @@
+ #include "base/i18n/number_formatting.h"
+ #include "base/notreached.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+@@ -20,6 +21,7 @@
+ #include "chrome/browser/ui/views/location_bar/zoom_bubble_coordinator.h"
+ #include "chrome/browser/ui/views/location_bar/zoom_bubble_view.h"
+ #include "chrome/browser/ui/views/page_action/page_action_view.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/zoom/zoom_controller.h"
+@@ -36,6 +38,13 @@ ZoomViewController::ZoomViewController(
+     : tab_interface_(tab_interface),
+       page_action_controller_(page_action_controller) {
+   DCHECK(IsPageActionMigrated(PageActionIconType::kZoom));
++  show_zoom_indicator_.Init(
++      prefs::kShowZoomIndicator,
++      Profile::FromBrowserContext(GetWebContents()->GetBrowserContext())
++          ->GetPrefs(),
++      base::BindRepeating(&ZoomViewController::UpdatePageActionIconVisibility,
++                          base::Unretained(this),
++                          /*is_bubble_visible=*/false));
+ }
+ 
+ ZoomViewController::~ZoomViewController() = default;
+@@ -65,69 +74,36 @@ void ZoomViewController::UpdatePageActio
+       zoom::ZoomController::FromWebContents(GetWebContents());
+   CHECK(zoom_controller);
+ 
+-  auto accessible_text = l10n_util::GetStringFUTF16(
+-      IDS_TOOLTIP_ZOOM, base::FormatPercent(zoom_controller->GetZoomPercent()));
++  const std::u16string zoom_percent =
++      base::FormatPercent(zoom_controller->GetZoomPercent());
++  const std::u16string accessible_text =
++      l10n_util::GetStringFUTF16(IDS_TOOLTIP_ZOOM, zoom_percent);
+ 
++  page_action_controller_->OverrideText(kActionZoomNormal, zoom_percent);
+   page_action_controller_->OverrideTooltip(kActionZoomNormal, accessible_text);
+   page_action_controller_->OverrideAccessibleName(kActionZoomNormal,
+                                                   accessible_text);
+-
+-  switch (zoom_controller->GetZoomRelativeToDefault()) {
+-    case ZoomController::ZOOM_BELOW_DEFAULT_ZOOM:
+-      page_action_controller_->OverrideImage(
+-          kActionZoomNormal,
+-          ui::ImageModel::FromVectorIcon(features::IsRoundedIconsEnabled()
+-                                             ? kZoomOutIcon
+-                                             : kZoomMinusChromeRefreshOldIcon));
+-      break;
+-    case ZoomController::ZOOM_AT_DEFAULT_ZOOM:
+-    case ZoomController::ZOOM_ABOVE_DEFAULT_ZOOM:
+-      page_action_controller_->OverrideImage(
+-          kActionZoomNormal,
+-          ui::ImageModel::FromVectorIcon(features::IsRoundedIconsEnabled()
+-                                             ? kZoomInIcon
+-                                             : kZoomPlusChromeRefreshOldIcon));
+-      break;
+-    default:
+-      NOTREACHED();
+-  }
+ }
+ 
+ void ZoomViewController::UpdatePageActionIconVisibility(
+-    bool is_bubble_visible) {
++    bool /*is_bubble_visible*/) {
+   zoom::ZoomController* zoom_controller =
+       zoom::ZoomController::FromWebContents(GetWebContents());
+   CHECK(zoom_controller);
+ 
+-  const bool is_at_default_zoom = zoom_controller->IsAtDefaultZoom();
+-  if (is_at_default_zoom && !is_bubble_visible) {
+-    page_action_controller_->Hide(kActionZoomNormal);
+-  } else {
++  if (!zoom_controller->IsAtDefaultZoom() &&
++      show_zoom_indicator_.GetValue()) {
+     page_action_controller_->Show(kActionZoomNormal);
++  } else {
++    page_action_controller_->Hide(kActionZoomNormal);
+   }
+ }
+ 
+-void ZoomViewController::UpdateBubbleVisibility(bool prefer_to_show_bubble,
+-                                                bool from_user_gesture) {
+-  zoom::ZoomController* zoom_controller =
+-      zoom::ZoomController::FromWebContents(GetWebContents());
+-  CHECK(zoom_controller);
+-
+-  const bool is_at_default_zoom = zoom_controller->IsAtDefaultZoom();
+-  const bool can_bubble_be_visible =
+-      CanBubbleBeVisible(prefer_to_show_bubble, is_at_default_zoom);
+-  if (can_bubble_be_visible) {
+-    if (prefer_to_show_bubble) {
+-      GetBubbleCoordinator()->Show(
+-          GetWebContents(), from_user_gesture ? ZoomBubbleView::USER_GESTURE
+-                                              : ZoomBubbleView::AUTOMATIC);
+-    } else {
+-      GetBubbleCoordinator()->RefreshIfShowing(GetWebContents());
+-    }
+-  } else {
+-    if (IsBubbleVisible()) {
+-      GetBubbleCoordinator()->Hide();
+-    }
++void ZoomViewController::UpdateBubbleVisibility(
++    bool /*prefer_to_show_bubble*/,
++    bool /*from_user_gesture*/) {
++  if (IsBubbleVisible()) {
++    GetBubbleCoordinator()->Hide();
+   }
+ }
+ 
+@@ -139,18 +115,6 @@ bool ZoomViewController::IsBubbleVisible
+   return action_item->GetIsShowingBubble();
+ }
+ 
+-bool ZoomViewController::CanBubbleBeVisible(bool prefer_to_show_bubble,
+-                                            bool is_zoom_at_default) const {
+-  // The zoom bubble should be visible if either:
+-  // 1. The caller prefers to show the bubble (`prefer_to_show_bubble`), or
+-  // 2. The bubble is already visible (`IsBubbleVisible()`).
+-  //
+-  // If neither of these is true, we only show the bubble if the zoom level
+-  // is not at the default (`!is_zoom_at_default`), indicating that zoom is
+-  // active.
+-  return prefer_to_show_bubble || IsBubbleVisible() || !is_zoom_at_default;
+-}
+-
+ content::WebContents* ZoomViewController::GetWebContents() const {
+   return tab_interface_->GetContents();
+ }
+--- a/chrome/browser/ui/views/zoom/zoom_view_controller.h
++++ b/chrome/browser/ui/views/zoom/zoom_view_controller.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_ZOOM_ZOOM_VIEW_CONTROLLER_H_
+ #define CHROME_BROWSER_UI_VIEWS_ZOOM_ZOOM_VIEW_CONTROLLER_H_
+ 
++#include "components/prefs/pref_member.h"
+ #include "components/tabs/public/tab_interface.h"
+ 
+ class ZoomBubbleCoordinator;
+@@ -57,11 +58,6 @@ class ZoomViewController {
+   // default.
+   void UpdatePageActionIconProperties();
+ 
+-  // Determines if the page action should be visible under the current zoom
+-  // conditions, factoring in whether the bubble is already visible or allowed.
+-  bool CanBubbleBeVisible(bool prefer_to_show_bubble,
+-                          bool is_zoom_at_default) const;
+-
+   // Helper to retrieve the active WebContents from the tab.
+   content::WebContents* GetWebContents() const;
+ 
+@@ -76,6 +72,8 @@ class ZoomViewController {
+   // Unowned reference to the page action controller that will coordinate
+   // requests from this object.
+   const raw_ref<page_actions::PageActionController> page_action_controller_;
++
++  BooleanPrefMember show_zoom_indicator_;
+ };
+ 
+ }  // namespace zoom
+--- a/chrome/browser/ui/views/page_action/page_action_view.cc
++++ b/chrome/browser/ui/views/page_action/page_action_view.cc
+@@ -12,11 +12,13 @@
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/page_action/page_action_controller.h"
+ #include "chrome/browser/ui/page_action/page_action_model.h"
+ #include "chrome/browser/ui/page_action/page_action_triggers.h"
+ #include "chrome/browser/ui/views/location_bar/icon_label_bubble_view.h"
++#include "chrome/browser/ui/views/location_bar/location_bar_util.h"
+ #include "chrome/browser/ui/views/page_action/page_action_view_params.h"
+ #include "ui/actions/actions.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -24,12 +26,15 @@
+ #include "ui/color/color_id.h"
+ #include "ui/events/event.h"
+ #include "ui/gfx/animation/slide_animation.h"
++#include "ui/gfx/font.h"
+ #include "ui/gfx/font_list.h"
+ #include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/paint_vector_icon.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/animation/ink_drop.h"
++#include "ui/views/background.h"
+ #include "ui/views/controls/button/single_animated_image_container.h"
++#include "ui/views/controls/highlight_path_generator.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/widget/widget_delegate.h"
+ 
+@@ -37,11 +42,13 @@ namespace page_actions {
+ 
+ PageActionView::PageActionView(actions::ActionItem* action_item,
+                                const PageActionViewParams& params,
+-                               ui::ElementIdentifier element_identifier)
++                               ui::ElementIdentifier element_identifier,
++                               bool text_only)
+     : IconLabelBubbleView(gfx::FontList(), params.icon_label_bubble_delegate),
+       action_item_(action_item->GetAsWeakPtr()),
+       icon_size_(params.icon_size),
+-      icon_insets_(params.icon_insets) {
++      icon_insets_(params.icon_insets),
++      text_only_(text_only) {
+   CHECK(action_item_->GetActionId().has_value());
+   SetUpForAnimation(base::Milliseconds(600));
+ 
+@@ -59,7 +66,19 @@ PageActionView::PageActionView(actions::
+   SetUseTonalColorsWhenExpanded(false);
+   SetBackgroundVisibility(BackgroundVisibility::kWithLabel);
+   UpdateBorder();
+-  SetExpandedLabelAdditionalInsets(views::Inset1D(4, 8));
++  SetExpandedLabelAdditionalInsets(
++      text_only_ ? views::Inset1D(2, 2) : views::Inset1D(4, 8));
++
++  if (text_only_) {
++    SetFontList(font_list().Derive(
++        -3, gfx::Font::NORMAL, gfx::Font::Weight::MEDIUM));
++    views::InstallRoundRectHighlightPathGenerator(
++        this, gfx::Insets::VH(2, 0), GetCornerRadii());
++    image_container_view()->SetPreferredSize(gfx::Size(0, icon_size_));
++    label()->SetHorizontalAlignment(gfx::ALIGN_CENTER);
++    SetCustomForegroundColorId(kColorOmniboxActionIcon);
++    SetCustomBackgroundColorId(kColorOmniboxActionIconHover);
++  }
+ 
+   label_visibility_changed_subscription_ =
+       label()->AddVisibleChangedCallback(base::BindRepeating(
+@@ -80,7 +99,7 @@ PageActionView::~PageActionView() {
+ }
+ 
+ bool PageActionView::IsChipVisible() const {
+-  return ShouldShowLabel();
++  return !text_only_ && ShouldShowLabel();
+ }
+ 
+ bool PageActionView::IsAnchoredMessageVisible() const {
+@@ -173,6 +192,8 @@ void PageActionView::OnPageActionModelCh
+   if (!visible) {
+     ResetSlideAnimation(/*show=*/false);
+     NotifyIsChipShowingChange();
++  } else if (text_only_) {
++    ResetSlideAnimation(/*show=*/true);
+   } else if (model.ShouldShowSuggestionChip()) {
+     if (model.GetShouldAnimateChipIn()) {
+       AnimateIn(/*string_id=*/std::nullopt);
+@@ -219,6 +240,18 @@ void PageActionView::OnThemeChanged() {
+   UpdateIconImage();
+ }
+ 
++void PageActionView::UpdateBackground() {
++  IconLabelBubbleView::UpdateBackground();
++  if (text_only_) {
++    if (GetBackground()) {
++      SetBackground(views::CreateRoundedRectBackground(
++          GetBackgroundColor(), GetCornerRadii(), gfx::Insets::VH(2, 0)));
++    }
++    ConfigureInkDropForRefresh2023(this, kColorOmniboxIconPressed,
++                                   kColorOmniboxIconPressed);
++  }
++}
++
+ void PageActionView::OnTouchUiChanged() {
+   IconLabelBubbleView::OnTouchUiChanged();
+   UpdateIconImage();
+@@ -242,7 +275,7 @@ void PageActionView::UpdateBorder() {
+ }
+ 
+ bool PageActionView::ShouldShowLabel() const {
+-  return false;
++  return text_only_ && IconLabelBubbleView::ShouldShowLabel();
+ }
+ 
+ bool PageActionView::ShouldShowSeparator() const {
+@@ -297,7 +330,7 @@ void PageActionView::AnimationEnded(cons
+ }
+ 
+ void PageActionView::UpdateIconImage() {
+-  if (!GetVisible() || observation_.GetSource() == nullptr ||
++  if (text_only_ || !GetVisible() || observation_.GetSource() == nullptr ||
+       observation_.GetSource()->GetImage().IsEmpty()) {
+     return;
+   }
+@@ -375,6 +408,10 @@ void PageActionView::SetModel(PageAction
+ }
+ 
+ gfx::Size PageActionView::GetMinimumSize() const {
++  if (text_only_) {
++    return gfx::Size();
++  }
++
+   gfx::Size icon_preferred_size = image_container_view()->GetPreferredSize();
+   if (observation_.IsObserving() &&
+       !observation_.GetSource()->GetImage().IsVectorIcon()) {
+--- a/chrome/browser/ui/views/page_action/page_action_view.h
++++ b/chrome/browser/ui/views/page_action/page_action_view.h
+@@ -44,7 +44,8 @@ class PageActionView : public IconLabelB
+   PageActionView(actions::ActionItem* action_item,
+ 
+                  const PageActionViewParams& params,
+-                 ui::ElementIdentifier element_identifier);
++                 ui::ElementIdentifier element_identifier,
++                 bool text_only = false);
+   PageActionView(const PageActionView&) = delete;
+   PageActionView& operator=(const PageActionView&) = delete;
+   ~PageActionView() override;
+@@ -100,6 +101,7 @@ class PageActionView : public IconLabelB
+   void ViewHierarchyChanged(
+       const views::ViewHierarchyChangedDetails& details) override;
+   void OnThemeChanged() override;
++  void UpdateBackground() override;
+   void OnTouchUiChanged() override;
+   void UpdateBorder() override;
+   bool ShouldShowLabel() const override;
+@@ -163,6 +165,7 @@ class PageActionView : public IconLabelB
+ 
+   const int icon_size_;
+   const gfx::Insets icon_insets_;
++  const bool text_only_ = false;
+ 
+   // Subscription to changes in label visibility, used for updating properties
+   // dependent on label visibility and notifying others of chip state changes.
+--- a/chrome/browser/ui/views/page_action/page_action_container_view.cc
++++ b/chrome/browser/ui/views/page_action/page_action_container_view.cc
+@@ -52,7 +52,8 @@ PageActionContainerView::PageActionConta
+     }
+ 
+     PageActionView* view = AddChildView(std::make_unique<PageActionView>(
+-        action_item, params, properties.element_identifier));
++        action_item, params, properties.element_identifier,
++        /*text_only=*/properties.type == PageActionIconType::kZoom));
+ 
+     page_action_views_[action_item_id] = view;
+     chip_state_changed_callbacks_.push_back(
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -295,6 +295,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kShiftRightClickContextMenu] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kShowZoomIndicator] =
++      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumRoundedFrame] =
+       settings_api::PrefType::kBoolean;
+ 
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -274,6 +274,9 @@
+     <message name="IDS_SETTINGS_SHIFT_RIGHT_CLICK_CONTEXT_MENU" desc="Label for the checkbox which makes Shift+right click show the browser context menu even when a page blocks it.">
+       Force context menu with Shift+Right Click
+     </message>
++    <message name="IDS_SETTINGS_SHOW_ZOOM_INDICATOR" desc="Label for the checkbox which shows the current page zoom percentage in the address bar.">
++      Show the zoom indicator in the address bar
++    </message>
+     <message name="IDS_SETTINGS_ROUNDED_FRAME" desc="Label for the toggle which enables or disables a rounded frame around web contents.">
+       Show a rounded frame around web contents
+     </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -570,6 +570,7 @@ void AddAppearanceStrings(content::WebUI
+       {"minimalLocationBar", IDS_SETTINGS_MINIMAL_LOCATION_BAR},
+       {"shiftRightClickContextMenu",
+        IDS_SETTINGS_SHIFT_RIGHT_CLICK_CONTEXT_MENU},
++      {"showZoomIndicator", IDS_SETTINGS_SHOW_ZOOM_INDICATOR},
+       {"showHomeButton", IDS_SETTINGS_SHOW_HOME_BUTTON},
+       {"showBookmarksBar", IDS_SETTINGS_SHOW_BOOKMARKS_BAR},
+       {"bookmarksBar", IDS_SETTINGS_BOOKMARKS_BAR},
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html
+@@ -327,6 +327,13 @@
+             </template>
+           </select>
+         </div>
++        <div class="list-frame indented-toggles"
++            hidden="[[!pageVisibility.pageZoom]]">
++          <settings-toggle-button id="showZoomIndicator"
++              pref="{{prefs.helium.browser.show_zoom_indicator}}"
++              label="$i18n{showZoomIndicator}">
++          </settings-toggle-button>
++        </div>
+ <if expr="is_macosx">
+         <settings-toggle-button class="hr"
+             pref="{{prefs.webkit.webprefs.tabs_to_links}}"
