@@ -70,7 +70,7 @@
            Send Feedback
 --- /dev/null
 +++ b/chrome/browser/ui/startup/helium_crash_dialog_controller.cc
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,163 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -87,18 +87,13 @@
 +#include "base/i18n/message_formatter.h"
 +#include "base/no_destructor.h"
 +#include "chrome/app/vector_icons/vector_icons.h"
-+#include "chrome/browser/browser_process.h"
 +#include "chrome/browser/crash_upload_list/helium_crash_reporting.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/dialogs/browser_dialogs.h"
-+#include "chrome/common/pref_names.h"
 +#include "chrome/grit/generated_resources.h"
 +#include "components/crash/core/app/crashpad.h"
-+#include "components/prefs/pref_service.h"
 +#include "components/strings/grit/components_strings.h"
-+#include "third_party/crashpad/crashpad/client/crash_report_database.h"
-+#include "third_party/crashpad/crashpad/util/misc/uuid.h"
 +#include "ui/base/l10n/l10n_util.h"
 +#include "ui/base/mojom/dialog_button.mojom.h"
 +#include "ui/base/models/dialog_model.h"
@@ -110,18 +105,14 @@
 +
 +constexpr int kCrashDialogIconSize = 32;
 +
-+std::set<crashpad::UUID>& ReservedReportIds() {
-+  static base::NoDestructor<std::set<crashpad::UUID>> reports;
++std::set<std::string>& ReservedReportIds() {
++  static base::NoDestructor<std::set<std::string>> reports;
 +  return *reports;
-+}
-+
-+crashpad::CrashReportDatabase* GetDatabase() {
-+  return crash_reporter::internal::GetCrashReportDatabase();
 +}
 +
 +class HeliumCrashDialogDelegate : public ui::DialogModelDelegate {
 + public:
-+  explicit HeliumCrashDialogDelegate(std::vector<crashpad::UUID> report_ids)
++  explicit HeliumCrashDialogDelegate(std::vector<std::string> report_ids)
 +      : report_ids_(std::move(report_ids)) {}
 +
 +  HeliumCrashDialogDelegate(const HeliumCrashDialogDelegate&) = delete;
@@ -146,23 +137,18 @@
 +    }
 +    resolved_ = true;
 +
-+    const bool can_upload =
-+        upload && !crash_reporter::UploadsDisabledByPolicy();
-+    crashpad::CrashReportDatabase* database = GetDatabase();
-+    for (const crashpad::UUID& report_id : report_ids_) {
++    const bool can_upload = upload && !helium::UploadsDisabledByPolicy();
++    for (const std::string& report_id : report_ids_) {
 +      ReservedReportIds().erase(report_id);
-+      if (!database) {
-+        continue;
-+      }
 +      if (can_upload) {
-+        database->RequestUpload(report_id);
++        crash_reporter::RequestSingleCrashUpload(report_id);
 +      } else {
-+        database->DeleteReport(report_id);
++        crash_reporter::DeleteCrashReport(report_id);
 +      }
 +    }
 +  }
 +
-+  const std::vector<crashpad::UUID> report_ids_;
++  const std::vector<std::string> report_ids_;
 +  bool resolved_ = false;
 +};
 +
@@ -173,7 +159,7 @@
 +}
 +
 +std::unique_ptr<ui::DialogModel> BuildCrashDialog(
-+    std::vector<crashpad::UUID> report_ids) {
++    std::vector<std::string> report_ids) {
 +  const size_t report_count = report_ids.size();
 +  auto delegate =
 +      std::make_unique<HeliumCrashDialogDelegate>(std::move(report_ids));
@@ -226,30 +212,20 @@
 +    return;
 +  }
 +
-+  PrefService* local_state = g_browser_process->local_state();
-+  if (!local_state) {
-+    return;
-+  }
-+
-+  if (crash_reporter::UploadsDisabledByPolicy() ||
++  if (helium::UploadsDisabledByPolicy() ||
 +      helium::GetCrashReportingMode() != helium::CrashReportingMode::kAsk) {
 +    return;
 +  }
 +
-+  crashpad::CrashReportDatabase* database = GetDatabase();
-+  std::vector<crashpad::CrashReportDatabase::Report> reports;
-+  if (!database ||
-+      database->GetPendingReports(&reports) !=
-+          crashpad::CrashReportDatabase::kNoError) {
-+    return;
-+  }
-+  std::vector<crashpad::UUID> report_ids;
++  std::vector<crash_reporter::Report> reports;
++  crash_reporter::GetReports(&reports);
++  std::vector<std::string> report_ids;
 +  for (const auto& report : reports) {
-+    if (report.upload_explicitly_requested ||
-+        !ReservedReportIds().insert(report.uuid).second) {
++    if (report.state != crash_reporter::ReportUploadState::Pending ||
++        !ReservedReportIds().insert(report.local_id).second) {
 +      continue;
 +    }
-+    report_ids.push_back(report.uuid);
++    report_ids.emplace_back(report.local_id);
 +  }
 +  if (report_ids.empty()) {
 +    return;
@@ -283,11 +259,13 @@
  #include "chrome/browser/ui/startup/obsolete_system_infobar_delegate.h"
  #include "chrome/browser/ui/startup/oscryptasync_availability_infobar_delegate.h"
  #include "chrome/browser/ui/startup/startup_browser_creator.h"
-@@ -164,6 +165,8 @@ void AddInfoBarsIfNecessary(BrowserWindo
+@@ -164,6 +165,10 @@ void AddInfoBarsIfNecessary(BrowserWindo
      return;
    }
  
-+  MaybeShowHeliumCrashDialog(browser);
++  if (is_post_crash_launch) {
++    MaybeShowHeliumCrashDialog(browser);
++  }
 +
    // The below info bars are only added to the first profile which is
    // launched. Other profiles might be restoring the browsing sessions

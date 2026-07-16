@@ -62,25 +62,29 @@
  #include "build/branding_buildflags.h"
  #include "build/build_config.h"
  
-@@ -27,6 +28,8 @@ CrashReporterClient* g_client = nullptr;
+@@ -27,6 +28,10 @@ CrashReporterClient* g_client = nullptr;
  const char kDefaultUploadURL[] = "https://clients2.google.com/cr/report";
  #endif
  
++#if !BUILDFLAG(IS_WIN)
 +constexpr char kCrashServerUrlCommandLine[] = "custom-crash-server-url";
++#endif
 +
  }  // namespace
  
  ProductInfo::ProductInfo() = default;
-@@ -146,8 +149,13 @@ void CrashReporterClient::GetSanitizatio
+@@ -146,8 +151,15 @@ void CrashReporterClient::GetSanitizatio
  #endif
  
  std::string CrashReporterClient::GetUploadUrl() {
 -#if BUILDFLAG(GOOGLE_CHROME_BRANDING) && defined(OFFICIAL_BUILD)
 -  return kDefaultUploadURL;
++#if !BUILDFLAG(IS_WIN)
 +  const auto* command_line = base::CommandLine::ForCurrentProcess();
 +  if (command_line->HasSwitch(kCrashServerUrlCommandLine)) {
 +    return command_line->GetSwitchValueASCII(kCrashServerUrlCommandLine);
 +  }
++#endif
 +
 +#if defined(OFFICIAL_BUILD)
 +  return "https://crash.helium.computer/crash";
@@ -124,24 +128,75 @@
 +
 +}  // namespace
 +
-+void SetUploadConsent(bool) {}
-+
-+void SetUploadConsentFromUser(bool consent) {
-+  ApplyUploadConsent(consent);
++void SetUploadConsent(bool) {
++  // Helium manages crash upload consent through SetUploadConsentFromUser(),
++  // this function is stubbed out and the callers are ignored.
  }
  
-+bool UploadsDisabledByPolicy() {
-+  bool policy_enabled = true;
-+  return GetCrashReporterClient()->ReportingIsEnforcedByPolicy(
-+             &policy_enabled) &&
-+         !policy_enabled;
++void SetUploadConsentFromUser(bool consent) {
++#if BUILDFLAG(IS_WIN)
++  SetUploadConsentFromUser_ExportThunk(consent);
++#else
++  internal::SetUploadConsentFromUserImpl(consent);
++#endif
 +}
  #endif  // !BUILDFLAG(IS_CHROMEOS)
  
  #if !BUILDFLAG(IS_ANDROID)
+@@ -358,6 +369,14 @@ void RequestSingleCrashUpload(const std:
+ #endif
+ }
+ 
++bool DeleteCrashReport(const std::string& local_id) {
++#if BUILDFLAG(IS_WIN)
++  return DeleteCrashReport_ExportThunk(local_id.c_str());
++#else
++  return DeleteCrashReportImpl(local_id);
++#endif
++}
++
+ std::optional<base::FilePath> GetCrashpadDatabasePath() {
+ #if BUILDFLAG(IS_WIN)
+   base::FilePath::StringType::const_pointer path =
+@@ -448,6 +467,24 @@ void RequestSingleCrashUploadImpl(const
+   g_database->RequestUpload(uuid);
+ }
+ 
++bool DeleteCrashReportImpl(const std::string& local_id) {
++  if (!g_database)
++    return false;
++
++  crashpad::UUID uuid;
++  if (!uuid.InitializeFromString(local_id))
++    return false;
++
++  // Explicit upload requests bypass the global upload toggle. Move the report
++  // out of the pending state first so a deletion failure cannot authorize a
++  // later upload.
++  g_database->SkipReportUpload(
++      uuid, crashpad::Metrics::CrashSkippedReason::kUploadsDisabled);
++  const auto status = g_database->DeleteReport(uuid);
++  return status == crashpad::CrashReportDatabase::kNoError ||
++         status == crashpad::CrashReportDatabase::kReportNotFound;
++}
++
+ base::FilePath::StringType::const_pointer GetCrashpadDatabasePathImpl() {
+   if (!g_database_path)
+     return nullptr;
+@@ -472,6 +509,10 @@ void ClearReportsBetweenImpl(time_t begi
+ 
+ namespace internal {
+ 
++void SetUploadConsentFromUserImpl(bool consent) {
++  ApplyUploadConsent(consent);
++}
++
+ crashpad::CrashReportDatabase* GetCrashReportDatabase() {
+   return g_database;
+ }
 --- a/components/crash/core/app/crashpad.h
 +++ b/components/crash/core/app/crashpad.h
-@@ -139,6 +139,14 @@ void DestroyCrashpadClient();
+@@ -139,6 +139,10 @@ void DestroyCrashpadClient();
  // running.
  void SetUploadConsent(bool consent);
  
@@ -149,13 +204,42 @@
 +// Unlike SetUploadConsent(), this must only be called from Helium-owned UI.
 +void SetUploadConsentFromUser(bool consent);
 +
-+// Returns true only when policy explicitly disables crash reporting. A policy
-+// that enables reporting does not constitute user consent.
-+bool UploadsDisabledByPolicy();
-+
  #endif  // !BUILDFLAG(IS_CHROMEOS)
  
  enum class ReportUploadState {
+@@ -166,6 +170,11 @@ void GetReports(std::vector<Report>* rep
+ // Requests a user triggered upload for a crash report with a given id.
+ void RequestSingleCrashUpload(const std::string& local_id);
+ 
++// Permanently deletes the crash report with the given id. Any explicit upload
++// request is cleared before deletion so a deletion failure cannot leave the
++// report uploadable.
++bool DeleteCrashReport(const std::string& local_id);
++
+ void DumpWithoutCrashing();
+ 
+ #if BUILDFLAG(IS_IOS)
+@@ -224,6 +233,9 @@ void GetReportsImpl(std::vector<Report>*
+ // The implementation function for RequestSingleCrashUpload.
+ void RequestSingleCrashUploadImpl(const std::string& local_id);
+ 
++// The implementation function for DeleteCrashReport.
++bool DeleteCrashReportImpl(const std::string& local_id);
++
+ // The implementation function for GetCrashpadDatabasePath.
+ base::FilePath::StringType::const_pointer GetCrashpadDatabasePathImpl();
+ 
+@@ -291,6 +303,10 @@ bool GetHandlerSocket(int* sock, pid_t*
+ 
+ namespace internal {
+ 
++// Applies explicit Helium user consent in the module that owns the Crashpad
++// database. On Windows this is invoked through chrome_elf.dll.
++void SetUploadConsentFromUserImpl(bool consent);
++
+ #if BUILDFLAG(IS_WIN)
+ // Returns platform specific annotations. This is broken out on Windows only so
+ // that it may be reused by GetCrashKeysForKasko.
 --- a/chrome/browser/crash_upload_list/BUILD.gn
 +++ b/chrome/browser/crash_upload_list/BUILD.gn
 @@ -12,6 +12,8 @@ static_library("crash_upload_list") {
@@ -185,7 +269,7 @@
    if (is_android) {
 --- /dev/null
 +++ b/chrome/browser/crash_upload_list/helium_crash_reporting.cc
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,149 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -203,44 +287,29 @@
 +#include "components/metrics/metrics_pref_names.h"
 +#include "components/prefs/pref_change_registrar.h"
 +#include "components/prefs/pref_service.h"
-+#include "third_party/crashpad/crashpad/client/crash_report_database.h"
 +
 +namespace helium {
 +
 +namespace {
 +
 +void DeletePendingReports(bool include_explicitly_requested) {
-+  crashpad::CrashReportDatabase* database =
-+      crash_reporter::internal::GetCrashReportDatabase();
-+  std::vector<crashpad::CrashReportDatabase::Report> reports;
-+  if (!database ||
-+      database->GetPendingReports(&reports) !=
-+          crashpad::CrashReportDatabase::kNoError) {
-+    return;
-+  }
++  std::vector<crash_reporter::Report> reports;
++  crash_reporter::GetReports(&reports);
 +
 +  for (const auto& report : reports) {
-+    if (!include_explicitly_requested && report.upload_explicitly_requested) {
++    if (report.state != crash_reporter::ReportUploadState::Pending &&
++        report.state !=
++            crash_reporter::ReportUploadState::Pending_UserRequested) {
++      continue;
++    }
++    if (!include_explicitly_requested &&
++        report.state ==
++            crash_reporter::ReportUploadState::Pending_UserRequested) {
 +      continue;
 +    }
 +
-+    crashpad::CrashReportDatabase::OperationStatus skip_status =
-+        crashpad::CrashReportDatabase::kNoError;
-+    if (report.upload_explicitly_requested) {
-+      // Explicit requests bypass the global upload toggle. Clear that state
-+      // before deletion so a deletion failure cannot leave the report
-+      // uploadable while policy forbids reporting.
-+      skip_status = database->SkipReportUpload(
-+          report.uuid,
-+          crashpad::Metrics::CrashSkippedReason::kUploadsDisabled);
-+    }
-+
-+    const auto delete_status = database->DeleteReport(report.uuid);
-+    if (delete_status != crashpad::CrashReportDatabase::kNoError &&
-+        delete_status != crashpad::CrashReportDatabase::kReportNotFound) {
-+      LOG(ERROR) << "Failed to delete crash report: " << report.uuid.ToString()
-+                 << " (delete status " << static_cast<int>(delete_status)
-+                 << ", skip status " << static_cast<int>(skip_status) << ")";
++    if (!crash_reporter::DeleteCrashReport(report.local_id)) {
++      LOG(ERROR) << "Failed to delete crash report: " << report.local_id;
 +    }
 +  }
 +}
@@ -256,6 +325,18 @@
 +  CHECK(IsValidCrashReportingMode(value));
 +
 +  return static_cast<CrashReportingMode>(value);
++}
++
++bool UploadsDisabledByPolicy() {
++  PrefService* local_state = g_browser_process->local_state();
++  if (!local_state) {
++    return false;
++  }
++
++  const PrefService::Preference* preference =
++      local_state->FindPreference(metrics::prefs::kMetricsReportingEnabled);
++  return preference && preference->IsManaged() &&
++         !local_state->GetBoolean(metrics::prefs::kMetricsReportingEnabled);
 +}
 +
 +void InitializeCrashReportingMode() {
@@ -285,7 +366,7 @@
 +
 +  crash_reporter::SetUploadConsentFromUser(false);
 +
-+  if (crash_reporter::UploadsDisabledByPolicy()) {
++  if (UploadsDisabledByPolicy()) {
 +    // Policy overrides the stored mode without changing the user's selection.
 +    // Explicit requests bypass Crashpad's global upload toggle, so discard
 +    // those reports as well while reporting is forbidden by policy.
@@ -320,8 +401,7 @@
 +  // preserved unless reporting is disabled by the user or policy.
 +  crash_reporter::SetUploadConsentFromUser(false);
 +
-+  const bool uploads_disabled_by_policy =
-+      crash_reporter::UploadsDisabledByPolicy();
++  const bool uploads_disabled_by_policy = UploadsDisabledByPolicy();
 +  DeletePendingReports(
 +      /*include_explicitly_requested=*/
 +      uploads_disabled_by_policy || mode == CrashReportingMode::kDisabled);
@@ -341,7 +421,7 @@
 +}  // namespace helium
 --- /dev/null
 +++ b/chrome/browser/crash_upload_list/helium_crash_reporting.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,39 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -364,6 +444,10 @@
 +
 +CrashReportingMode GetCrashReportingMode();
 +
++// Returns true only when policy explicitly disables crash reporting. A policy
++// that enables reporting does not constitute user consent.
++bool UploadsDisabledByPolicy();
++
 +// Applies the stored mode at startup and discards all pending reports when
 +// reporting is disabled by the user or policy.
 +void InitializeCrashReportingMode();
@@ -377,3 +461,140 @@
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_CRASH_UPLOAD_LIST_HELIUM_CRASH_REPORTING_H_
+--- a/chrome/chrome_elf/chrome_elf.def
++++ b/chrome/chrome_elf/chrome_elf.def
+@@ -9,10 +9,12 @@ EXPORTS
+   DumpHungProcessWithPtype_ExportThunk
+   GetCrashpadDatabasePath_ExportThunk
+   ClearReportsBetween_ExportThunk
++  DeleteCrashReport_ExportThunk
+   GetCrashReports_ExportThunk
+   InjectDumpForHungInput_ExportThunk
+   RequestSingleCrashUpload_ExportThunk
+   SetUploadConsent_ExportThunk
++  SetUploadConsentFromUser_ExportThunk
+   GetUploadConsent_ExportThunk
+   GetProductInfo_ExportThunk
+ 
+--- a/components/crash/core/app/crash_export_stubs.cc
++++ b/components/crash/core/app/crash_export_stubs.cc
+@@ -15,6 +15,10 @@
+ 
+ void RequestSingleCrashUpload_ExportThunk(const char* local_id) {}
+ 
++bool DeleteCrashReport_ExportThunk(const char* local_id) {
++  return false;
++}
++
+ size_t GetCrashReports_ExportThunk(crash_reporter::Report* reports,
+                                    size_t reports_size) {
+   return 0;
+@@ -28,6 +32,8 @@ int CrashForException_ExportThunk(EXCEPT
+ 
+ void SetUploadConsent_ExportThunk(bool consent) {}
+ 
++void SetUploadConsentFromUser_ExportThunk(bool consent) {}
++
+ bool GetUploadConsent_ExportThunk() {
+   return crash_reporter::GetCrashReporterClient()->GetCollectStatsConsent();
+ }
+--- a/components/crash/core/app/crash_export_thunks.cc
++++ b/components/crash/core/app/crash_export_thunks.cc
+@@ -20,6 +20,10 @@ void RequestSingleCrashUpload_ExportThun
+   crash_reporter::RequestSingleCrashUploadImpl(local_id);
+ }
+ 
++bool DeleteCrashReport_ExportThunk(const char* local_id) {
++  return crash_reporter::DeleteCrashReportImpl(local_id);
++}
++
+ size_t GetCrashReports_ExportThunk(crash_reporter::Report* reports,
+                                    size_t reports_size) {
+   static_assert(std::is_trivially_copyable<crash_reporter::Report>::value,
+@@ -56,6 +60,10 @@ void SetUploadConsent_ExportThunk(bool c
+   crash_reporter::SetUploadConsent(consent);
+ }
+ 
++void SetUploadConsentFromUser_ExportThunk(bool consent) {
++  crash_reporter::internal::SetUploadConsentFromUserImpl(consent);
++}
++
+ bool GetUploadConsent_ExportThunk() {
+   return crash_reporter::GetCrashReporterClient()->GetCollectStatsConsent();
+ }
+--- a/components/crash/core/app/crash_export_thunks.h
++++ b/components/crash/core/app/crash_export_thunks.h
+@@ -29,6 +29,10 @@ extern "C" {
+ // crash report upload. See CrashUploadListCrashpad.
+ void RequestSingleCrashUpload_ExportThunk(const char* local_id);
+ 
++// This function may be invoked across module boundaries to permanently delete
++// a single crash report. See crash_reporter::DeleteCrashReport.
++bool DeleteCrashReport_ExportThunk(const char* local_id);
++
+ // This function may be invoked across module boundaries to retrieve the crash
+ // list. It copies up to |report_count| reports into |reports| and returns the
+ // number of reports available. If the return value is less than or equal to
+@@ -53,6 +57,10 @@ int CrashForException_ExportThunk(EXCEPT
+ // not enforced to avoid blocking startup code on synchronizing them.
+ void SetUploadConsent_ExportThunk(bool consent);
+ 
++// This function may be invoked across module boundaries to update upload
++// consent granted explicitly through Helium's crash reporting UI.
++void SetUploadConsentFromUser_ExportThunk(bool consent);
++
+ // Returns the current upload consent state.
+ // This function is used by JS Error reporting which lives in chrome.dll.
+ bool GetUploadConsent_ExportThunk();
+--- a/chrome/app/chrome_crash_reporter_client_win.cc
++++ b/chrome/app/chrome_crash_reporter_client_win.cc
+@@ -11,6 +11,7 @@
+ #include <assert.h>
+ #include <iterator>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -26,6 +27,13 @@
+ #include "components/crash/core/app/crashpad.h"
+ #include "components/version_info/channel.h"
+ 
++namespace {
++
++constexpr wchar_t kCrashServerUrlCommandLine[] =
++    L"custom-crash-server-url";
++
++}  // namespace
++
+ ChromeCrashReporterClient::ChromeCrashReporterClient() = default;
+ 
+ ChromeCrashReporterClient::~ChromeCrashReporterClient() = default;
+@@ -96,6 +104,17 @@ void ChromeCrashReporterClient::GetProdu
+   product_info->channel = base::WideToUTF8(channel_name);
+ }
+ 
++std::string ChromeCrashReporterClient::GetUploadUrl() {
++  std::optional<std::wstring> upload_url =
++      install_static::GetCommandLineSwitch(::GetCommandLine(),
++                                           kCrashServerUrlCommandLine);
++  if (upload_url.has_value()) {
++    return base::WideToUTF8(*upload_url);
++  }
++
++  return CrashReporterClient::GetUploadUrl();
++}
++
+ bool ChromeCrashReporterClient::GetShouldDumpLargerDumps() {
+   // Capture larger dumps for Google Chrome beta, dev, and canary channels, and
+   // Chromium builds. The Google Chrome stable channel uses smaller dumps.
+--- a/chrome/app/chrome_crash_reporter_client_win.h
++++ b/chrome/app/chrome_crash_reporter_client_win.h
+@@ -30,6 +30,7 @@ class ChromeCrashReporterClient : public
+                                 std::wstring* special_build,
+                                 std::wstring* channel_name) override;
+   void GetProductInfo(ProductInfo* product_info) override;
++  std::string GetUploadUrl() override;
+   bool GetShouldDumpLargerDumps() override;
+ 
+   bool GetCrashDumpLocation(std::wstring* crash_dir) override;
