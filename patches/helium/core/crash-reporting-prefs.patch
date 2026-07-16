@@ -71,16 +71,18 @@
  }  // namespace
  
  ProductInfo::ProductInfo() = default;
-@@ -146,8 +149,13 @@ void CrashReporterClient::GetSanitizatio
+@@ -146,8 +149,15 @@ void CrashReporterClient::GetSanitizatio
  #endif
  
  std::string CrashReporterClient::GetUploadUrl() {
 -#if BUILDFLAG(GOOGLE_CHROME_BRANDING) && defined(OFFICIAL_BUILD)
 -  return kDefaultUploadURL;
++#if !BUILDFLAG(IS_WIN)
 +  const auto* command_line = base::CommandLine::ForCurrentProcess();
 +  if (command_line->HasSwitch(kCrashServerUrlCommandLine)) {
 +    return command_line->GetSwitchValueASCII(kCrashServerUrlCommandLine);
 +  }
++#endif
 +
 +#if defined(OFFICIAL_BUILD)
 +  return "https://crash.helium.computer/crash";
@@ -185,7 +187,7 @@
    if (is_android) {
 --- /dev/null
 +++ b/chrome/browser/crash_upload_list/helium_crash_reporting.cc
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,164 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -199,6 +201,7 @@
 +#include "base/no_destructor.h"
 +#include "chrome/browser/browser_process.h"
 +#include "chrome/common/pref_names.h"
++#include "chrome/install_static/install_util.h"
 +#include "components/crash/core/app/crashpad.h"
 +#include "components/metrics/metrics_pref_names.h"
 +#include "components/prefs/pref_change_registrar.h"
@@ -285,7 +288,7 @@
 +
 +  crash_reporter::SetUploadConsentFromUser(false);
 +
-+  if (crash_reporter::UploadsDisabledByPolicy()) {
++  if (helium::UploadsDisabledByPolicy()) {
 +    // Policy overrides the stored mode without changing the user's selection.
 +    // Explicit requests bypass Crashpad's global upload toggle, so discard
 +    // those reports as well while reporting is forbidden by policy.
@@ -320,8 +323,7 @@
 +  // preserved unless reporting is disabled by the user or policy.
 +  crash_reporter::SetUploadConsentFromUser(false);
 +
-+  const bool uploads_disabled_by_policy =
-+      crash_reporter::UploadsDisabledByPolicy();
++  const bool uploads_disabled_by_policy = helium::UploadsDisabledByPolicy();
 +  DeletePendingReports(
 +      /*include_explicitly_requested=*/
 +      uploads_disabled_by_policy || mode == CrashReportingMode::kDisabled);
@@ -338,10 +340,21 @@
 +  }
 +}
 +
++bool UploadsDisabledByPolicy() {
++#if BUILDFLAG(IS_WIN)
++  bool reporting_enabled = true;
++  return install_static::ReportingIsEnforcedByPolicy(
++             &reporting_enabled) &&
++         !reporting_enabled;
++#else
++  return crash_reporter::UploadsDisabledByPolicy();
++#endif
++}
++
 +}  // namespace helium
 --- /dev/null
 +++ b/chrome/browser/crash_upload_list/helium_crash_reporting.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,39 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -374,6 +387,42 @@
 +// If policy disables crash reporting, the stored mode is preserved.
 +void SetCrashReportingMode(CrashReportingMode mode);
 +
++// Returns whether crash report uploads are disabled by enterprise policy,
++// using the platform-appropriate policy source.
++bool UploadsDisabledByPolicy();
++
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_CRASH_UPLOAD_LIST_HELIUM_CRASH_REPORTING_H_
+--- a/chrome/app/chrome_crash_reporter_client_win.cc
++++ b/chrome/app/chrome_crash_reporter_client_win.cc
+@@ -149,6 +149,18 @@ bool ChromeCrashReporterClient::GetColle
+   return install_static::GetCollectStatsInSample();
+ }
+ 
++std::string ChromeCrashReporterClient::GetUploadUrl() {
++  const std::optional<std::wstring> custom_url =
++      install_static::GetCommandLineSwitch(
++          ::GetCommandLineW(), L"custom-crash-server-url");
++
++  if (custom_url.has_value()) {
++    return install_static::WideToUTF8(*custom_url);
++  }
++
++  return crash_reporter::CrashReporterClient::GetUploadUrl();
++}
++
+ bool ChromeCrashReporterClient::ShouldMonitorCrashHandlerExpensively() {
+   // The expensive mechanism dedicates a process to be crashpad_handler's own
+   // crashpad_handler. In Google Chrome, scale back on this in the more stable
+--- a/chrome/app/chrome_crash_reporter_client_win.h
++++ b/chrome/app/chrome_crash_reporter_client_win.h
+@@ -43,6 +43,8 @@ class ChromeCrashReporterClient : public
+ 
+   bool ReportingIsEnforcedByPolicy(bool* breakpad_enabled) override;
+ 
++  std::string GetUploadUrl() override;
++
+   bool ShouldMonitorCrashHandlerExpensively() override;
+ 
+   bool EnableBreakpadForProcess(const std::string& process_type) override;
