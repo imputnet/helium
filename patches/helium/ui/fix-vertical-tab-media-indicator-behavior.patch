@@ -1,0 +1,288 @@
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -314,9 +314,42 @@
+ 
+ void VerticalTabView::Layout(PassKey) {
+   LayoutSuperclass<views::View>(this);
++
++  UpdateMediaBadgeAppearance();
+   alert_indicator_->UpdateAlertIndicatorAnimation();
+ }
+ 
++void VerticalTabView::UpdateMediaBadgeAppearance(bool force) {
++  // Keep large unpinned tabs untouched. Pinned and compact tabs use the
++  // circular media badge to keep the mute target distinct from the favicon.
++  const bool show_media_badge_background =
++      (pinned_ || (collapsed_ && !IsInExpandOnHover(width())) ||
++       width() < UncollapsedMinWidth()) &&
++      IsChildVisible(alert_indicator_, width());
++  if (force || show_media_badge_background !=
++      compact_media_badge_background_visible_) {
++    compact_media_badge_background_visible_ =
++        show_media_badge_background;
++    const SkColor media_badge_background =
++        GetColorProvider()
++            ? (color_utils::IsDark(
++                   GetColorProvider()->GetColor(kColorToolbar))
++                   ? SkColorSetRGB(0x1E, 0x1E, 0x20)
++                   : SkColorSetRGB(0xE4, 0xE4, 0xE7))
++            : gfx::kPlaceholderColor;
++    alert_indicator_->SetBackground(
++        show_media_badge_background
++            ? views::CreateRoundedRectBackground(
++                  media_badge_background,
++                  kIconDesignWidth / 2.0f)
++            : nullptr);
++  }
++  alert_indicator_->SetIconColorOverride(
++      show_media_badge_background
++          ? std::optional(kColorToolbarButtonIconDefault)
++          : std::nullopt);
++}
++
+ bool VerticalTabView::OnKeyPressed(const ui::KeyEvent& event) {
+   CHECK(collection_node_);
+ 
+@@ -370,6 +403,8 @@
+ bool VerticalTabView::OnMousePressed(const ui::MouseEvent& event) {
+   CHECK(collection_node_);
+ 
++  suppress_tab_selection_on_mouse_release_ = false;
++
+   auto* controller = collection_node_->GetController();
+   shift_pressed_on_mouse_down_ = event.IsShiftDown();
+   RecordMousePressedInTab();
+@@ -414,13 +449,16 @@
+     }
+   } else if (event.IsOnlyLeftMouseButton() &&
+              !(event.IsShiftDown() || shift_pressed_on_mouse_down_) &&
+-             !IsSelectionModifierDown(event)) {
++             !IsSelectionModifierDown(event) &&
++             !suppress_tab_selection_on_mouse_release_ &&
++             !alert_indicator_->bounds().Contains(event.location())) {
+     controller->SelectTab(GetTabInterface(), GetGestureDetail(event));
+   }
+   // Cancel the initialized drag (noop if not started). This is considered
+   // a cancel because the drag handler assumes mouse capture when the drag
+   // loop starts.
+   controller->GetDragHandler().EndDrag(EndDragReason::kCancel);
++  suppress_tab_selection_on_mouse_release_ = false;
+   if (!self) {
+     return;
+   }
+@@ -727,6 +765,7 @@
+   views::View::OnThemeChanged();
+   UpdateThemeColors();
+   UpdateColors();
++  UpdateMediaBadgeAppearance(/*force=*/true);
+ }
+ 
+ gfx::Rect VerticalTabView::GetChildBounds(const gfx::Rect& container,
+@@ -768,8 +807,9 @@
+ bool VerticalTabView::IsChildVisible(const views::View* child_view,
+                                      const int width) const {
+   const bool use_compact_media_badge =
+-      (collapsed_ && !IsInExpandOnHover(width)) ||
+-      width < UncollapsedMinWidth();
++      (pinned_ || (collapsed_ && !IsInExpandOnHover(width)) ||
++       width < UncollapsedMinWidth()) &&
++      alert_indicator_->showing_alert_state().has_value();
+ 
+   if (child_view == title_) {
+     // Pinned titles should be visible in the expand on hover state when the
+@@ -844,10 +884,10 @@
+   gfx::Rect bounds_remaining = gfx::Rect(0, 0, width, height);
+   bounds_remaining.Inset(gfx::Insets::VH(0, kHorizontalInset));
+ 
+-  // Preserve the standard layout. Only narrow media tabs opt into the layered
+-  // favicon treatment.
++  // Large unpinned tabs retain the standard layout. Pinned and compact media
++  // tabs layer the favicon and media indicator.
+   const bool use_compact_media_badge =
+-      ((collapsed_ && !IsInExpandOnHover(width)) ||
++      (pinned_ || (collapsed_ && !IsInExpandOnHover(width)) ||
+        width < UncollapsedMinWidth()) &&
+       IsChildVisible(alert_indicator_, width);
+   const bool is_centered =
+@@ -869,15 +909,14 @@
+         // Keep the favicon centered and layer the native-size media glyph over
+         // its upper-right quadrant. Clamp it inside the rounded tab bounds so
+         // neither the glyph nor its click target is clipped.
+-        constexpr int kCompactAlertIndicatorSize = kIconDesignWidth;
+         constexpr int kCompactAlertIndicatorInset = 2;
+         child_bounds = gfx::Rect(
+             std::min(width / 2 - 1,
+-                     width - kCompactAlertIndicatorSize -
++                     width - kIconDesignWidth -
+                          kCompactAlertIndicatorInset),
+             std::max(kCompactAlertIndicatorInset,
+-                     height / 2 - kCompactAlertIndicatorSize),
+-            kCompactAlertIndicatorSize, kCompactAlertIndicatorSize);
++                     height / 2 - kIconDesignWidth),
++            kIconDesignWidth, kIconDesignWidth);
+       }
+       layouts.child_layouts.emplace_back(
+           child.view.get(), is_child_visible, child_bounds);
+@@ -910,8 +949,12 @@
+ }
+ 
+ bool VerticalTabView::ShouldEnableMuteToggle(int required_width) {
+-  if (collapsed_) {
+-    return alert_indicator_->GetVisible();
++  const bool use_compact_media_badge =
++      (pinned_ || (collapsed_ && !IsInExpandOnHover(width())) ||
++       width() < UncollapsedMinWidth()) &&
++      IsChildVisible(alert_indicator_, width());
++  if (use_compact_media_badge) {
++    return true;
+   }
+ 
+   if (active_) {
+@@ -939,6 +982,10 @@
+                    /*extension_id=*/std::string());
+ }
+ 
++void VerticalTabView::OnMuteToggleButtonPressed() {
++  suppress_tab_selection_on_mouse_release_ = true;
++}
++
+ bool VerticalTabView::IsApparentlyActive() const {
+   if (active_) {
+     return true;
+@@ -1103,8 +1150,7 @@
+   // Keep an audio-muted badge available for compact and pinned tabs so its
+   // click target remains available until the tab is unmuted.
+   std::optional<tabs::TabAlert> alert_state = tab_data_.alert_state;
+-  if (!alert_state && (collapsed_ || pinned_) &&
+-      tab->GetContents()->IsAudioMuted()) {
++  if (!alert_state && tab->GetContents()->IsAudioMuted()) {
+     alert_state = tabs::TabAlert::kAudioMuting;
+   }
+   alert_indicator_->TransitionToAlertState(alert_state);
+Index: src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
++++ src/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
+@@ -161,6 +161,7 @@
+   // AlertIndicatorButton::Delegate
+   bool ShouldEnableMuteToggle(int required_width) override;
+   void ToggleTabAudioMute() override;
++  void OnMuteToggleButtonPressed() override;
+   bool IsApparentlyActive() const override;
+   void AlertStateChanged() override;
+ 
+@@ -186,6 +187,7 @@
+   void UpdateBorder();
+   void UpdateThemeColors();
+   void UpdateColors();
++  void UpdateMediaBadgeAppearance(bool force = false);
+   void UpdateContrastRatioValues();
+ 
+   void CloseButtonPressed(const ui::Event& event);
+@@ -240,7 +242,9 @@
+   bool split_ = false;
+   bool collapsed_ = false;
+   bool pinned_ = false;
++  bool compact_media_badge_background_visible_ = false;
+   bool shift_pressed_on_mouse_down_ = false;
++  bool suppress_tab_selection_on_mouse_release_ = false;
+ 
+   std::unique_ptr<GlowHoverController> hover_controller_;
+   float hover_opacity_min_;
+Index: src/chrome/browser/ui/views/tabs/tab/alert_indicator_button.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab/alert_indicator_button.cc
++++ src/chrome/browser/ui/views/tabs/tab/alert_indicator_button.cc
+@@ -281,6 +281,18 @@
+   }
+ }
+ 
++void AlertIndicatorButton::SetIconColorOverride(
++    std::optional<ui::ColorId> color) {
++  if (icon_color_override_ == color) {
++    return;
++  }
++
++  icon_color_override_ = color;
++  if (alert_state_.has_value()) {
++    UpdateIconForAlertState(alert_state_.value());
++  }
++}
++
+ views::View* AlertIndicatorButton::GetTooltipHandlerForPoint(
+     const gfx::Point& point) {
+   return nullptr;  // Tab (the parent View) provides the tooltip.
+@@ -359,6 +371,10 @@
+ void AlertIndicatorButton::OnThemeChanged() {
+   ImageButton::OnThemeChanged();
+ 
++  if (alert_state_.has_value()) {
++    UpdateIconForAlertState(alert_state_.value());
++  }
++
+   if (!actor_indicator_spinner_ ||
+       !base::FeatureList::IsEnabled(features::kActorUiThemed)) {
+     return;
+@@ -389,6 +405,8 @@
+ }
+ 
+ void AlertIndicatorButton::NotifyClick(const ui::Event& event) {
++  delegate_->OnMuteToggleButtonPressed();
++
+   // Call TransitionToAlertState() to change the image, providing the user with
+   // instant feedback.  In the very unlikely event that the mute toggle fails,
+   // TransitionToAlertState() will be called again, via another code path, to
+@@ -506,10 +524,12 @@
+ 
+ void AlertIndicatorButton::UpdateIconForAlertState(tabs::TabAlert state) {
+   const ui::ColorId color =
+-      GetColorProvider()
+-          ? tabs::GetAlertIndicatorColor(state, delegate_->IsApparentlyActive(),
+-                                         GetWidget()->ShouldPaintAsActive())
+-          : gfx::kPlaceholderColor;
++      icon_color_override_.value_or(
++          GetColorProvider()
++              ? tabs::GetAlertIndicatorColor(
++                    state, delegate_->IsApparentlyActive(),
++                    GetWidget()->ShouldPaintAsActive())
++              : gfx::kPlaceholderColor);
+   const ui::ImageModel indicator_image = tabs::GetAlertImageModel(state, color);
+ 
+   SetImageModel(views::Button::STATE_NORMAL, indicator_image);
+Index: src/chrome/browser/ui/views/tabs/tab/alert_indicator_button.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab/alert_indicator_button.h
++++ src/chrome/browser/ui/views/tabs/tab/alert_indicator_button.h
+@@ -53,6 +53,11 @@
+     // Toggles tab-wide audio muting.
+     virtual void ToggleTabAudioMute() = 0;
+ 
++    // Notifies the parent that this mouse click is handling a mute toggle.
++    // The vertical-tab implementation uses this to avoid treating the same
++    // mouse release as a tab-selection click.
++    virtual void OnMuteToggleButtonPressed() {}
++
+     // Returns whether the tab appears more like the active state than the
+     // inactive state, given the current opacity.
+     virtual bool IsApparentlyActive() const = 0;
+@@ -91,6 +95,10 @@
+   // ResetImages() needs to be called.
+   void OnParentTabButtonColorChanged();
+ 
++  // Overrides the alert icon color. Vertical tabs use this only for their
++  // circular media badge; horizontal tabs leave it unset.
++  void SetIconColorOverride(std::optional<ui::ColorId> color);
++
+   // Sets visibility of animation around alert indicator icon.
+   void UpdateAlertIndicatorAnimation();
+ 
+@@ -167,6 +175,7 @@
+   std::unique_ptr<gfx::AnimationDelegate> fade_animation_delegate_;
+   std::unique_ptr<gfx::Animation> fade_animation_;
+   std::optional<tabs::TabAlert> showing_alert_state_;
++  std::optional<ui::ColorId> icon_color_override_;
+ 
+   // The time when the alert indicator is displayed when a camera and/or a
+   // microphone are captured.
