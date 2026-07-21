@@ -1,0 +1,659 @@
+--- a/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.cc
++++ b/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.cc
+@@ -20,6 +20,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/common/pref_names.h"
++#include "chrome/common/webui_url_constants.h"
+ #include "components/content_settings/core/common/content_settings_types.h"
+ #include "components/content_settings/core/common/features.h"
+ #include "components/page_info/core/about_this_site_service.h"
+@@ -200,6 +201,12 @@ void ChromePageInfoUiDelegate::ShowPriva
+   chrome::ShowPrivacySandboxSettings(browser);
+ }
+ 
++void ChromePageInfoUiDelegate::ShowNoiseSettings() {
++  BrowserWindowInterface* browser =
++      GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(web_contents_);
++  chrome::ShowSettingsSubPage(browser, chrome::kNoiseSubPage);
++}
++
+ std::u16string ChromePageInfoUiDelegate::GetPermissionDetail(
+     ContentSettingsType type) {
+   switch (type) {
+--- a/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.h
++++ b/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.h
+@@ -76,6 +76,9 @@ class ChromePageInfoUiDelegate : public
+   // Opens Privacy Sandbox settings page.
+   void ShowPrivacySandboxSettings();
+ 
++  // Opens Noise settings page.
++  void ShowNoiseSettings();
++
+   // PageInfoUiDelegate implementation
+   bool IsBlockAutoPlayEnabled() override;
+   bool IsMultipleTabsOpen() override;
+--- a/components/page_info/page_info.cc
++++ b/components/page_info/page_info.cc
+@@ -843,6 +843,10 @@ void PageInfo::OnSitePermissionChanged(
+   PresentSitePermissions();
+ }
+ 
++void PageInfo::OnHeliumNoiseSettingChanged() {
++  show_info_bar_ = true;
++}
++
+ void PageInfo::OnSiteChosenObjectDeleted(const ChooserUIInfo& ui_info,
+                                          const base::Value& object) {
+   permissions::ObjectPermissionContextBase* context =
+--- a/components/page_info/page_info.h
++++ b/components/page_info/page_info.h
+@@ -203,6 +203,10 @@ class PageInfo : private content_setting
+                                std::optional<url::Origin> requesting_origin,
+                                bool is_one_time);
+ 
++  // Marks the current page for a reload prompt after its Helium Noise setting
++  // changes. The setting itself is owned by the Chrome-layer Noise helper.
++  void OnHeliumNoiseSettingChanged();
++
+   // This method is called whenever access to an object is revoked.
+   void OnSiteChosenObjectDeleted(const ChooserUIInfo& ui_info,
+                                  const base::Value& object);
+--- a/components/page_info_strings.grdp
++++ b/components/page_info_strings.grdp
+@@ -1015,6 +1015,26 @@
+     Your organization has blocked this site because it violates a policy.
+   </message>
+ 
++  <!-- Helium Noise strings -->
++  <message name="IDS_PAGE_INFO_HELIUM_NOISE_HEADER" desc="The title of the fingerprinting protection row and subpage in Page Info.">
++    Fingerprinting protection
++  </message>
++  <message name="IDS_PAGE_INFO_HELIUM_NOISE_TOOLTIP" desc="Tooltip for the fingerprinting protection row in Page Info.">
++    Manage fingerprinting protection for this site
++  </message>
++  <message name="IDS_PAGE_INFO_HELIUM_NOISE_DESCRIPTION" desc="Explanation of how Helium fingerprinting protection works.">
++    When fingerprinting protection is enabled, Helium adds noise to certain browser features to make it harder for sites to track and profile you.
++  </message>
++  <message name="IDS_PAGE_INFO_HELIUM_NOISE_BREAKAGE" desc="Explanation of how disabling Helium's fingerprinting protection may fix privacy-invasive websites, but will reduce user's privacy.">
++    Turning off the protection will reduce your privacy, but may fix site features that require fingerprinting.
++  </message>
++  <message name="IDS_PAGE_INFO_HELIUM_NOISE_GLOBALLY_DISABLED" desc="Explanation shown when the site toggle is unavailable because fingerprinting protection is disabled globally.">
++    Fingerprinting protection is turned off in Helium settings.
++  </message>
++  <message name="IDS_PAGE_INFO_HELIUM_NOISE_SETTINGS_BUTTON" desc="A button label that opens Helium's global fingerprinting protection settings page.">
++    Manage fingerprinting protection
++  </message>
++
+   <!-- Ad privacy strings -->
+   <message name="IDS_PAGE_INFO_AD_PRIVACY_HEADER" desc="A label that represents the new ad-related settings. 1) Navigate to any site. 2) Click the icon (often a lock) to the left of the URL in the address bar. Information about the page you're viewing appears. The 'Ad privacy' label will appear above the 'Site settings' button.">
+     Ad privacy
+--- /dev/null
++++ b/chrome/browser/ui/views/page_info/page_info_noise_content_view.cc
+@@ -0,0 +1,160 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/page_info/page_info_noise_content_view.h"
++
++#include <memory>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "chrome/browser/helium_noise/helium_noise_settings.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/page_info/chrome_page_info_ui_delegate.h"
++#include "chrome/browser/ui/views/chrome_layout_provider.h"
++#include "chrome/browser/ui/views/controls/rich_controls_container_view.h"
++#include "chrome/browser/ui/views/controls/rich_hover_button.h"
++#include "chrome/browser/ui/views/page_info/page_info_view_factory.h"
++#include "components/page_info/page_info.h"
++#include "components/strings/grit/components_strings.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/button/toggle_button.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/styled_label.h"
++#include "ui/views/layout/box_layout_view.h"
++#include "ui/views/style/typography.h"
++
++PageInfoNoiseContentView::PageInfoNoiseContentView(
++    PageInfo* presenter,
++    ChromePageInfoUiDelegate* ui_delegate)
++    : presenter_(presenter), ui_delegate_(ui_delegate),
++      web_contents_(ui_delegate_->GetWebContents()->GetWeakPtr()) {
++
++  ChromeLayoutProvider* layout_provider = ChromeLayoutProvider::Get();
++  SetOrientation(views::LayoutOrientation::kVertical);
++  SetProperty(
++      views::kMarginsKey,
++      gfx::Insets::TLBR(
++          0, 0,
++          layout_provider->GetDistanceMetric(
++              DISTANCE_CONTENT_LIST_VERTICAL_MULTI),
++          0));
++
++  const helium_noise::HeliumNoiseState noise_state =
++      helium_noise::GetHeliumNoiseState(web_contents_->GetBrowserContext(),
++                                        presenter_->site_url());
++
++  const auto button_insets = layout_provider->GetInsetsMetric(
++      ChromeInsetsMetric::INSETS_PAGE_INFO_HOVER_BUTTON);
++  auto* description_label =
++      AddChildView(std::make_unique<views::StyledLabel>());
++  description_label->SetText(
++      l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_DESCRIPTION));
++  description_label->SetDefaultTextStyle(views::style::STYLE_BODY_3);
++  description_label->SetDefaultEnabledColorId(kColorPageInfoForeground);
++  description_label->SetProperty(views::kMarginsKey, button_insets);
++  description_label->SizeToFit(PageInfoViewFactory::kMinBubbleWidth -
++                               button_insets.width());
++
++  const int vertical_margin = layout_provider->GetDistanceMetric(
++      DISTANCE_CONTENT_LIST_VERTICAL_MULTI);
++  const int side_margin =
++      layout_provider->GetInsetsMetric(views::INSETS_DIALOG).left();
++  if (noise_state == helium_noise::HeliumNoiseState::kGloballyDisabled) {
++    auto* globally_disabled_label = AddChildView(std::make_unique<views::Label>(
++        l10n_util::GetStringUTF16(
++            IDS_PAGE_INFO_HELIUM_NOISE_GLOBALLY_DISABLED),
++        views::style::CONTEXT_LABEL, views::style::STYLE_BODY_4));
++    globally_disabled_label->SetEnabledColor(
++        kColorPageInfoSubtitleForeground);
++    globally_disabled_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    globally_disabled_label->SetMultiLine(true);
++    globally_disabled_label->SetMaximumWidth(
++        PageInfoViewFactory::kMinBubbleWidth - side_margin * 2);
++    globally_disabled_label->SetProperty(
++        views::kMarginsKey, gfx::Insets::VH(vertical_margin, side_margin));
++  } else {
++    auto* breakage_container =
++        AddChildView(std::make_unique<views::BoxLayoutView>());
++    breakage_container->SetOrientation(views::LayoutOrientation::kVertical);
++    breakage_container->SetProperty(
++        views::kMarginsKey, gfx::Insets::VH(vertical_margin, side_margin));
++
++    auto* breakage_title = breakage_container->AddChildView(
++        std::make_unique<views::Label>(
++            l10n_util::GetStringUTF16(
++                IDS_PAGE_INFO_COOKIES_SITE_NOT_WORKING_TITLE),
++            views::style::CONTEXT_DIALOG_BODY_TEXT,
++            views::style::STYLE_BODY_3_MEDIUM));
++    breakage_title->SetEnabledColor(kColorPageInfoForeground);
++    breakage_title->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++
++    auto* breakage_description = breakage_container->AddChildView(
++        std::make_unique<views::Label>(
++            l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_BREAKAGE),
++            views::style::CONTEXT_LABEL, views::style::STYLE_BODY_4));
++    breakage_description->SetEnabledColor(kColorPageInfoSubtitleForeground);
++    breakage_description->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    breakage_description->SetMultiLine(true);
++    breakage_description->SetMaximumWidth(
++        PageInfoViewFactory::kMinBubbleWidth - side_margin * 2);
++
++    setting_row_ =
++        AddChildView(std::make_unique<RichControlsContainerView>());
++    setting_row_->SetIcon(PageInfoViewFactory::GetNoiseIcon(
++        noise_state == helium_noise::HeliumNoiseState::kEnabled));
++    setting_row_->SetTitle(
++        l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_HEADER));
++
++    toggle_button_ = setting_row_->AddControl(
++        std::make_unique<views::ToggleButton>(base::BindRepeating(
++            &PageInfoNoiseContentView::OnToggleButtonPressed,
++            base::Unretained(this))));
++    toggle_button_->SetID(
++        PageInfoViewFactory::VIEW_ID_PAGE_INFO_HELIUM_NOISE_TOGGLE);
++    toggle_button_->GetViewAccessibility().SetName(
++        l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_HEADER));
++    toggle_button_->SetIsOn(noise_state ==
++                            helium_noise::HeliumNoiseState::kEnabled);
++    toggle_button_->SetEnabled(
++        noise_state != helium_noise::HeliumNoiseState::kUnavailable);
++    toggle_button_->SetPreferredSize(gfx::Size(
++        toggle_button_->GetPreferredSize().width(),
++        setting_row_->GetFirstLineHeight()));
++  }
++
++  AddChildView(PageInfoViewFactory::CreateSeparator(
++      layout_provider->GetDistanceMetric(
++          DISTANCE_HORIZONTAL_SEPARATOR_PADDING_PAGE_INFO_VIEW)));
++  auto* settings_button = AddChildView(std::make_unique<RichHoverButton>(
++      base::BindRepeating(&ChromePageInfoUiDelegate::ShowNoiseSettings,
++                          base::Unretained(ui_delegate_)),
++      PageInfoViewFactory::GetSiteSettingsIcon(),
++      l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_SETTINGS_BUTTON),
++      std::u16string(), PageInfoViewFactory::GetLaunchIcon()));
++  settings_button->SetTitleTextStyleAndColor(
++      views::style::STYLE_BODY_3_MEDIUM, kColorPageInfoForeground);
++
++  presenter_->InitializeUiState(this, base::DoNothing());
++}
++
++PageInfoNoiseContentView::~PageInfoNoiseContentView() = default;
++
++void PageInfoNoiseContentView::OnToggleButtonPressed() {
++  if (!web_contents_ || !setting_row_ || !toggle_button_ ||
++      !toggle_button_->GetEnabled()) {
++    return;
++  }
++
++  helium_noise::SetHeliumNoiseEnabledForOrigin(
++      web_contents_->GetBrowserContext(), presenter_->site_url(),
++      toggle_button_->GetIsOn());
++  setting_row_->SetIcon(
++      PageInfoViewFactory::GetNoiseIcon(toggle_button_->GetIsOn()));
++  presenter_->OnHeliumNoiseSettingChanged();
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/page_info/page_info_noise_content_view.h
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_PAGE_INFO_PAGE_INFO_NOISE_CONTENT_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_PAGE_INFO_PAGE_INFO_NOISE_CONTENT_VIEW_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "components/page_info/page_info_ui.h"
++#include "ui/views/layout/flex_layout_view.h"
++
++class ChromePageInfoUiDelegate;
++class PageInfo;
++class RichControlsContainerView;
++
++namespace content {
++class WebContents;
++}
++
++namespace views {
++class ToggleButton;
++}
++
++// Content for the Helium Noise subpage in Page Info.
++class PageInfoNoiseContentView : public views::FlexLayoutView,
++                                 public PageInfoUI {
++ public:
++  PageInfoNoiseContentView(PageInfo* presenter,
++                           ChromePageInfoUiDelegate* ui_delegate);
++  ~PageInfoNoiseContentView() override;
++
++ private:
++  void OnToggleButtonPressed();
++
++  const raw_ptr<PageInfo, DanglingUntriaged> presenter_;
++  const raw_ptr<ChromePageInfoUiDelegate, DanglingUntriaged> ui_delegate_;
++  base::WeakPtr<content::WebContents> web_contents_;
++  raw_ptr<RichControlsContainerView> setting_row_ = nullptr;
++  raw_ptr<views::ToggleButton> toggle_button_ = nullptr;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_PAGE_INFO_PAGE_INFO_NOISE_CONTENT_VIEW_H_
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -203,6 +203,7 @@ static_library("ui") {
+     "//chrome/browser:flags",
+     "//chrome/browser:font_pref",
+     "//chrome/browser:global_features",
++    "//chrome/browser:helium_noise_settings_headers",
+     "//chrome/browser:icon_manager",
+     "//chrome/browser:renderer_preferences_util",
+     "//chrome/browser:resources_util",
+@@ -4139,6 +4140,8 @@ static_library("ui") {
+       "views/page_info/page_info_merchant_trust_controller.h",
+       "views/page_info/page_info_merchant_trust_coordinator.cc",
+       "views/page_info/page_info_merchant_trust_coordinator.h",
++      "views/page_info/page_info_noise_content_view.cc",
++      "views/page_info/page_info_noise_content_view.h",
+       "views/page_info/page_info_permission_content_view.cc",
+       "views/page_info/page_info_permission_content_view.h",
+       "views/page_info/page_info_security_content_view.cc",
+--- /dev/null
++++ b/components/vector_icons/shield_check.icon
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++CANVAS_DIMENSIONS, 20,
++FILL_RULE_NONZERO,
++MOVE_TO, 9.13f, 10.81f,
++LINE_TO, 7.88f, 9.56f,
++CUBIC_TO, 7.73f, 9.41f, 7.55f, 9.33f, 7.36f, 9.33f,
++CUBIC_TO, 7.16f, 9.33f, 6.99f, 9.41f, 6.83f, 9.56f,
++CUBIC_TO, 6.68f, 9.72f, 6.6f, 9.89f, 6.6f, 10.1f,
++CUBIC_TO, 6.6f, 10.3f, 6.68f, 10.48f, 6.83f, 10.63f,
++LINE_TO, 8.58f, 12.4f,
++CUBIC_TO, 8.73f, 12.55f, 8.91f, 12.63f, 9.11f, 12.63f,
++CUBIC_TO, 9.32f, 12.63f, 9.49f, 12.55f, 9.65f, 12.4f,
++LINE_TO, 13.19f, 8.85f,
++CUBIC_TO, 13.34f, 8.7f, 13.42f, 8.53f, 13.42f, 8.33f,
++CUBIC_TO, 13.42f, 8.14f, 13.34f, 7.97f, 13.19f, 7.81f,
++CUBIC_TO, 13.03f, 7.66f, 12.86f, 7.58f, 12.65f, 7.58f,
++CUBIC_TO, 12.45f, 7.58f, 12.27f, 7.66f, 12.13f, 7.81f,
++LINE_TO, 9.13f, 10.81f,
++CLOSE,
++MOVE_TO, 9.75f, 17.91f,
++CUBIC_TO, 9.67f, 17.9f, 9.59f, 17.88f, 9.52f, 17.85f,
++CUBIC_TO, 7.7f, 17.26f, 6.24f, 16.15f, 5.15f, 14.54f,
++CUBIC_TO, 4.05f, 12.93f, 3.5f, 11.17f, 3.5f, 9.27f,
++V_LINE_TO, 5.52f,
++CUBIC_TO, 3.5f, 5.21f, 3.59f, 4.92f, 3.76f, 4.67f,
++CUBIC_TO, 3.93f, 4.42f, 4.17f, 4.24f, 4.46f, 4.13f,
++LINE_TO, 9.46f, 2.21f,
++CUBIC_TO, 9.64f, 2.14f, 9.82f, 2.1f, 10, 2.1f,
++CUBIC_TO, 10.18f, 2.1f, 10.36f, 2.14f, 10.54f, 2.21f,
++LINE_TO, 15.54f, 4.13f,
++CUBIC_TO, 15.83f, 4.24f, 16.07f, 4.42f, 16.24f, 4.67f,
++CUBIC_TO, 16.41f, 4.92f, 16.5f, 5.21f, 16.5f, 5.52f,
++V_LINE_TO, 9.27f,
++CUBIC_TO, 16.5f, 11.17f, 15.95f, 12.93f, 14.85f, 14.54f,
++CUBIC_TO, 13.76f, 16.15f, 12.3f, 17.26f, 10.48f, 17.85f,
++CUBIC_TO, 10.41f, 17.88f, 10.33f, 17.9f, 10.25f, 17.91f,
++CUBIC_TO, 10.17f, 17.91f, 10.08f, 17.92f, 10, 17.92f,
++CUBIC_TO, 9.92f, 17.92f, 9.83f, 17.91f, 9.75f, 17.91f,
++CLOSE,
++MOVE_TO, 10, 16.44f,
++CUBIC_TO, 11.44f, 15.99f, 12.64f, 15.09f, 13.58f, 13.75f,
++CUBIC_TO, 14.53f, 12.41f, 15, 10.91f, 15, 9.27f,
++V_LINE_TO, 5.52f,
++LINE_TO, 10, 3.6f,
++LINE_TO, 5, 5.52f,
++V_LINE_TO, 9.27f,
++CUBIC_TO, 5, 10.91f, 5.47f, 12.41f, 6.42f, 13.75f,
++CUBIC_TO, 7.36f, 15.09f, 8.56f, 15.99f, 10, 16.44f,
++CLOSE
+--- /dev/null
++++ b/components/vector_icons/shield_cross.icon
+@@ -0,0 +1,62 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++CANVAS_DIMENSIONS, 20,
++FILL_RULE_NONZERO,
++MOVE_TO, 10, 11.04f,
++LINE_TO, 11.18f, 12.23f,
++CUBIC_TO, 11.34f, 12.38f, 11.51f, 12.46f, 11.71f, 12.46f,
++CUBIC_TO, 11.9f, 12.46f, 12.08f, 12.38f, 12.23f, 12.23f,
++CUBIC_TO, 12.38f, 12.08f, 12.46f, 11.9f, 12.46f, 11.71f,
++CUBIC_TO, 12.46f, 11.51f, 12.38f, 11.34f, 12.23f, 11.18f,
++LINE_TO, 11.04f, 10,
++LINE_TO, 12.23f, 8.82f,
++CUBIC_TO, 12.38f, 8.66f, 12.46f, 8.49f, 12.46f, 8.29f,
++CUBIC_TO, 12.46f, 8.1f, 12.38f, 7.92f, 12.23f, 7.77f,
++CUBIC_TO, 12.08f, 7.62f, 11.9f, 7.54f, 11.71f, 7.54f,
++CUBIC_TO, 11.51f, 7.54f, 11.34f, 7.62f, 11.18f, 7.77f,
++LINE_TO, 10, 8.96f,
++LINE_TO, 8.82f, 7.77f,
++CUBIC_TO, 8.66f, 7.62f, 8.49f, 7.54f, 8.29f, 7.54f,
++CUBIC_TO, 8.1f, 7.54f, 7.92f, 7.62f, 7.77f, 7.77f,
++CUBIC_TO, 7.62f, 7.92f, 7.54f, 8.1f, 7.54f, 8.29f,
++CUBIC_TO, 7.54f, 8.49f, 7.62f, 8.66f, 7.77f, 8.82f,
++LINE_TO, 8.96f, 10,
++LINE_TO, 7.77f, 11.18f,
++CUBIC_TO, 7.62f, 11.34f, 7.54f, 11.51f, 7.54f, 11.71f,
++CUBIC_TO, 7.54f, 11.9f, 7.62f, 12.08f, 7.77f, 12.23f,
++CUBIC_TO, 7.92f, 12.38f, 8.1f, 12.46f, 8.29f, 12.46f,
++CUBIC_TO, 8.49f, 12.46f, 8.66f, 12.38f, 8.82f, 12.23f,
++LINE_TO, 10, 11.04f,
++CLOSE,
++MOVE_TO, 9.75f, 17.91f,
++CUBIC_TO, 9.67f, 17.9f, 9.59f, 17.88f, 9.52f, 17.85f,
++CUBIC_TO, 7.7f, 17.26f, 6.24f, 16.15f, 5.15f, 14.54f,
++CUBIC_TO, 4.05f, 12.93f, 3.5f, 11.17f, 3.5f, 9.27f,
++V_LINE_TO, 5.52f,
++CUBIC_TO, 3.5f, 5.21f, 3.59f, 4.92f, 3.76f, 4.67f,
++CUBIC_TO, 3.93f, 4.42f, 4.17f, 4.24f, 4.46f, 4.13f,
++LINE_TO, 9.46f, 2.21f,
++CUBIC_TO, 9.64f, 2.14f, 9.82f, 2.1f, 10, 2.1f,
++CUBIC_TO, 10.18f, 2.1f, 10.36f, 2.14f, 10.54f, 2.21f,
++LINE_TO, 15.54f, 4.13f,
++CUBIC_TO, 15.83f, 4.24f, 16.07f, 4.42f, 16.24f, 4.67f,
++CUBIC_TO, 16.41f, 4.92f, 16.5f, 5.21f, 16.5f, 5.52f,
++V_LINE_TO, 9.27f,
++CUBIC_TO, 16.5f, 11.17f, 15.95f, 12.93f, 14.85f, 14.54f,
++CUBIC_TO, 13.76f, 16.15f, 12.3f, 17.26f, 10.48f, 17.85f,
++CUBIC_TO, 10.41f, 17.88f, 10.33f, 17.9f, 10.25f, 17.91f,
++CUBIC_TO, 10.17f, 17.91f, 10.08f, 17.92f, 10, 17.92f,
++CUBIC_TO, 9.92f, 17.92f, 9.83f, 17.91f, 9.75f, 17.91f,
++CLOSE,
++MOVE_TO, 10, 16.44f,
++CUBIC_TO, 11.44f, 15.99f, 12.64f, 15.09f, 13.58f, 13.75f,
++CUBIC_TO, 14.53f, 12.41f, 15, 10.91f, 15, 9.27f,
++V_LINE_TO, 5.52f,
++LINE_TO, 10, 3.6f,
++LINE_TO, 5, 5.52f,
++V_LINE_TO, 9.27f,
++CUBIC_TO, 5, 10.91f, 5.47f, 12.41f, 6.42f, 13.75f,
++CUBIC_TO, 7.36f, 15.09f, 8.56f, 15.99f, 10, 16.44f,
++CLOSE
+--- a/components/vector_icons/BUILD.gn
++++ b/components/vector_icons/BUILD.gn
+@@ -405,6 +405,8 @@ if (current_toolchain == default_toolcha
+       "settings_old.icon",
+       "settings_outline_old.icon",
+       "shield.icon",
++      "shield_check.icon",
++      "shield_cross.icon",
+       "shopping_bag.icon",
+       "shopping_bag_old.icon",
+       "shopping_bag_refresh_old.icon",
+--- a/chrome/browser/ui/views/page_info/page_info_view_factory.cc
++++ b/chrome/browser/ui/views/page_info/page_info_view_factory.cc
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/ui/views/page_info/page_info_main_view.h"
+ #include "chrome/browser/ui/views/page_info/page_info_merchant_trust_content_view.h"
+ #include "chrome/browser/ui/views/page_info/page_info_navigation_handler.h"
++#include "chrome/browser/ui/views/page_info/page_info_noise_content_view.h"
+ #include "chrome/browser/ui/views/page_info/page_info_permission_content_view.h"
+ #include "chrome/browser/ui/views/page_info/page_info_security_content_view.h"
+ #include "components/content_settings/core/browser/permission_settings_registry.h"
+@@ -187,6 +188,14 @@ std::unique_ptr<views::View> PageInfoVie
+       std::make_unique<PageInfoCookiesContentView>(presenter_));
+ }
+ 
++std::unique_ptr<views::View> PageInfoViewFactory::CreateNoisePageView() {
++  return std::make_unique<PageInfoSubpageView>(
++      CreateSubpageHeader(
++          l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_HEADER),
++          presenter_->GetSubjectNameForDisplay()),
++      std::make_unique<PageInfoNoiseContentView>(presenter_, ui_delegate_));
++}
++
+ std::unique_ptr<views::View>
+ PageInfoViewFactory::CreateMerchantTrustPageView() {
+   return std::make_unique<PageInfoSubpageView>(
+@@ -903,6 +912,12 @@ const ui::ImageModel PageInfoViewFactory
+ }
+ 
+ // static
++const ui::ImageModel PageInfoViewFactory::GetNoiseIcon(bool enabled) {
++  return GetImageModel(enabled ? vector_icons::kShieldCheckIcon
++                               : vector_icons::kShieldCrossIcon);
++}
++
++// static
+ const ui::ImageModel PageInfoViewFactory::GetOpenSubpageIcon() {
+   // GetIconSize() does not work for subpage icons because the default size of
+   // features::IsRoundedIconsEnabled() ? vector_icons::kArrowRightFlippableIcon
+--- a/chrome/browser/ui/views/page_info/page_info_view_factory.h
++++ b/chrome/browser/ui/views/page_info/page_info_view_factory.h
+@@ -42,6 +42,7 @@ class PageInfoViewFactory {
+     VIEW_ID_PAGE_INFO_BLOCK_THIRD_PARTY_COOKIES_SUBTITLE,
+     VIEW_ID_PAGE_INFO_LINK_OR_BUTTON_COOKIE_DIALOG,
+     VIEW_ID_PAGE_INFO_LINK_OR_BUTTON_COOKIES_SUBPAGE,
++    VIEW_ID_PAGE_INFO_LINK_OR_BUTTON_NOISE_SUBPAGE,
+     VIEW_ID_PAGE_INFO_LINK_OR_BUTTON_PRIVACY_SITE_DATA_SUBPAGE,
+     VIEW_ID_PAGE_INFO_COOKIES_DESCRIPTION_LABEL,
+     VIEW_ID_PAGE_INFO_LINK_OR_BUTTON_RWS_SETTINGS,
+@@ -76,6 +77,7 @@ class PageInfoViewFactory {
+     VIEW_ID_PAGE_INFO_EXTENDED_SITE_INFO_SECTION,
+     VIEW_ID_PAGE_INFO_COOKIES_SYNC,
+     VIEW_ID_PAGE_INFO_PERMISSION_SUBTITLE_LABEL,
++    VIEW_ID_PAGE_INFO_HELIUM_NOISE_TOGGLE,
+   };
+ 
+   // Creates a separator view with padding on top and bottom. Use with flex
+@@ -114,6 +116,9 @@ class PageInfoViewFactory {
+   // Returns the icon for the secure connection button.
+   static const ui::ImageModel GetConnectionSecureIcon();
+ 
++  // Returns the Helium Noise icon for the given enabled state.
++  static const ui::ImageModel GetNoiseIcon(bool enabled);
++
+   // Returns the icon for a button which opens a subpage within page info.
+   static const ui::ImageModel GetOpenSubpageIcon();
+ 
+@@ -134,6 +139,7 @@ class PageInfoViewFactory {
+       content::WebContents* web_contents);
+   [[nodiscard]] std::unique_ptr<views::View> CreateAdPersonalizationPageView();
+   [[nodiscard]] std::unique_ptr<views::View> CreateCookiesPageView();
++  [[nodiscard]] std::unique_ptr<views::View> CreateNoisePageView();
+   [[nodiscard]] std::unique_ptr<views::View> CreateMerchantTrustPageView();
+ 
+  private:
+--- a/chrome/browser/ui/views/page_info/page_info_navigation_handler.h
++++ b/chrome/browser/ui/views/page_info/page_info_navigation_handler.h
+@@ -20,6 +20,7 @@ class PageInfoNavigationHandler {
+   virtual void OpenPermissionPage(ContentSettingsType type) = 0;
+   virtual void OpenAdPersonalizationPage() = 0;
+   virtual void OpenCookiesPage() = 0;
++  virtual void OpenNoisePage() = 0;
+   virtual void OpenMerchantTrustPage() = 0;
+   virtual void CloseBubble() = 0;
+ };
+--- a/chrome/browser/ui/views/page_info/page_info_bubble_view.cc
++++ b/chrome/browser/ui/views/page_info/page_info_bubble_view.cc
+@@ -318,6 +318,15 @@ void PageInfoBubbleView::OpenCookiesPage
+   AnnouncePageOpened(l10n_util::GetStringUTF16(IDS_PAGE_INFO_COOKIES));
+ }
+ 
++void PageInfoBubbleView::OpenNoisePage() {
++  std::unique_ptr<views::View> noise_page_view =
++      view_factory_->CreateNoisePageView();
++  noise_page_view->SetID(PageInfoViewFactory::VIEW_ID_PAGE_INFO_CURRENT_VIEW);
++  page_container_->SwitchToPage(std::move(noise_page_view));
++  AnnouncePageOpened(
++      l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_HEADER));
++}
++
+ void PageInfoBubbleView::OpenMerchantTrustPage() {
+   CHECK(merchant_trust_coordinator_);
+   auto title = l10n_util::GetStringUTF16(IDS_PAGE_INFO_MERCHANT_TRUST_HEADER);
+--- a/chrome/browser/ui/views/page_info/page_info_bubble_view.h
++++ b/chrome/browser/ui/views/page_info/page_info_bubble_view.h
+@@ -45,6 +45,7 @@ class PageInfoBubbleView : public PageIn
+   void OpenPermissionPage(ContentSettingsType type) override;
+   void OpenAdPersonalizationPage() override;
+   void OpenCookiesPage() override;
++  void OpenNoisePage() override;
+   void OpenMerchantTrustPage() override;
+   void CloseBubble() override;
+ 
+--- a/chrome/browser/ui/views/page_info/page_info_main_view.cc
++++ b/chrome/browser/ui/views/page_info/page_info_main_view.cc
+@@ -12,6 +12,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/helium_noise/helium_noise_settings.h"
+ #include "chrome/browser/lookalikes/safety_tip_ui_helper.h"
+ #include "chrome/browser/page_info/page_info_features.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+@@ -40,6 +41,7 @@
+ #include "components/vector_icons/vector_icons.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/models/image_model.h"
+@@ -131,6 +133,7 @@ PageInfoMainView::PageInfoMainView(
+ #endif
+ 
+   security_container_view_ = AddChildView(CreateContainerView());
++  MaybeAddNoiseButton();
+ 
+   permissions_view_ = AddChildView(std::make_unique<views::View>());
+   permissions_view_->SetLayoutManager(std::make_unique<views::FlexLayout>())
+@@ -218,6 +221,39 @@ void PageInfoMainView::SetCookieInfo(con
+       views::style::STYLE_BODY_4, kColorPageInfoSubtitleForeground);
+ }
+ 
++void PageInfoMainView::MaybeAddNoiseButton() {
++  content::WebContents* web_contents = ui_delegate_->GetWebContents();
++  if (!web_contents ||
++      !helium_noise::CanSetHeliumNoiseForOrigin(presenter_->site_url())) {
++    return;
++  }
++
++  const helium_noise::HeliumNoiseState noise_state =
++      helium_noise::GetHeliumNoiseState(web_contents->GetBrowserContext(),
++                                        presenter_->site_url());
++  if (noise_state == helium_noise::HeliumNoiseState::kUnavailable) {
++    return;
++  }
++  const bool noise_enabled =
++      noise_state == helium_noise::HeliumNoiseState::kEnabled;
++
++  noise_container_view_ = AddChildView(CreateContainerView());
++  auto* noise_button =
++      noise_container_view_->AddChildView(std::make_unique<RichHoverButton>(
++          base::BindRepeating(&PageInfoNavigationHandler::OpenNoisePage,
++                              base::Unretained(navigation_handler_)),
++          PageInfoViewFactory::GetNoiseIcon(noise_enabled),
++          l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_HEADER),
++          /*subtitle_text=*/std::u16string(),
++          PageInfoViewFactory::GetOpenSubpageIcon()));
++  noise_button->SetTooltipText(
++      l10n_util::GetStringUTF16(IDS_PAGE_INFO_HELIUM_NOISE_TOOLTIP));
++  noise_button->SetID(
++      PageInfoViewFactory::VIEW_ID_PAGE_INFO_LINK_OR_BUTTON_NOISE_SUBPAGE);
++  noise_button->SetTitleTextStyleAndColor(views::style::STYLE_BODY_3_MEDIUM,
++                                          kColorPageInfoForeground);
++}
++
+ void PageInfoMainView::SetPermissionInfo(
+     const PermissionInfoList& permission_info_list,
+     ChosenObjectInfoList chosen_object_info_list) {
+@@ -618,6 +654,11 @@ gfx::Size PageInfoMainView::CalculatePre
+     width =
+         std::max(width, security_container_view_->GetPreferredSize().width());
+   }
++
++  if (noise_container_view_) {
++    width =
++        std::max(width, noise_container_view_->GetPreferredSize().width());
++  }
+   return gfx::Size(width,
+                    GetLayoutManager()->GetPreferredHeightForWidth(this, width));
+ }
+--- a/chrome/browser/ui/views/page_info/page_info_main_view.h
++++ b/chrome/browser/ui/views/page_info/page_info_main_view.h
+@@ -129,6 +129,8 @@ class PageInfoMainView : public views::V
+   // the label depending on the number of visible permissions.
+   void UpdateResetButton(const PermissionInfoList& permission_info_list);
+ 
++  void MaybeAddNoiseButton();
++
+   void OnMerchantTrustDataFetched(
+       const GURL& url,
+       std::optional<page_info::MerchantData> merchant_data);
+@@ -223,6 +225,8 @@ class PageInfoMainView : public views::V
+ 
+   raw_ptr<views::View> security_container_view_ = nullptr;
+ 
++  raw_ptr<views::View> noise_container_view_ = nullptr;
++
+   raw_ptr<views::LabelButton, AcrossTasksDanglingUntriaged> reset_button_ =
+       nullptr;
+ 
