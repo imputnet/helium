@@ -180,23 +180,19 @@
        .At(base::TimeDelta())
        .SetDuration(base::Milliseconds(50))
        .SetOpacity(bubble_frame_view, 1)
-@@ -395,12 +397,6 @@ void ToastView::Close(ToastCloseReason r
-   }
+@@ -396,7 +398,7 @@ void ToastView::Close(ToastCloseReason r
  }
  
--void ToastView::UpdateRenderToastOverWebContentsAndPaint(
+ void ToastView::UpdateRenderToastOverWebContentsAndPaint(
 -    const bool render_toast_over_web_contents) {
--  render_toast_over_web_contents_ = render_toast_over_web_contents;
--  SizeToContents();
--}
--
- gfx::Rect ToastView::GetBubbleBounds() {
-   views::View* anchor_view = GetAnchorView();
-   if (!anchor_view) {
-@@ -410,21 +406,18 @@ gfx::Rect ToastView::GetBubbleBounds() {
-   const gfx::Size preferred_size =
-       GetWidget()->GetContentsView()->GetPreferredSize();
++    bool render_toast_over_web_contents) {
+   render_toast_over_web_contents_ = render_toast_over_web_contents;
+   SizeToContents();
+ }
+@@ -412,24 +414,23 @@ gfx::Rect ToastView::GetBubbleBounds() {
    const gfx::Rect anchor_bounds = anchor_view->GetBoundsInScreen();
+   const gfx::Rect anchor_widget_bounds =
+       anchor_view->GetWidget()->GetWindowBoundsInScreen();
 +  const int window_margin = ChromeLayoutProvider::Get()->GetDistanceMetric(
 +      DISTANCE_TOAST_BUBBLE_BROWSER_WINDOW_MARGIN);
  
@@ -206,23 +202,31 @@
 -                             views::BubbleBorder::kShadowBlur;
    const int width =
        std::min(preferred_size.width(),
--               std::max(anchor_bounds.width() - 2 * minimum_margin, 0));
--  const int x = anchor_bounds.x() + ((anchor_bounds.width() - width) / 2);
-+               std::max(anchor_bounds.width() - 2 * window_margin, 0));
- 
+-               std::max(anchor_widget_bounds.width() - 2 * minimum_margin, 0));
++               std::max(anchor_widget_bounds.width() - 2 * window_margin, 0));
++  const int minimum_x = anchor_widget_bounds.x() + window_margin;
++  const int maximum_x =
++      std::max(minimum_x,
++               anchor_widget_bounds.right() - window_margin - width);
+   const int x =
+-      std::clamp(anchor_bounds.x() + ((anchor_bounds.width() - width) / 2),
+-                 anchor_widget_bounds.x() + minimum_margin,
+-                 anchor_widget_bounds.right() - minimum_margin - width);
+-
 -  // Take bubble out of its original bounds to cross "line of death", unless in
 -  // fullscreen mode where the top container isn't rendered.
 -  const int y = anchor_bounds.bottom() - (render_toast_over_web_contents_
 -                                              ? views::BubbleBorder::kShadowBlur
 -                                              : (preferred_size.height() / 2));
-+  const int x = anchor_bounds.right() - width - window_margin;
++      std::clamp(anchor_bounds.right() - width - window_margin,
++                 minimum_x, maximum_x);
 +  const int y = (render_toast_over_web_contents_ ? anchor_bounds.y()
 +                                                 : anchor_bounds.bottom()) +
 +                window_margin;
    return gfx::Rect(x, y, width, preferred_size.height());
  }
  
-@@ -436,7 +429,7 @@ void ToastView::OnThemeChanged() {
+@@ -441,7 +442,7 @@ void ToastView::OnThemeChanged() {
      icon_view_->SetImage(image_override_.value());
    } else {
      icon_view_->SetImage(ui::ImageModel::FromVectorIcon(
@@ -231,7 +235,7 @@
          GetIconSize()));
    }
  }
-@@ -455,19 +448,12 @@ void ToastView::AnimateOut(base::OnceClo
+@@ -460,19 +461,12 @@ void ToastView::AnimateOut(base::OnceClo
    }
  
    if (show_height_animation) {
@@ -296,17 +300,23 @@
      case DISTANCE_RECENT_ACTIVITY_AVATAR_FALLBACK_SIZE:
 --- a/chrome/browser/ui/toasts/toast_controller.cc
 +++ b/chrome/browser/ui/toasts/toast_controller.cc
-@@ -34,6 +34,9 @@
- #include "chrome/browser/ui/toasts/toast_features.h"
- #include "chrome/browser/ui/toasts/toast_metrics.h"
- #include "chrome/browser/ui/toasts/toast_view.h"
-+#include "chrome/browser/ui/views/frame/browser_view.h"
-+#include "chrome/browser/ui/views/frame/contents_container_view.h"
-+#include "chrome/browser/ui/views/frame/contents_web_view.h"
- #include "chrome/browser/ui/views/interaction/browser_elements_views.h"
- #include "chrome/browser/ui/webui_browser/webui_browser.h"
- #include "chrome/common/pref_names.h"
-@@ -47,10 +50,6 @@
+@@ -18,7 +18,6 @@
+ #include "base/location.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+-#include "base/types/to_address.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+@@ -26,7 +25,6 @@
+ #include "chrome/browser/ui/browser_window/public/desktop_browser_window_capabilities.h"
+ #include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
+ #include "chrome/browser/ui/exclusive_access/fullscreen_controller.h"
+-#include "chrome/browser/ui/fullscreen/browser_window_fullscreen_controller.h"
+ #include "chrome/browser/ui/omnibox/omnibox_tab_helper.h"
+ #include "chrome/browser/ui/toasts/api/toast_id.h"
+ #include "chrome/browser/ui/toasts/api/toast_registry.h"
+@@ -49,10 +47,6 @@
  #include "ui/views/view.h"
  #include "ui/views/widget/widget.h"
  
@@ -314,14 +324,13 @@
 -#include "chrome/browser/ui/fullscreen_util_mac.h"
 -#endif
 -
+ DEFINE_USER_DATA(ToastController);
+ 
  ToastParams::ToastParams(ToastId id) : toast_id(id) {}
- ToastParams::ToastParams(ToastParams&& other) noexcept = default;
- ToastParams& ToastParams::operator=(ToastParams&& other) noexcept = default;
-@@ -242,19 +241,6 @@ void ToastController::UpdateToastWidgetV
-   }
+@@ -260,16 +254,19 @@ void ToastController::UpdateToastWidgetV
  }
  
--bool ToastController::ShouldRenderToastOverWebContents() {
+ bool ToastController::ShouldRenderToastOverWebContents() {
 -  bool render_in_contents = BrowserWindowFullscreenController::From(
 -                                base::to_address(browser_window_interface_))
 -                                ->ShouldHideUIForFullscreen();
@@ -332,44 +341,23 @@
 -#endif
 -
 -  return render_in_contents;
--}
--
- void ToastController::WebContentsDestroyed() {
-   omnibox_helper_observer_.Reset();
-   Observe(nullptr);
-@@ -299,9 +285,20 @@ void ToastController::CreateToast(ToastP
-   // TODO(crbug.com/364730656): Replace this logic when improving
-   // ToastController testability.
-   views::View* anchor_view = nullptr;
-+  bool render_toast_over_web_contents = false;
-   if (browser_window_interface_) {
--    anchor_view = BrowserElementsViews::From(browser_window_interface_)
--                      ->GetView(kTopContainerElementId);
-+    if (BrowserView* browser_view =
-+            BrowserView::GetBrowserViewForBrowser(browser_window_interface_)) {
-+      if (ContentsContainerView* contents_container_view =
-+              browser_view->GetActiveContentsContainerView()) {
-+        anchor_view = contents_container_view->contents_view();
-+      }
-+    }
-+    render_toast_over_web_contents = anchor_view != nullptr;
-+    if (!anchor_view) {
-+      anchor_view = BrowserElementsViews::From(browser_window_interface_)
-+                        ->GetView(kTopContainerElementId);
-+    }
-   }
-   if (!anchor_view) {
-     // Don't actually create the toast in unit tests
-@@ -320,7 +317,7 @@ void ToastController::CreateToast(ToastP
-                          params.body_string_cardinality_param);
-   auto toast_view = std::make_unique<toasts::ToastView>(
-       anchor_view, body_string, spec->icon(), params.image_override,
--      ShouldRenderToastOverWebContents(),
-+      render_toast_over_web_contents,
-       base::BindRepeating(&RecordToastDismissReason, params.toast_id));
++  if (!browser_window_interface_ ||
++      !currently_showing_toast_id_.has_value()) {
++    return false;
++  }
++  const bool global_scope =
++      toast_registry_
++          ->GetToastSpecification(currently_showing_toast_id_.value())
++          ->is_global_scope();
++  views::View* const anchor_view = GetAnchorView(global_scope);
++  views::View* const top_container =
++      BrowserElementsViews::From(browser_window_interface_)
++          ->GetView(kTopContainerElementId);
++  return anchor_view && anchor_view != top_container;
+ }
  
-   if (spec->has_close_button()) {
-@@ -344,10 +341,6 @@ void ToastController::CreateToast(ToastP
+ void ToastController::WebContentsDestroyed() {
+@@ -357,10 +354,6 @@ void ToastController::CreateToast(ToastP
    toast_view_ = toast_view.get();
    toast_widget_ =
        views::BubbleDialogDelegateView::CreateBubble(std::move(toast_view));
@@ -380,16 +368,6 @@
    toast_observer_.Observe(toast_widget_);
    fullscreen_subscription_ =
        ExclusiveAccessManager::From(browser_window_interface_)
-@@ -387,8 +380,7 @@ std::u16string ToastController::FormatSt
- }
- 
- void ToastController::OnFullscreenStateChanged() {
--  toast_view_->UpdateRenderToastOverWebContentsAndPaint(
--      ShouldRenderToastOverWebContents());
-+  toast_view_->SizeToContents();
- }
- 
- void ToastController::ClearTabScopedToasts() {
 --- a/chrome/browser/ui/toasts/toast_view.h
 +++ b/chrome/browser/ui/toasts/toast_view.h
 @@ -21,6 +21,7 @@ class MenuModel;
@@ -419,7 +397,7 @@
        base::RepeatingCallback<void(ToastCloseReason)> on_toast_close_callback);
    ~ToastView() override;
  
-@@ -81,20 +81,19 @@ class ToastView : public views::BubbleDi
+@@ -81,11 +81,13 @@ class ToastView : public views::BubbleDi
    // views::BubbleDialogDelegateView::CreateBubble).
    void AddMenu(std::unique_ptr<ui::MenuModel> model);
  
@@ -436,16 +414,16 @@
  
    void AnimateIn();
  
-   // Animates out the toast, then closes the toast widget.
+@@ -93,7 +95,7 @@ class ToastView : public views::BubbleDi
    void Close(ToastCloseReason close_reason);
  
--  void UpdateRenderToastOverWebContentsAndPaint(
+   void UpdateRenderToastOverWebContentsAndPaint(
 -      const bool render_toast_over_web_contents);
--
++      bool render_toast_over_web_contents);
+ 
    views::Label* label_for_testing() { return label_; }
    views::MdTextButton* action_button_for_testing() { return action_button_; }
-   views::ImageButton* close_button_for_testing() { return close_button_; }
-@@ -118,15 +117,10 @@ class ToastView : public views::BubbleDi
+@@ -124,11 +126,6 @@ class ToastView : public views::BubbleDi
    // Resets `menu_runner_` and removes the highlight from the menu button.
    void OnMenuClosed();
  
@@ -457,8 +435,3 @@
    const std::u16string toast_text_;
    const raw_ref<const gfx::VectorIcon> icon_;
    const std::optional<ui::ImageModel> image_override_;
--  bool render_toast_over_web_contents_;
-+  const bool render_toast_over_web_contents_;
-   bool has_close_button_ = false;
-   bool has_action_button_ = false;
-   std::u16string action_button_text_;
