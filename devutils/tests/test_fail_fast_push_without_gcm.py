@@ -86,16 +86,15 @@ void GCMDriverDesktop::RemoveCachedData() {
         local_patch = root / 'test.patch'
         local_patch.write_text(''.join(local_patch_lines), encoding=ENCODING)
 
-        dry = subprocess.run(['patch', '-p1', '--dry-run', '-i',
-                              str(local_patch)],
-                             cwd=root,
-                             capture_output=True,
-                             text=True,
-                             check=False)
+        dry = subprocess.run(
+            ['patch', '-p1', '--dry-run', '-i', str(local_patch)],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False)
         assert dry.returncode == 0, dry.stdout + dry.stderr
 
-        applied = subprocess.run(['patch', '-p1', '-i',
-                                  str(local_patch)],
+        applied = subprocess.run(['patch', '-p1', '-i', str(local_patch)],
                                  cwd=root,
                                  capture_output=True,
                                  text=True,
