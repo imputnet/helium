@@ -1,0 +1,215 @@
+--- a/chrome/app/chrome_crash_reporter_client.cc
++++ b/chrome/app/chrome_crash_reporter_client.cc
+@@ -119,7 +119,7 @@ base::FilePath ChromeCrashReporterClient
+ }
+ 
+ bool ChromeCrashReporterClient::GetShouldDumpLargerDumps() {
+-  return chrome::GetChannel() != version_info::Channel::STABLE;
++  return false;
+ }
+ #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
+ 
+--- a/chrome/app/chrome_crash_reporter_client_win.cc
++++ b/chrome/app/chrome_crash_reporter_client_win.cc
+@@ -99,7 +99,7 @@ void ChromeCrashReporterClient::GetProdu
+ bool ChromeCrashReporterClient::GetShouldDumpLargerDumps() {
+   // Capture larger dumps for Google Chrome beta, dev, and canary channels, and
+   // Chromium builds. The Google Chrome stable channel uses smaller dumps.
+-  return install_static::GetChromeChannel() != version_info::Channel::STABLE;
++  return false;
+ }
+ 
+ bool ChromeCrashReporterClient::ReportingIsEnforcedByPolicy(
+--- a/components/crash/core/app/crashpad.cc
++++ b/components/crash/core/app/crashpad.cc
+@@ -183,8 +183,7 @@ bool InitializeCrashpadImpl(bool initial
+     // On Android crashpad doesn't handle uploads. Android uses
+     // //components/minidump_uploader which queries metrics sample/consent opt
+     // in from preferences.
+-    CrashReporterClient* crash_reporter_client = GetCrashReporterClient();
+-    SetUploadConsent(crash_reporter_client->GetCollectStatsConsent());
++    SetUploadConsent(false);
+ #endif
+   }
+   return true;
+@@ -192,6 +191,12 @@ bool InitializeCrashpadImpl(bool initial
+ 
+ }  // namespace
+ 
++bool DisableCrashpadUploadsAtStartup(const base::FilePath& database_path) {
++  std::unique_ptr<crashpad::CrashReportDatabase> database =
++      crashpad::CrashReportDatabase::Initialize(database_path);
++  return database && database->GetSettings()->SetUploadsEnabled(false);
++}
++
+ bool InitializeCrashpad(bool initial_client, const std::string& process_type) {
+   return InitializeCrashpadImpl(initial_client, process_type, std::string(),
+                                 base::FilePath(), std::vector<std::string>(),
+--- a/chrome/common/crash_keys.cc
++++ b/chrome/common/crash_keys.cc
+@@ -7,9 +7,11 @@
+ #include <array>
+ #include <deque>
+ #include <string_view>
++#include <vector>
+ 
+ #include "base/base_switches.h"
+ #include "base/command_line.h"
++#include "base/files/file_path.h"
+ #include "base/format_macros.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/strcat.h"
+@@ -105,6 +107,28 @@ void HandleEnableDisableFeatures(const b
+       "commandline-disabled-feature");
+ }
+ 
++std::string SanitizeFeatureList(std::string_view feature_list) {
++  std::vector<std::string> sanitized_features;
++  for (std::string feature :
++       base::SplitString(feature_list, ",", base::TRIM_WHITESPACE,
++                         base::SPLIT_WANT_NONEMPTY)) {
++    const size_t separator = feature.find_first_of("<:");
++    if (separator != std::string::npos) {
++      feature.resize(separator);
++    }
++    bool valid = !feature.empty();
++    for (size_t i = 0; valid && i < feature.size(); ++i) {
++      const char c = feature[i];
++      valid = base::IsAsciiAlphaNumeric(c) || c == '_' || c == '-' ||
++              c == '.' || (i == 0 && c == '*');
++    }
++    if (valid) {
++      sanitized_features.push_back(feature);
++    }
++  }
++  return base::JoinString(sanitized_features, ",");
++}
++
+ // Return true if we DON'T want to upload this flag to the crash server.
+ bool IsBoringSwitch(const std::string& flag) {
+   static const auto kIgnoreSwitches = std::to_array<std::string_view>({
+@@ -211,9 +235,24 @@ void AppendStringAnnotationsCommandLineS
+ }
+ 
+ void SetCrashKeysFromCommandLine(const base::CommandLine& command_line) {
+-  SetStringAnnotations(command_line);
+-  HandleEnableDisableFeatures(command_line);
+-  SetSwitchesFromCommandLine(command_line, &IsBoringSwitch);
++  // Keep useful switch and feature names without copying arbitrary values into
++  // crash reports.
++  base::CommandLine sanitized(command_line.GetProgram());
++  for (const auto& entry : command_line.GetSwitches()) {
++    const std::string& name = entry.first;
++    if (name == kStringAnnotationsSwitch) {
++      continue;
++    }
++    if (name == switches::kEnableFeatures ||
++        name == switches::kDisableFeatures) {
++      sanitized.AppendSwitchASCII(
++          name, SanitizeFeatureList(command_line.GetSwitchValueASCII(name)));
++    } else {
++      sanitized.AppendSwitch(name);
++    }
++  }
++  HandleEnableDisableFeatures(sanitized);
++  SetSwitchesFromCommandLine(sanitized, &IsBoringSwitch);
+ }
+ 
+ }  // namespace crash_keys
+--- a/third_party/crashpad/crashpad/handler/crash_report_upload_thread.cc
++++ b/third_party/crashpad/crashpad/handler/crash_report_upload_thread.cc
+@@ -201,8 +201,6 @@ void CrashReportUploadThread::ProcessPen
+     // Don’t attempt an upload if there’s no URL to upload to. Allow upload if
+     // it has been explicitly requested by the user, otherwise, respect the
+     // upload-enabled state stored in the database’s settings.
+-    database_->SkipReportUpload(report.uuid,
+-                                Metrics::CrashSkippedReason::kUploadsDisabled);
+     return;
+   }
+ 
+@@ -312,7 +310,9 @@ CrashReportUploadThread::UploadResult Cr
+     if (kv.first == kMinidumpKey) {
+       LOG(WARNING) << "reserved key " << kv.first << ", discarding value "
+                    << kv.second;
+-    } else {
++    } else if (kv.first == "prod" || kv.first == "ver" ||
++               kv.first == "plat" || kv.first == "ptype" ||
++               kv.first == "channel") {
+       http_multipart_builder.SetFormData(kv.first, kv.second);
+     }
+   }
+@@ -350,7 +350,6 @@ CrashReportUploadThread::UploadResult Cr
+     } kURLParameterMappings[] = {
+         {"prod", "product"},
+         {"ver", "version"},
+-        {"guid", "guid"},
+     };
+ 
+     for (const auto& parameter_mapping : kURLParameterMappings) {
+--- a/third_party/crashpad/crashpad/client/settings.cc
++++ b/third_party/crashpad/crashpad/client/settings.cc
+@@ -154,12 +154,7 @@ SettingsReader::~SettingsReader() = defa
+ 
+ bool SettingsReader::GetClientID(UUID* client_id) {
+   DCHECK(initialized().is_valid());
+-
+-  Data settings;
+-  if (!OpenAndReadSettings(&settings))
+-    return false;
+-
+-  *client_id = settings.client_id;
++  client_id->InitializeToZero();
+   return true;
+ }
+ 
+--- a/components/crash/core/app/crashpad.h
++++ b/components/crash/core/app/crashpad.h
+@@ -78,6 +78,9 @@ namespace crash_reporter {
+ // On iOS, this will return false if Crashpad initialization fails.
+ bool InitializeCrashpad(bool initial_client, const std::string& process_type);
+ 
++// Disables uploads in the Crashpad database before its handler starts.
++bool DisableCrashpadUploadsAtStartup(const base::FilePath& database_path);
++
+ #if BUILDFLAG(IS_WIN)
+ // This is the same as InitializeCrashpad(), but rather than launching a
+ // crashpad_handler executable, relaunches the executable at |exe_path| or the
+--- a/components/crash/core/app/crashpad_linux.cc
++++ b/components/crash/core/app/crashpad_linux.cc
+@@ -165,6 +165,10 @@ bool PlatformCrashpadInitialization(
+     crash_reporter_client->GetCrashDumpLocation(database_path);
+     crash_reporter_client->GetCrashMetricsLocation(&metrics_path);
+ 
++    if (!DisableCrashpadUploadsAtStartup(*database_path)) {
++      return false;
++    }
++
+     base::FilePath handler_path;
+     if (!base::PathService::Get(base::DIR_EXE, &handler_path)) {
+       return false;
+--- a/components/crash/core/app/crashpad_mac.mm
++++ b/components/crash/core/app/crashpad_mac.mm
+@@ -153,6 +153,10 @@ bool PlatformCrashpadInitialization(
+       crash_reporter_client->GetCrashDumpLocation(database_path);
+       crash_reporter_client->GetCrashMetricsLocation(&metrics_path);
+ 
++      if (!DisableCrashpadUploadsAtStartup(*database_path)) {
++        return false;
++      }
++
+       std::string url = crash_reporter_client->GetUploadUrl();
+ 
+       std::vector<std::string> arguments;
+--- a/components/crash/core/app/crashpad_win.cc
++++ b/components/crash/core/app/crashpad_win.cc
+@@ -87,6 +87,10 @@ bool PlatformCrashpadInitialization(
+     if (crash_reporter_client->GetCrashDumpLocation(&database_path_str))
+       *database_path = base::FilePath(database_path_str);
+ 
++    if (!DisableCrashpadUploadsAtStartup(*database_path)) {
++      return false;
++    }
++
+     std::wstring metrics_path_str;
+     if (crash_reporter_client->GetCrashMetricsLocation(&metrics_path_str)) {
+       metrics_path = base::FilePath(metrics_path_str);

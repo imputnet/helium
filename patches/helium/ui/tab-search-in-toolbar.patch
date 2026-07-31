@@ -1,0 +1,577 @@
+--- a/chrome/browser/ui/toolbar/pinned_toolbar/BUILD.gn
++++ b/chrome/browser/ui/toolbar/pinned_toolbar/BUILD.gn
+@@ -12,6 +12,7 @@ source_set("pinned_toolbar") {
+       "pinned_toolbar_actions_model.h",
+       "pinned_toolbar_actions_model_factory.h",
+       "pinned_translate_action_listener.h",
++      "tab_search_toolbar_button_controller.h",
+     ]
+     public_deps += [
+       "//base",
+@@ -37,6 +38,7 @@ source_set("impl") {
+       "pinned_toolbar_actions_model.cc",
+       "pinned_toolbar_actions_model_factory.cc",
+       "pinned_translate_action_listener.cc",
++      "tab_search_toolbar_button_controller.cc",
+     ]
+     deps = [
+       "//chrome/browser:primitives",
+--- /dev/null
++++ b/chrome/browser/ui/toolbar/pinned_toolbar/tab_search_toolbar_button_controller.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TOOLBAR_PINNED_TOOLBAR_TAB_SEARCH_TOOLBAR_BUTTON_CONTROLLER_H_
++#define CHROME_BROWSER_UI_TOOLBAR_PINNED_TOOLBAR_TAB_SEARCH_TOOLBAR_BUTTON_CONTROLLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/views/tab_search_bubble_host_observer.h"
++#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++
++namespace actions {
++class ActionItem;
++}  // namespace actions
++
++class BrowserView;
++class BrowserWindowInterface;
++class PinnedToolbarActions;
++class TabSearchBubbleHost;
++
++class TabSearchToolbarButtonController : public TabSearchBubbleHostObserver {
++ public:
++  DECLARE_USER_DATA(TabSearchToolbarButtonController);
++
++  static TabSearchToolbarButtonController* From(
++      BrowserWindowInterface* browser_window);
++
++  TabSearchToolbarButtonController(BrowserWindowInterface* browser_window,
++                                   BrowserView* browser_view);
++  ~TabSearchToolbarButtonController() override;
++
++  TabSearchToolbarButtonController(
++      const TabSearchToolbarButtonController&) = delete;
++  TabSearchToolbarButtonController& operator=(
++      const TabSearchToolbarButtonController&) = delete;
++
++  void PrepareToShowBubble();
++  void UpdateBubbleHost(TabSearchBubbleHost* bubble_host);
++
++  // TabSearchBubbleHostObserver:
++  void OnBubbleInitializing() override;
++  void OnBubbleDestroying() override;
++  void OnHostDestroying() override;
++
++ private:
++  actions::ActionItem* GetTabSearchActionItem();
++  PinnedToolbarActions* GetPinnedToolbarActions();
++  void MaybeHideActionEphemerallyInToolbar();
++
++  const raw_ptr<BrowserView> browser_view_;
++
++  ui::ScopedUnownedUserData<TabSearchToolbarButtonController>
++      scoped_unowned_user_data_;
++
++  base::ScopedObservation<TabSearchBubbleHost, TabSearchBubbleHostObserver>
++      tab_search_bubble_host_observation_{this};
++
++  base::WeakPtrFactory<TabSearchToolbarButtonController> weak_ptr_factory_{
++      this};
++};
++
++#endif  // CHROME_BROWSER_UI_TOOLBAR_PINNED_TOOLBAR_TAB_SEARCH_TOOLBAR_BUTTON_CONTROLLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/toolbar/pinned_toolbar/tab_search_toolbar_button_controller.cc
+@@ -0,0 +1,117 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/toolbar/pinned_toolbar/tab_search_toolbar_button_controller.h"
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/actions/chrome_action_id.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_actions.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
++#include "chrome/browser/ui/views/tab_search_bubble_host.h"
++#include "chrome/browser/ui/views/toolbar/pinned_toolbar_actions.h"
++#include "ui/actions/actions.h"
++
++namespace {
++
++constexpr base::TimeDelta kHideTabSearchButtonDelay = base::Seconds(2);
++
++}  // namespace
++
++DEFINE_USER_DATA(TabSearchToolbarButtonController);
++
++// static
++TabSearchToolbarButtonController* TabSearchToolbarButtonController::From(
++    BrowserWindowInterface* browser_window) {
++  return Get(browser_window->GetUnownedUserDataHost());
++}
++
++TabSearchToolbarButtonController::TabSearchToolbarButtonController(
++    BrowserWindowInterface* browser_window,
++    BrowserView* browser_view)
++    : browser_view_(browser_view),
++      scoped_unowned_user_data_(browser_window->GetUnownedUserDataHost(),
++                                *this) {
++  browser_view_->UpdateTabSearchBubbleHost();
++}
++
++TabSearchToolbarButtonController::~TabSearchToolbarButtonController() = default;
++
++void TabSearchToolbarButtonController::PrepareToShowBubble() {
++  weak_ptr_factory_.InvalidateWeakPtrs();
++
++  PinnedToolbarActions* const pinned_actions = GetPinnedToolbarActions();
++  if (pinned_actions && !pinned_actions->IsActionPinned(kActionTabSearch)) {
++    pinned_actions->ShowActionEphemerallyInToolbar(kActionTabSearch, true);
++  }
++}
++
++void TabSearchToolbarButtonController::UpdateBubbleHost(
++    TabSearchBubbleHost* bubble_host) {
++  tab_search_bubble_host_observation_.Reset();
++  if (bubble_host) {
++    tab_search_bubble_host_observation_.Observe(bubble_host);
++  }
++}
++
++void TabSearchToolbarButtonController::OnBubbleInitializing() {
++  actions::ActionItem* const action_item = GetTabSearchActionItem();
++  CHECK(action_item);
++  action_item->SetIsShowingBubble(true);
++
++  PrepareToShowBubble();
++}
++
++void TabSearchToolbarButtonController::OnBubbleDestroying() {
++  actions::ActionItem* const action_item = GetTabSearchActionItem();
++  CHECK(action_item);
++  action_item->SetIsShowingBubble(false);
++
++  PinnedToolbarActions* const pinned_actions = GetPinnedToolbarActions();
++  if (!pinned_actions || pinned_actions->IsActionPinned(kActionTabSearch)) {
++    return;
++  }
++
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&TabSearchToolbarButtonController::
++                         MaybeHideActionEphemerallyInToolbar,
++                     weak_ptr_factory_.GetWeakPtr()),
++      kHideTabSearchButtonDelay);
++}
++
++void TabSearchToolbarButtonController::OnHostDestroying() {
++  UpdateBubbleHost(nullptr);
++}
++
++actions::ActionItem*
++TabSearchToolbarButtonController::GetTabSearchActionItem() {
++  return actions::ActionManager::Get().FindAction(
++      kActionTabSearch,
++      browser_view_->browser()->GetActions()->root_action_item());
++}
++
++PinnedToolbarActions*
++TabSearchToolbarButtonController::GetPinnedToolbarActions() {
++  ToolbarButtonProvider* const provider =
++      browser_view_->toolbar_button_provider();
++  return provider ? provider->GetPinnedToolbarActions() : nullptr;
++}
++
++void TabSearchToolbarButtonController::
++    MaybeHideActionEphemerallyInToolbar() {
++  actions::ActionItem* const action_item = GetTabSearchActionItem();
++  PinnedToolbarActions* const pinned_actions = GetPinnedToolbarActions();
++  if (!action_item || !pinned_actions || action_item->GetIsShowingBubble() ||
++      pinned_actions->IsActionPinned(kActionTabSearch)) {
++    return;
++  }
++
++  pinned_actions->ShowActionEphemerallyInToolbar(kActionTabSearch, false);
++}
+--- a/chrome/browser/ui/browser_window/public/browser_window_features.h
++++ b/chrome/browser/ui/browser_window/public/browser_window_features.h
+@@ -82,6 +82,7 @@ class SplitViewIphController;
+ class TabDragServiceFeature;
+ class TabListBridge;
+ class TabMenuModelDelegate;
++class TabSearchToolbarButtonController;
+ class TabStripModel;
+ class TabStripServiceFeature;
+ class TabsFromOtherDevicesSidePanelCoordinator;
+@@ -723,6 +724,8 @@ class BrowserWindowFeatures {
+       skills_ui_window_controller_;
+   std::unique_ptr<split_tabs::SplitTabHighlightController>
+       split_tab_highlight_controller_;
++  std::unique_ptr<TabSearchToolbarButtonController>
++      tab_search_toolbar_button_controller_;
+ 
+   // Members owned only when a WebUIBrowserWindow is used.
+   std::unique_ptr<WebUIBrowserExclusiveAccessContext>
+--- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+@@ -111,6 +111,7 @@
+ #include "chrome/browser/ui/toasts/toast_features.h"
+ #include "chrome/browser/ui/toasts/toast_service.h"
+ #include "chrome/browser/ui/toolbar/chrome_labs/chrome_labs_utils.h"
++#include "chrome/browser/ui/toolbar/pinned_toolbar/tab_search_toolbar_button_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/unload_controller.h"
+ #include "chrome/browser/ui/views/animations/side_panel_animations.h"
+@@ -847,6 +848,12 @@ void BrowserWindowFeatures::InitPostWind
+       browser, browser->GetTabStripModel(), browser->GetSessionID(),
+       browser->GetType());
+ 
++  if (browser_view && browser->is_type_normal()) {
++    tab_search_toolbar_button_controller_ =
++        GetUserDataFactory().CreateInstance<TabSearchToolbarButtonController>(
++            *browser_, browser_.get(), browser_view);
++  }
++
+   if (browser->is_type_normal() || browser->is_type_app()) {
+     toast_service_ = std::make_unique<ToastService>(browser);
+   }
+@@ -1130,6 +1137,7 @@ void BrowserWindowFeatures::TearDownPreB
+   }
+   upgrade_notification_controller_.reset();
+   toast_service_.reset();
++  tab_search_toolbar_button_controller_.reset();
+   synced_window_delegate_.reset();
+   skills_ui_window_controller_.reset();
+   // TODO(crbug.com/346148093): This logic should not be gated behind a
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -174,6 +174,7 @@ class ToolbarView : public views::Access
+     return extensions_container_;
+   }
+   ToolbarButton* forward_button() const { return forward_; }
++  views::Button* tab_search_button();
+   ExtensionsToolbarButton* GetExtensionsButton() const;
+   ReloadButton* reload_button() const { return reload_; }
+   LocationBarView* location_bar_view() const { return location_bar_view_; }
+@@ -398,6 +399,7 @@ class ToolbarView : public views::Access
+       nullptr;
+   raw_ptr<PinnedToolbarActionsContainer> pinned_toolbar_actions_container_ =
+       nullptr;
++  raw_ptr<views::Button> tab_search_button_ = nullptr;
+ 
+   // An alias for `pinned_toolbar_actions_container_` or
+   // `toolbar_webview_->GetPinnedActionsContainer()`.
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -1337,6 +1337,15 @@ views::Button* ToolbarView::GetChromeLab
+   return ChromeLabsCoordinator::From(browser_)->GetChromeLabsButton();
+ }
+ 
++views::Button* ToolbarView::tab_search_button() {
++  if (!tab_search_button_ && pinned_toolbar_actions_container_) {
++    tab_search_button_ =
++        pinned_toolbar_actions_container_->CreatePermanentButtonFor(
++            kActionTabSearch);
++  }
++  return tab_search_button_;
++}
++
+ ExtensionsToolbarButton* ToolbarView::GetExtensionsButton() const {
+   return extensions_container_->GetExtensionsButton();
+ }
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -840,6 +840,8 @@ class BrowserView : public BrowserWindow
+   FRIEND_TEST_ALL_PREFIXES(BrowserViewTest, AccessibleWindowTitle);
+   FRIEND_TEST_ALL_PREFIXES(PermissionChipUnitTest, AccessibleName);
+ 
++  void ShowTabSearchBubbleAfterAnchorUpdate();
++
+   // Modes that require reparenting of views. For example, tab strip and web app
+   // views must be reparented to top_container in certain modes. This state is
+   // track which combination of states the browser is in so we only reparent in
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -125,6 +125,7 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/toolbar/app_menu_model.h"
+ #include "chrome/browser/ui/toolbar/chrome_labs/chrome_labs_utils.h"
++#include "chrome/browser/ui/toolbar/pinned_toolbar/tab_search_toolbar_button_controller.h"
+ #include "chrome/browser/ui/toolbar/toolbar_pref_names.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+@@ -306,6 +307,7 @@
+ #include "ui/accessibility/platform/assistive_tech.h"
+ #include "ui/accessibility/platform/ax_mode_observer.h"
+ #include "ui/accessibility/platform/ax_platform.h"
++#include "ui/actions/actions.h"
+ #include "ui/base/accelerators/accelerator.h"
+ #include "ui/base/dragdrop/os_exchange_data.h"
+ #include "ui/base/hit_test.h"
+@@ -4212,13 +4214,32 @@ const views::Widget* BrowserView::GetWid
+ }
+ 
+ void BrowserView::CreateTabSearchBubble() {
+-  if (auto* tab_search_host = GetTabSearchBubbleHost()) {
++  if (auto* controller =
++          TabSearchToolbarButtonController::From(browser_.get())) {
++    controller->PrepareToShowBubble();
++  }
++
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&BrowserView::ShowTabSearchBubbleAfterAnchorUpdate,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++void BrowserView::ShowTabSearchBubbleAfterAnchorUpdate() {
++  UpdateTabSearchBubbleHost();
++  auto* tab_search_host = GetTabSearchBubbleHost();
++  if (tab_search_host) {
+     tab_search_host->ShowTabSearchBubble(true);
+   }
+ }
+ 
+ void BrowserView::CloseTabSearchBubble() {
+-  if (auto* tab_search_host = GetTabSearchBubbleHost()) {
++  auto* tab_search_host = GetTabSearchBubbleHost();
++  if (!tab_search_host) {
++    UpdateTabSearchBubbleHost();
++    tab_search_host = GetTabSearchBubbleHost();
++  }
++  if (tab_search_host) {
+     tab_search_host->CloseTabSearchBubble();
+   }
+ }
+@@ -4258,20 +4279,27 @@ void BrowserView::UpdateTabSearchBubbleH
+     return;
+   }
+ 
+-  auto* vertical_tab_strip_state_controller =
+-      tabs::VerticalTabStripStateController::From(browser_);
+-  if (vertical_tab_strip_state_controller &&
+-      vertical_tab_strip_state_controller->ShouldDisplayVerticalTabs()) {
+-    auto* combo_button =
+-        vertical_tab_strip_region_view_->GetTopContainer()->GetComboButton();
+-    tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
+-        combo_button->end_button(), browser_.get());
+-    combo_button->SetTabSearchBubbleHost(tab_search_bubble_host_.get());
+-  } else {
+-    auto* combo_button = horizontal_tab_strip_region_view_->GetComboButton();
+-    tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
+-        combo_button->end_button(), browser_.get());
+-    combo_button->SetTabSearchBubbleHost(tab_search_bubble_host_.get());
++  views::Button* const tab_search_button =
++      toolbar_ ? toolbar_->tab_search_button() : nullptr;
++  if (!tab_search_button) {
++    tab_search_bubble_host_.reset();
++    return;
++  }
++
++  if (tab_search_bubble_host_ &&
++      tab_search_bubble_host_->button() == tab_search_button) {
++    if (auto* controller =
++            TabSearchToolbarButtonController::From(browser_.get())) {
++      controller->UpdateBubbleHost(tab_search_bubble_host_.get());
++    }
++    return;
++  }
++
++  tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
++      tab_search_button, browser_.get());
++  if (auto* controller =
++          TabSearchToolbarButtonController::From(browser_.get())) {
++    controller->UpdateBubbleHost(tab_search_bubble_host_.get());
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/shared/tab_strip_combo_button.cc
++++ b/chrome/browser/ui/views/tabs/shared/tab_strip_combo_button.cc
+@@ -100,15 +100,19 @@ TabStripComboButton::TabStripComboButton
+   if (start_button) {
+     start_button_ = AddChildView(std::move(start_button));
+   }
+-  end_button_ = AddChildView(
+-      CreateFlatEdgeButtonFor(kActionTabSearch, kTabSearchButtonElementId));
++  if (context_ == Context::kHorizontalTabStrip) {
++    end_button_ = AddChildView(
++        CreateFlatEdgeButtonFor(kActionTabSearch, kTabSearchButtonElementId));
++  }
+ 
+   PrefService* prefs = browser_->GetProfile()->GetPrefs();
+   pref_registrar_.Init(prefs);
+-  pref_registrar_.Add(
+-      prefs::kTabSearchPinnedToTabstrip,
+-      base::BindRepeating(&TabStripComboButton::UpdateButtonsVisibility,
+-                          base::Unretained(this)));
++  if (end_button_) {
++    pref_registrar_.Add(
++        prefs::kTabSearchPinnedToTabstrip,
++        base::BindRepeating(&TabStripComboButton::UpdateButtonsVisibility,
++                            base::Unretained(this)));
++  }
+   pref_registrar_.Add(
+       prefs::kProjectsPanelPinnedToTabstrip,
+       base::BindRepeating(&TabStripComboButton::UpdateButtonsVisibility,
+@@ -159,8 +163,11 @@ void TabStripComboButton::UpdateButtonsV
+                              prefs->GetBoolean(pref_name));
+   }
+ 
+-  update_button_visibility(GetEndButtonActionItem(), end_button_animation_,
+-                           IsTabSearchPinned() || show_tab_search_ephemerally_);
++  if (end_button_) {
++    update_button_visibility(GetEndButtonActionItem(), end_button_animation_,
++                             IsTabSearchPinned() ||
++                                 show_tab_search_ephemerally_);
++  }
+ }
+ 
+ void TabStripComboButton::OnTabSearchBubbleShown() {
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_top_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_top_container.h
+@@ -12,7 +12,6 @@
+ #include "ui/views/view.h"
+ 
+ class TabStripComboButton;
+-class TabStripFlatEdgeButton;
+ class BrowserWindowInterface;
+ class ExpandOnHoverLock;
+ 
+@@ -30,8 +29,8 @@ class LabelButton;
+ class MenuRunner;
+ }  // namespace views
+ 
+-// Top container of the vertical tab strip, manages the collapse and tab search
+-// buttons, accounting for space that might be needed for caption buttons.
++// Top container of the vertical tab strip, manages its controls while
++// accounting for space that might be needed for caption buttons.
+ class VerticalTabStripTopContainer : public views::View,
+                                      public views::LayoutDelegate,
+                                      public views::ContextMenuController,
+@@ -58,7 +57,6 @@ class VerticalTabStripTopContainer : pub
+   views::LabelButton* AddChildButtonFor(actions::ActionId action_id);
+ 
+   TabStripComboButton* GetComboButton();
+-  TabStripFlatEdgeButton* GetTabSearchButton();
+   views::LabelButton* GetCollapseButton() { return collapse_button_; }
+   views::LabelButton* GetUnfocusButton() { return unfocus_button_; }
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_top_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_top_container.cc
+@@ -297,10 +297,6 @@ TabStripComboButton* VerticalTabStripTop
+   return combo_button_.get();
+ }
+ 
+-TabStripFlatEdgeButton* VerticalTabStripTopContainer::GetTabSearchButton() {
+-  return combo_button_->end_button();
+-}
+-
+ bool VerticalTabStripTopContainer::IsPositionInWindowCaption(
+     const gfx::Point& point) {
+   if (combo_button_ && IsHitInView(combo_button_, point)) {
+--- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+@@ -180,15 +180,6 @@ HorizontalTabStripRegionView::Horizontal
+ 
+   BrowserWindowInterface* const browser = browser_view->browser();
+ 
+-  if (browser &&
+-      (browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL)) {
+-    combo_button_ = AddChildView(std::make_unique<TabStripComboButton>(
+-        browser, TabStripComboButton::Context::kHorizontalTabStrip));
+-    combo_button_->SetProperty(views::kCrossAxisAlignmentKey,
+-                               views::LayoutAlignment::kCenter);
+-    combo_button_->MaybeShowIPH();
+-  }
+-
+   if (base::FeatureList::IsEnabled(features::kTabGroupsFocusing)) {
+     unfocus_button_ = AddChildView(std::make_unique<TabStripControlButton>(
+         browser, views::Button::PressedCallback(),
+@@ -208,7 +199,7 @@ HorizontalTabStripRegionView::Horizontal
+                                  views::LayoutAlignment::kCenter);
+   }
+ 
+-  // Add and configure the TabStripComboButton.
++  // Add and configure the TabStripActionContainer.
+   std::unique_ptr<TabStripActionContainer> tab_strip_action_container;
+   if (browser &&
+       (browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL)) {
+--- a/chrome/browser/ui/browser_actions.cc
++++ b/chrome/browser/ui/browser_actions.cc
+@@ -927,17 +927,20 @@ void BrowserActions::InitializeChromeMen
+           base::BindRepeating(
+               [](BrowserWindowInterface* bwi, actions::ActionItem* item,
+                  actions::ActionInvocationContext context) {
+-                chrome::ShowTabSearch(bwi);
++                if (item->GetIsShowingBubble()) {
++                  chrome::CloseTabSearch(bwi);
++                } else {
++                  chrome::ShowTabSearch(bwi);
++                }
+               },
+               bwi),
+           kActionTabSearch, IDS_TAB_SEARCH_MENU, IDS_TAB_SEARCH_MENU,
+-          features::IsRoundedIconsEnabled()
+-              ? vector_icons::kKeyboardArrowDownIcon
+-              : vector_icons::kExpandMoreOldIcon)
++          features::IsRoundedIconsEnabled() ? kManageSearchIcon
++                                            : kTabSearchTabStripOldIcon)
+           .SetProperty(
+               actions::kActionItemPinnableKey,
+               static_cast<std::underlying_type_t<actions::ActionPinnableState>>(
+-                  actions::ActionPinnableState::kNotPinnable))
++                  actions::ActionPinnableState::kPinnable))
+           .Build());
+ 
+   if (tabs::IsVerticalTabsFeatureEnabled()) {
+--- a/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar_handler.cc
++++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_toolbar/customize_toolbar_handler.cc
+@@ -412,6 +412,8 @@ void CustomizeToolbarHandler::ListAction
+         actions.push_back(std::move(mojo_action));
+       };
+ 
++  add_action(kActionTabSearch,
++             side_panel::customize_chrome::mojom::CategoryId::kTools);
+   add_action(kActionSidePanelShowBookmarks,
+              side_panel::customize_chrome::mojom::CategoryId::kTools);
+   add_action(kActionSidePanelShowHistoryCluster,
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.h
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.h
+@@ -17,6 +17,7 @@ namespace tabs {
+ enum class TabSearchPosition {
+   kLeadingHorizontalTabstrip,
+   kVerticalTabstrip,
++  kToolbar,
+ };
+ 
+ // Returns the default behavior per platform for tab search position.
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+@@ -75,15 +75,8 @@ void MigrateEverythingMenuPinnedToTabstr
+ }
+ 
+ TabSearchPosition GetTabSearchPosition(
+-    const BrowserWindowInterface* browser_window) {
+-  if (browser_window) {
+-    auto* const controller =
+-        tabs::VerticalTabStripStateController::From(browser_window);
+-    if (controller && controller->ShouldDisplayVerticalTabs()) {
+-      return TabSearchPosition::kVerticalTabstrip;
+-    }
+-  }
+-  return TabSearchPosition::kLeadingHorizontalTabstrip;
++    const BrowserWindowInterface* /*browser_window*/) {
++  return TabSearchPosition::kToolbar;
+ }
+ 
+ }  // namespace tabs
