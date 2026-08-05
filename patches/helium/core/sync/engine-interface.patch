@@ -1,0 +1,158 @@
+--- /dev/null
++++ b/components/sync/engine/custom_sync_backend.h
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SYNC_ENGINE_CUSTOM_SYNC_BACKEND_H_
++#define COMPONENTS_SYNC_ENGINE_CUSTOM_SYNC_BACKEND_H_
++
++#include <memory>
++#include <string>
++
++namespace syncer {
++
++class CancelationSignal;
++class ServerConnectionManager;
++
++// Sync-engine factory for an embedder-provided backend.
++class CustomSyncBackend {
++ public:
++  CustomSyncBackend() = default;
++  CustomSyncBackend(const CustomSyncBackend&) = delete;
++  CustomSyncBackend& operator=(const CustomSyncBackend&) = delete;
++  virtual ~CustomSyncBackend() = default;
++
++  virtual std::unique_ptr<ServerConnectionManager> CreateConnectionManager(
++      CancelationSignal* cancelation_signal) = 0;
++
++  // A non-sensitive implementation name for local diagnostics.
++  virtual std::string GetDebugName() const = 0;
++};
++
++}  // namespace syncer
++
++#endif  // COMPONENTS_SYNC_ENGINE_CUSTOM_SYNC_BACKEND_H_
+--- a/components/sync/engine/sync_engine.cc
++++ b/components/sync/engine/sync_engine.cc
+@@ -5,6 +5,7 @@
+ #include "components/sync/engine/sync_engine.h"
+ 
+ #include "components/os_crypt/async/common/encryptor.h"
++#include "components/sync/engine/custom_sync_backend.h"
+ #include "components/sync/engine/engine_components_factory.h"
+ 
+ namespace syncer {
+--- a/components/sync/engine/sync_engine.h
++++ b/components/sync/engine/sync_engine.h
+@@ -31,6 +31,7 @@ class Encryptor;
+ namespace syncer {
+ 
+ class CustomPassphraseBootstrapToken;
++class CustomSyncBackend;
+ class EngineComponentsFactory;
+ class HttpPostProviderFactory;
+ class SyncEngineHost;
+@@ -64,6 +65,9 @@ class SyncEngine : public DataTypeConfig
+     std::unique_ptr<SyncManagerFactory> sync_manager_factory;
+     bool enable_local_sync_backend = false;
+     base::FilePath local_sync_backend_folder;
++
++    // Mutually exclusive with `enable_local_sync_backend`.
++    std::unique_ptr<CustomSyncBackend> custom_sync_backend;
+     std::unique_ptr<EngineComponentsFactory> engine_components_factory;
+     scoped_refptr<os_crypt_async::Encryptor> encryptor;
+   };
+--- a/components/sync/engine/sync_manager.cc
++++ b/components/sync/engine/sync_manager.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "components/sync/engine/sync_manager.h"
+ 
++#include "components/sync/engine/custom_sync_backend.h"
++
+ namespace syncer {
+ 
+ SyncManager::Observer::~Observer() = default;
+--- a/components/sync/engine/sync_manager.h
++++ b/components/sync/engine/sync_manager.h
+@@ -34,6 +34,7 @@
+ namespace syncer {
+ 
+ class CancelationSignal;
++class CustomSyncBackend;
+ class EngineComponentsFactory;
+ class ExtensionsActivity;
+ class ProtocolEvent;
+@@ -81,6 +82,7 @@ class SyncManager {
+     // and the location of the local sync backend storage.
+     bool enable_local_sync_backend = false;
+     base::FilePath local_sync_backend_folder;
++    std::unique_ptr<CustomSyncBackend> custom_sync_backend;
+ 
+     // Used to communicate with the sync server.
+     std::unique_ptr<HttpPostProviderFactory> post_factory;
+--- a/components/sync/engine/sync_manager_impl.cc
++++ b/components/sync/engine/sync_manager_impl.cc
+@@ -23,6 +23,7 @@
+ #include "components/sync/engine/cancelation_signal.h"
+ #include "components/sync/engine/configure_reason.h"
+ #include "components/sync/engine/cryptographer.h"
++#include "components/sync/engine/custom_sync_backend.h"
+ #include "components/sync/engine/data_type_connector_proxy.h"
+ #include "components/sync/engine/data_type_worker.h"
+ #include "components/sync/engine/engine_components_factory.h"
+@@ -162,7 +163,17 @@ void SyncManagerImpl::Init(InitArgs* arg
+   sync_status_tracker_->SetHasKeystoreKey(
+       !sync_encryption_handler_->GetKeystoreKeysHandler()->NeedKeystoreKey());
+ 
+-  if (args->enable_local_sync_backend) {
++  CHECK(!args->enable_local_sync_backend || !args->custom_sync_backend);
++  const bool use_non_network_backend =
++      args->enable_local_sync_backend || args->custom_sync_backend;
++  if (args->custom_sync_backend) {
++    VLOG(1) << "Running against a custom sync backend.";
++    sync_status_tracker_->SetLocalBackendFolder(
++        args->custom_sync_backend->GetDebugName());
++    connection_manager_ = args->custom_sync_backend->CreateConnectionManager(
++        args->cancelation_signal);
++    CHECK(connection_manager_);
++  } else if (args->enable_local_sync_backend) {
+     VLOG(1) << "Running against local sync backend.";
+     sync_status_tracker_->SetLocalBackendFolder(
+         args->local_sync_backend_folder.AsUTF8Unsafe());
+@@ -191,13 +202,13 @@ void SyncManagerImpl::Init(InitArgs* arg
+       args->birthday, args->bag_of_chips, args->poll_interval);
+   scheduler_ = args->engine_components_factory->BuildScheduler(
+       name_, cycle_context_.get(), args->cancelation_signal,
+-      args->enable_local_sync_backend);
++      use_non_network_backend);
+ 
+   scheduler_->Start(SyncScheduler::CONFIGURATION_MODE, base::Time());
+ 
+   initialized_ = true;
+ 
+-  if (!args->enable_local_sync_backend) {
++  if (!use_non_network_backend) {
+     network_connection_tracker_->AddNetworkConnectionObserver(this);
+   } else {
+     scheduler_->OnCredentialsUpdated();
+--- a/components/sync/service/glue/sync_engine_backend.cc
++++ b/components/sync/service/glue/sync_engine_backend.cc
+@@ -23,6 +23,7 @@
+ #include "components/sync/base/sync_invalidation_adapter.h"
+ #include "components/sync/base/sync_stop_metadata_fate.h"
+ #include "components/sync/engine/configure_reason.h"
++#include "components/sync/engine/custom_sync_backend.h"
+ #include "components/sync/engine/cycle/sync_cycle_snapshot.h"
+ #include "components/sync/engine/data_type_activation_response.h"
+ #include "components/sync/engine/engine_components_factory.h"
+@@ -308,6 +309,7 @@ void SyncEngineBackend::DoInitialize(
+   args.service_url = params.service_url;
+   args.enable_local_sync_backend = params.enable_local_sync_backend;
+   args.local_sync_backend_folder = params.local_sync_backend_folder;
++  args.custom_sync_backend = std::move(params.custom_sync_backend);
+   args.post_factory = std::move(params.http_factory_getter).Run();
+   args.encryption_observer_proxy = std::move(params.encryption_observer_proxy);
+   args.extensions_activity = params.extensions_activity.get();
