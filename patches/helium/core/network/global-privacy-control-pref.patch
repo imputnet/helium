@@ -1,0 +1,313 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -895,6 +895,10 @@ inline constexpr char kEnableReferrers[]
+ // Whether to send the DNT header.
+ inline constexpr char kEnableDoNotTrack[] = "enable_do_not_track";
+ 
++// Whether to send the Global Privacy Control signal.
++inline constexpr char kHeliumGlobalPrivacyControl[] =
++    "helium.global_privacy_control";
++
+ // Whether to allow the use of Encrypted Media Extensions (EME), except for the
+ // use of Clear Key key sytems, which is always allowed as required by the spec.
+ // TODO(crbug.com/40549758): This pref was used as a WebPreference which is why
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -150,6 +150,7 @@ void RegisterBrowserUserPrefs(user_prefs
+   registry->RegisterBooleanPref(
+       prefs::kEnableDoNotTrack, false,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
++  registry->RegisterBooleanPref(prefs::kHeliumGlobalPrivacyControl, false);
+ #if !BUILDFLAG(IS_CHROMEOS) && !BUILDFLAG(IS_ANDROID)
+   registry->RegisterBooleanPref(prefs::kPrintPreviewUseSystemDefaultPrinter,
+                                 false);
+--- a/third_party/blink/public/common/renderer_preferences/renderer_preferences.h
++++ b/third_party/blink/public/common/renderer_preferences/renderer_preferences.h
+@@ -52,6 +52,7 @@ struct BLINK_COMMON_EXPORT RendererPrefe
+   bool enable_referrers{true};
+   bool allow_cross_origin_auth_prompt{false};
+   bool enable_do_not_track{false};
++  bool enable_global_privacy_control{false};
+   bool enable_encrypted_media{true};
+ #if BUILDFLAG(IS_CHROMEOS)
+   bool use_overlay_scrollbar{false};
+--- a/third_party/blink/public/mojom/renderer_preferences.mojom
++++ b/third_party/blink/public/mojom/renderer_preferences.mojom
+@@ -89,6 +89,9 @@ struct RendererPreferences {
+   // Set to true to indicate that the preference to set DNT to 1 is enabled.
+   bool enable_do_not_track = false;
+ 
++  // Set to true to enable the Global Privacy Control signal.
++  bool enable_global_privacy_control = false;
++
+   // Whether to allow the use of Encrypted Media Extensions (EME), except for
+   // the use of Clear Key key system which is always allowed as required by the
+   // spec.
+--- a/third_party/blink/public/common/renderer_preferences/renderer_preferences_mojom_traits.h
++++ b/third_party/blink/public/common/renderer_preferences/renderer_preferences_mojom_traits.h
+@@ -128,6 +128,11 @@ struct BLINK_COMMON_EXPORT
+     return data.enable_do_not_track;
+   }
+ 
++  static const bool& enable_global_privacy_control(
++      const ::blink::RendererPreferences& data) {
++    return data.enable_global_privacy_control;
++  }
++
+   static const bool& enable_encrypted_media(
+       const ::blink::RendererPreferences& data) {
+     return data.enable_encrypted_media;
+--- a/third_party/blink/common/renderer_preferences/renderer_preferences_mojom_traits.cc
++++ b/third_party/blink/common/renderer_preferences/renderer_preferences_mojom_traits.cc
+@@ -54,6 +54,7 @@ bool StructTraits<blink::mojom::Renderer
+   out->enable_referrers = data.enable_referrers();
+   out->allow_cross_origin_auth_prompt = data.allow_cross_origin_auth_prompt();
+   out->enable_do_not_track = data.enable_do_not_track();
++  out->enable_global_privacy_control = data.enable_global_privacy_control();
+   out->enable_encrypted_media = data.enable_encrypted_media();
+ 
+   if (!data.ReadWebrtcIpHandlingPolicy(&out->webrtc_ip_handling_policy))
+--- a/chrome/browser/renderer_preferences_util.cc
++++ b/chrome/browser/renderer_preferences_util.cc
+@@ -149,6 +149,8 @@ void UpdateFromSystemSettings(blink::Ren
+   prefs->enable_referrers = pref_service->GetBoolean(prefs::kEnableReferrers);
+   prefs->enable_do_not_track =
+       pref_service->GetBoolean(prefs::kEnableDoNotTrack);
++  prefs->enable_global_privacy_control =
++      pref_service->GetBoolean(prefs::kHeliumGlobalPrivacyControl);
+   prefs->enable_encrypted_media =
+       pref_service->GetBoolean(prefs::kEnableEncryptedMedia);
+ 
+--- a/chrome/browser/ui/prefs/pref_watcher.cc
++++ b/chrome/browser/ui/prefs/pref_watcher.cc
+@@ -152,6 +152,8 @@ PrefWatcher::PrefWatcher(Profile* profil
+                                      renderer_callback);
+   profile_pref_change_registrar_.Add(prefs::kEnableDoNotTrack,
+                                      renderer_callback);
++  profile_pref_change_registrar_.Add(prefs::kHeliumGlobalPrivacyControl,
++                                     renderer_callback);
+ 
+ #if !BUILDFLAG(IS_MAC)
+   profile_pref_change_registrar_.Add(prefs::kFullscreenAllowed,
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -3367,11 +3367,8 @@
+     },
+     {
+       name: "GlobalPrivacyControl",
+-      implied_by: ["GlobalPrivacyControlForce"],
+       base_feature: "none",
+-    },
+-    {
+-      name: "GlobalPrivacyControlForce",
++      status: "stable",
+     },
+     {
+       name: "GraphemeClusterBoundsCheck",
+--- a/third_party/blink/public/platform/web_worker_fetch_context.h
++++ b/third_party/blink/public/platform/web_worker_fetch_context.h
+@@ -145,6 +145,8 @@ class WebWorkerFetchContext : public bas
+   // Returns the current list of user preferred languages.
+   virtual blink::WebString GetAcceptLanguages() const = 0;
+ 
++  virtual bool GlobalPrivacyControlEnabled() const { return false; }
++
+   // Creates a notifier used to notify loading stats for workers.
+   virtual std::unique_ptr<blink::ResourceLoadInfoNotifierWrapper>
+   CreateResourceLoadInfoNotifierWrapper() {
+--- a/third_party/blink/renderer/core/frame/local_frame_client.h
++++ b/third_party/blink/renderer/core/frame/local_frame_client.h
+@@ -277,6 +277,7 @@ class CORE_EXPORT LocalFrameClient : pub
+   virtual std::optional<blink::UserAgentMetadata> UserAgentMetadata() = 0;
+ 
+   virtual String DoNotTrackValue() = 0;
++  virtual bool GlobalPrivacyControlEnabled() { return false; }
+ 
+   virtual void TransitionToCommittedForNewPage() = 0;
+ 
+--- a/third_party/blink/renderer/core/frame/local_frame_client_impl.h
++++ b/third_party/blink/renderer/core/frame/local_frame_client_impl.h
+@@ -189,6 +189,7 @@ class CORE_EXPORT LocalFrameClientImpl f
+   String UserAgent() override;
+   std::optional<blink::UserAgentMetadata> UserAgentMetadata() override;
+   String DoNotTrackValue() override;
++  bool GlobalPrivacyControlEnabled() override;
+   void TransitionToCommittedForNewPage() override;
+   LocalFrame* CreateFrame(const AtomicString& name,
+                           HTMLFrameOwnerElement*) override;
+--- a/third_party/blink/renderer/core/frame/local_frame_client_impl.cc
++++ b/third_party/blink/renderer/core/frame/local_frame_client_impl.cc
+@@ -975,6 +975,11 @@ String LocalFrameClientImpl::DoNotTrackV
+   return String();
+ }
+ 
++bool LocalFrameClientImpl::GlobalPrivacyControlEnabled() {
++  const auto& prefs = web_frame_->View()->GetRendererPreferences();
++  return prefs.enable_global_privacy_control;
++}
++
+ // Called when the FrameLoader goes into a state in which a new page load
+ // will occur.
+ void LocalFrameClientImpl::TransitionToCommittedForNewPage() {
+--- a/third_party/blink/renderer/modules/service_worker/web_service_worker_fetch_context_impl.h
++++ b/third_party/blink/renderer/modules/service_worker/web_service_worker_fetch_context_impl.h
+@@ -77,6 +77,9 @@ class BLINK_EXPORT WebServiceWorkerFetch
+   std::unique_ptr<WebSocketHandshakeThrottle> CreateWebSocketHandshakeThrottle(
+       scoped_refptr<base::SingleThreadTaskRunner> task_runner) override;
+   WebString GetAcceptLanguages() const override;
++  bool GlobalPrivacyControlEnabled() const override {
++    return renderer_preferences_.enable_global_privacy_control;
++  }
+ 
+   // mojom::blink::SubresourceLoaderUpdater implementation:
+   void UpdateSubresourceLoaderFactories(
+--- a/third_party/blink/renderer/modules/service_worker/web_service_worker_fetch_context_impl.cc
++++ b/third_party/blink/renderer/modules/service_worker/web_service_worker_fetch_context_impl.cc
+@@ -153,7 +153,7 @@ void WebServiceWorkerFetchContextImpl::F
+   if (renderer_preferences_.enable_do_not_track) {
+     request.SetHttpHeaderField(WebString::FromUtf8(kDoNotTrackHeader), "1");
+   }
+-  if (IsGlobalPrivacyControlEnabled()) {
++  if (renderer_preferences_.enable_global_privacy_control) {
+     request.SetHttpHeaderField(WebString::FromUtf8(kGlobalPrivacyControlHeader),
+                                "1");
+     blink::MaybeRecordGlobalPrivacyControlSourceMetric(
+--- a/third_party/blink/renderer/platform/loader/fetch/url_loader/dedicated_or_shared_worker_global_scope_context_impl.h
++++ b/third_party/blink/renderer/platform/loader/fetch/url_loader/dedicated_or_shared_worker_global_scope_context_impl.h
+@@ -156,6 +156,9 @@ class BLINK_PLATFORM_EXPORT DedicatedOrS
+   void set_container_is_shared_worker(bool is_sharedworker) override;
+ 
+   WebString GetAcceptLanguages() const override;
++  bool GlobalPrivacyControlEnabled() const override {
++    return renderer_preferences_.enable_global_privacy_control;
++  }
+ 
+   std::unique_ptr<ResourceLoadInfoNotifierWrapper>
+   CreateResourceLoadInfoNotifierWrapper() override;
+--- a/third_party/blink/renderer/platform/loader/fetch/url_loader/dedicated_or_shared_worker_global_scope_context_impl.cc
++++ b/third_party/blink/renderer/platform/loader/fetch/url_loader/dedicated_or_shared_worker_global_scope_context_impl.cc
+@@ -380,7 +380,7 @@ void DedicatedOrSharedWorkerGlobalScopeC
+   if (renderer_preferences_.enable_do_not_track) {
+     request.SetHttpHeaderField(WebString::FromUtf8(kDoNotTrackHeader), "1");
+   }
+-  if (IsGlobalPrivacyControlEnabled()) {
++  if (renderer_preferences_.enable_global_privacy_control) {
+     request.SetHttpHeaderField(WebString::FromUtf8(kGlobalPrivacyControlHeader),
+                                "1");
+     blink::MaybeRecordGlobalPrivacyControlSourceMetric(
+--- a/third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h
++++ b/third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h
+@@ -127,6 +127,8 @@ class CORE_EXPORT WorkerOrWorkletGlobalS
+   // Returns nullptr if this global scope is a WorkletGlobalScope
+   virtual WorkerNavigator* navigator() const { return nullptr; }
+ 
++  bool GlobalPrivacyControlEnabled() const;
++
+   // Returns the resource fetcher for subresources (a.k.a. inside settings
+   // resource fetcher). See core/workers/README.md for details.
+   ResourceFetcher* Fetcher() override;
+--- a/third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.cc
++++ b/third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.cc
+@@ -382,6 +382,11 @@ void WorkerOrWorkletGlobalScope::Initial
+   }
+ }
+ 
++bool WorkerOrWorkletGlobalScope::GlobalPrivacyControlEnabled() const {
++  return web_worker_fetch_context_ &&
++         web_worker_fetch_context_->GlobalPrivacyControlEnabled();
++}
++
+ ResourceFetcher* WorkerOrWorkletGlobalScope::Fetcher() {
+   DCHECK(IsContextThread());
+   // Worklets don't support subresource fetch.
+--- a/third_party/blink/renderer/modules/global_privacy_control/navigator_global_privacy_control.cc
++++ b/third_party/blink/renderer/modules/global_privacy_control/navigator_global_privacy_control.cc
+@@ -4,20 +4,24 @@
+ 
+ #include "third_party/blink/renderer/modules/global_privacy_control/navigator_global_privacy_control.h"
+ 
+-#include "third_party/blink/public/common/global_privacy_control/global_privacy_control_util.h"
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_client.h"
++#include "third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h"
+ 
+ namespace blink {
+ namespace NavigatorGlobalPrivacyControl {
+ 
+ bool globalPrivacyControl(NavigatorBase& navigator) {
+-  // TODO(crbug.com/40745270): Currently, the GPC signal is controlled by a
+-  // feature flag, when a user facing setting is added, this should be modified
+-  // to use frame cached value.
+-  return IsGlobalPrivacyControlEnabled();
++  ExecutionContext* context = navigator.GetExecutionContext();
++  if (auto* window = DynamicTo<LocalDOMWindow>(context)) {
++    LocalFrame* frame = window->GetFrame();
++    return frame && frame->Client()->GlobalPrivacyControlEnabled();
++  }
++
++  auto* worker_scope = DynamicTo<WorkerOrWorkletGlobalScope>(context);
++  return worker_scope && worker_scope->GlobalPrivacyControlEnabled();
+ }
+ 
+ }  // namespace NavigatorGlobalPrivacyControl
+--- a/content/browser/loader/browser_initiated_resource_request.cc
++++ b/content/browser/loader/browser_initiated_resource_request.cc
+@@ -34,7 +34,7 @@ void UpdateAdditionalHeadersForBrowserIn
+ 
+   // Set the GlobalPrivacyControl header if appropriate.
+   // https://w3c.github.io/gpc/#expression-format
+-  if (blink::IsGlobalPrivacyControlEnabled()) {
++  if (renderer_preferences.enable_global_privacy_control) {
+     if (should_update_existing_headers) {
+       headers->RemoveHeader(blink::kGlobalPrivacyControlHeader);
+     }
+--- a/content/renderer/render_frame_impl.cc
++++ b/content/renderer/render_frame_impl.cc
+@@ -4600,7 +4600,7 @@ void RenderFrameImpl::FinalizeRequestInt
+     request.SetHttpHeaderField(
+         blink::WebString::FromUtf8(blink::kDoNotTrackHeader), "1");
+   }
+-  if (blink::IsGlobalPrivacyControlEnabled()) {
++  if (GetWebView()->GetRendererPreferences().enable_global_privacy_control) {
+     request.SetHttpHeaderField(
+         blink::WebString::FromUtf8(blink::kGlobalPrivacyControlHeader), "1");
+     blink::MaybeRecordGlobalPrivacyControlSourceMetric(
+--- a/third_party/blink/public/common/global_privacy_control/global_privacy_control_util.h
++++ b/third_party/blink/public/common/global_privacy_control/global_privacy_control_util.h
+@@ -24,9 +24,6 @@ enum class GPCSignalSourceType {
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/network/enums.xml:GPCSignalSourceType)
+ 
+-// Returns true if the Global Privacy Control is enabled.
+-BLINK_COMMON_EXPORT bool IsGlobalPrivacyControlEnabled();
+-
+ // Records the source of the GPC signal in a subsampled histogram.
+ // The histogram is subsampled one out of one thousand times.
+ BLINK_COMMON_EXPORT void MaybeRecordGlobalPrivacyControlSourceMetric(
+--- a/third_party/blink/common/global_privacy_control/global_privacy_control_util.cc
++++ b/third_party/blink/common/global_privacy_control/global_privacy_control_util.cc
+@@ -20,11 +20,6 @@ inline constexpr double kGlobalPrivacyCo
+     0.001;
+ }  // namespace
+ 
+-bool IsGlobalPrivacyControlEnabled() {
+-  return base::FeatureList::IsEnabled(
+-      blink::features::kGlobalPrivacyControlForce);
+-}
+-
+ void MaybeRecordGlobalPrivacyControlSourceMetric(
+     GPCSignalSourceType source_type) {
+   if (base::FeatureList::IsEnabled(
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -473,6 +473,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+   (*s_allowlist)[::prefs::kBlockAll3pcToggleEnabled] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kEnableDoNotTrack] = settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumGlobalPrivacyControl] =
++      settings_api::PrefType::kBoolean;
+ 
+   // Sync and personalization page.
+   (*s_allowlist)[::prefs::kSearchSuggestEnabled] =
