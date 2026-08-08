@@ -1,0 +1,1003 @@
+--- a/components/sync/service/BUILD.gn
++++ b/components/sync/service/BUILD.gn
+@@ -54,6 +54,8 @@ static_library("service") {
+     "passphrase_type_metrics_provider.h",
+     "sync_auth_manager.cc",
+     "sync_auth_manager.h",
++    "sync_backend_type.h",
++    "sync_client.cc",
+     "sync_client.h",
+     "sync_engine_factory.h",
+     "sync_error.cc",
+--- /dev/null
++++ b/components/sync/service/sync_backend_type.h
+@@ -0,0 +1,22 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SYNC_SERVICE_SYNC_BACKEND_TYPE_H_
++#define COMPONENTS_SYNC_SERVICE_SYNC_BACKEND_TYPE_H_
++
++namespace syncer {
++
++// Identifies the backend selected for a SyncService instance.
++enum class SyncBackendType {
++  // No backend is configured. Sync remains inactive while preserving local
++  // metadata so a backend can be connected later.
++  kDisabled,
++
++  kLocal,
++  kCustom,
++};
++
++}  // namespace syncer
++
++#endif  // COMPONENTS_SYNC_SERVICE_SYNC_BACKEND_TYPE_H_
+--- /dev/null
++++ b/components/sync/service/sync_client.cc
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/sync/service/sync_client.h"
++
++#include "components/os_crypt/async/common/encryptor.h"
++#include "components/sync/engine/custom_sync_backend.h"
++
++namespace syncer {
++
++bool SyncClient::IsCustomSyncBackendConfigured() const {
++  return false;
++}
++
++CustomSyncBackendStatus SyncClient::GetCustomSyncBackendStatus() const {
++  return CustomSyncBackendStatus::kFeatureDisabled;
++}
++
++std::string SyncClient::GetCustomSyncBackendNamespace() const {
++  return std::string();
++}
++
++std::unique_ptr<CustomSyncBackend> SyncClient::CreateCustomSyncBackend(
++    scoped_refptr<os_crypt_async::Encryptor> encryptor) {
++  return nullptr;
++}
++
++}  // namespace syncer
+--- a/components/sync/service/sync_client.h
++++ b/components/sync/service/sync_client.h
+@@ -5,6 +5,9 @@
+ #ifndef COMPONENTS_SYNC_SERVICE_SYNC_CLIENT_H_
+ #define COMPONENTS_SYNC_SERVICE_SYNC_CLIENT_H_
+ 
++#include <memory>
++#include <string>
++
+ #include "base/files/file_path.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "components/sync/base/data_type.h"
+@@ -16,6 +19,10 @@ namespace network_time {
+ class NetworkTimeTracker;
+ }  // namespace network_time
+ 
++namespace os_crypt_async {
++class Encryptor;
++}
++
+ namespace signin {
+ class IdentityManager;
+ }
+@@ -26,10 +33,20 @@ class TrustedVaultClient;
+ 
+ namespace syncer {
+ 
++class CustomSyncBackend;
+ class SyncEngineFactory;
+ class SyncInvalidationsService;
+ class TrustedVaultAutoUpgradeSyntheticFieldTrialGroup;
+ 
++// Why a configured custom backend can or cannot currently run.
++enum class CustomSyncBackendStatus {
++  kEnabled,
++  kFeatureDisabled,
++  kProviderUnavailable,
++  kDisabledByPolicy,
++  kReconciliationBlocked,
++};
++
+ // Interface for clients of the Sync API to plumb through necessary dependent
+ // components. This interface is purely for abstracting dependencies, and
+ // should not contain any non-trivial functional logic.
+@@ -55,6 +72,13 @@ class SyncClient {
+   // It is only used when sync is running against a local backend.
+   virtual base::FilePath GetLocalSyncBackendFolder() = 0;
+ 
++  // Optional embedder-provided custom Sync backend.
++  virtual bool IsCustomSyncBackendConfigured() const;
++  virtual CustomSyncBackendStatus GetCustomSyncBackendStatus() const;
++  virtual std::string GetCustomSyncBackendNamespace() const;
++  virtual std::unique_ptr<CustomSyncBackend> CreateCustomSyncBackend(
++      scoped_refptr<os_crypt_async::Encryptor> encryptor);
++
+   virtual SyncInvalidationsService* GetSyncInvalidationsService() = 0;
+   virtual trusted_vault::TrustedVaultClient* GetTrustedVaultClient() = 0;
+   virtual scoped_refptr<ExtensionsActivity> GetExtensionsActivity() = 0;
+--- a/components/sync/service/sync_service.cc
++++ b/components/sync/service/sync_service.cc
+@@ -20,6 +20,15 @@ SyncSetupInProgressHandle::~SyncSetupInP
+   std::move(on_destroy_).Run();
+ }
+ 
++SyncBackendType SyncService::GetSyncBackendType() const {
++  return IsLocalSyncEnabled() ? SyncBackendType::kLocal
++                              : SyncBackendType::kDisabled;
++}
++
++bool SyncService::ReconfigureBackend() {
++  return false;
++}
++
+ bool SyncService::HasCompletedSyncCycle() const {
+   // Stats on the last Sync cycle are only available in internal "for debugging"
+   // information. Better to access that here than making clients do it.
+--- a/components/sync/service/sync_service.h
++++ b/components/sync/service/sync_service.h
+@@ -18,6 +18,7 @@
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "components/sync/base/data_type.h"
+ #include "components/sync/service/local_data_description.h"
++#include "components/sync/service/sync_backend_type.h"
+ #include "components/sync/service/sync_service_observer.h"
+ #include "components/sync/service/type_status_map_for_debugging.h"
+ #include "third_party/abseil-cpp/absl/container/flat_hash_map.h"
+@@ -142,7 +143,19 @@ class SyncService : public KeyedService
+     // again until either the browser is restarted, or the user fully signs out
+     // and back in again.
+     DISABLE_REASON_UNRECOVERABLE_ERROR,
+-    DISABLE_REASON_LAST = DISABLE_REASON_UNRECOVERABLE_ERROR,
++    // No local or custom Sync backend is configured.
++    DISABLE_REASON_NO_SYNC_BACKEND,
++    // The custom backend feature is disabled.
++    DISABLE_REASON_CUSTOM_BACKEND_FEATURE_DISABLED,
++    // The configured provider extension is not currently available.
++    // Local Sync metadata must be retained so a provider becoming
++    // available can resume it.
++    DISABLE_REASON_CUSTOM_BACKEND_PROVIDER_UNAVAILABLE,
++    // The custom backend rejected remote state and requires explicit
++    // recovery. This is separate from a Sync engine failure and
++    // remains blocked across browser restarts.
++    DISABLE_REASON_CUSTOM_BACKEND_BLOCKED,
++    DISABLE_REASON_LAST = DISABLE_REASON_CUSTOM_BACKEND_BLOCKED,
+   };
+ 
+   using DisableReasonSet =
+@@ -320,6 +333,12 @@ class SyncService : public KeyedService
+   // etc. is considered not granted.
+   virtual bool IsLocalSyncEnabled() const = 0;
+ 
++  // Returns the currently selected backend.
++  virtual SyncBackendType GetSyncBackendType() const;
++
++  // Read the embedder's configuration and perform a live engine restart.
++  virtual bool ReconfigureBackend();
++
+   // Information about the primary account. Note that this account doesn't
+   // necessarily have Sync consent (in that case, only Sync-the-transport may be
+   // running).
+@@ -542,7 +561,8 @@ class SyncService : public KeyedService
+     kLocalSync = 4,
+     kSyncInternals = 5,
+     kForeignSessionHelper = 6,
+-    kMaxValue = kForeignSessionHelper,
++    kExtensionSyncProvider = 7,
++    kMaxValue = kExtensionSyncProvider,
+   };
+   // LINT.ThenChange(/tools/metrics/histograms/metadata/sync/enums.xml:TriggerRefreshSource)
+ 
+--- a/components/sync/service/sync_service_impl.cc
++++ b/components/sync/service/sync_service_impl.cc
+@@ -46,6 +46,7 @@
+ #include "components/sync/base/sync_util.h"
+ #include "components/sync/base/user_selectable_type.h"
+ #include "components/sync/engine/configure_reason.h"
++#include "components/sync/engine/custom_sync_backend.h"
+ #include "components/sync/engine/engine_components_factory_impl.h"
+ #include "components/sync/engine/net/http_post_provider_factory.h"
+ #include "components/sync/engine/shutdown_reason.h"
+@@ -147,6 +148,10 @@ enum class DownloadStatusWaitingForUpdat
+ void RecordSyncInitialState(SyncService::DisableReasonSet disable_reasons,
+                             bool is_sync_feature_requested,
+                             bool initial_sync_feature_setup_complete) {
++  if (disable_reasons.Has(SyncService::DISABLE_REASON_NO_SYNC_BACKEND)) {
++    return;
++  }
++
+   SyncInitialState sync_state = kFeatureCanStart;
+   if (disable_reasons.Has(SyncService::DISABLE_REASON_NOT_SIGNED_IN)) {
+     sync_state = kNotSignedIn;
+@@ -227,9 +232,12 @@ SyncServiceImpl::SyncServiceImpl(InitPar
+           std::move(init_params.create_http_post_provider_factory)),
+       os_crypt_async_(init_params.os_crypt_async),
+       sync_prefs_(sync_client_->GetPrefService()),
+-      identity_manager_(sync_prefs_.IsLocalSyncEnabled()
+-                            ? nullptr
+-                            : sync_client_->GetIdentityManager()),
++      backend_type_(sync_prefs_.IsLocalSyncEnabled()
++                        ? SyncBackendType::kLocal
++                        : (sync_client_->IsCustomSyncBackendConfigured()
++                               ? SyncBackendType::kCustom
++                               : SyncBackendType::kDisabled)),
++      identity_manager_(sync_client_->GetIdentityManager()),
+       auth_manager_(std::make_unique<SyncAuthManager>(identity_manager_,
+                                                       /*delegate=*/this)),
+       channel_(init_params.channel),
+@@ -242,7 +250,6 @@ SyncServiceImpl::SyncServiceImpl(InitPar
+           std::move(init_params.network_connection_tracker)) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(sync_client_);
+-  DCHECK(IsLocalSyncEnabled() || identity_manager_ != nullptr);
+   CHECK(os_crypt_async_);
+ 
+   // If Sync is disabled via command line flag, then SyncServiceImpl
+@@ -252,10 +259,6 @@ SyncServiceImpl::SyncServiceImpl(InitPar
+   sync_stopped_reporter_ = std::make_unique<SyncStoppedReporter>(
+       sync_service_url_, MakeUserAgentForSync(channel_), url_loader_factory_);
+ 
+-  if (identity_manager_) {
+-    identity_manager_observation_.Observe(identity_manager_);
+-  }
+-
+   observers_.emplace();
+ 
+   // Based on the information cached in preferences, it might be required to
+@@ -315,9 +318,7 @@ void SyncServiceImpl::Initialize(DataTyp
+       /*delegate=*/this, &crypto_, &sync_prefs_,
+       data_type_manager_->GetRegisteredDataTypes());
+ 
+-  if (!IsLocalSyncEnabled()) {
+-    auth_manager_->RegisterForAuthNotifications();
+-
++  if (backend_type_ != SyncBackendType::kLocal) {
+     // Trigger a refresh when additional data types get enabled for
+     // invalidations. This is needed to get the latest data after subscribing
+     // for the updates.
+@@ -326,15 +327,6 @@ void SyncServiceImpl::Initialize(DataTyp
+             &SyncServiceImpl::TriggerRefresh, weak_factory_.GetWeakPtr(),
+             TriggerRefreshSource::kSyncInvalidationsService));
+ 
+-    // TODO(crbug.com/40257467): revisit this logic. IsSignedIn() doesn't feel
+-    // the right condition to check.
+-    if (IsSignedIn()) {
+-      // Start receiving invalidations as soon as possible since GCMDriver drops
+-      // incoming FCM messages otherwise. The messages will be collected by
+-      // SyncInvalidationsService until sync engine is initialized and ready to
+-      // handle invalidations.
+-      sync_client_->GetSyncInvalidationsService()->StartListening();
+-    }
+   }
+ 
+   // *After* setting up `auth_manager_`, run pref migrations that depend on
+@@ -378,7 +370,7 @@ void SyncServiceImpl::Initialize(DataTyp
+   }
+ 
+   const bool is_sync_feature_requested_for_metrics =
+-      IsLocalSyncEnabled() ||
++      HasActiveSyncBackend() ||
+ #if BUILDFLAG(IS_CHROMEOS)
+       !user_settings_->IsSyncFeatureDisabledViaDashboard();
+ #else
+@@ -401,7 +393,7 @@ void SyncServiceImpl::Initialize(DataTyp
+   if (IsEngineAllowedToRun()) {
+     if (!sync_client_->GetSyncEngineFactory()
+              ->HasTransportDataIncludingFirstSync(
+-                 signin::GaiaIdHash::FromGaiaId(GetAccountInfo().gaia))) {
++                 GetTransportDataAccountKey())) {
+       // Sync never initialized before on this profile, so let's try immediately
+       // the very first time. This is particularly useful for Chrome Ash (where
+       // the user is signed in to begin with) and local sync (where sign-in
+@@ -436,8 +428,11 @@ void SyncServiceImpl::StartSyncingWithSe
+   if (engine_) {
+     engine_->StartSyncingWithServer();
+   }
+-  if (IsLocalSyncEnabled()) {
++  if (backend_type_ == SyncBackendType::kLocal) {
+     TriggerRefresh(TriggerRefreshSource::kLocalSync, DataTypeSet::All());
++  } else if (backend_type_ == SyncBackendType::kCustom) {
++    TriggerRefresh(TriggerRefreshSource::kExtensionSyncProvider,
++                   DataTypeSet::All());
+   }
+ }
+ 
+@@ -523,7 +518,7 @@ bool SyncServiceImpl::ShouldClearTranspo
+ }
+ 
+ bool SyncServiceImpl::IsEngineAllowedToRun() const {
+-  return GetDisableReasons().empty() && !auth_manager_->IsSyncPaused();
++  return GetDisableReasons().empty();
+ }
+ 
+ void SyncServiceImpl::OnProtocolEvent(const ProtocolEvent& event) {
+@@ -602,23 +597,21 @@ void SyncServiceImpl::TryStartImpl(
+   }
+ 
+   const CoreAccountInfo authenticated_account_info = GetAccountInfo();
+-
+-  if (IsLocalSyncEnabled()) {
+-    // With local sync (roaming profiles) there is no identity manager and hence
+-    // `authenticated_account_info` is empty. This is required for
+-    // IsLocalSyncTransportDataValid() to work properly.
+-    DCHECK(authenticated_account_info.gaia.empty());
+-    DCHECK(authenticated_account_info.account_id.empty());
+-  } else {
+-    // Except for local sync (roaming profiles), the user must be signed in for
+-    // sync to start.
+-    DCHECK(!authenticated_account_info.gaia.empty());
+-    DCHECK(!authenticated_account_info.account_id.empty());
++  DCHECK(HasActiveSyncBackend());
++  DCHECK(authenticated_account_info.gaia.empty());
++  DCHECK(authenticated_account_info.account_id.empty());
++
++  std::unique_ptr<CustomSyncBackend> custom_sync_backend;
++  if (backend_type_ == SyncBackendType::kCustom) {
++    custom_sync_backend = sync_client_->CreateCustomSyncBackend(encryptors[1]);
++    if (!custom_sync_backend) {
++      DLOG(ERROR) << "The configured custom Sync backend is unavailable.";
++      return;
++    }
+   }
+ 
+   engine_ = sync_client_->GetSyncEngineFactory()->CreateSyncEngine(
+-      debug_identifier_,
+-      signin::GaiaIdHash::FromGaiaId(authenticated_account_info.gaia),
++      debug_identifier_, GetTransportDataAccountKey(),
+       sync_client_->GetSyncInvalidationsService());
+   DCHECK(engine_);
+ 
+@@ -641,7 +634,9 @@ void SyncServiceImpl::TryStartImpl(
+ 
+   params.sync_manager_factory =
+       std::make_unique<SyncManagerFactory>(network_connection_tracker_);
+-  if (sync_prefs_.IsLocalSyncEnabled()) {
++  if (custom_sync_backend) {
++    params.custom_sync_backend = std::move(custom_sync_backend);
++  } else if (backend_type_ == SyncBackendType::kLocal) {
+     params.enable_local_sync_backend = true;
+     params.local_sync_backend_folder =
+         sync_client_->GetLocalSyncBackendFolder();
+@@ -652,15 +647,6 @@ void SyncServiceImpl::TryStartImpl(
+ 
+   params.encryptor = std::move(encryptors[1]);
+ 
+-  if (!IsLocalSyncEnabled()) {
+-    auth_manager_->ConnectionOpened();
+-
+-    // Ensures that invalidations are enabled, e.g. when the sync was just
+-    // enabled or after the engine was stopped with clearing data. Note that
+-    // invalidations are not supported for local sync.
+-    sync_client_->GetSyncInvalidationsService()->StartListening();
+-  }
+-
+   engine_->Initialize(std::move(params));
+ }
+ 
+@@ -695,7 +681,8 @@ void SyncServiceImpl::Shutdown() {
+ }
+ 
+ std::unique_ptr<SyncEngine> SyncServiceImpl::ResetEngine(
+-    ResetEngineReason reset_reason) {
++    ResetEngineReason reset_reason,
++    bool restart_after_reset) {
+   TRACE_EVENT0("sync", "SyncServiceImpl::ResetEngine");
+   CHECK(data_type_manager_);
+ 
+@@ -724,7 +711,7 @@ std::unique_ptr<SyncEngine> SyncServiceI
+     // data.
+     if (ShouldClearTransportDataForAccount(reset_reason)) {
+       sync_client_->GetSyncEngineFactory()->ClearTransportDataForAccount(
+-          signin::GaiaIdHash::FromGaiaId(GetAccountInfo().gaia));
++          GetTransportDataAccountKey());
+     }
+     return nullptr;
+   }
+@@ -764,16 +751,16 @@ std::unique_ptr<SyncEngine> SyncServiceI
+   // Depending on the `reset_reason`, maybe clear account-keyed transport data.
+   if (ShouldClearTransportDataForAccount(reset_reason)) {
+     sync_client_->GetSyncEngineFactory()->ClearTransportDataForAccount(
+-        signin::GaiaIdHash::FromGaiaId(GetAccountInfo().gaia));
+-  }
+-
+-  if (!IsLocalSyncEnabled()) {
+-    auth_manager_->ConnectionClosed();
++        GetTransportDataAccountKey());
+   }
+ 
+   DVLOG(2) << "Notify observers on reset engine";
+   NotifyObservers();
+ 
++  if (!restart_after_reset) {
++    return engine_to_be_destroyed;
++  }
++
+   // Now that everything is shut down, try to start up again.
+   switch (shutdown_reason) {
+     case ShutdownReason::STOP_SYNC_AND_KEEP_DATA:
+@@ -822,16 +809,35 @@ SyncService::DisableReasonSet SyncServic
+   DCHECK(IsSyncAllowedByFlag());
+   DisableReasonSet result;
+ 
+-  // If local sync is enabled, most disable reasons don't apply.
+-  if (!IsLocalSyncEnabled()) {
++  // Local roaming sync intentionally ignores account Sync policy.
++  // Custom sync does not.
++  if (backend_type_ != SyncBackendType::kLocal) {
+     if (user_settings_->IsSyncClientDisabledByPolicy() ||
+         sync_disabled_by_admin_) {
+       result.Put(DISABLE_REASON_ENTERPRISE_POLICY);
+     }
+-    if (!IsSignedIn()) {
+-      result.Put(DISABLE_REASON_NOT_SIGNED_IN);
++  }
++  if (backend_type_ == SyncBackendType::kCustom) {
++    switch (sync_client_->GetCustomSyncBackendStatus()) {
++      case CustomSyncBackendStatus::kEnabled:
++        break;
++      case CustomSyncBackendStatus::kFeatureDisabled:
++        result.Put(DISABLE_REASON_CUSTOM_BACKEND_FEATURE_DISABLED);
++        break;
++      case CustomSyncBackendStatus::kProviderUnavailable:
++        result.Put(DISABLE_REASON_CUSTOM_BACKEND_PROVIDER_UNAVAILABLE);
++        break;
++      case CustomSyncBackendStatus::kDisabledByPolicy:
++        result.Put(DISABLE_REASON_ENTERPRISE_POLICY);
++        break;
++      case CustomSyncBackendStatus::kReconciliationBlocked:
++        result.Put(DISABLE_REASON_CUSTOM_BACKEND_BLOCKED);
++        break;
+     }
+   }
++  if (backend_type_ == SyncBackendType::kDisabled) {
++    result.Put(DISABLE_REASON_NO_SYNC_BACKEND);
++  }
+ 
+   if (unrecoverable_error_reason_) {
+     result.Put(DISABLE_REASON_UNRECOVERABLE_ERROR);
+@@ -848,10 +854,6 @@ SyncService::TransportState SyncServiceI
+     return TransportState::DISABLED;
+   }
+ 
+-  if (auth_manager_->IsSyncPaused()) {
+-    return TransportState::PAUSED;
+-  }
+-
+   CHECK(IsEngineAllowedToRun());
+ 
+   if (!engine_) {
+@@ -876,16 +878,6 @@ SyncService::TransportState SyncServiceI
+     return TransportState::INITIALIZING;
+   }
+ 
+-  if (base::FeatureList::IsEnabled(kSyncDetermineAccountManagedStatus)) {
+-    // Determining the account's managed-ness status is also considered part of
+-    // initialization.
+-    if (!IsLocalSyncEnabled() &&
+-        auth_manager_->GetActiveAccountInfo().managed_status ==
+-            signin::AccountManagedStatusFinderOutcome::kPending) {
+-      return TransportState::INITIALIZING;
+-    }
+-  }
+-
+   // At this point we should usually be able to configure our data types (so the
+   // DataTypeManager should not be STOPPED anymore), unless setup is in
+   // progress. But it can also happen if this gets called from DataTypeManager
+@@ -1096,11 +1088,8 @@ void SyncServiceImpl::OnSyncCycleComplet
+   NotifySyncCycleCompleted();
+ }
+ 
+-void SyncServiceImpl::OnConnectionStatusChange(ConnectionStatus status) {
++void SyncServiceImpl::OnConnectionStatusChange(ConnectionStatus) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  if (!IsLocalSyncEnabled()) {
+-    auth_manager_->ConnectionStatusChanged(status);
+-  }
+   DVLOG(2) << "Notify observers OnConnectionStatusChange";
+   NotifyObservers();
+ }
+@@ -1162,37 +1151,6 @@ void SyncServiceImpl::OnActionableProtoc
+       // immediately because IsEngineAllowedToRun() is almost certainly true at
+       // this point and StopAndClear() leads to TryStart().
+       user_settings_->SetSyncFeatureDisabledViaDashboard();
+-#else  // !BUILDFLAG(IS_CHROMEOS)
+-      // On every platform except ash, revoke the Sync consent/Clear primary
+-      // account after a dashboard clear.
+-      // TODO(crbug.com/40066949): Simplify once kSync becomes unreachable or is
+-      // deleted from the codebase. See ConsentLevel::kSync documentation for
+-      // details.
+-      if (!IsLocalSyncEnabled() &&
+-          identity_manager_->HasPrimaryAccount(signin::ConsentLevel::kSync)) {
+-        signin::PrimaryAccountMutator* account_mutator =
+-            identity_manager_->GetPrimaryAccountMutator();
+-        // GetPrimaryAccountMutator() returns nullptr on ChromeOS only.
+-        DCHECK(account_mutator);
+-
+-        // TODO(crbug.com/40220945): make the behaviour consistent across
+-        // platforms. Any platforms which support a single-step flow that signs
+-        // in and enables sync should clear the primary account here for
+-        // symmetry.
+-#if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+-        // On mobile, fully sign out the user (clear the primary account) but
+-        // do not remove the list of known accounts, as the user may sign in
+-        // again.
+-        account_mutator->RemovePrimaryAccountButKeepTokens(
+-            signin_metrics::ProfileSignout::kServerForcedDisable);
+-#else
+-        // Note: On some platforms, revoking the sync consent will also clear
+-        // the primary account as transitioning from ConsentLevel::kSync to
+-        // ConsentLevel::kSignin is not supported.
+-        account_mutator->RevokeSyncConsent(
+-            signin_metrics::ProfileSignout::kServerForcedDisable);
+-#endif  // BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+-      }
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+       break;
+     case STOP_SYNC_FOR_DISABLED_ACCOUNT:
+@@ -1278,85 +1236,12 @@ void SyncServiceImpl::OnConfigureStart()
+ 
+ void SyncServiceImpl::SyncAuthAccountStateChanged() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-
+-  if (!IsSignedIn()) {
+-    // The account was signed out, so shut down.
+-    sync_disabled_by_admin_ = false;
+-    StopAndClear(ResetEngineReason::kNotSignedIn);
+-    DCHECK(!engine_);
+-  } else {
+-    // Either a new account was signed in, or the existing account's
+-    // `is_sync_consented` and/or `managed_status` have changed. Start up or
+-    // reconfigure.
+-    if (!engine_) {
+-      // If sync startup is still deferred, then honor that. (In practice, this
+-      // mostly happens when the `managed_status` of the account gets
+-      // determined.)
+-      if (!base::FeatureList::IsEnabled(kSyncDetermineAccountManagedStatus) ||
+-          deferring_first_start_since_.is_null()) {
+-        TryStart();
+-      }
+-      NotifyObservers();
+-    } else {
+-      ConfigureDataTypeManager(ConfigureReason::kReconfiguration,
+-                               /*bypass_setup_in_progress_check=*/false);
+-    }
+-  }
++  NOTREACHED();
+ }
+ 
+ void SyncServiceImpl::SyncAuthCredentialsChanged() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-
+-  // Cache in prefs whether a persistent auth error exists.
+-  if (auth_manager_->IsSyncPaused()) {
+-    sync_prefs_.SetHasCachedPersistentAuthErrorForMetrics(true);
+-  } else if (!auth_manager_->GetCredentials().access_token_info.token.empty()) {
+-    if (!IsSyncFeatureEnabled() &&
+-        sync_prefs_.HasCachedPersistentAuthErrorForMetrics()) {
+-      // An auth error is being fixed while in transport mode. Record the amount
+-      // of unsynced data in histograms.
+-      GetTypesWithUnsyncedData(
+-          TypesRequiringUnsyncedDataCheckOnSignout(),
+-          base::BindOnce(
+-              &SyncRecordDataTypeNumUnsyncedEntitiesFromDataCounts,
+-              UnsyncedDataRecordingEvent::kOnReauthFromPendingState));
+-    }
+-
+-    // In order to conclude with certainty that there is no persistent auth
+-    // error, it is necessary to get an access token successfully.
+-    sync_prefs_.SetHasCachedPersistentAuthErrorForMetrics(false);
+-  }
+-
+-  // If the engine isn't allowed to start anymore due to the credentials change,
+-  // then shut down. This happens when there is a persistent auth error (e.g.
+-  // the user signs out on the web), which implies the "Sync paused" state.
+-  if (!IsEngineAllowedToRun()) {
+-    // If the engine currently exists, then ResetEngine() will notify observers
+-    // anyway. Otherwise, notify them here. (One relevant case is when entering
+-    // the PAUSED state before the engine was created, e.g. during deferred
+-    // startup.)
+-    if (!engine_) {
+-      DVLOG(2) << "Notify observers on credentials changed";
+-      NotifyObservers();
+-    }
+-    ResetEngine(ResetEngineReason::kCredentialsChanged);
+-    return;
+-  }
+-
+-  if (!engine_) {
+-    TryStart();
+-  } else {
+-    // If the engine already exists, just propagate the new credentials.
+-    SyncCredentials credentials = auth_manager_->GetCredentials();
+-    if (credentials.access_token_info.token.empty()) {
+-      engine_->InvalidateCredentials();
+-    } else {
+-      engine_->UpdateCredentials(credentials);
+-    }
+-  }
+-
+-  DVLOG(2) << "Notify observers on credentials changed";
+-  NotifyObservers();
++  NOTREACHED();
+ }
+ 
+ void SyncServiceImpl::CryptoStateChanged() {
+@@ -1453,21 +1338,54 @@ bool SyncServiceImpl::IsCustomPassphrase
+   return sync_client_->IsCustomPassphraseAllowed();
+ }
+ 
++SyncBackendType SyncServiceImpl::GetSyncBackendType() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return backend_type_;
++}
++
++bool SyncServiceImpl::ReconfigureBackend() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++
++  const SyncBackendType desired_backend =
++      sync_prefs_.IsLocalSyncEnabled()
++          ? SyncBackendType::kLocal
++          : (sync_client_->IsCustomSyncBackendConfigured()
++                 ? SyncBackendType::kCustom
++                 : SyncBackendType::kDisabled);
++
++  // Local roaming sync is selected before service construction and has
++  // platform-specific storage semantics. It remains restart-only.
++  if (backend_type_ == SyncBackendType::kLocal ||
++      desired_backend == SyncBackendType::kLocal) {
++    return desired_backend == backend_type_;
++  }
++  if (desired_backend == backend_type_ &&
++      desired_backend != SyncBackendType::kCustom) {
++    return true;
++  }
++
++  std::unique_ptr<SyncEngine> old_engine =
++      ResetEngine(ResetEngineReason::kCredentialsChanged,
++                  /*restart_after_reset=*/false);
++
++  backend_type_ = desired_backend;
++
++  old_engine.reset();
++  if (IsEngineAllowedToRun()) {
++    TryStart();
++  }
++  NotifyObservers();
++  return true;
++}
++
+ SyncPrefs::SyncAccountState SyncServiceImpl::GetSyncAccountStateForPrefs()
+     const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  if (IsLocalSyncEnabled()) {
+-    // Local sync should behave like a syncing user.
++  if (HasActiveSyncBackend()) {
++    // Local and custom Sync should behave like a syncing user for type prefs.
+     return SyncPrefs::SyncAccountState::kSyncing;
+   }
+-  if (!IsSignedIn()) {
+-    return SyncPrefs::SyncAccountState::kNotSignedIn;
+-  }
+-  // This doesn't check IsSyncFeatureEnabled() so it covers the case of advanced
+-  // sync setup, where IsInitialSyncFeatureSetupComplete() is not true yet.
+-  return HasSyncConsent()
+-             ? SyncPrefs::SyncAccountState::kSyncing
+-             : SyncPrefs::SyncAccountState::kSignedInWithoutSyncConsent;
++  return SyncPrefs::SyncAccountState::kNotSignedIn;
+ }
+ 
+ CoreAccountInfo SyncServiceImpl::GetSyncAccountInfoForPrefs() const {
+@@ -1512,12 +1430,12 @@ bool SyncServiceImpl::QueryDetailedSyncS
+ 
+ GoogleServiceAuthError SyncServiceImpl::GetAuthError() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return auth_manager_->GetLastAuthError();
++  return GoogleServiceAuthError::AuthErrorNone();
+ }
+ 
+ base::Time SyncServiceImpl::GetAuthErrorTime() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return auth_manager_->GetLastAuthErrorTime();
++  return base::Time();
+ }
+ 
+ bool SyncServiceImpl::HasCachedPersistentAuthErrorForMetrics() const {
+@@ -1543,7 +1461,28 @@ SyncServiceImpl::GetSetupInProgressHandl
+ 
+ bool SyncServiceImpl::IsLocalSyncEnabled() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return sync_prefs_.IsLocalSyncEnabled();
++  return backend_type_ == SyncBackendType::kLocal;
++}
++
++bool SyncServiceImpl::HasActiveSyncBackend() const {
++  return backend_type_ != SyncBackendType::kDisabled;
++}
++
++signin::GaiaIdHash SyncServiceImpl::GetTransportDataAccountKey() const {
++  if (backend_type_ == SyncBackendType::kCustom) {
++    std::string backend_namespace =
++        sync_client_->GetCustomSyncBackendNamespace();
++    if (backend_namespace.empty()) {
++      // A configuration can disappear while a disabled custom backend is
++      // selected. Keep its cleanup isolated until explicit reconfiguration.
++      backend_namespace = "custom-sync-unconfigured";
++    }
++    return signin::GaiaIdHash::FromGaiaId(GaiaId(backend_namespace));
++  }
++  if (backend_type_ == SyncBackendType::kDisabled) {
++    return signin::GaiaIdHash::FromGaiaId(GaiaId("sync-disabled"));
++  }
++  return signin::GaiaIdHash::FromGaiaId(GaiaId());
+ }
+ 
+ void SyncServiceImpl::TriggerRefresh(TriggerRefreshSource source,
+@@ -1555,11 +1494,6 @@ void SyncServiceImpl::TriggerRefresh(Tri
+   }
+ }
+ 
+-bool SyncServiceImpl::IsSignedIn() const {
+-  // Sync is logged in if there is a non-empty account id.
+-  return !GetAccountInfo().account_id.empty();
+-}
+-
+ base::Time SyncServiceImpl::GetLastSyncedTimeForDebugging() const {
+   if (!engine_ || !engine_->IsInitialized()) {
+     return base::Time();
+@@ -1664,7 +1598,7 @@ DataTypeSet SyncServiceImpl::GetTypesWit
+ 
+   if (GetTransportState() == TransportState::INITIALIZING &&
+       !sync_client_->GetSyncEngineFactory()->HasTransportDataIncludingFirstSync(
+-          signin::GaiaIdHash::FromGaiaId(GetAccountInfo().gaia))) {
++          GetTransportDataAccountKey())) {
+     // The engine is initializing for the very first sync (usually after
+     // sign-in). In this case all types are reported as pending download,
+     // optimistically assuming datatype preconditions will be met.
+@@ -1690,16 +1624,6 @@ void SyncServiceImpl::ConfigureDataTypeM
+     return;
+   }
+ 
+-  if (base::FeatureList::IsEnabled(kSyncDetermineAccountManagedStatus)) {
+-    // If the account type hasn't been determined yet, don't configure. A
+-    // configuration will be triggered again once the type has been determined.
+-    if (!IsLocalSyncEnabled() &&
+-        auth_manager_->GetActiveAccountInfo().managed_status ==
+-            signin::AccountManagedStatusFinderOutcome::kPending) {
+-      return;
+-    }
+-  }
+-
+   DCHECK(!engine_->GetCacheGuid().empty());
+   DVLOG(1) << "Started DataTypeManager configuration, reason: "
+            << static_cast<int>(reason);
+@@ -1707,9 +1631,8 @@ void SyncServiceImpl::ConfigureDataTypeM
+   const bool use_transport_only_mode = UseTransportOnlyMode();
+ 
+   ConfigureContext configure_context;
+-  configure_context.authenticated_gaia_id = GetAccountInfo().gaia;
+   configure_context.account_managed_status =
+-      auth_manager_->GetActiveAccountInfo().managed_status;
++      signin::AccountManagedStatusFinderOutcome::kConsumerNotWellKnown;
+   configure_context.cache_guid = engine_->GetCacheGuid();
+   configure_context.sync_mode =
+       use_transport_only_mode ? SyncMode::kTransportOnly : SyncMode::kFull;
+@@ -1734,8 +1657,7 @@ void SyncServiceImpl::ConfigureDataTypeM
+     }
+   }
+ 
+-  DCHECK(!configure_context.authenticated_gaia_id.empty() ||
+-         IsLocalSyncEnabled());
++  DCHECK(HasActiveSyncBackend());
+   DCHECK(!configure_context.cache_guid.empty());
+   DCHECK_NE(configure_context.reason, ConfigureReason::kUnknown);
+ 
+@@ -1804,7 +1726,7 @@ void SyncServiceImpl::ConfigureDataTypeM
+ bool SyncServiceImpl::UseTransportOnlyMode() const {
+   // Note: When local Sync is enabled, then we want full-sync mode (not just
+   // transport), even though Sync-the-feature is not considered enabled.
+-  return !IsSyncFeatureEnabled() && !IsLocalSyncEnabled();
++  return !IsSyncFeatureEnabled() && !HasActiveSyncBackend();
+ }
+ 
+ void SyncServiceImpl::UpdateDataTypesForInvalidations() {
+@@ -2060,22 +1982,6 @@ SyncService::DataTypeDownloadStatus Sync
+   // Download status doesn't make sense for non-real data types.
+   CHECK(IsRealDataType(type));
+ 
+-  if (!IsLocalSyncEnabled()) {
+-    // TODO(crbug.com/40260679): Verify whether it's actually necessary to check
+-    // IsActiveAccountInfoFullyLoaded() - can the engine actually start, and
+-    // data types become active, if that isn't true?
+-    if (!auth_manager_->IsActiveAccountInfoFullyLoaded()) {
+-      DVLOG(1) << "Waiting for refresh tokens to be loaded from the disk";
+-      // GetDisableReasons() won't be empty until then.
+-      return DataTypeDownloadStatus::kWaitingForUpdates;
+-    }
+-
+-    if (auth_manager_->IsSyncPaused()) {
+-      DVLOG(1) << "Error download status because sync is paused";
+-      return DataTypeDownloadStatus::kError;
+-    }
+-  }
+-
+   // TODO(crbug.com/40260679): check whether this works when local sync is
+   // enabled.
+   if (!GetDisableReasons().empty() || !GetPreferredDataTypes().Has(type)) {
+@@ -2141,24 +2047,12 @@ void SyncServiceImpl::CacheTrustedVaultD
+ 
+ CoreAccountInfo SyncServiceImpl::GetAccountInfo() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  if (!auth_manager_) {
+-    // Some crashes on iOS (crbug.com/962384) suggest that SyncServiceImpl
+-    // gets called after it has been already shutdown. It's not clear why this
+-    // actually happens. We add this null check here to protect against such
+-    // crashes.
+-    return CoreAccountInfo();
+-  }
+-  return auth_manager_->GetActiveAccountInfo().account_info;
++  return CoreAccountInfo();
+ }
+ 
+ bool SyncServiceImpl::HasSyncConsent() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  if (!auth_manager_) {
+-    // This is a precautionary check to be consistent with the check in
+-    // GetAccountInfo().
+-    return false;
+-  }
+-  return auth_manager_->GetActiveAccountInfo().is_sync_consented;
++  return false;
+ }
+ 
+ void SyncServiceImpl::SetInvalidationsForSessionsEnabled(bool enabled) {
+@@ -2390,7 +2284,7 @@ void SyncServiceImpl::GetTypesWithUnsync
+ 
+   // Syncing users do not use separate local and account storages. Thus, there's
+   // no local-only data. The same is true for local sync users.
+-  if (HasSyncConsent() || IsLocalSyncEnabled()) {
++  if ((true)) {
+     std::move(callback).Run({});
+     return;
+   }
+@@ -2421,7 +2315,7 @@ void SyncServiceImpl::GetLocalDataDescri
+         callback) {
+   // Syncing users do not use separate local and account storages. Thus, there's
+   // no local-only data. The same is true for local sync users.
+-  if (HasSyncConsent() || IsLocalSyncEnabled()) {
++  if ((true)) {
+     std::move(callback).Run({});
+     return;
+   }
+@@ -2430,6 +2324,8 @@ void SyncServiceImpl::GetLocalDataDescri
+ }
+ 
+ void SyncServiceImpl::TriggerLocalDataMigration(DataTypeSet types) {
++  if ((true)) return;
++
+   for (DataType type : types) {
+     base::UmaHistogramEnumeration("Sync.BatchUpload.Requests3",
+                                   syncer::DataTypeHistogramValue(type));
+@@ -2446,6 +2342,8 @@ void SyncServiceImpl::TriggerLocalDataMi
+ 
+ void SyncServiceImpl::TriggerLocalDataMigrationForItems(
+     std::map<DataType, std::vector<LocalDataItemModel::DataId>> items) {
++  if ((true)) return;
++
+   for (const auto& [type, _] : items) {
+     base::UmaHistogramEnumeration("Sync.BatchUpload.Requests3",
+                                   syncer::DataTypeHistogramValue(type));
+@@ -2464,7 +2362,7 @@ void SyncServiceImpl::TriggerLocalDataMi
+ void SyncServiceImpl::SelectTypeAndMigrateLocalDataItemsWhenActive(
+     DataType data_type,
+     std::vector<LocalDataItemModel::DataId> items) {
+-  if (IsLocalSyncEnabled()) {
++  if ((true)) {
+     // This function should not have been called for local sync (i.e. enterprise
+     // roaming profiles). However, as additional safeguard, the call is ignored
+     // to avoid any unexpected side-effects.
+@@ -2472,7 +2370,6 @@ void SyncServiceImpl::SelectTypeAndMigra
+   }
+ 
+   CHECK(local_data_migration_item_queue_);
+-  CHECK(IsSignedIn());
+   // Syncing users do not use separate local and account storages. Thus, there's
+   // no local-only data to migrate. The sign in through the promo should not
+   // have made the user consent to sync.
+--- a/components/sync/service/sync_service_impl.h
++++ b/components/sync/service/sync_service_impl.h
+@@ -23,6 +23,7 @@
+ #include "base/timer/timer.h"
+ #include "build/build_config.h"
+ #include "components/os_crypt/async/common/encryptor.h"
++#include "components/signin/public/base/gaia_id_hash.h"
+ #include "components/signin/public/identity_manager/identity_manager.h"
+ #include "components/sync/base/data_type.h"
+ #include "components/sync/engine/configure_reason.h"
+@@ -39,6 +40,7 @@
+ #include "components/sync/service/device_statistics_scheduler.h"
+ #include "components/sync/service/local_data_migration_item_queue.h"
+ #include "components/sync/service/sync_auth_manager.h"
++#include "components/sync/service/sync_backend_type.h"
+ #include "components/sync/service/sync_client.h"
+ #include "components/sync/service/sync_prefs.h"
+ #include "components/sync/service/sync_service.h"
+@@ -127,6 +129,8 @@ class SyncServiceImpl : public SyncServi
+   TransportState GetTransportState() const override;
+   UserActionableError GetUserActionableError() const override;
+   bool IsLocalSyncEnabled() const override;
++  SyncBackendType GetSyncBackendType() const override;
++  bool ReconfigureBackend() override;
+   CoreAccountInfo GetAccountInfo() const override;
+   bool HasSyncConsent() const override;
+   GoogleServiceAuthError GetAuthError() const override;
+@@ -335,6 +339,9 @@ class SyncServiceImpl : public SyncServi
+ 
+   bool IsEngineAllowedToRun() const;
+ 
++  bool HasActiveSyncBackend() const;
++  signin::GaiaIdHash GetTransportDataAccountKey() const;
++
+   // Configures the data type manager with the latest enabled types.
+   // Note: Does not initialize the engine if it is not already initialized.
+   // If a Sync setup is currently in progress (i.e. a settings UI is open), then
+@@ -351,7 +358,8 @@ class SyncServiceImpl : public SyncServi
+   // the shutdown, and dictates if sync metadata should be kept or not.
+   // If the engine is still allowed to run (per IsEngineAllowedToRun()), it will
+   // soon start up again (possibly in transport-only mode).
+-  std::unique_ptr<SyncEngine> ResetEngine(ResetEngineReason reset_reason);
++  std::unique_ptr<SyncEngine> ResetEngine(ResetEngineReason reset_reason,
++                                          bool restart_after_reset = true);
+ 
+   // Helper for OnUnrecoverableError.
+   void OnUnrecoverableErrorImpl(const base::Location& from_here,
+@@ -381,9 +389,6 @@ class SyncServiceImpl : public SyncServi
+       base::TimeTicks try_start_time,
+       std::vector<scoped_refptr<os_crypt_async::Encryptor>> encryptors);
+ 
+-  // Whether sync has been authenticated with an account ID.
+-  bool IsSignedIn() const;
+-
+   // Tell the sync server that this client has disabled sync.
+   void RemoveClientFromServer() const;
+ 
+@@ -440,6 +445,9 @@ class SyncServiceImpl : public SyncServi
+   // The class that handles getting, setting, and persisting sync preferences.
+   SyncPrefs sync_prefs_;
+ 
++  // The type of the sync backend.
++  SyncBackendType backend_type_;
++
+   // The class that updates SyncPrefs when a policy is applied.
+   std::unique_ptr<SyncPrefsPolicyHandler> sync_prefs_policy_handler_;
+ 
+--- a/components/sync/service/sync_user_settings_impl.cc
++++ b/components/sync/service/sync_user_settings_impl.cc
+@@ -423,9 +423,7 @@ void SyncUserSettingsImpl::SetEncryption
+     const os_crypt_async::Encryptor& encryptor) {
+   const GaiaId& gaia_id = delegate_->GetSyncAccountInfoForPrefs().gaia;
+   if (gaia_id.empty()) {
+-    // The user must be signed in, so the only legit scenario where SyncService
+-    // uses no Gaia ID is local sync (roaming profiles).
+-    CHECK(prefs_->IsLocalSyncEnabled());
++    // Local and custom backends have no Gaia prefs.
+     return;
+   }
+   prefs_->SetEncryptionBootstrapTokenForAccount(token, encryptor, gaia_id);
+--- a/tools/metrics/histograms/metadata/sync/enums.xml
++++ b/tools/metrics/histograms/metadata/sync/enums.xml
+@@ -1928,6 +1928,7 @@ chromium-metrics-reviews@google.com.
+   <int value="4" label="Local Sync"/>
+   <int value="5" label="Sync Internals"/>
+   <int value="6" label="Foreign Session Helper"/>
++  <int value="7" label="Extension Sync Provider"/>
+ </enum>
+ 
+ <!-- LINT.ThenChange(/components/sync/service/sync_service.h:TriggerRefreshSource) -->
