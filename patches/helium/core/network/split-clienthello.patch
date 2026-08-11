@@ -1,0 +1,297 @@
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -36,6 +36,8 @@ namespace helium {
+       "helium-noise-hw-concurrency";
+ 
+   constexpr const char kDisableEchCommandLine[] = "disable-ech";
++  constexpr const char kHeliumSplitClientHelloCommandLine[] =
++      "helium-split-clienthello";
+ 
+ }  // namespace helium
+ 
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -39,4 +39,8 @@
+      "Use only QUIC v2 for HTTP/3",
+      "Restricts HTTP/3 connections to QUIC v2 instead of default QUIC v1. This may help on networks that block QUIC v1 but do not recognize QUIC v2. It does not force QUIC on unsupported sites. Connections may fall back to TCP when the server does not support QUIC v2. Helium flag.",
+      kOsAll, SINGLE_VALUE_TYPE_AND_VALUE(switches::kQuicVersion, "RFCv2")},
++    {helium::kHeliumSplitClientHelloCommandLine,
++     "Random TLS ClientHello splitting",
++     "Splits outgoing TLS ClientHello messages across two TLS records at a random point. The split targets the visible server name, or the ECH extension when ECH is used. This can bypass some domain-based network filtering, but it does not hide DNS queries or destination IP addresses and makes TLS traffic unusual and potentially recognizable. Some middleboxes and TLS endpoints mishandle this behavior and may become inaccessible. Helium flag.",
++     kOsAll, FEATURE_VALUE_TYPE(net::features::kHeliumSplitClientHello)},
+ #endif  /* CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_ */
+--- a/net/base/features.cc
++++ b/net/base/features.cc
+@@ -29,6 +29,8 @@
+ 
+ namespace net::features {
+ 
++BASE_FEATURE(kHeliumSplitClientHello, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ BASE_FEATURE(kSetIpv6ProbeFalse, "SetIpv6ProbeFalse", base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ BASE_FEATURE(kAlpsForHttp2, base::FEATURE_ENABLED_BY_DEFAULT);
+--- a/net/base/features.h
++++ b/net/base/features.h
+@@ -22,6 +22,9 @@
+ 
+ namespace net::features {
+ 
++// Splits outgoing TLS ClientHello messages across TLS records.
++NET_EXPORT BASE_DECLARE_FEATURE(kHeliumSplitClientHello);
++
+ NET_EXPORT BASE_DECLARE_FEATURE(kSetIpv6ProbeFalse);
+ 
+ // Enables ALPS extension of TLS 1.3 for HTTP/2, see
+--- a/third_party/boringssl/src/include/openssl/prefix_symbols.h
++++ b/third_party/boringssl/src/include/openssl/prefix_symbols.h
+@@ -2361,6 +2361,7 @@
+ #pragma redefine_extname SSL_set_ex_data BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_ex_data)
+ #pragma redefine_extname SSL_set_fd BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_fd)
+ #pragma redefine_extname SSL_set_handshake_hints BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_handshake_hints)
++#pragma redefine_extname SSL_set_helium_split_client_hello BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_helium_split_client_hello)
+ #pragma redefine_extname SSL_set_hostflags BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_hostflags)
+ #pragma redefine_extname SSL_set_info_callback BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_info_callback)
+ #pragma redefine_extname SSL_set_jdk11_workaround BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_jdk11_workaround)
+@@ -5480,6 +5481,7 @@
+ #define SSL_set_ex_data BORINGSSL_ADD_PREFIX(SSL_set_ex_data)
+ #define SSL_set_fd BORINGSSL_ADD_PREFIX(SSL_set_fd)
+ #define SSL_set_handshake_hints BORINGSSL_ADD_PREFIX(SSL_set_handshake_hints)
++#define SSL_set_helium_split_client_hello BORINGSSL_ADD_PREFIX(SSL_set_helium_split_client_hello)
+ #define SSL_set_hostflags BORINGSSL_ADD_PREFIX(SSL_set_hostflags)
+ #define SSL_set_info_callback BORINGSSL_ADD_PREFIX(SSL_set_info_callback)
+ #define SSL_set_jdk11_workaround BORINGSSL_ADD_PREFIX(SSL_set_jdk11_workaround)
+--- a/third_party/boringssl/src/include/openssl/ssl.h
++++ b/third_party/boringssl/src/include/openssl/ssl.h
+@@ -5115,6 +5115,11 @@ OPENSSL_EXPORT void SSL_set_msg_callback
+ // SSL_set_msg_callback_arg sets the `arg` parameter of the message callback.
+ OPENSSL_EXPORT void SSL_set_msg_callback_arg(SSL *ssl, void *arg);
+ 
++// SSL_set_helium_split_client_hello configures `ssl` to add a random record
++// boundary inside the server name or, for a real ECH offer, inside the
++// encrypted_client_hello extension body.
++OPENSSL_EXPORT void SSL_set_helium_split_client_hello(SSL *ssl, int enabled);
++
+ // SSL_CTX_set_keylog_callback configures a callback to log key material. This
+ // is intended for debugging use with tools like Wireshark. The `cb` function
+ // should log `line` followed by a newline, synchronizing with any concurrent
+@@ -6697,6 +6702,9 @@ OPENSSL_EXPORT int SSL_server_sent_reque
+ #if !defined(SSL_set1_groups)
+ #define SSL_set1_groups SSL_set1_groups
+ #endif
++#if !defined(SSL_set_helium_split_client_hello)
++#define SSL_set_helium_split_client_hello SSL_set_helium_split_client_hello
++#endif
+ #if !defined(SSL_set_max_cert_list)
+ #define SSL_set_max_cert_list SSL_set_max_cert_list
+ #endif
+--- a/third_party/boringssl/src/ssl/internal.h
++++ b/third_party/boringssl/src/ssl/internal.h
+@@ -3784,8 +3784,12 @@ bool tls1_get_shared_group(SSL_HANDSHAKE
+ // If `type` is `ssl_client_hello_inner`, this function also writes the
+ // compressed extensions to `out_encoded`. Otherwise, `out_encoded` should be
+ // nullptr.
++//
++// If `out_record_split_offset` is not nullptr, it is set to a suitable record
++// boundary in the encoded handshake message, or zero if none exists.
+ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+-                                ssl_client_hello_type_t type);
++                                ssl_client_hello_type_t type,
++                                size_t *out_record_split_offset);
+ 
+ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out);
+ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
+@@ -4242,6 +4246,9 @@ struct ssl_st {
+                        void *arg) = nullptr;
+   void *msg_callback_arg = nullptr;
+ 
++  bool helium_split_client_hello = false;
++  size_t helium_client_hello_record_split_offset = 0;
++
+   // session info
+ 
+   // initial_timeout_duration_ms is the default DTLS timeout duration in
+--- a/third_party/boringssl/src/ssl/ssl_lib.cc
++++ b/third_party/boringssl/src/ssl/ssl_lib.cc
+@@ -2889,6 +2889,10 @@ void SSL_set_msg_callback_arg(SSL *ssl,
+   ssl->msg_callback_arg = arg;
+ }
+ 
++void SSL_set_helium_split_client_hello(SSL *ssl, int enabled) {
++  ssl->helium_split_client_hello = !!enabled;
++}
++
+ void SSL_CTX_set_keylog_callback(SSL_CTX *ctx,
+                                  void (*cb)(const SSL *ssl, const char *line)) {
+   FromOpaque(ctx)->keylog_callback = cb;
+--- a/third_party/boringssl/src/ssl/extensions.cc
++++ b/third_party/boringssl/src/ssl/extensions.cc
+@@ -520,6 +520,17 @@ static bool dont_add_serverhello(SSL_HAN
+ //
+ // https://tools.ietf.org/html/rfc6066#section-3.
+ 
++static bool choose_split_offset(size_t length, size_t *out_offset) {
++  assert(length >= 2);
++  size_t random_value;
++  if (!RAND_bytes(reinterpret_cast<uint8_t *>(&random_value),
++                  sizeof(random_value))) {
++    return false;
++  }
++  *out_offset = 1 + random_value % (length - 1);
++  return true;
++}
++
+ static bool ext_sni_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+                                     CBB *out_compressible,
+                                     ssl_client_hello_type_t type) {
+@@ -4468,7 +4479,8 @@ static bool ssl_add_clienthello_tlsext_i
+ }
+ 
+ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+-                                ssl_client_hello_type_t type) {
++                                ssl_client_hello_type_t type,
++                                size_t *out_record_split_offset) {
+   // `out` must contain the start of a ClientHello, which means it must begin
+   // with a TLS or DTLS version.
+   assert(CBB_len(out) != 0 && (CBB_data(out)[0] == SSL3_VERSION_MAJOR ||
+@@ -4481,6 +4493,9 @@ bool ssl_add_clienthello_tlsext(SSL_HAND
+   // Sample the length of the ClientHello thus far, including the message
+   // header.
+   size_t msg_len = SSL3_HM_HEADER_LENGTH + CBB_len(out);
++  if (out_record_split_offset != nullptr) {
++    *out_record_split_offset = 0;
++  }
+   assert(out_encoded == nullptr);  // Only ClientHelloInner needs two outputs.
+   SSL *const ssl = hs->ssl;
+   CBB extensions;
+@@ -4517,6 +4532,42 @@ bool ssl_add_clienthello_tlsext(SSL_HAND
+     if (bytes_written != 0) {
+       hs->extensions.sent |= (1u << i);
+     }
++    if (out_record_split_offset != nullptr && bytes_written != 0) {
++      const size_t extension_offset =
++          msg_len + 2 /* extensions length */ + len_before;
++      if (type == ssl_client_hello_outer &&
++          kExtensions[i].value == TLSEXT_TYPE_encrypted_client_hello) {
++        constexpr size_t kExtensionHeaderSize = 4;
++        if (bytes_written >= kExtensionHeaderSize + 2) {
++          const size_t extension_body_length =
++              bytes_written - kExtensionHeaderSize;
++          size_t body_split_offset;
++          if (!choose_split_offset(extension_body_length,
++                                   &body_split_offset)) {
++            return false;
++          }
++          *out_record_split_offset =
++              extension_offset + kExtensionHeaderSize + body_split_offset;
++        }
++      } else if (type == ssl_client_hello_unencrypted &&
++                 kExtensions[i].value == TLSEXT_TYPE_server_name &&
++                 ssl->hostname != nullptr) {
++        const Span<const uint8_t> hostname =
++            StringAsBytes(ssl->hostname.get());
++        const Span<const uint8_t> extension(
++            CBB_data(&extensions) + len_before, bytes_written);
++        if (hostname.size() >= 2 && extension.size() >= hostname.size() &&
++            extension.last(hostname.size()) == hostname) {
++          size_t hostname_split_offset;
++          if (!choose_split_offset(hostname.size(), &hostname_split_offset)) {
++            return false;
++          }
++          *out_record_split_offset =
++              extension_offset + bytes_written - hostname.size() +
++              hostname_split_offset;
++        }
++      }
++    }
+     // If the difference in lengths is only four bytes then the extension had
+     // an empty body.
+     last_was_empty = (bytes_written == 4);
+--- a/third_party/boringssl/src/ssl/encrypted_client_hello.cc
++++ b/third_party/boringssl/src/ssl/encrypted_client_hello.cc
+@@ -803,7 +803,8 @@ bool ssl_encrypt_client_hello(SSL_HANDSH
+                                                  ssl_client_hello_inner,
+                                                  /*empty_session_id=*/true) ||
+       !ssl_add_clienthello_tlsext(hs, &body, encoded_cbb.get(),
+-                                  ssl_client_hello_inner) ||
++                                  ssl_client_hello_inner,
++                                  /*out_record_split_offset=*/nullptr) ||
+       !ssl->method->finish_message(ssl, cbb.get(), &hello_inner)) {
+     OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+     return false;
+@@ -865,7 +866,8 @@ bool ssl_encrypt_client_hello(SSL_HANDSH
+                                                  ssl_client_hello_outer,
+                                                  /*empty_session_id=*/false) ||
+       !ssl_add_clienthello_tlsext(hs, aad.get(), /*out_encoded=*/nullptr,
+-                                  ssl_client_hello_outer)) {
++                                  ssl_client_hello_outer,
++                                  /*out_record_split_offset=*/nullptr)) {
+     OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+     return false;
+   }
+--- a/third_party/boringssl/src/ssl/handshake_client.cc
++++ b/third_party/boringssl/src/ssl/handshake_client.cc
+@@ -224,15 +224,21 @@ bool ssl_add_client_hello(SSL_HANDSHAKE
+                                      ? ssl_client_hello_outer
+                                      : ssl_client_hello_unencrypted;
+   Array<uint8_t> msg;
++  size_t record_split_offset = 0;
+   if (!ssl->method->init_message(ssl, cbb.get(), &body, SSL3_MT_CLIENT_HELLO) ||
+       !ssl_write_client_hello_without_extensions(hs, &body, type,
+                                                  /*empty_session_id=*/false) ||
+-      !ssl_add_clienthello_tlsext(hs, &body, /*out_encoded=*/nullptr, type) ||
++      !ssl_add_clienthello_tlsext(
++          hs, &body, /*out_encoded=*/nullptr, type,
++          ssl->helium_split_client_hello ? &record_split_offset : nullptr) ||
+       !ssl->method->finish_message(ssl, cbb.get(), &msg)) {
+     return false;
+   }
+ 
+-  return ssl->method->add_message(ssl, std::move(msg));
++  ssl->helium_client_hello_record_split_offset = record_split_offset;
++  const bool ok = ssl->method->add_message(ssl, std::move(msg));
++  ssl->helium_client_hello_record_split_offset = 0;
++  return ok;
+ }
+ 
+ static bool parse_server_version(const SSL_HANDSHAKE *hs, uint16_t *out_version,
+--- a/third_party/boringssl/src/ssl/s3_both.cc
++++ b/third_party/boringssl/src/ssl/s3_both.cc
+@@ -100,10 +100,23 @@ bool tls_add_message(SSL *ssl, Array<uin
+   // TODO(crbug.com/374991962): See if we can do this uniformly.
+   Span<const uint8_t> rest = msg;
+   if (!SSL_is_quic(ssl) && ssl->s3->aead_write_ctx->is_null_cipher()) {
++    size_t split_offset = ssl->helium_client_hello_record_split_offset;
++    ssl->helium_client_hello_record_split_offset = 0;
++    if (split_offset >= msg.size()) {
++      split_offset = 0;
++    }
++
++    size_t message_offset = 0;
+     while (!rest.empty()) {
+-      Span<const uint8_t> chunk =
+-          rest.first(std::min(size_t{ssl->max_send_fragment}, rest.size()));
++      size_t chunk_size =
++          std::min(size_t{ssl->max_send_fragment}, rest.size());
++      if (split_offset > message_offset &&
++          split_offset < message_offset + chunk_size) {
++        chunk_size = split_offset - message_offset;
++      }
++      Span<const uint8_t> chunk = rest.first(chunk_size);
+       rest = rest.subspan(chunk.size());
++      message_offset += chunk.size();
+ 
+       if (!add_record_to_flight(ssl, SSL3_RT_HANDSHAKE, chunk)) {
+         return false;
+--- a/net/socket/ssl_client_socket_impl.cc
++++ b/net/socket/ssl_client_socket_impl.cc
+@@ -727,6 +727,9 @@ int SSLClientSocketImpl::Init() {
+       SSL_set_session(ssl_.get(), session.get());
+   }
+ 
++  if (base::FeatureList::IsEnabled(features::kHeliumSplitClientHello)) {
++    SSL_set_helium_split_client_hello(ssl_.get(), 1);
++  }
+   transport_adapter_ = std::make_unique<SocketBIOAdapter>(
+       stream_socket_.get(), kDefaultOpenSSLBufferSize,
+       kDefaultOpenSSLBufferSize, this);
