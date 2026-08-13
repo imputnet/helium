@@ -1,0 +1,104 @@
+--- a/components/sync/base/data_type.h
++++ b/components/sync/base/data_type.h
+@@ -393,6 +393,9 @@ DataTypeSet EncryptableUserTypes();
+ // Returns the set of data types that support local sync.
+ DataTypeSet LocalSyncSupportedTypes();
+ 
++// Returns the set of data types supported by extension-based sync.
++DataTypeSet CustomSyncSupportedTypes();
++
+ // Determine a data type from the field number of its associated
+ // EntitySpecifics field.  Returns UNSPECIFIED if the field number is
+ // not recognized.
+--- a/components/sync/base/data_type.cc
++++ b/components/sync/base/data_type.cc
+@@ -1609,6 +1609,19 @@ DataTypeSet LocalSyncSupportedTypes() {
+   return types;
+ }
+ 
++DataTypeSet CustomSyncSupportedTypes() {
++  static const DataTypeSet types = {
++      AUTOFILL, AUTOFILL_PROFILE,
++      BOOKMARKS, DEVICE_INFO, DICTIONARY,
++      EXTENSIONS, EXTENSION_SETTINGS,
++      HISTORY, HISTORY_DELETE_DIRECTIVES,
++      NIGORI, PREFERENCES, PRIORITY_PREFERENCES, READING_LIST,
++      SAVED_TAB_GROUP, SEARCH_ENGINES, SEND_TAB_TO_SELF, SESSIONS,
++      THEMES, WEB_APPS
++  };
++  return types;
++}
++
+ std::string_view DataTypeToDebugString(DataType data_type) {
+   return GetDataTypeInfo(data_type).debug_string;
+ }
+--- a/components/sync/service/sync_user_settings_impl.cc
++++ b/components/sync/service/sync_user_settings_impl.cc
+@@ -209,9 +209,14 @@ void SyncUserSettingsImpl::KeepAccountSe
+ 
+ UserSelectableTypeSet SyncUserSettingsImpl::GetRegisteredSelectableTypes()
+     const {
++  DataTypeSet selectable_data_types = registered_data_types_;
++  if (delegate_->GetSyncBackendType() == SyncBackendType::kCustom) {
++    selectable_data_types.RetainAll(CustomSyncSupportedTypes());
++  }
++
+   UserSelectableTypeSet registered_types;
+   for (UserSelectableType type : UserSelectableTypeSet::All()) {
+-    if (!base::Intersection(registered_data_types_,
++    if (!base::Intersection(selectable_data_types,
+                             UserSelectableTypeToAllDataTypes(type))
+              .empty()) {
+       registered_types.Put(type);
+@@ -367,7 +372,8 @@ bool SyncUserSettingsImpl::SetDecryption
+ }
+ 
+ DataTypeSet SyncUserSettingsImpl::GetPreferredDataTypes() const {
+-  DataTypeSet types = UserSelectableTypesToDataTypes(GetSelectedTypes());
++  const UserSelectableTypeSet selected_types = GetSelectedTypes();
++  DataTypeSet types = UserSelectableTypesToDataTypes(selected_types);
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   if (IsSyncFeatureDisabledViaDashboard() &&
+@@ -391,8 +397,21 @@ DataTypeSet SyncUserSettingsImpl::GetPre
+   // though they're technically not registered.
+   types.PutAll(ControlTypes());
+ 
+-  if (prefs_->IsLocalSyncEnabled()) {
+-    types.RetainAll(LocalSyncSupportedTypes());
++  switch (delegate_->GetSyncBackendType()) {
++    case SyncBackendType::kDisabled:
++      break;
++    case SyncBackendType::kLocal:
++      types.RetainAll(LocalSyncSupportedTypes());
++      break;
++    case SyncBackendType::kCustom:
++      types.RetainAll(CustomSyncSupportedTypes());
++      // SEND_TAB_TO_SELF has no corresponding UserSelectableType, so
++      // it is normally always preferred. Custom backends group it
++      // under Tabs.
++      if (!selected_types.Has(UserSelectableType::kTabs)) {
++        types.Remove(SEND_TAB_TO_SELF);
++      }
++      break;
+   }
+   return types;
+ }
+--- a/components/sync/service/sync_user_settings_impl.h
++++ b/components/sync/service/sync_user_settings_impl.h
+@@ -15,6 +15,7 @@
+ #include "components/signin/public/identity_manager/account_info.h"
+ #include "components/sync/base/data_type.h"
+ #include "components/sync/base/user_selectable_type.h"
++#include "components/sync/service/sync_backend_type.h"
+ #include "components/sync/service/sync_prefs.h"
+ #include "components/sync/service/sync_user_settings.h"
+ 
+@@ -31,6 +32,7 @@ class SyncUserSettingsImpl : public Sync
+     virtual ~Delegate() = default;
+ 
+     virtual bool IsCustomPassphraseAllowed() const = 0;
++    virtual SyncBackendType GetSyncBackendType() const = 0;
+     virtual SyncPrefs::SyncAccountState GetSyncAccountStateForPrefs() const = 0;
+     virtual CoreAccountInfo GetSyncAccountInfoForPrefs() const = 0;
+ 
