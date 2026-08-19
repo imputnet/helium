@@ -11,15 +11,17 @@
  
 --- /dev/null
 +++ b/components/sync/engine/extension_sync/sync_vault_store.cc
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,895 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "components/sync/engine/extension_sync/sync_vault_store.h"
 +
++#include <algorithm>
 +#include <cstddef>
 +#include <cstdint>
++#include <limits>
 +#include <memory>
 +#include <optional>
 +#include <string>
@@ -29,7 +31,11 @@
 +
 +#include "base/check.h"
 +#include "base/containers/span.h"
++#include "base/memory/ptr_util.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/strings/strcat.h"
 +#include "base/strings/string_number_conversions.h"
++#include "base/time/time.h"
 +#include "components/sync/engine/extension_sync/sync_vault_cryptographer.h"
 +#include "crypto/hash.h"
 +
@@ -37,21 +43,29 @@
 +
 +namespace {
 +
-+constexpr char kObjectRootPrefix[] = "helium/v1/";
-+constexpr char kDescriptorSuffix[] = "/descriptor";
++constexpr std::string_view kObjectRootPrefix = "helium/v1/";
++constexpr std::string_view kDescriptorSuffix = "/descriptor";
 +constexpr char kEpochSegment[] = "epoch/";
 +constexpr size_t kMaximumMetadataContainerBytes =
 +    kSyncVaultMaximumMetadataPlaintextBytes + kSyncVaultContainerOverheadBytes;
 +constexpr size_t kContentDigestHexLength = 64;
++// These are writer rollover policy, not wire-format validity limits. Readers
++// accept larger authenticated epochs produced by another conforming writer.
++constexpr uint64_t kEpochCommitTarget = 256;
++constexpr uint64_t kEpochUploadedBytesTarget = 512 * 1024 * 1024;
 +
 +SyncVaultStoreError MapTransportError(SyncVaultTransportError error) {
 +  switch (error) {
 +    case SyncVaultTransportError::kAuthenticationRequired:
 +      return SyncVaultStoreError::kAuthenticationRequired;
++    case SyncVaultTransportError::kConflict:
++      return SyncVaultStoreError::kConflict;
 +    case SyncVaultTransportError::kNetworkError:
 +      return SyncVaultStoreError::kNetworkError;
 +    case SyncVaultTransportError::kTemporaryError:
 +      return SyncVaultStoreError::kTemporaryError;
++    case SyncVaultTransportError::kQuotaExceeded:
++      return SyncVaultStoreError::kQuotaExceeded;
 +    case SyncVaultTransportError::kAccessDenied:
 +      return SyncVaultStoreError::kAccessDenied;
 +    case SyncVaultTransportError::kInvalidData:
@@ -61,6 +75,12 @@
 +    case SyncVaultTransportError::kAborted:
 +      return SyncVaultStoreError::kAborted;
 +  }
++}
++
++std::string ContentAddressedObjectId(std::string_view prefix,
++                                     base::span<const uint8_t> encrypted_data) {
++  return std::string(prefix) +
++         base::HexEncode(crypto::hash::Sha256(encrypted_data));
 +}
 +
 +SyncVaultStoreError MapCryptoError(SyncVaultCryptoError error) {
@@ -130,11 +150,17 @@
 +}
 +
 +std::string GetSyncVaultObjectPrefix(const std::string& vault_uuid) {
-+  return std::string(kObjectRootPrefix) + vault_uuid + "/";
++  return base::StrCat({kObjectRootPrefix, vault_uuid, "/"});
 +}
 +
 +std::string GetSyncVaultDescriptorObjectId(const std::string& vault_uuid) {
-+  return std::string(kObjectRootPrefix) + vault_uuid + kDescriptorSuffix;
++  return base::StrCat({kObjectRootPrefix, vault_uuid, kDescriptorSuffix});
++}
++
++std::string GetSyncVaultEpochObjectPrefix(const std::string& vault_uuid,
++                                          uint32_t epoch) {
++  return base::StrCat({GetSyncVaultObjectPrefix(vault_uuid), kEpochSegment,
++                       base::NumberToString(epoch), "/"});
 +}
 +
 +}  // namespace
@@ -172,7 +198,7 @@
 +  if (!SerializeSyncVaultCheckpoint(effective_checkpoint).has_value()) {
 +    return base::unexpected(SyncVaultStoreError::kInvalidData);
 +  }
-+  return std::unique_ptr<SyncVaultStore>(new SyncVaultStore(
++  return base::WrapUnique(new SyncVaultStore(
 +      std::move(transport), std::move(cryptographer.value()),
 +      std::move(effective_checkpoint), std::move(persist_checkpoint_callback)));
 +}
@@ -292,9 +318,11 @@
 +  if (should_advance_checkpoint && !AdvanceCheckpoint(head)) {
 +    return base::unexpected(SyncVaultStoreError::kCheckpointPersistenceFailed);
 +  }
++  MaybeCollectEpochs(head);
 +
 +  return SyncVaultState{std::move(state), std::move(head),
-+                        std::move(head_revision), true};
++                        std::move(head_revision), true,
++                        std::move(latest_record.state_chunks)};
 +}
 +
 +SyncVaultStore::RefreshResult SyncVaultStore::ReadStateIfChanged(
@@ -359,6 +387,211 @@
 +  return base::ok();
 +}
 +
++SyncVaultStore::ReadResult SyncVaultStore::InitializeEmptyVaultAndReadState() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ReadResult state = ReadState();
++  if (!state.has_value() || state->initialized) {
++    return state;
++  }
++
++  WriteResult initialization = InitializeVault();
++  if (!initialization.has_value()) {
++    return base::unexpected(initialization.error());
++  }
++
++  ReadResult verified_state = ReadState();
++  if (!verified_state.has_value()) {
++    return base::unexpected(verified_state.error());
++  }
++  if (!verified_state->initialized || !verified_state->head_revision ||
++      verified_state->head.generation != 0) {
++    return base::unexpected(SyncVaultStoreError::kIncompleteHistory);
++  }
++  return verified_state;
++}
++
++SyncVaultStore::CommitResult SyncVaultStore::CommitState(
++    const SyncVaultState& base_state,
++    base::span<const uint8_t> state,
++    uint32_t mutation_count) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (mutation_count == 0 || state.empty() ||
++      state.size() > kSyncVaultMaximumReconstructedBytes ||
++      base_state.head.generation == std::numeric_limits<uint64_t>::max()) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
++
++  SyncVaultHead base_head = base_state.head;
++  std::optional<std::string> expected_head_revision = base_state.head_revision;
++  if (!base_state.initialized) {
++    if (base_state.head.generation != 0 || expected_head_revision) {
++      return base::unexpected(SyncVaultStoreError::kInvalidData);
++    }
++    WriteResult initialized_revision = InitializeVault();
++    if (!initialized_revision.has_value()) {
++      return base::unexpected(initialized_revision.error());
++    }
++    base_head = SyncVaultHead();
++    expected_head_revision = std::move(initialized_revision.value());
++  } else if (!expected_head_revision) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
++
++  uint64_t pending_entity_bytes = 0;
++  size_t chunk_index = 0;
++  for (size_t offset = 0; offset < state.size(); ++chunk_index) {
++    const size_t chunk_size =
++        std::min(state.size() - offset, kSyncVaultMaximumEntityPlaintextBytes);
++    const bool can_reuse =
++        chunk_index < base_state.state_chunks.size() &&
++        base_state.state_chunks[chunk_index].plaintext_size == chunk_size &&
++        offset + chunk_size <= base_state.data.size() &&
++        std::ranges::equal(
++            state.subspan(offset, chunk_size),
++            base::span(base_state.data).subspan(offset, chunk_size));
++    if (!can_reuse) {
++      pending_entity_bytes += chunk_size + kSyncVaultContainerOverheadBytes;
++    }
++    offset += chunk_size;
++  }
++
++  const uint64_t commits_in_epoch =
++      base_head.generation == 0
++          ? 0
++          : base_head.generation - base_head.epoch_start_generation + 1;
++  const bool byte_target_reached =
++      pending_entity_bytes > kEpochUploadedBytesTarget ||
++      base_head.epoch_uploaded_bytes >
++          kEpochUploadedBytesTarget - pending_entity_bytes;
++  const bool start_new_epoch =
++      base_head.generation > 0 &&
++      (commits_in_epoch >= kEpochCommitTarget || byte_target_reached);
++  if (start_new_epoch &&
++      base_head.epoch == std::numeric_limits<uint32_t>::max()) {
++    return base::unexpected(SyncVaultStoreError::kObjectTooLarge);
++  }
++
++  const uint64_t new_generation = base_head.generation + 1;
++  const uint32_t new_epoch =
++      start_new_epoch ? base_head.epoch + 1 : base_head.epoch;
++  const uint64_t new_epoch_start_generation =
++      start_new_epoch || base_head.generation == 0
++          ? new_generation
++          : base_head.epoch_start_generation;
++  const uint32_t new_minimum_retained_epoch =
++      start_new_epoch ? new_epoch - 1 : base_head.minimum_retained_epoch;
++  const uint64_t new_minimum_retained_generation =
++      start_new_epoch ? (new_epoch <= 1 ? 0 : base_head.epoch_start_generation)
++                      : base_head.minimum_retained_generation;
++  uint64_t new_epoch_uploaded_bytes =
++      start_new_epoch ? 0 : base_head.epoch_uploaded_bytes;
++
++  const std::string epoch_object_prefix =
++      GetSyncVaultEpochObjectPrefix(cryptographer_->vault_uuid(), new_epoch);
++  const std::string journal_object_prefix = epoch_object_prefix + "journal/";
++  const std::string entity_object_prefix = epoch_object_prefix + "entity/";
++
++  std::vector<SyncVaultObjectReference> chunks;
++  chunk_index = 0;
++  for (size_t offset = 0; offset < state.size(); ++chunk_index) {
++    const size_t chunk_size =
++        std::min(state.size() - offset, kSyncVaultMaximumEntityPlaintextBytes);
++    if (!start_new_epoch && chunk_index < base_state.state_chunks.size() &&
++        base_state.state_chunks[chunk_index].plaintext_size == chunk_size &&
++        offset + chunk_size <= base_state.data.size() &&
++        std::ranges::equal(
++            state.subspan(offset, chunk_size),
++            base::span(base_state.data).subspan(offset, chunk_size))) {
++      chunks.push_back(base_state.state_chunks[chunk_index]);
++      offset += chunk_size;
++      continue;
++    }
++    auto encrypted = cryptographer_->Encrypt(SyncVaultObjectRole::kEntity,
++                                             state.subspan(offset, chunk_size));
++    if (!encrypted.has_value()) {
++      return base::unexpected(MapCryptoError(encrypted.error()));
++    }
++    new_epoch_uploaded_bytes += encrypted->size();
++    const std::string object_id =
++        ContentAddressedObjectId(entity_object_prefix, encrypted.value());
++    WriteResult write_result =
++        WriteImmutableObject(object_id, std::move(encrypted.value()));
++    if (!write_result.has_value()) {
++      return base::unexpected(write_result.error());
++    }
++    chunks.push_back({object_id, base::checked_cast<uint32_t>(chunk_size)});
++    offset += chunk_size;
++  }
++
++  SyncVaultJournalRecord record;
++  record.generation = new_generation;
++  record.creation_time_millis =
++      base::Time::Now().InMillisecondsSinceUnixEpoch();
++  record.mutation_count = mutation_count;
++  record.parent_record_id = base_head.record_id;
++  record.state_chunks = chunks;
++  record.epoch = new_epoch;
++  auto serialized_record = SerializeSyncVaultJournalRecord(record);
++  if (!serialized_record.has_value()) {
++    return base::unexpected(MapFormatError(serialized_record.error()));
++  }
++  auto encrypted_record = cryptographer_->Encrypt(SyncVaultObjectRole::kJournal,
++                                                  serialized_record.value());
++  if (!encrypted_record.has_value()) {
++    return base::unexpected(MapCryptoError(encrypted_record.error()));
++  }
++  new_epoch_uploaded_bytes += encrypted_record->size();
++  const std::string record_id =
++      ContentAddressedObjectId(journal_object_prefix, encrypted_record.value());
++  WriteResult record_write =
++      WriteImmutableObject(record_id, std::move(encrypted_record.value()));
++  if (!record_write.has_value()) {
++    return base::unexpected(record_write.error());
++  }
++
++  SyncVaultHead new_head;
++  new_head.generation = record.generation;
++  new_head.record_id = record_id;
++  new_head.epoch = new_epoch;
++  new_head.epoch_start_generation = new_epoch_start_generation;
++  new_head.minimum_retained_epoch = new_minimum_retained_epoch;
++  new_head.minimum_retained_generation = new_minimum_retained_generation;
++  new_head.epoch_uploaded_bytes = new_epoch_uploaded_bytes;
++  auto serialized_head = SerializeSyncVaultHead(new_head);
++  if (!serialized_head.has_value()) {
++    return base::unexpected(MapFormatError(serialized_head.error()));
++  }
++  auto encrypted_head = cryptographer_->Encrypt(SyncVaultObjectRole::kHead,
++                                                serialized_head.value());
++  if (!encrypted_head.has_value()) {
++    return base::unexpected(MapCryptoError(encrypted_head.error()));
++  }
++  WriteResult head_write =
++      WriteObject(head_object_id_, std::move(expected_head_revision),
++                  std::move(encrypted_head.value()));
++  std::string committed_head_revision;
++  if (!head_write.has_value()) {
++    if (head_write.error() == SyncVaultStoreError::kConflict) {
++      return base::unexpected(SyncVaultStoreError::kConflict);
++    }
++    // Resolve an ambiguous commit response by authenticating the current head.
++    HeadResult current = ReadHead();
++    if (!current.has_value() || current->first != new_head) {
++      return base::unexpected(head_write.error());
++    }
++    committed_head_revision = std::move(current->second);
++  } else {
++    committed_head_revision = std::move(head_write.value());
++  }
++  if (!AdvanceCheckpoint(new_head)) {
++    return base::unexpected(SyncVaultStoreError::kCheckpointPersistenceFailed);
++  }
++  MaybeCollectEpochs(new_head);
++  return SyncVaultState{std::vector<uint8_t>(state.begin(), state.end()),
++                        std::move(new_head), std::move(committed_head_revision),
++                        true, std::move(chunks)};
++}
++
 +SyncVaultStore::ObjectResult SyncVaultStore::ReadObject(
 +    const std::string& object_id,
 +    size_t maximum_bytes) const {
@@ -377,6 +610,29 @@
 +      (result->value().data.size() > maximum_bytes ||
 +       result->value().revision.empty() ||
 +       result->value().revision.size() > kSyncVaultMaximumIdentifierBytes)) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
++  return std::move(result.value());
++}
++
++SyncVaultStore::WriteResult SyncVaultStore::WriteObject(
++    const std::string& object_id,
++    std::optional<std::string> expected_revision,
++    std::vector<uint8_t> data) {
++  if (object_id.empty() ||
++      object_id.size() > kSyncVaultMaximumIdentifierBytes || data.empty() ||
++      data.size() > kSyncVaultMaximumEncryptedObjectBytes ||
++      (expected_revision &&
++       (expected_revision->empty() ||
++        expected_revision->size() > kSyncVaultMaximumIdentifierBytes))) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
++  SyncVaultTransport::WriteResult result = transport_->WriteObject(
++      object_id, std::move(expected_revision), std::move(data));
++  if (!result.has_value()) {
++    return base::unexpected(MapTransportError(result.error()));
++  }
++  if (result->empty() || result->size() > kSyncVaultMaximumIdentifierBytes) {
 +    return base::unexpected(SyncVaultStoreError::kInvalidData);
 +  }
 +  return std::move(result.value());
@@ -554,6 +810,80 @@
 +  return std::move(record.value());
 +}
 +
++SyncVaultStore::WriteResult SyncVaultStore::InitializeVault() {
++  SyncVaultDescriptor descriptor;
++  descriptor.vault_uuid = cryptographer_->vault_uuid();
++  descriptor.creation_time_millis =
++      base::Time::Now().InMillisecondsSinceUnixEpoch();
++  auto serialized_descriptor = SerializeSyncVaultDescriptor(descriptor);
++  if (!serialized_descriptor.has_value()) {
++    return base::unexpected(MapFormatError(serialized_descriptor.error()));
++  }
++  auto encrypted_descriptor = cryptographer_->Encrypt(
++      SyncVaultObjectRole::kDescriptor, serialized_descriptor.value());
++  if (!encrypted_descriptor.has_value()) {
++    return base::unexpected(MapCryptoError(encrypted_descriptor.error()));
++  }
++  WriteResult descriptor_write =
++      WriteObject(descriptor_object_id_, std::nullopt,
++                  std::move(encrypted_descriptor.value()));
++  if (!descriptor_write.has_value()) {
++    ObjectResult existing =
++        ReadObject(descriptor_object_id_, kMaximumMetadataContainerBytes);
++    if (!existing.has_value() || !existing->has_value()) {
++      return base::unexpected(descriptor_write.error());
++    }
++    auto validation = ValidateDescriptor(existing->value());
++    if (!validation.has_value()) {
++      return base::unexpected(validation.error());
++    }
++  }
++
++  SyncVaultHead initial_head;
++  auto serialized_head = SerializeSyncVaultHead(initial_head);
++  if (!serialized_head.has_value()) {
++    return base::unexpected(MapFormatError(serialized_head.error()));
++  }
++  auto encrypted_head = cryptographer_->Encrypt(SyncVaultObjectRole::kHead,
++                                                serialized_head.value());
++  if (!encrypted_head.has_value()) {
++    return base::unexpected(MapCryptoError(encrypted_head.error()));
++  }
++  WriteResult head_write = WriteObject(head_object_id_, std::nullopt,
++                                       std::move(encrypted_head.value()));
++  if (head_write.has_value()) {
++    return head_write;
++  }
++  HeadResult existing_head = ReadHead();
++  if (!existing_head.has_value()) {
++    return base::unexpected(head_write.error());
++  }
++  if (existing_head->first.generation != 0) {
++    return base::unexpected(SyncVaultStoreError::kConflict);
++  }
++  return std::move(existing_head->second);
++}
++
++SyncVaultStore::WriteResult SyncVaultStore::WriteImmutableObject(
++    const std::string& object_id,
++    std::vector<uint8_t> encrypted_data) {
++  const std::vector<uint8_t> expected_data = encrypted_data;
++  WriteResult write =
++      WriteObject(object_id, std::nullopt, std::move(encrypted_data));
++  if (write.has_value()) {
++    return write;
++  }
++  // A collision or missing acknowledgement is successful only when the
++  // complete immutable ciphertext is already present byte-for-byte.
++  ObjectResult existing =
++      ReadObject(object_id, kSyncVaultMaximumEncryptedObjectBytes);
++  if (existing.has_value() && existing->has_value() &&
++      existing->value().data == expected_data) {
++    return existing->value().revision;
++  }
++  return base::unexpected(write.error());
++}
++
 +bool SyncVaultStore::AdvanceCheckpoint(const SyncVaultHead& head) {
 +  SyncVaultCheckpoint next{cryptographer_->vault_uuid(), head.generation,
 +                           head.record_id, head.epoch};
@@ -564,10 +894,22 @@
 +  return true;
 +}
 +
++void SyncVaultStore::MaybeCollectEpochs(const SyncVaultHead& head) {
++  if (head.minimum_retained_epoch == 0 ||
++      (attempted_collection_floor_ &&
++       *attempted_collection_floor_ >= head.minimum_retained_epoch)) {
++    return;
++  }
++  attempted_collection_floor_ = head.minimum_retained_epoch;
++  // Collection is an optimization. The authenticated head already commits to
++  // the retention floor, and a failed provider cleanup must not fail syncing.
++  transport_->CollectEpochsBefore(head.minimum_retained_epoch);
++}
++
 +}  // namespace syncer
 --- /dev/null
 +++ b/components/sync/engine/extension_sync/sync_vault_store.h
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,145 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -596,8 +938,10 @@
 +
 +enum class SyncVaultStoreError {
 +  kAuthenticationRequired,
++  kConflict,
 +  kNetworkError,
 +  kTemporaryError,
++  kQuotaExceeded,
 +  kAccessDenied,
 +  kInvalidData,
 +  kUnsupported,
@@ -618,10 +962,12 @@
 +  SyncVaultHead head;
 +  std::optional<std::string> head_revision;
 +  bool initialized = false;
++  std::vector<SyncVaultObjectReference> state_chunks;
 +};
 +
-+// Authenticates and reconstructs a browser-owned encrypted journal from opaque
-+// provider objects. A protected local checkpoint anchors accepted history.
++// Implements the browser-owned encrypted journal over an opaque object
++// provider. Immutable state chunks and journal records are installed first;
++// only the fixed head is conditionally replaced.
 +class SyncVaultStore {
 + public:
 +  using PersistCheckpointCallback =
@@ -631,6 +977,7 @@
 +  using ReadResult = base::expected<SyncVaultState, SyncVaultStoreError>;
 +  using RefreshResult =
 +      base::expected<std::optional<SyncVaultState>, SyncVaultStoreError>;
++  using CommitResult = base::expected<SyncVaultState, SyncVaultStoreError>;
 +
 +  static CreateResult Create(
 +      std::unique_ptr<SyncVaultTransport> transport,
@@ -651,6 +998,14 @@
 +  // Authenticates the current head and returns a complete replacement only
 +  // when it differs from the already loaded state.
 +  RefreshResult ReadStateIfChanged(const SyncVaultState& loaded_state);
++  // Creates an authenticated empty descriptor/head when needed, then reads
++  // both objects back through the normal verification path. This is intended
++  // for new-vault setup; joining an existing vault must use ReadState() so a
++  // missing remote history cannot be silently initialized.
++  ReadResult InitializeEmptyVaultAndReadState();
++  CommitResult CommitState(const SyncVaultState& base_state,
++                           base::span<const uint8_t> state,
++                           uint32_t mutation_count);
 +
 +  const SyncVaultCheckpoint& checkpoint() const { return checkpoint_; }
 +
@@ -666,16 +1021,24 @@
 +                                    SyncVaultStoreError>;
 +  using JournalResult =
 +      base::expected<SyncVaultJournalRecord, SyncVaultStoreError>;
++  using WriteResult = base::expected<std::string, SyncVaultStoreError>;
 +
 +  ObjectResult ReadObject(const std::string& object_id,
 +                          size_t maximum_bytes) const;
++  WriteResult WriteObject(const std::string& object_id,
++                          std::optional<std::string> expected_revision,
++                          std::vector<uint8_t> data);
 +  base::expected<void, SyncVaultStoreError> ValidateDescriptor(
 +      const OpaqueSyncVaultObject& object) const;
 +  HeadResult ReadHead();
 +  JournalResult AuthenticateHead(const SyncVaultHead& head) const;
 +  base::expected<SyncVaultJournalRecord, SyncVaultStoreError> ReadJournalRecord(
 +      const std::string& record_id) const;
++  WriteResult InitializeVault();
++  WriteResult WriteImmutableObject(const std::string& object_id,
++                                   std::vector<uint8_t> encrypted_data);
 +  bool AdvanceCheckpoint(const SyncVaultHead& head);
++  void MaybeCollectEpochs(const SyncVaultHead& head);
 +
 +  std::unique_ptr<SyncVaultTransport> transport_;
 +  std::unique_ptr<SyncVaultCryptographer> cryptographer_;
@@ -684,6 +1047,7 @@
 +  const std::string object_prefix_;
 +  const std::string descriptor_object_id_;
 +  const std::string head_object_id_;
++  std::optional<uint32_t> attempted_collection_floor_;
 +
 +  SEQUENCE_CHECKER(sequence_checker_);
 +};
