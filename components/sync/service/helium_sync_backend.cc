@@ -2,7 +2,9 @@
 // You can use, redistribute, and/or modify this source code under
 // the terms of the GPL-3.0 license that can be found in the LICENSE file.
 
+#include <memory>
 #include "components/sync/service/helium_sync_backend.h"
+#include "components/sync/engine/custom_sync_backend.h"
 
 namespace syncer {
 
