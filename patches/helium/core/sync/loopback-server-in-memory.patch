@@ -1,0 +1,232 @@
+--- a/components/sync/engine/loopback_server/loopback_server.cc
++++ b/components/sync/engine/loopback_server/loopback_server.cc
+@@ -56,7 +56,7 @@ namespace {
+ 
+ constexpr char kHistogramSuffix[] = "LoopBackServer";
+ 
+-constexpr int kCurrentLoopbackServerProtoVersion = 1;
++constexpr int kCurrentLoopbackServerProtoVersion = 1;  // Patch guard.
+ constexpr int kKeystoreKeyLength = 16;
+ 
+ // Properties of the bookmark bar permanent folders.
+@@ -250,13 +250,17 @@ bool SortByVersion(const LoopbackServerE
+ 
+ }  // namespace
+ 
++LoopbackServer::LoopbackServer() {
++  Init();
++}
++
+ LoopbackServer::LoopbackServer(const base::FilePath& persistent_file)
+     : persistent_file_(persistent_file),
+-      writer_(
++      writer_(std::make_unique<base::ImportantFileWriter>(
+           persistent_file_,
+           base::ThreadPool::CreateSequencedTaskRunner(
+               {base::MayBlock(), base::TaskShutdownBehavior::BLOCK_SHUTDOWN}),
+-          kHistogramSuffix) {
++          kHistogramSuffix)) {
+   DCHECK(!persistent_file_.empty());
+   Init();
+ }
+@@ -353,9 +357,17 @@ void LoopbackServer::SaveEntity(std::uni
+ net::HttpStatusCode LoopbackServer::HandleCommand(
+     const sync_pb::ClientToServerMessage& message,
+     sync_pb::ClientToServerResponse* response) {
++  return HandleCommandWithResult(message, response).status;
++}
++
++LoopbackServer::CommandResult LoopbackServer::HandleCommandWithResult(
++    const sync_pb::ClientToServerMessage& message,
++    sync_pb::ClientToServerResponse* response) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(response);
+ 
++  const int64_t version_before_command = version_;
++  bool cleared_server_data = false;
+   response->Clear();
+ 
+   if (bag_of_chips_.has_value()) {
+@@ -387,6 +399,7 @@ net::HttpStatusCode LoopbackServer::Hand
+         break;
+       case sync_pb::ClientToServerMessage::CLEAR_SERVER_DATA:
+         ClearServerData();
++        cleared_server_data = true;
+         response->mutable_clear_server_data();
+         success = true;
+         break;
+@@ -424,14 +437,16 @@ net::HttpStatusCode LoopbackServer::Hand
+       // Avoid tests waiting too long after throttling is disabled.
+       response->mutable_client_command()->set_throttle_delay_seconds(1);
+     } else {
+-      return net::HTTP_INTERNAL_SERVER_ERROR;
++      return {net::HTTP_INTERNAL_SERVER_ERROR,
++              cleared_server_data || version_ != version_before_command};
+     }
+   }
+ 
+   response->set_store_birthday(GetStoreBirthday());
+ 
+   ScheduleSaveStateToFile();
+-  return net::HTTP_OK;
++  return {net::HTTP_OK,
++          cleared_server_data || version_ != version_before_command};
+ }
+ 
+ void LoopbackServer::EnableStrongConsistencyWithConflictDetectionModel() {
+@@ -447,8 +462,8 @@ void LoopbackServer::AddNewKeystoreKeyFo
+ }
+ 
+ void LoopbackServer::FlushToDisk() {
+-  if (writer_.HasPendingWrite()) {
+-    writer_.DoScheduledWrite();
++  if (writer_ && writer_->HasPendingWrite()) {
++    writer_->DoScheduledWrite();
+   }
+ }
+ 
+@@ -934,33 +949,69 @@ bool LoopbackServer::DeSerializeState(
+ 
+ std::optional<std::string> LoopbackServer::SerializeData() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  sync_pb::LoopbackServerProto proto;
+-  SerializeState(&proto);
+-  std::string data;
+-  if (!proto.SerializeToString(&data)) {
++  std::optional<std::string> data = SerializeStateToString();
++  if (!data) {
+     DVLOG(1) << "Loopback sync proto could not be serialized";
+     return std::nullopt;
+   }
+   UMA_HISTOGRAM_MEMORY_KB(
+       "Sync.Local.FileSizeKB",
+       base::saturated_cast<base::Histogram::Sample32>(
+-          base::ClampDiv(base::ClampAdd(data.size(), 512), 1024)));
++          base::ClampDiv(base::ClampAdd(data->size(), 512), 1024)));
+   return data;
+ }
+ 
++std::optional<std::string> LoopbackServer::SerializeStateToString() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  sync_pb::LoopbackServerProto proto;
++  SerializeState(&proto);
++  std::string data;
++  if (!proto.SerializeToString(&data)) {
++    return std::nullopt;
++  }
++  return data;
++}
++
++bool LoopbackServer::LoadStateFromString(std::string_view serialized) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  sync_pb::LoopbackServerProto proto;
++  if (serialized.empty() ||
++      !proto.ParseFromArray(serialized.data(), serialized.size()) ||
++      proto.version() != kCurrentLoopbackServerProtoVersion) {
++    return false;
++  }
++
++  version_ = 0;
++  store_birthday_ = 0;
++  entities_.clear();
++  keystore_keys_.clear();
++  return DeSerializeState(proto);
++}
++
++size_t LoopbackServer::GetEntityCount() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return entities_.size();
++}
++
+ bool LoopbackServer::ScheduleSaveStateToFile() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!writer_) {
++    return true;
++  }
+   if (!base::CreateDirectory(persistent_file_.DirName())) {
+     DVLOG(1) << "Loopback sync could not create the storage directory.";
+     return false;
+   }
+ 
+-  writer_.ScheduleWrite(this);
++  writer_->ScheduleWrite(this);
+   return true;
+ }
+ 
+ bool LoopbackServer::LoadStateFromFile() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (persistent_file_.empty()) {
++    return false;
++  }
+ 
+   // Ensures local sync file can be opened, read, and is not being written to.
+   // Also makes sure file will not be written to during serialization.
+--- a/components/sync/engine/loopback_server/loopback_server.h
++++ b/components/sync/engine/loopback_server/loopback_server.h
+@@ -11,6 +11,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include "base/files/file_path.h"
+@@ -40,6 +41,11 @@ namespace syncer {
+ // A loopback version of the Sync server used for local profile serialization.
+ class LoopbackServer : public base::ImportantFileWriter::DataSerializer {
+  public:
++  struct CommandResult {
++    net::HttpStatusCode status;
++    bool state_changed;
++  };
++
+   class ObserverForTests {
+    public:
+     virtual ~ObserverForTests() = default;
+@@ -54,6 +60,9 @@ class LoopbackServer : public base::Impo
+         const sync_pb::DeletionOrigin& deletion_origin) = 0;
+   };
+ 
++  // Creates a server that keeps persistence entirely in memory. Call
++  // LoadStateFromString() to restore a previously serialized snapshot.
++  LoopbackServer();
+   explicit LoopbackServer(const base::FilePath& persistent_file);
+   ~LoopbackServer() override;
+ 
+@@ -63,6 +72,13 @@ class LoopbackServer : public base::Impo
+       const sync_pb::ClientToServerMessage& message,
+       sync_pb::ClientToServerResponse* response);
+ 
++  // Handles a command and also reports whether it changed the in-memory state.
++  // A non-OK command may have partially mutated state; callers that require
++  // transactional behavior must discard or restore the server in that case.
++  CommandResult HandleCommandWithResult(
++      const sync_pb::ClientToServerMessage& message,
++      sync_pb::ClientToServerResponse* response);
++
+   // Enables strong consistency model (i.e. server detects conflicts).
+   void EnableStrongConsistencyWithConflictDetectionModel();
+ 
+@@ -86,6 +102,12 @@ class LoopbackServer : public base::Impo
+   static int GetMigrationVersionFromProgressTokenForTesting(
+       const std::string& token);
+ 
++  // Serializes or restores the complete server state without touching disk.
++  // LoadStateFromString() replaces the current in-memory state.
++  std::optional<std::string> SerializeStateToString() const;
++  bool LoadStateFromString(std::string_view serialized);
++  size_t GetEntityCount() const;
++
+   const std::vector<std::vector<uint8_t>>& GetKeystoreKeysForTesting() const {
+     return keystore_keys_;
+   }
+@@ -276,7 +298,8 @@ class LoopbackServer : public base::Impo
+   const base::FilePath persistent_file_;
+ 
+   // Used to limit the rate of file rewrites due to updates.
+-  base::ImportantFileWriter writer_;
++  // Null for an in-memory server.
++  std::unique_ptr<base::ImportantFileWriter> writer_;
+ 
+   // Used to verify that LoopbackServer is only used from one sequence.
+   SEQUENCE_CHECKER(sequence_checker_);
