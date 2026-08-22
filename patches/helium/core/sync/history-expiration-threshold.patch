@@ -1,0 +1,220 @@
+--- a/components/sync/engine/BUILD.gn
++++ b/components/sync/engine/BUILD.gn
+@@ -180,6 +180,7 @@ static_library("engine") {
+     "//base:i18n",
+     "//build:branding_buildflags",
+     "//components/autofill/core/browser:payments_sync_utils",
++    "//components/history/core/common",
+     "//components/os_crypt/async/common",
+     "//components/variations/net",
+ 
+--- a/components/history/core/browser/browsing_history_service.cc
++++ b/components/history/core/browser/browsing_history_service.cc
+@@ -27,6 +27,7 @@
+ #include "components/history/core/browser/features.h"
+ #include "components/history/core/browser/history_backend.h"
+ #include "components/history/core/browser/history_types.h"
++#include "components/history/core/common/history_expiration.h"
+ #include "components/keyed_service/core/service_access_type.h"
+ #include "components/sync/protocol/history_delete_directive_specifics.pb.h"
+ 
+@@ -790,8 +791,7 @@ void BrowsingHistoryService::QueryComple
+   if (results.reached_beginning()) {
+     // Exhausted the local results; continue querying to get remote results.
+     // Start querying at the point where local history ends.
+-    base::Time expiry_treshold =
+-        clock_->Now() - base::Days(HistoryBackend::kExpireDaysThreshold);
++    base::Time expiry_treshold = clock_->Now() - kHistoryExpirationThreshold;
+     if (state->remote_end_time_for_continuation.is_null()) {
+       state->remote_end_time_for_continuation = base::Time::Max();
+     }
+@@ -876,7 +876,7 @@ void BrowsingHistoryService::RecordResul
+   // Count the number of local, remote, and combined entries, each split by
+   // entries before vs after the local expiry threshold (90 days).
+   const base::Time local_expiry_threshold =
+-      clock_->Now() - base::Days(HistoryBackend::kExpireDaysThreshold);
++      clock_->Now() - kHistoryExpirationThreshold;
+   base::flat_map<HistoryEntry::EntryType, size_t> pre_expiry_counts;
+   base::flat_map<HistoryEntry::EntryType, size_t> post_expiry_counts;
+   for (const HistoryEntry& entry : results) {
+--- a/components/history/core/browser/history_backend.cc
++++ b/components/history/core/browser/history_backend.cc
+@@ -62,6 +62,7 @@
+ #include "components/history/core/browser/sync/history_sync_bridge.h"
+ #include "components/history/core/browser/url_row.h"
+ #include "components/history/core/browser/url_utils.h"
++#include "components/history/core/common/history_expiration.h"
+ #include "components/sync/base/features.h"
+ #include "components/sync/base/report_unrecoverable_error.h"
+ #include "components/sync/model/client_tag_based_data_type_processor.h"
+@@ -1384,7 +1385,7 @@ void HistoryBackend::InitImpl(
+ 
+   // Start expiring old stuff.
+   if (!base::CommandLine::ForCurrentProcess()->HasSwitch("keep-old-history"))
+-    expirer_.StartExpiringOldStuff(base::Days(kExpireDaysThreshold));
++    expirer_.StartExpiringOldStuff(kHistoryExpirationThreshold);
+ }
+ 
+ void HistoryBackend::CloseAllDatabases() {
+--- a/components/history/core/browser/history_backend.h
++++ b/components/history/core/browser/history_backend.h
+@@ -38,6 +38,7 @@
+ #include "components/history/core/browser/keyword_id.h"
+ #include "components/history/core/browser/sync/history_backend_for_sync.h"
+ #include "components/history/core/browser/visit_tracker.h"
++#include "components/history/core/common/history_expiration.h"
+ #include "components/sync/service/sync_service.h"
+ #include "sql/init_status.h"
+ #include "url/origin.h"
+@@ -205,7 +206,8 @@ class HistoryBackend : public base::RefC
+ 
+   // The number of days old a history entry can be before it is considered "old"
+   // and is deleted.
+-  static constexpr int kExpireDaysThreshold = 90;
++  static constexpr int kExpireDaysThreshold =
++      kHistoryExpirationThreshold.InDays();
+ 
+   // Init must be called to complete object creation. This object can be
+   // constructed on any thread, but all other functions including Init() must
+--- a/components/history/core/common/BUILD.gn
++++ b/components/history/core/common/BUILD.gn
+@@ -4,6 +4,7 @@
+ 
+ static_library("common") {
+   sources = [
++    "history_expiration.h",
+     "pref_names.cc",
+     "pref_names.h",
+   ]
+--- /dev/null
++++ b/components/history/core/common/history_expiration.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_HISTORY_CORE_COMMON_HISTORY_EXPIRATION_H_
++#define COMPONENTS_HISTORY_CORE_COMMON_HISTORY_EXPIRATION_H_
++
++#include "base/time/time.h"
++
++namespace history {
++
++// Visits older than this are no longer retained locally or by private Sync
++// backends.
++inline constexpr base::TimeDelta kHistoryExpirationThreshold = base::Days(90);
++
++}  // namespace history
++
++#endif  // COMPONENTS_HISTORY_CORE_COMMON_HISTORY_EXPIRATION_H_
+--- a/components/sync/engine/loopback_server/loopback_server.cc
++++ b/components/sync/engine/loopback_server/loopback_server.cc
+@@ -9,6 +9,7 @@
+ #include <map>
+ #include <set>
+ #include <string_view>
++#include <tuple>
+ #include <utility>
+ 
+ #include "base/containers/map_util.h"
+@@ -993,6 +994,74 @@ size_t LoopbackServer::GetEntityCount()
+   return entities_.size();
+ }
+ 
++bool LoopbackServer::GarbageCollectHistoryBefore(base::Time cutoff) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  const int64_t cutoff_windows_micros =
++      cutoff.ToDeltaSinceWindowsEpoch().InMicroseconds();
++  const size_t removed =
++      std::erase_if(entities_, [&](const auto& id_and_entity) {
++        const LoopbackServerEntity& entity = *id_and_entity.second;
++        if (entity.GetDataType() != syncer::HISTORY || entity.IsDeleted()) {
++          return false;
++        }
++        const sync_pb::EntitySpecifics specifics = entity.GetSpecifics();
++        return !specifics.has_history() ||
++               specifics.history().visit_time_windows_epoch_micros() <
++                   cutoff_windows_micros;
++      });
++  if (removed == 0) {
++    return false;
++  }
++  ScheduleSaveStateToFile();
++  return true;
++}
++
++bool LoopbackServer::GarbageCollectOldestHistory(
++    size_t minimum_bytes_to_reclaim) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (minimum_bytes_to_reclaim == 0) {
++    return false;
++  }
++
++  struct Candidate {
++    std::string id;
++    int64_t visit_time_windows_epoch_micros;
++    size_t serialized_size;
++  };
++  std::vector<Candidate> candidates;
++  for (const auto& [id, entity] : entities_) {
++    if (entity->GetDataType() != syncer::HISTORY || entity->IsDeleted()) {
++      continue;
++    }
++    const sync_pb::EntitySpecifics specifics = entity->GetSpecifics();
++    sync_pb::LoopbackServerEntity serialized_entity;
++    entity->SerializeAsLoopbackServerEntity(&serialized_entity);
++    candidates.push_back(
++        {id,
++         specifics.has_history()
++             ? specifics.history().visit_time_windows_epoch_micros()
++             : 0,
++         serialized_entity.ByteSizeLong()});
++  }
++  std::ranges::sort(candidates, {}, [](const Candidate& candidate) {
++    return std::tie(candidate.visit_time_windows_epoch_micros, candidate.id);
++  });
++
++  size_t reclaimed = 0;
++  for (const Candidate& candidate : candidates) {
++    reclaimed += candidate.serialized_size;
++    entities_.erase(candidate.id);
++    if (reclaimed >= minimum_bytes_to_reclaim) {
++      break;
++    }
++  }
++  if (reclaimed == 0) {
++    return false;
++  }
++  ScheduleSaveStateToFile();
++  return true;
++}
++
+ bool LoopbackServer::ScheduleSaveStateToFile() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   if (!writer_) {
+--- a/components/sync/engine/loopback_server/loopback_server.h
++++ b/components/sync/engine/loopback_server/loopback_server.h
+@@ -19,6 +19,7 @@
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/sequence_checker.h"
++#include "base/time/time.h"
+ #include "base/values.h"
+ #include "components/sync/base/data_type.h"
+ #include "components/sync/engine/loopback_server/loopback_server_entity.h"
+@@ -108,6 +109,15 @@ class LoopbackServer : public base::Impo
+   bool LoadStateFromString(std::string_view serialized);
+   size_t GetEntityCount() const;
+ 
++  // Removes history visits older than |cutoff|.
++  // Returns true if the server state changed.
++  bool GarbageCollectHistoryBefore(base::Time cutoff);
++
++  // Removes the oldest history visits until their serialized entity payloads
++  // account for at least |minimum_bytes_to_reclaim|.
++  // Returns true if the server state changed.
++  bool GarbageCollectOldestHistory(size_t minimum_bytes_to_reclaim);
++
+   const std::vector<std::vector<uint8_t>>& GetKeystoreKeysForTesting() const {
+     return keystore_keys_;
+   }
