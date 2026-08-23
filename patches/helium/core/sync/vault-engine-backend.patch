@@ -102,7 +102,7 @@
 +#endif  // COMPONENTS_SYNC_ENGINE_EXTENSION_SYNC_EXTENSION_SYNC_BACKEND_H_
 --- /dev/null
 +++ b/components/sync/engine/extension_sync/extension_sync_connection_manager.cc
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,191 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -117,6 +117,8 @@
 +#include "base/check.h"
 +#include "base/containers/span.h"
 +#include "base/strings/string_view_util.h"
++#include "base/time/time.h"
++#include "components/history/core/common/history_expiration.h"
 +#include "components/sync/engine/loopback_server/loopback_server.h"
 +#include "components/sync/protocol/sync.pb.h"
 +#include "net/base/net_errors.h"
@@ -182,11 +184,15 @@
 +      loopback_server_ = std::move(server);
 +    }
 +
++    const bool history_was_collected =
++        loopback_server_->GarbageCollectHistoryBefore(
++            base::Time::Now() - history::kHistoryExpirationThreshold);
++
 +    sync_pb::ClientToServerResponse response;
 +    const LoopbackServer::CommandResult command_result =
 +        loopback_server_->HandleCommandWithResult(message, &response);
 +    if (command_result.status != net::HTTP_OK) {
-+      if (command_result.state_changed) {
++      if (command_result.state_changed || history_was_collected) {
 +        loopback_server_.reset();
 +      }
 +      return HttpResponse::ForHttpStatusCode(command_result.status);
@@ -195,15 +201,25 @@
 +    // A new LoopbackServer creates its permanent entities before handling the
 +    // first command. Persist that initial state even if the command itself was
 +    // read-only.
-+    const bool must_persist = command_result.state_changed ||
-+                              !vault_state.initialized ||
-+                              vault_state.data.empty();
++    const bool must_persist =
++        history_was_collected || command_result.state_changed ||
++        !vault_state.initialized || vault_state.data.empty();
 +    if (must_persist) {
 +      std::optional<std::string> serialized_state =
 +          loopback_server_->SerializeStateToString();
 +      if (!serialized_state) {
 +        loopback_server_.reset();
 +        return HttpResponse::ForHttpStatusCode(net::HTTP_INTERNAL_SERVER_ERROR);
++      }
++      if (serialized_state->size() > kSyncVaultMaximumReconstructedBytes &&
++          loopback_server_->GarbageCollectOldestHistory(
++              serialized_state->size() - kSyncVaultMaximumReconstructedBytes)) {
++        serialized_state = loopback_server_->SerializeStateToString();
++        if (!serialized_state) {
++          loopback_server_.reset();
++          return HttpResponse::ForHttpStatusCode(
++              net::HTTP_INTERNAL_SERVER_ERROR);
++        }
 +      }
 +      SyncVaultStore::CommitResult write_result = vault_store_->CommitState(
 +          vault_state, base::as_byte_span(*serialized_state), 1);
