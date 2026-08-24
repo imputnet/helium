@@ -1,0 +1,325 @@
+--- a/extensions/common/manifest_constants.h
++++ b/extensions/common/manifest_constants.h
+@@ -140,6 +140,9 @@ inline constexpr char kShortName[] = "sh
+ inline constexpr char kSockets[] = "sockets";
+ inline constexpr char kStorageManagedSchema[] = "storage.managed_schema";
+ inline constexpr char kSuggestedKey[] = "suggested_key";
++inline constexpr char kSyncVaultProvider[] = "sync_vault_provider";
++inline constexpr char kSyncVaultProviderAccountKeyReason[] =
++    "sync_vault_provider.account_key.reason";
+ inline constexpr char kTheme[] = "theme";
+ inline constexpr char kThemeColors[] = "colors";
+ inline constexpr char kThemeDisplayProperties[] = "properties";
+@@ -714,6 +717,17 @@ inline constexpr char16_t kSandboxPagesC
+ inline constexpr char16_t kSidePanelManifestDefaultPathInvalid[] =
+     u"Side panel file path must be a relative URL to a valid extension "
+     u"resource.";
++inline constexpr char16_t kInvalidSyncVaultProviderMissingDeclaration[] =
++    u"The 'syncVaultProvider' permission requires a "
++    u"'sync_vault_provider' manifest declaration.";
++inline constexpr char kInvalidSyncVaultProviderMissingPermission[] =
++    "The 'sync_vault_provider' declaration requires the "
++    "'syncVaultProvider' permission.";
++inline constexpr char16_t kInvalidSyncVaultProviderVersion[] =
++    u"'sync_vault_provider.api_version' must be 1.";
++inline constexpr char16_t kInvalidSyncVaultProviderAccountKey[] =
++    u"'sync_vault_provider.account_key.reason' must be a non-empty localized "
++    u"string.";
+ inline constexpr char kSidePanelManifestDefaultPathDoesNotExist[] =
+     "Side panel file path must exist.";
+ inline constexpr char16_t
+--- a/chrome/common/extensions/BUILD.gn
++++ b/chrome/common/extensions/BUILD.gn
+@@ -14,6 +14,7 @@ source_set("extensions") {
+     "api/notifications/notification_style.h",
+     "api/omnibox/omnibox_handler.h",
+     "api/storage/storage_schema_manifest_handler.h",
++    "api/sync_vault_provider/sync_vault_provider_manifest_handler.h",
+     "chrome_extensions_client.h",
+     "extension_constants.h",
+     "extension_metrics.h",
+@@ -33,6 +34,7 @@ source_set("extensions") {
+     "api/notifications/notification_style.cc",
+     "api/omnibox/omnibox_handler.cc",
+     "api/storage/storage_schema_manifest_handler.cc",
++    "api/sync_vault_provider/sync_vault_provider_manifest_handler.cc",
+     "chrome_extensions_api_provider.cc",
+     "chrome_extensions_api_provider.h",
+     "chrome_extensions_client.cc",
+@@ -64,6 +66,7 @@ source_set("extensions") {
+   ]
+ 
+   deps = [
++    "//base:i18n",
+     "//chrome/app:branded_strings",
+     "//chrome/app:generated_resources",
+     "//chrome/common:chrome_features",
+--- a/chrome/common/extensions/chrome_manifest_handlers.cc
++++ b/chrome/common/extensions/chrome_manifest_handlers.cc
+@@ -9,6 +9,7 @@
+ #include "build/build_config.h"
+ #include "chrome/common/extensions/api/omnibox/omnibox_handler.h"
+ #include "chrome/common/extensions/api/storage/storage_schema_manifest_handler.h"
++#include "chrome/common/extensions/api/sync_vault_provider/sync_vault_provider_manifest_handler.h"
+ #include "chrome/common/extensions/manifest_handlers/app_launch_info.h"
+ #include "chrome/common/extensions/manifest_handlers/minimum_chrome_version_checker.h"
+ #include "chrome/common/extensions/manifest_handlers/natively_connectable_handler.h"
+@@ -39,6 +40,8 @@ void RegisterChromeManifestHandlers(Mani
+   registry->RegisterHandler(std::make_unique<OmniboxHandler>());
+   registry->RegisterHandler(std::make_unique<SettingsOverridesHandler>());
+   registry->RegisterHandler(std::make_unique<StorageSchemaManifestHandler>());
++  registry->RegisterHandler(
++      std::make_unique<SyncVaultProviderManifestHandler>());
+   registry->RegisterHandler(std::make_unique<ThemeHandler>());
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+--- a/chrome/common/extensions/api/_manifest_features.json
++++ b/chrome/common/extensions/api/_manifest_features.json
+@@ -68,6 +68,13 @@
+       "login_screen_extension"
+     ]
+   },
++  "sync_vault_provider": {
++    "channel": "stable",
++    "extension_types": ["extension"],
++    "min_manifest_version": 3,
++    "platforms": ["linux", "mac", "win"],
++    "feature_flag": "ApiSyncVaultProvider"
++  },
+   "theme": {
+     "channel": "stable",
+     "extension_types": ["theme"]
+--- a/chrome/common/extensions/api/manifest_types.json
++++ b/chrome/common/extensions/api/manifest_types.json
+@@ -133,6 +133,28 @@
+             "description": "Source of data for mounted file systems."
+           }
+         }
++      },
++      {
++        "id": "SyncVaultProvider",
++        "description": "Declares an extension-backed private sync provider.",
++        "type": "object",
++        "properties": {
++          "api_version": {
++            "type": "integer",
++            "description": "Version of the sync vault provider extension API used by this declaration."
++          },
++          "account_key": {
++            "type": "object",
++            "optional": true,
++            "description": "Declares that the provider can protect and recover vault keys using the user's provider account.",
++            "properties": {
++              "reason": {
++                "type": "string",
++                "description": "Localized explanation shown before the browser allows the provider to wrap or unwrap a vault key."
++              }
++            }
++          }
++        }
+       }
+     ]
+   }
+--- /dev/null
++++ b/chrome/common/extensions/api/sync_vault_provider/sync_vault_provider_manifest_handler.cc
+@@ -0,0 +1,116 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/common/extensions/api/sync_vault_provider/sync_vault_provider_manifest_handler.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/i18n/rtl.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
++#include "chrome/common/extensions/api/manifest_types.h"
++#include "extensions/common/manifest_constants.h"
++#include "extensions/common/manifest_handlers/permissions_parser.h"
++
++namespace extensions {
++
++namespace {
++
++constexpr size_t kMaximumAccountKeyReasonBytes = 512;
++
++}  // namespace
++
++std::optional<std::string> SanitizeSyncVaultProviderDisplayText(
++    std::string_view text,
++    size_t maximum_bytes) {
++  if (text.empty() || text.size() > maximum_bytes ||
++      !base::IsStringUTF8(text)) {
++    return std::nullopt;
++  }
++  std::u16string sanitized =
++      base::CollapseWhitespace(base::UTF8ToUTF16(text), true);
++  if (sanitized.empty()) {
++    return std::nullopt;
++  }
++  base::i18n::SanitizeUserSuppliedString(&sanitized);
++  return base::UTF16ToUTF8(sanitized);
++}
++
++SyncVaultProviderInfo::SyncVaultProviderInfo(
++    std::optional<AccountKey> account_key)
++    : account_key_(std::move(account_key)) {}
++
++SyncVaultProviderInfo::~SyncVaultProviderInfo() = default;
++
++// static
++const SyncVaultProviderInfo* SyncVaultProviderInfo::Get(
++    const Extension* extension) {
++  return static_cast<const SyncVaultProviderInfo*>(
++      extension->GetManifestData(manifest_keys::kSyncVaultProvider));
++}
++
++SyncVaultProviderManifestHandler::SyncVaultProviderManifestHandler() = default;
++SyncVaultProviderManifestHandler::~SyncVaultProviderManifestHandler() = default;
++
++bool SyncVaultProviderManifestHandler::Parse(Extension* extension,
++                                             std::u16string* error) {
++  const bool has_permission = PermissionsParser::HasAPIPermission(
++      extension, mojom::APIPermissionID::kSyncVaultProvider);
++  const base::DictValue* declaration =
++      extension->manifest()->FindDictPath(manifest_keys::kSyncVaultProvider);
++
++  if (has_permission && !declaration) {
++    *error = manifest_errors::kInvalidSyncVaultProviderMissingDeclaration;
++    return false;
++  }
++  if (!has_permission && declaration) {
++    extension->AddInstallWarning(InstallWarning(
++        manifest_errors::kInvalidSyncVaultProviderMissingPermission));
++    return true;
++  }
++  if (!has_permission) {
++    return true;
++  }
++
++  auto parsed = api::manifest_types::SyncVaultProvider::FromValue(*declaration);
++  if (!parsed.has_value()) {
++    *error = std::move(parsed).error();
++    return false;
++  }
++  if (parsed->api_version != 1) {
++    *error = manifest_errors::kInvalidSyncVaultProviderVersion;
++    return false;
++  }
++
++  std::optional<SyncVaultProviderInfo::AccountKey> account_key;
++  if (parsed->account_key) {
++    std::optional<std::string> sanitized_reason =
++        SanitizeSyncVaultProviderDisplayText(parsed->account_key->reason,
++                                             kMaximumAccountKeyReasonBytes);
++    if (!sanitized_reason) {
++      *error = manifest_errors::kInvalidSyncVaultProviderAccountKey;
++      return false;
++    }
++    account_key.emplace(std::move(*sanitized_reason));
++  }
++
++  extension->SetManifestData(
++      manifest_keys::kSyncVaultProvider,
++      std::make_unique<SyncVaultProviderInfo>(std::move(account_key)));
++  return true;
++}
++
++base::span<const char* const> SyncVaultProviderManifestHandler::Keys() const {
++  static constexpr const char* kKeys[] = {manifest_keys::kSyncVaultProvider};
++  return kKeys;
++}
++
++bool SyncVaultProviderManifestHandler::AlwaysParseForType(
++    Manifest::Type type) const {
++  return type == Manifest::Type::kExtension;
++}
++
++}  // namespace extensions
+--- /dev/null
++++ b/chrome/common/extensions/api/sync_vault_provider/sync_vault_provider_manifest_handler.h
+@@ -0,0 +1,66 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_COMMON_EXTENSIONS_API_SYNC_VAULT_PROVIDER_SYNC_VAULT_PROVIDER_MANIFEST_HANDLER_H_
++#define CHROME_COMMON_EXTENSIONS_API_SYNC_VAULT_PROVIDER_SYNC_VAULT_PROVIDER_MANIFEST_HANDLER_H_
++
++#include <cstddef>
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "extensions/common/extension.h"
++#include "extensions/common/manifest_handler.h"
++
++namespace extensions {
++
++// Returns bounded provider-supplied UI text sanitized using Chromium's normal
++// handling for user-controlled display strings, or nullopt for invalid input.
++std::optional<std::string> SanitizeSyncVaultProviderDisplayText(
++    std::string_view text,
++    size_t maximum_bytes);
++
++// Parsed, immutable declaration for an extension implementing opaque sync
++// storage. The browser treats all user-facing strings as provider-supplied.
++class SyncVaultProviderInfo : public Extension::ManifestData {
++ public:
++  struct AccountKey {
++    // Provider-supplied explanation shown when requesting vault-key access.
++    std::string reason;
++  };
++
++  explicit SyncVaultProviderInfo(std::optional<AccountKey> account_key);
++  ~SyncVaultProviderInfo() override;
++
++  SyncVaultProviderInfo(const SyncVaultProviderInfo&) = delete;
++  SyncVaultProviderInfo& operator=(const SyncVaultProviderInfo&) = delete;
++
++  static const SyncVaultProviderInfo* Get(const Extension* extension);
++
++  const std::optional<AccountKey>& account_key() const { return account_key_; }
++
++ private:
++  std::optional<AccountKey> account_key_;
++};
++
++class SyncVaultProviderManifestHandler : public ManifestHandler {
++ public:
++  SyncVaultProviderManifestHandler();
++  ~SyncVaultProviderManifestHandler() override;
++
++  SyncVaultProviderManifestHandler(const SyncVaultProviderManifestHandler&) =
++      delete;
++  SyncVaultProviderManifestHandler& operator=(
++      const SyncVaultProviderManifestHandler&) = delete;
++
++  bool Parse(Extension* extension, std::u16string* error) override;
++  bool AlwaysParseForType(Manifest::Type type) const override;
++
++ private:
++  base::span<const char* const> Keys() const override;
++};
++
++}  // namespace extensions
++
++#endif  // CHROME_COMMON_EXTENSIONS_API_SYNC_VAULT_PROVIDER_SYNC_VAULT_PROVIDER_MANIFEST_HANDLER_H_
+--- a/extensions/common/extension_l10n_util.cc
++++ b/extensions/common/extension_l10n_util.cc
+@@ -357,6 +357,12 @@ bool LocalizeManifest(const extensions::
+           keys::kOverrideStartupPage, messages, manifest, error))
+     return false;
+ 
++  // Initialize sync_vault_provider.account_key.reason.
++  if (!LocalizeManifestValue(keys::kSyncVaultProviderAccountKeyReason, messages,
++                             manifest, error)) {
++    return false;
++  }
++
+   // Add desired locale key to the manifest, so we can overwrite prefs
+   // with new manifest when chrome locale changes.
+   manifest->Set(keys::kCurrentLocale, LocaleForLocalization());
