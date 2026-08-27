@@ -420,31 +420,56 @@
  
 --- a/chrome/browser/ui/views/frame/browser_native_widget_mac.h
 +++ b/chrome/browser/ui/views/frame/browser_native_widget_mac.h
-@@ -13,8 +13,10 @@
+@@ -7,24 +7,20 @@
+ 
+ #include <optional>
+ 
+-#include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+ #include "chrome/browser/command_observer.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/views/frame/browser_native_widget.h"
- #include "chrome/browser/ui/views/frame/glass_frame_service.h"
+-#include "chrome/browser/ui/views/frame/glass_frame_service.h"
 +#include "components/prefs/pref_change_registrar.h"
  #include "third_party/skia/include/core/SkColor.h"
  #include "ui/base/mojom/window_show_state.mojom-forward.h"
+-#include "ui/native_theme/native_theme.h"
 +#include "ui/color/color_provider_key.h"
- #include "ui/native_theme/native_theme.h"
  #include "ui/views/widget/native_widget_mac.h"
  
-@@ -105,12 +107,16 @@ class BrowserNativeWidgetMac : public vi
+ class BrowserWidget;
+ class BrowserView;
+ @class BrowserWindowTouchBarController;
+ @class BrowserWindowTouchBarViewsDelegate;
+-namespace tabs {
+-class VerticalTabStripStateController;
+-}  // namespace tabs
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+ //  BrowserNativeWidgetMac is a NativeWidgetMac subclass that provides
+@@ -96,21 +92,16 @@ class BrowserNativeWidgetMac : public vi
+   void EnabledStateChangedForCommand(int id, bool enabled) override;
+ 
+  private:
+-  bool IsBrowserWidgetEligible() const;
+-  void UpdateBackground(bool is_eligible);
+-  void OnVerticalTabStripModeChanged(
+-      tabs::VerticalTabStripStateController* controller);
++  void UpdateBackground();
++  void OnNativeFrameMaterialsPrefChanged();
+ 
+   raw_ptr<BrowserView> browser_view_;  // Weak. Our ClientView.
    BrowserWindowTouchBarViewsDelegate* __strong touch_bar_delegate_;
    NSView* __strong background_view_;
-   NSView* __strong tint_view_;
+-  NSView* __strong tint_view_;
 +  PrefChangeRegistrar pref_change_registrar_;
  
+-  std::optional<ui::NativeTheme::PreferredColorScheme>
+-      last_preferred_color_scheme_;
 +  std::optional<ui::ColorProviderKey::ColorMode> last_color_mode_;
-   std::optional<ui::NativeTheme::PreferredColorScheme>
-       last_preferred_color_scheme_;
    std::optional<SkColor> last_theme_color_;
-   base::CallbackListSubscription vertical_tab_subscription_;
-   base::CallbackListSubscription glass_frame_service_subscription_;
-+
-+  void OnNativeFrameMaterialsPrefChanged();
+-  base::CallbackListSubscription vertical_tab_subscription_;
+-  base::CallbackListSubscription glass_frame_service_subscription_;
  };
  
  #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_BROWSER_NATIVE_WIDGET_MAC_H_
@@ -465,16 +490,22 @@
  #import "chrome/browser/ui/cocoa/browser_window_command_handler.h"
  #import "chrome/browser/ui/cocoa/chrome_command_dispatcher_delegate.h"
  #import "chrome/browser/ui/cocoa/touchbar/browser_window_touch_bar_controller.h"
-@@ -36,6 +38,8 @@
+@@ -30,12 +32,11 @@
+ #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
+ #include "chrome/browser/ui/omnibox/omnibox_next_features.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
+-#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+-#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/frame/browser_widget.h"
- #include "chrome/browser/ui/views/frame/glass_frame_service.h"
+-#include "chrome/browser/ui/views/frame/glass_frame_service.h"
 +#include "chrome/browser/ui/views/helium/native_frame_materials.h"
 +#include "chrome/browser/ui/views/helium/native_frame_materials_mac.h"
  #include "chrome/browser/ui/views/web_apps/frame_toolbar/web_app_frame_toolbar_utils.h"
  #include "chrome/browser/ui/web_applications/app_browser_controller.h"
  #include "chrome/common/pref_names.h"
-@@ -60,8 +64,6 @@
+@@ -60,8 +61,6 @@
  #import "ui/base/cocoa/window_size_constants.h"
  #include "ui/base/l10n/l10n_util.h"
  #include "ui/base/mojom/window_show_state.mojom.h"
@@ -483,7 +514,40 @@
  #import "ui/views/cocoa/native_widget_mac_ns_window_host.h"
  #include "ui/views/interaction/element_tracker_views.h"
  
-@@ -115,19 +117,6 @@ double GetGlassFrameTintOpacity(bool is_
+@@ -97,37 +96,26 @@ bool ShouldHandleKeyboardEvent(const inp
+   return event.os_event && event.os_event.Get().type == NSEventTypeKeyDown;
+ }
+ 
+-double GetGlassFrameTintOpacity(bool is_dark_mode, bool is_vertical_tabs) {
+-  double opacity_value = is_dark_mode
+-                             ? features::kGlassTintOpacityForDarkMode.Get()
+-                             : features::kGlassTintOpacityForLightMode.Get();
+-
+-  constexpr double kLiquidGlassOpacityLightMode = 0.55;
+-  constexpr double kLiquidGlassOpacityDarkMode = 0.80;
+-
+-  double opacity = opacity_value >= 0.0
+-                       ? opacity_value
+-                       : (is_dark_mode ? kLiquidGlassOpacityDarkMode
+-                                       : kLiquidGlassOpacityLightMode);
++void SetNativeFrameMaterialWindowState(NSWindow* ns_window, bool enabled) {
++  if (!ns_window) {
++    return;
++  }
+ 
+-  return std::clamp(opacity, 0.0, 1.0);
++  if (enabled) {
++    // A completely transparent background ([NSColor clearColor]) causes AppKit
++    // to continuously invalidate the window surface, resulting in high CPU
++    // and energy usage. Using an almost-transparent color (alpha 0.001) avoids
++    // this performance issue while remaining visually indistinguishable.
++    [ns_window setBackgroundColor:[[NSColor windowBackgroundColor]
++                                      colorWithAlphaComponent:0.001]];
++  } else {
++    [ns_window setBackgroundColor:[NSColor windowBackgroundColor]];
++  }
++  [ns_window setOpaque:!enabled];
+ }
  
  }  // namespace
  
@@ -503,7 +567,7 @@
  // Bridge Obj-C class for WindowTouchBarDelegate and
  // BrowserWindowTouchBarController.
  @interface BrowserWindowTouchBarViewsDelegate
-@@ -172,6 +161,12 @@ BrowserNativeWidgetMac::BrowserNativeWid
+@@ -172,23 +160,17 @@ BrowserNativeWidgetMac::BrowserNativeWid
      : views::NativeWidgetMac(browser_widget), browser_view_(browser_view) {
    CHECK(browser_widget);
    CHECK(browser_view);
@@ -516,7 +580,24 @@
    if (GetRemoteCocoaApplicationHost()) {
      // Only add observer on PWA.
      chrome::AddCommandObserver(browser_view_->browser(), IDC_BACK, this);
-@@ -261,8 +256,9 @@ void BrowserNativeWidgetMac::OnWidgetDes
+     chrome::AddCommandObserver(browser_view_->browser(), IDC_FORWARD, this);
+   }
+-
+-  if (features::IsGlassFrameEnabled()) {
+-    if (auto* vertical_tab_strip_state_controller =
+-            tabs::VerticalTabStripStateController::From(
+-                browser_view_->browser())) {
+-      vertical_tab_subscription_ =
+-          vertical_tab_strip_state_controller->RegisterOnModeChanged(
+-              base::BindRepeating(
+-                  &BrowserNativeWidgetMac::OnVerticalTabStripModeChanged,
+-                  base::Unretained(this)));
+-    }
+-  }
+ }
+ 
+ BrowserNativeWidgetMac::~BrowserNativeWidgetMac() = default;
+@@ -261,8 +243,9 @@ void BrowserNativeWidgetMac::OnWidgetDes
    }
    touch_bar_delegate_ = nullptr;
    background_view_ = nil;
@@ -527,26 +608,30 @@
    last_theme_color_.reset();
    NativeWidgetMac::OnWidgetDestroyed(widget);
  }
-@@ -614,6 +610,11 @@ NativeWidgetMacNSWindow* BrowserNativeWi
+@@ -614,6 +597,8 @@ NativeWidgetMacNSWindow* BrowserNativeWi
      const remote_cocoa::mojom::CreateWindowParams* params) {
    CHECK(browser_view_);
    NativeWidgetMacNSWindow* ns_window = NativeWidgetMac::CreateNSWindow(params);
-+  if (helium::ShouldUseNativeFrameMaterials(browser_view_)) {
-+    [ns_window setOpaque:NO];
-+    [ns_window setBackgroundColor:[[NSColor windowBackgroundColor]
-+                                      colorWithAlphaComponent:0.001]];
-+  }
++  SetNativeFrameMaterialWindowState(
++      ns_window, helium::ShouldUseNativeFrameMaterials(browser_view_));
    touch_bar_delegate_ = [[BrowserWindowTouchBarViewsDelegate alloc]
        initWithBrowser:browser_view_->browser()
                 window:ns_window];
-@@ -654,16 +655,13 @@ void BrowserNativeWidgetMac::OnWidgetIni
-             browser_view_->browser(),
-             base::BindRepeating(&BrowserNativeWidgetMac::UpdateBackground,
-                                 base::Unretained(this)));
+@@ -647,23 +632,12 @@ void BrowserNativeWidgetMac::OnWidgetIni
+   if (!GetWidget()->HasObserver(this)) {
+     GetWidget()->AddObserver(this);
+   }
+-  // GlassFrameService is only available if glass frame is enabled.
+-  if (auto* const glass_frame_service = GlassFrameService::GetInstance()) {
+-    glass_frame_service_subscription_ =
+-        glass_frame_service->RegisterGlassFrameEligibilityChangedCallback(
+-            browser_view_->browser(),
+-            base::BindRepeating(&BrowserNativeWidgetMac::UpdateBackground,
+-                                base::Unretained(this)));
 -    UpdateBackground(
 -        glass_frame_service->IsBrowserWindowEligible(browser_view_->browser()));
-   }
-+  UpdateBackground(IsBrowserWidgetEligible());
+-  }
++  UpdateBackground();
  }
  
  void BrowserNativeWidgetMac::OnWidgetThemeChanged(views::Widget* widget) {
@@ -554,99 +639,121 @@
 -  if (features::IsGlassFrameEnabled()) {
 -    UpdateBackground(IsBrowserWidgetEligible());
 -  }
-+  UpdateBackground(IsBrowserWidgetEligible());
++  UpdateBackground();
  }
  
  void BrowserNativeWidgetMac::OnWindowDestroying(
-@@ -678,6 +676,7 @@ void BrowserNativeWidgetMac::OnWindowDes
+@@ -678,9 +652,7 @@ void BrowserNativeWidgetMac::OnWindowDes
  
  void BrowserNativeWidgetMac::OnWidgetActivationChanged(views::Widget* widget,
                                                         bool active) {
-+  last_color_mode_.reset();
-   last_theme_color_.reset();
-   last_preferred_color_scheme_.reset();
-   UpdateBackground(IsBrowserWidgetEligible());
-@@ -783,6 +782,7 @@ void BrowserNativeWidgetMac::AnnounceTex
+-  last_theme_color_.reset();
+-  last_preferred_color_scheme_.reset();
+-  UpdateBackground(IsBrowserWidgetEligible());
++  UpdateBackground();
+ }
  
- void BrowserNativeWidgetMac::OnVerticalTabStripModeChanged(
-     tabs::VerticalTabStripStateController* controller) {
-+  last_color_mode_.reset();
-   last_theme_color_.reset();
-   last_preferred_color_scheme_.reset();
-   UpdateBackground(IsBrowserWidgetEligible());
-@@ -803,6 +803,9 @@ void BrowserNativeWidgetMac::UpdateBackg
-     return;
+ void BrowserNativeWidgetMac::EnabledStateChangedForCommand(int id,
+@@ -781,110 +753,60 @@ void BrowserNativeWidgetMac::AnnounceTex
    }
+ }
  
-+  const bool use_native_frame_materials =
+-void BrowserNativeWidgetMac::OnVerticalTabStripModeChanged(
+-    tabs::VerticalTabStripStateController* controller) {
+-  last_theme_color_.reset();
+-  last_preferred_color_scheme_.reset();
+-  UpdateBackground(IsBrowserWidgetEligible());
+-}
++void BrowserNativeWidgetMac::UpdateBackground() {
++  NSWindow* ns_window = GetNSWindowHost()->GetInProcessNSWindow();
++  const bool should_use_native_frame_materials =
 +      helium::ShouldUseNativeFrameMaterials(browser_view_);
-+  is_eligible = is_eligible || use_native_frame_materials;
-   [ns_window setOpaque:!is_eligible];
++  SetNativeFrameMaterialWindowState(ns_window,
++                                    should_use_native_frame_materials);
  
-   if (!is_eligible) {
-@@ -816,10 +819,58 @@ void BrowserNativeWidgetMac::UpdateBackg
-       tint_view_ = nil;
+-bool BrowserNativeWidgetMac::IsBrowserWidgetEligible() const {
+-  if (auto* const glass_frame_service = GlassFrameService::GetInstance()) {
+-    if (auto* const browser = browser_view_->browser()) {
+-      return glass_frame_service->IsBrowserWindowEligible(browser);
++  if (!should_use_native_frame_materials) {
++    if (background_view_) {
++      [background_view_ removeFromSuperview];
      }
-     last_preferred_color_scheme_.reset();
-+    last_color_mode_.reset();
-     last_theme_color_.reset();
-     return;
-   }
- 
-+  // A completely transparent background causes AppKit to continuously
-+  // invalidate the window surface. An almost-transparent color avoids that
-+  // cost while remaining visually indistinguishable.
-+  [ns_window setBackgroundColor:[[NSColor windowBackgroundColor]
-+                                    colorWithAlphaComponent:0.001]];
-+
-+  if (use_native_frame_materials) {
-+    const ui::ColorProviderKey::ColorMode color_mode = GetWidget()->GetColorMode();
-+    const SkColor theme_color =
-+        GetWidget()->GetColorProvider()->GetColor(kColorToolbar);
-+    if (background_view_ && last_color_mode_ == color_mode &&
-+        last_theme_color_ == theme_color) {
-+      return;
-+    }
-+
-+    last_color_mode_ = color_mode;
-+    last_preferred_color_scheme_.reset();
-+    last_theme_color_ = theme_color;
-+    if (background_view_) {
-+      [background_view_ removeFromSuperview];
-+    }
-+    if (tint_view_) {
-+      [tint_view_ removeFromSuperview];
-+      tint_view_ = nil;
-+    }
-+    NSView* const content_view = [ns_window contentView];
-+    background_view_ = helium::CreateNativeFrameMaterialBackgroundView(
-+        content_view.bounds, color_mode, theme_color);
-+    [content_view addSubview:background_view_
-+                  positioned:NSWindowBelow
-+                  relativeTo:nil];
-+    return;
-+  }
-+
-+  if (last_color_mode_) {
-+    if (background_view_) {
-+      [background_view_ removeFromSuperview];
-+      background_view_ = nil;
-+    }
-+    if (tint_view_) {
-+      [tint_view_ removeFromSuperview];
-+      tint_view_ = nil;
-+    }
++    background_view_ = nil;
 +    last_color_mode_.reset();
 +    last_theme_color_.reset();
-+  }
-+
-   const ui::NativeTheme::PreferredColorScheme color_scheme =
-       browser_view_->GetNativeTheme()->preferred_color_scheme();
-   const bool is_active = GetWidget()->IsActive();
-@@ -849,13 +900,6 @@ void BrowserNativeWidgetMac::UpdateBackg
-                                    ui::NativeTheme::PreferredColorScheme::kDark,
-                                is_vertical_tabs);
++    return;
+   }
+-  return false;
+-}
  
+-void BrowserNativeWidgetMac::UpdateBackground(bool is_eligible) {
+-  NSWindow* const ns_window = GetNSWindowHost()->GetInProcessNSWindow();
+-  if (!ns_window) {
++  views::Widget* widget = GetWidget();
++  if (!widget) {
+     return;
+   }
+ 
+-  [ns_window setOpaque:!is_eligible];
++  auto color_mode = widget->GetColorMode();
++  auto theme_color = widget->GetColorProvider()->GetColor(kColorToolbar);
+ 
+-  if (!is_eligible) {
+-    if (background_view_) {
+-      [ns_window setBackgroundColor:[NSColor windowBackgroundColor]];
+-      [background_view_ removeFromSuperview];
+-      background_view_ = nil;
+-    }
+-    if (tint_view_) {
+-      [tint_view_ removeFromSuperview];
+-      tint_view_ = nil;
+-    }
+-    last_preferred_color_scheme_.reset();
+-    last_theme_color_.reset();
++  if (background_view_ && last_color_mode_ == color_mode &&
++      last_theme_color_ == theme_color) {
+     return;
+   }
+ 
+-  const ui::NativeTheme::PreferredColorScheme color_scheme =
+-      browser_view_->GetNativeTheme()->preferred_color_scheme();
+-  const bool is_active = GetWidget()->IsActive();
+-  const SkColor theme_color = browser_view_->GetColorProvider()->GetColor(
+-      is_active ? ui::kColorFrameActive : ui::kColorFrameInactive);
++  last_color_mode_ = color_mode;
++  last_theme_color_ = theme_color;
+ 
+-  // Avoid updating the background view if the theme colors haven't changed.
+-  if (background_view_ && last_preferred_color_scheme_ == color_scheme &&
+-      last_theme_color_ == theme_color) {
++  if (background_view_) {
++    [background_view_ removeFromSuperview];
++  }
++  background_view_ = nil;
++
++  if (!ns_window) {
+     return;
+   }
+ 
+-  last_preferred_color_scheme_ = color_scheme;
+-  last_theme_color_ = theme_color;
++  NSView* content_view = [ns_window contentView];
+ 
+-  bool is_vertical_tabs = false;
+-  if (auto* controller = tabs::VerticalTabStripStateController::From(
+-          browser_view_->browser())) {
+-    is_vertical_tabs = controller->ShouldDisplayVerticalTabs();
+-  }
+-
+-  const CGFloat r = SkColorGetR(theme_color) / 255.0;
+-  const CGFloat g = SkColorGetG(theme_color) / 255.0;
+-  const CGFloat b = SkColorGetB(theme_color) / 255.0;
+-  const CGFloat a =
+-      GetGlassFrameTintOpacity(last_preferred_color_scheme_ ==
+-                                   ui::NativeTheme::PreferredColorScheme::kDark,
+-                               is_vertical_tabs);
+-
 -  // A completely transparent background ([NSColor clearColor]) causes AppKit
 -  // to continuously invalidate the window surface, resulting in high CPU
 -  // and energy usage. Using an almost-transparent color (alpha 0.001) avoids
@@ -654,20 +761,48 @@
 -  [ns_window setBackgroundColor:[[NSColor windowBackgroundColor]
 -                                    colorWithAlphaComponent:0.001]];
 -
-   if (tint_view_) {
-     tint_view_.layer.backgroundColor =
-         [NSColor colorWithSRGBRed:r green:g blue:b alpha:a].CGColor;
-@@ -888,3 +932,10 @@ void BrowserNativeWidgetMac::UpdateBackg
-     }
-   }
- }
-+
+-  if (tint_view_) {
+-    tint_view_.layer.backgroundColor =
+-        [NSColor colorWithSRGBRed:r green:g blue:b alpha:a].CGColor;
+-  } else {
+-    DCHECK(!background_view_);
+-    NSView* const content_view = [ns_window contentView];
++  background_view_ = helium::CreateNativeFrameMaterialBackgroundView(
++      content_view.bounds, color_mode, theme_color);
++  [content_view addSubview:background_view_
++                positioned:NSWindowBelow
++                relativeTo:nil];
++}
+ 
+-    if (@available(macOS 26.0, *)) {
+-      NSGlassEffectView* const glass_view =
+-          [[GlassFrameBackgroundView alloc] initWithFrame:content_view.bounds];
+-      glass_view.wantsLayer = YES;
+-      glass_view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+-      glass_view.style = NSGlassEffectViewStyleRegular;
+-
+-      glass_view.tintColor = [NSColor clearColor];
+-
+-      NSView* tint_view = [[NSView alloc] initWithFrame:glass_view.bounds];
+-      tint_view.wantsLayer = YES;
+-      tint_view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+-      tint_view.layer.backgroundColor =
+-          [NSColor colorWithSRGBRed:r green:g blue:b alpha:a].CGColor;
+-
+-      tint_view_ = tint_view;
+-      [glass_view addSubview:tint_view_];
+-
+-      background_view_ = glass_view;
+-      [content_view addSubview:background_view_
+-                    positioned:NSWindowBelow
+-                    relativeTo:nil];
+-    }
 +void BrowserNativeWidgetMac::OnNativeFrameMaterialsPrefChanged() {
-+  UpdateBackground(IsBrowserWidgetEligible());
++  UpdateBackground();
 +  if (browser_view_ && browser_view_->GetWidget()) {
 +    browser_view_->GetWidget()->ThemeChanged();
-+  }
-+}
+   }
+ }
 --- a/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
 +++ b/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
 @@ -24,7 +24,6 @@
@@ -678,15 +813,17 @@
  #include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
  #include "chrome/browser/ui/exclusive_access/fullscreen_controller.h"
  #include "chrome/browser/ui/fullscreen_util_mac.h"
-@@ -38,6 +37,7 @@
+@@ -36,8 +35,8 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/browser_widget.h"
  #include "chrome/browser/ui/views/frame/caption_button_placeholder_container.h"
- #include "chrome/browser/ui/views/frame/glass_frame_service.h"
+-#include "chrome/browser/ui/views/frame/glass_frame_service.h"
  #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
 +#include "chrome/browser/ui/views/helium/native_frame_materials.h"
  #include "chrome/browser/ui/views/tabs/tab_strip.h"
  #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
  #include "chrome/browser/ui/views/web_apps/frame_toolbar/web_app_frame_toolbar_utils.h"
-@@ -50,10 +50,8 @@
+@@ -50,10 +49,8 @@
  #include "components/remote_cocoa/common/native_widget_ns_window.mojom.h"
  #include "ui/base/hit_test.h"
  #include "ui/base/theme_provider.h"
@@ -697,18 +834,27 @@
  #include "ui/gfx/geometry/insets.h"
  #include "ui/gfx/geometry/outsets_f.h"
  #include "ui/gfx/geometry/rect.h"
-@@ -99,6 +97,10 @@ BrowserFrameViewMac::BrowserFrameViewMac
-                 &BrowserFrameViewMac::OnGlassFrameEligibilityChanged,
-                 base::Unretained(this)));
+@@ -86,18 +83,9 @@ BrowserFrameViewMac::BrowserFrameViewMac
+                                          BrowserView* browser_view)
+     : BrowserFrameView(frame, browser_view),
+       fullscreen_session_timer_(std::make_unique<base::OneShotTimer>()) {
+-  // GlassFrameService is only available if glass frame is enabled.
+-  if (auto* const glass_service = GlassFrameService::GetInstance()) {
++  if (helium::ShouldUseNativeFrameMaterials(browser_view)) {
+     SetPaintToLayer();
+     layer()->SetFillsBoundsOpaquely(false);
+-    is_glass_frame_eligible_ =
+-        glass_service->IsBrowserWindowEligible(browser_view->browser());
+-    glass_frame_service_subscription_ =
+-        glass_service->RegisterGlassFrameEligibilityChangedCallback(
+-            browser_view->browser(),
+-            base::BindRepeating(
+-                &BrowserFrameViewMac::OnGlassFrameEligibilityChanged,
+-                base::Unretained(this)));
    }
-+  if (helium::ShouldUseNativeFrameMaterials(browser_view) && !layer()) {
-+    SetPaintToLayer();
-+    layer()->SetFillsBoundsOpaquely(false);
-+  }
  
    if (web_app::AppBrowserController::IsWebApp(browser_view->browser())) {
-     auto* provider =
-@@ -338,6 +340,14 @@ void BrowserFrameViewMac::PaintAsActiveC
+@@ -338,6 +326,14 @@ void BrowserFrameViewMac::PaintAsActiveC
  }
  
  void BrowserFrameViewMac::OnThemeChanged() {
@@ -723,7 +869,7 @@
    UpdateCaptionButtonPlaceholderContainerBackground();
    BrowserFrameView::OnThemeChanged();
  }
-@@ -500,6 +510,10 @@ void BrowserFrameViewMac::OnPaint(gfx::C
+@@ -500,20 +496,17 @@ void BrowserFrameViewMac::OnPaint(gfx::C
      return;
    }
  
@@ -732,18 +878,78 @@
 +  }
 +
    SkColor frame_color = GetColorProvider()->GetColor(kColorToolbar);
-   if (is_glass_frame_eligible_) {
-     const SkAlpha frame_alpha = color_utils::IsDark(frame_color)
-@@ -584,7 +598,8 @@ void BrowserFrameViewMac::UpdateCaptionB
+-  if (is_glass_frame_eligible_) {
+-    const SkAlpha frame_alpha = color_utils::IsDark(frame_color)
+-                                    ? kBrowserFrameAlphaDark
+-                                    : kBrowserFrameAlphaLight;
+-    canvas->DrawColor(SkColorSetA(frame_color, frame_alpha));
+-  } else {
+-    canvas->DrawColor(frame_color);
++  canvas->DrawColor(frame_color);
+ 
+-    auto* theme_service = ThemeServiceFactory::GetForProfile(
+-        GetBrowserView()->browser()->GetProfile());
+-    if (!theme_service->UsingSystemTheme()) {
+-      PaintThemedFrame(canvas);
+-    }
++  auto* theme_service = ThemeServiceFactory::GetForProfile(
++      GetBrowserView()->browser()->GetProfile());
++  if (!theme_service->UsingSystemTheme()) {
++    PaintThemedFrame(canvas);
+   }
+ }
+ 
+@@ -584,7 +577,7 @@ void BrowserFrameViewMac::UpdateCaptionB
    if (caption_button_placeholder_container_) {
      caption_button_placeholder_container_->SetBackground(
          views::CreateSolidBackground(
 -            is_glass_frame_eligible_
-+            (is_glass_frame_eligible_ ||
-+             helium::ShouldUseNativeFrameMaterials(GetBrowserView()))
++            helium::ShouldUseNativeFrameMaterials(GetBrowserView())
                  ? SK_ColorTRANSPARENT
                  : GetColorProvider()->GetColor(kColorToolbar)));
    }
+@@ -602,11 +595,3 @@ void BrowserFrameViewMac::EmitFullscreen
+   UMA_HISTOGRAM_CUSTOM_TIMES("Session.BrowserFullscreen.DurationUpTo24H", delta,
+                              base::Milliseconds(1), base::Days(1), 100);
+ }
+-
+-void BrowserFrameViewMac::OnGlassFrameEligibilityChanged(bool is_eligible) {
+-  if (is_eligible == is_glass_frame_eligible_) {
+-    return;
+-  }
+-  is_glass_frame_eligible_ = is_eligible;
+-  SchedulePaint();
+-}
+--- a/chrome/browser/ui/views/frame/browser_frame_view_mac.h
++++ b/chrome/browser/ui/views/frame/browser_frame_view_mac.h
+@@ -9,7 +9,6 @@
+ 
+ #include <memory>
+ 
+-#include "base/callback_list.h"
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/raw_ptr.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+@@ -104,8 +103,6 @@ class BrowserFrameViewMac : public Brows
+   // Emits the duration of the current fullscreen session, if any.
+   void EmitFullscreenSessionHistograms();
+ 
+-  void OnGlassFrameEligibilityChanged(bool is_eligible);
+-
+   // Used to keep track of the update of kShowFullscreenToolbar preference.
+   BooleanPrefMember show_fullscreen_toolbar_;
+   base::ScopedObservation<web_app::WebAppRegistrar,
+@@ -130,10 +127,6 @@ class BrowserFrameViewMac : public Brows
+   // Used to track the current toolbar style.
+   std::optional<remote_cocoa::mojom::ToolbarVisibilityStyle>
+       current_toolbar_style_;
+-
+-  bool is_glass_frame_eligible_ = false;
+-
+-  base::CallbackListSubscription glass_frame_service_subscription_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_BROWSER_FRAME_VIEW_MAC_H_
 --- a/chrome/browser/ui/views/frame/themed_background.cc
 +++ b/chrome/browser/ui/views/frame/themed_background.cc
 @@ -10,6 +10,7 @@
