@@ -1,29 +1,31 @@
 --- a/chrome/browser/prefs/browser_prefs.cc
 +++ b/chrome/browser/prefs/browser_prefs.cc
-@@ -257,6 +257,7 @@
+@@ -242,6 +242,8 @@
+ #include "chrome/browser/background/extensions/background_mode_manager.h"
+ #endif
  
- #if BUILDFLAG(ENABLE_EXTENSIONS)
- #include "chrome/browser/accessibility/animation_policy_prefs.h"
-+#include "chrome/browser/sync/extension_sync/extension_sync_prefs.h"
- #include "chrome/browser/ui/extensions/extension_settings_overridden_dialog.h"
- #include "chrome/browser/ui/extensions/settings_api_bubble_helpers.h"
- #include "extensions/browser/api/audio/audio_api.h"
-@@ -1903,6 +1904,7 @@ void RegisterProfilePrefs(user_prefs::Pr
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ #include "chrome/browser/extensions/activity_log/activity_log.h"
+ #include "chrome/browser/extensions/commands/command_service.h"
+@@ -1902,6 +1904,8 @@ void RegisterProfilePrefs(user_prefs::Pr
+ 
  #endif  // BUILDFLAG(ENABLE_EXTENSIONS_CORE)
  
++  browser_sync::private_sync_prefs::RegisterProfilePrefs(registry);
++
  #if BUILDFLAG(ENABLE_EXTENSIONS)
-+  browser_sync::extension_sync_prefs::RegisterProfilePrefs(registry);
    RegisterAnimationPolicyPrefs(registry);
    extensions::AudioAPI::RegisterUserPrefs(registry);
-   // TODO(devlin): This would be more inline with the other calls here if it
 --- /dev/null
-+++ b/chrome/browser/sync/extension_sync/extension_sync_prefs.cc
-@@ -0,0 +1,258 @@
++++ b/chrome/browser/sync/private_sync/private_sync_prefs.cc
+@@ -0,0 +1,266 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
-+#include "chrome/browser/sync/extension_sync/extension_sync_prefs.h"
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
 +
 +#include <optional>
 +#include <string>
@@ -34,16 +36,16 @@
 +#include "base/strings/string_number_conversions.h"
 +#include "base/uuid.h"
 +#include "base/values.h"
-+#include "components/crx_file/id_util.h"
 +#include "components/prefs/pref_registry_simple.h"
 +#include "components/prefs/pref_service.h"
 +
-+namespace browser_sync::extension_sync_prefs {
++namespace browser_sync::private_sync_prefs {
 +
 +namespace {
 +
 +constexpr char kSchemaVersionField[] = "schema_version";
-+constexpr char kProviderIdField[] = "provider_extension_id";
++constexpr char kProviderKindField[] = "provider_kind";
++constexpr char kProviderIdField[] = "provider_id";
 +constexpr char kVaultUuidField[] = "vault_uuid";
 +constexpr char kEncryptedVaultKeyField[] = "encrypted_vault_key";
 +constexpr char kKeyModeField[] = "key_mode";
@@ -51,6 +53,7 @@
 +constexpr char kEncryptedCheckpointField[] = "encrypted_checkpoint";
 +constexpr char kRecoveryKeyMode[] = "recovery_key";
 +constexpr char kAccountBoundEnvelopeMode[] = "account_bound_envelope";
++constexpr char kExtensionProviderKind[] = "extension";
 +
 +constexpr char kAcceptedGenerationField[] = "accepted_generation";
 +constexpr char kHeadDigestPrefixField[] = "head_digest_prefix";
@@ -76,6 +79,7 @@
 +
 +std::optional<Configuration> ReadConfiguration(const PrefService& prefs) {
 +  const base::DictValue& value = prefs.GetDict(kConfiguration);
++  const std::string* provider_kind = value.FindString(kProviderKindField);
 +  const std::string* provider_id = value.FindString(kProviderIdField);
 +  const std::string* vault_uuid = value.FindString(kVaultUuidField);
 +  const std::string* encrypted_key = value.FindString(kEncryptedVaultKeyField);
@@ -83,8 +87,8 @@
 +  const std::string* consent_fingerprint =
 +      value.FindString(kConsentFingerprintField);
 +  if (value.FindInt(kSchemaVersionField) != kCurrentSchemaVersion ||
-+      !provider_id || !crx_file::id_util::IdIsValid(*provider_id) ||
-+      !vault_uuid || !key_mode || !encrypted_key || !consent_fingerprint ||
++      !provider_kind || !provider_id || provider_id->empty() || !vault_uuid ||
++      !key_mode || !encrypted_key || !consent_fingerprint ||
 +      consent_fingerprint->empty() ||
 +      !base::Uuid::ParseLowercase(*vault_uuid).is_valid()) {
 +    return std::nullopt;
@@ -96,7 +100,12 @@
 +    return std::nullopt;
 +  }
 +  Configuration configuration;
-+  configuration.provider_extension_id = *provider_id;
++  if (*provider_kind == kExtensionProviderKind) {
++    configuration.provider.kind = private_sync::ProviderKind::kExtension;
++  } else {
++    return std::nullopt;
++  }
++  configuration.provider.id = *provider_id;
 +  configuration.vault_uuid = *vault_uuid;
 +  configuration.encrypted_vault_key = std::move(*protected_key);
 +  if (*key_mode == kRecoveryKeyMode) {
@@ -125,7 +134,8 @@
 +  base::DictValue value =
 +      base::DictValue()
 +          .Set(kSchemaVersionField, kCurrentSchemaVersion)
-+          .Set(kProviderIdField, configuration.provider_extension_id)
++          .Set(kProviderKindField, kExtensionProviderKind)
++          .Set(kProviderIdField, configuration.provider.id)
 +          .Set(kVaultUuidField, configuration.vault_uuid)
 +          .Set(kEncryptedVaultKeyField,
 +               base::Base64Encode(configuration.encrypted_vault_key))
@@ -276,16 +286,16 @@
 +  prefs->ClearPref(kDiagnostics);
 +}
 +
-+}  // namespace browser_sync::extension_sync_prefs
++}  // namespace browser_sync::private_sync_prefs
 --- /dev/null
-+++ b/chrome/browser/sync/extension_sync/extension_sync_prefs.h
-@@ -0,0 +1,95 @@
++++ b/chrome/browser/sync/private_sync/private_sync_prefs.h
+@@ -0,0 +1,96 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
-+#ifndef CHROME_BROWSER_SYNC_EXTENSION_SYNC_EXTENSION_SYNC_PREFS_H_
-+#define CHROME_BROWSER_SYNC_EXTENSION_SYNC_EXTENSION_SYNC_PREFS_H_
++#ifndef CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PREFS_H_
++#define CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PREFS_H_
 +
 +#include <cstdint>
 +#include <optional>
@@ -294,14 +304,15 @@
 +#include <vector>
 +
 +#include "base/time/time.h"
++#include "chrome/browser/sync/private_sync/private_sync_provider.h"
 +
 +class PrefRegistrySimple;
 +class PrefService;
 +
-+namespace browser_sync::extension_sync_prefs {
++namespace browser_sync::private_sync_prefs {
 +
-+inline constexpr char kConfiguration[] = "helium.extension_sync.configuration";
-+inline constexpr char kDiagnostics[] = "helium.extension_sync.diagnostics";
++inline constexpr char kConfiguration[] = "helium.private_sync.configuration";
++inline constexpr char kDiagnostics[] = "helium.private_sync.diagnostics";
 +inline constexpr int kCurrentSchemaVersion = 1;
 +
 +enum class KeyMode {
@@ -310,7 +321,7 @@
 +};
 +
 +struct Configuration {
-+  std::string provider_extension_id;
++  private_sync::ProviderIdentity provider;
 +  std::string vault_uuid;
 +  std::vector<uint8_t> encrypted_vault_key;
 +  KeyMode key_mode = KeyMode::kRecoveryKey;
@@ -372,23 +383,46 @@
 +void WriteDiagnostics(PrefService* prefs, const Diagnostics& diagnostics);
 +void ClearDiagnostics(PrefService* prefs);
 +
-+}  // namespace browser_sync::extension_sync_prefs
++}  // namespace browser_sync::private_sync_prefs
 +
-+#endif  // CHROME_BROWSER_SYNC_EXTENSION_SYNC_EXTENSION_SYNC_PREFS_H_
++#endif  // CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PREFS_H_
 --- a/chrome/browser/sync/BUILD.gn
 +++ b/chrome/browser/sync/BUILD.gn
-@@ -254,9 +254,14 @@ source_set("sync") {
-     ]
-   }
-   if (enable_extensions) {
-+    sources += [
-+      "extension_sync/extension_sync_prefs.cc",
-+      "extension_sync/extension_sync_prefs.h",
-+    ]
-     deps += [
-       "//chrome/browser/themes",
-       "//chrome/browser/web_applications",
-+      "//components/crx_file",
-     ]
-   }
-   if (is_chromeos) {
+@@ -31,6 +31,9 @@ source_set("sync") {
+     "glue/sync_start_util.h",
+     "local_or_syncable_bookmark_sync_service_factory.cc",
+     "local_or_syncable_bookmark_sync_service_factory.h",
++    "private_sync/private_sync_prefs.cc",
++    "private_sync/private_sync_prefs.h",
++    "private_sync/private_sync_provider.h",
+     "prefs/chrome_syncable_prefs_database.cc",
+     "prefs/chrome_syncable_prefs_database.h",
+     "prefs/cross_device_pref_tracker/chrome_cross_device_pref_provider.cc",
+--- /dev/null
++++ b/chrome/browser/sync/private_sync/private_sync_provider.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PROVIDER_H_
++#define CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PROVIDER_H_
++
++#include <string>
++
++namespace browser_sync::private_sync {
++
++enum class ProviderKind {
++  kExtension,
++};
++
++struct ProviderIdentity {
++  ProviderKind kind = ProviderKind::kExtension;
++  std::string id;
++
++  bool operator==(const ProviderIdentity&) const = default;
++};
++
++}  // namespace browser_sync::private_sync
++
++#endif  // CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PROVIDER_H_
