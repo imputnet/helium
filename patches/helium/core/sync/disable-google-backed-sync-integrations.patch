@@ -1,0 +1,225 @@
+--- a/chrome/browser/history/web_history_service_factory.cc
++++ b/chrome/browser/history/web_history_service_factory.cc
+@@ -9,6 +9,7 @@
+ #include "chrome/browser/sync/sync_service_factory.h"
+ #include "components/history/core/browser/web_history_service.h"
+ #include "components/sync/service/sync_service.h"
++#include "components/sync/service/sync_service_utils.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/storage_partition.h"
+ 
+@@ -17,8 +18,9 @@ namespace {
+ // and false otherwise.
+ bool IsHistorySyncEnabled(Profile* profile) {
+   syncer::SyncService* sync = SyncServiceFactory::GetForProfile(profile);
+-  return sync && !sync->IsLocalSyncEnabled() &&
+-         sync->GetActiveDataTypes().Has(syncer::HISTORY_DELETE_DIRECTIVES);
++  return syncer::GetUploadToGoogleState(
++             sync, syncer::HISTORY_DELETE_DIRECTIVES) ==
++         syncer::UploadState::ACTIVE;
+ }
+ 
+ }  // namespace
+--- a/chrome/browser/safe_browsing/chrome_password_protection_service.cc
++++ b/chrome/browser/safe_browsing/chrome_password_protection_service.cc
+@@ -88,6 +88,7 @@
+ #include "components/strings/grit/components_strings.h"
+ #include "components/sync/protocol/user_event_specifics.pb.h"
+ #include "components/sync/service/sync_service.h"
++#include "components/sync/service/sync_service_utils.h"
+ #include "components/sync_user_events/user_event_service.h"
+ #include "components/unified_consent/pref_names.h"
+ #include "components/variations/service/variations_service.h"
+@@ -1771,9 +1772,9 @@ void ChromePasswordProtectionService::Fi
+ 
+ bool ChromePasswordProtectionService::IsPrimaryAccountSyncingHistory() const {
+   syncer::SyncService* sync = SyncServiceFactory::GetForProfile(profile_);
+-  return sync &&
+-         sync->GetActiveDataTypes().Has(syncer::HISTORY_DELETE_DIRECTIVES) &&
+-         !sync->IsLocalSyncEnabled();
++  return syncer::GetUploadToGoogleState(
++             sync, syncer::HISTORY_DELETE_DIRECTIVES) ==
++         syncer::UploadState::ACTIVE;
+ }
+ 
+ bool ChromePasswordProtectionService::IsPrimaryAccountSignedIn() const {
+--- a/chrome/browser/safe_browsing/chrome_user_population_helper.cc
++++ b/chrome/browser/safe_browsing/chrome_user_population_helper.cc
+@@ -20,6 +20,7 @@
+ #include "components/safe_browsing/core/browser/user_population.h"
+ #include "components/safe_browsing/core/browser/verdict_cache_manager.h"
+ #include "components/sync/service/sync_service.h"
++#include "components/sync/service/sync_service_utils.h"
+ 
+ namespace safe_browsing {
+ 
+@@ -67,8 +68,9 @@ ChromeUserPopulation GetUserPopulationFo
+ 
+   syncer::SyncService* sync = SyncServiceFactory::GetForProfile(profile);
+   bool is_history_sync_active =
+-      sync && !sync->IsLocalSyncEnabled() &&
+-      sync->GetActiveDataTypes().Has(syncer::HISTORY_DELETE_DIRECTIVES);
++      syncer::GetUploadToGoogleState(
++          sync, syncer::HISTORY_DELETE_DIRECTIVES) ==
++      syncer::UploadState::ACTIVE;
+   signin::IdentityManager* identity_manager =
+       IdentityManagerFactory::GetForProfile(profile);
+   bool is_signed_in =
+--- a/components/sync/service/sync_service_utils.cc
++++ b/components/sync/service/sync_service_utils.cc
+@@ -12,67 +12,10 @@
+ 
+ namespace syncer {
+ 
+-UploadState GetUploadToGoogleState(const SyncService* sync_service,
+-                                   DataType type) {
+-  // Without a SyncService, or in local-sync mode, there's no upload to Google.
+-  if (!sync_service || sync_service->IsLocalSyncEnabled()) {
+-    return UploadState::NOT_ACTIVE;
+-  }
+-
+-  // Make sure that the current user settings include `type`.
+-  if (!sync_service->GetPreferredDataTypes().Has(type)) {
+-    return UploadState::NOT_ACTIVE;
+-  }
+-
+-  // If the given DataType is encrypted with a custom passphrase, we also
+-  // consider uploading inactive, since Google can't read the data.
+-  // Note that encryption is tricky: Some data types (e.g. PASSWORDS) are always
+-  // encrypted, but not necessarily with a custom passphrase. On the other hand,
+-  // some data types are never encrypted (e.g. DEVICE_INFO), even if the
+-  // "encrypt everything" setting is enabled.
+-  if (sync_service->GetUserSettings()->GetAllEncryptedDataTypes().Has(type) &&
+-      sync_service->GetUserSettings()->IsUsingExplicitPassphrase()) {
+-    return UploadState::NOT_ACTIVE;
+-  }
+-
+-  // Persistent auth errors always map to NOT_ACTIVE because they cause the
+-  // transport state to be PAUSED (unless sync was DISABLED afterwards).
+-  CHECK(!sync_service->GetAuthError().IsPersistentError() ||
+-        sync_service->GetTransportState() ==
+-            SyncService::TransportState::PAUSED ||
+-        sync_service->GetTransportState() ==
+-            SyncService::TransportState::DISABLED)
+-      << "Invalid transport state: "
+-      << static_cast<int>(sync_service->GetTransportState());
+-
+-  // SyncService never reports transient errors.
+-  DCHECK(!sync_service->GetAuthError().IsTransientError());
+-
+-  switch (sync_service->GetTransportState()) {
+-    case SyncService::TransportState::DISABLED:
+-    case SyncService::TransportState::PAUSED:
+-      return UploadState::NOT_ACTIVE;
+-
+-    case SyncService::TransportState::START_DEFERRED:
+-    case SyncService::TransportState::INITIALIZING:
+-    case SyncService::TransportState::PENDING_DESIRED_CONFIGURATION:
+-    case SyncService::TransportState::CONFIGURING:
+-      return UploadState::INITIALIZING;
+-
+-    case SyncService::TransportState::ACTIVE:
+-      // If sync is active, but the data type in question still isn't, then
+-      // something must have gone wrong with that data type.
+-      if (!sync_service->GetActiveDataTypes().Has(type)) {
+-        return UploadState::NOT_ACTIVE;
+-      }
+-      // TODO(crbug.com/41382444): We only know if the refresh token is actually
+-      // valid (no auth error) after we've tried talking to the Sync server.
+-      if (!sync_service->HasCompletedSyncCycle()) {
+-        return UploadState::INITIALIZING;
+-      }
+-      return UploadState::ACTIVE;
+-  }
+-  NOTREACHED();
++UploadState GetUploadToGoogleState(const SyncService*, DataType) {
++  // Helium does not provide an account-backed Sync backend. Local and custom
++  // backends do not grant consent to upload data to Google services.
++  return UploadState::NOT_ACTIVE;
+ }
+ 
+ void RecordKeyRetrievalTrigger(
+--- a/components/sync/service/sync_service_utils.h
++++ b/components/sync/service/sync_service_utils.h
+@@ -36,9 +36,9 @@ enum class UploadState {
+   kMaxValue = ACTIVE
+ };
+ 
+-// Returns whether `type` is being uploaded to Google. This is useful for
+-// features that depend on user consent for uploading data (e.g. history) to
+-// Google.
++// Helium does not support account-backed Google Sync, so this always returns
++// NOT_ACTIVE. Account-only features should use this helper rather than infer
++// Google consent from the selected backend.
+ UploadState GetUploadToGoogleState(const SyncService* sync_service,
+                                    DataType type);
+ 
+--- a/components/autofill/core/browser/payments/iban_save_manager.cc
++++ b/components/autofill/core/browser/payments/iban_save_manager.cc
+@@ -36,6 +36,7 @@
+ #include "components/autofill/core/common/signatures.h"
+ #include "components/strike_database/strike_database.h"
+ #include "components/sync/base/data_type.h"
++#include "components/sync/service/sync_service_utils.h"
+ #include "components/sync/service/sync_user_settings.h"
+ 
+ namespace autofill {
+@@ -103,7 +104,9 @@ bool IbanSaveManager::IsIbanUploadEnable
+ 
+   // Don't offer upload for users that are only syncing locally, since they
+   // won't receive the IBANs back from Google Payments.
+-  if (sync_service->IsLocalSyncEnabled()) {
++  if (syncer::GetUploadToGoogleState(sync_service,
++                                     syncer::AUTOFILL_WALLET_DATA) !=
++      syncer::UploadState::ACTIVE) {
+     autofill_metrics::LogIbanUploadEnabledMetric(
+         autofill_metrics::IbanUploadEnabledStatus::kLocalSyncEnabled,
+         signin_state_for_metrics);
+--- a/components/autofill/core/browser/studies/autofill_experiments.cc
++++ b/components/autofill/core/browser/studies/autofill_experiments.cc
+@@ -182,7 +182,9 @@ bool IsCreditCardUploadEnabled(
+ 
+   // Don't offer upload for users that are only syncing locally, since they
+   // won't receive the cards back from Google Payments.
+-  if (sync_service->IsLocalSyncEnabled()) {
++  if (syncer::GetUploadToGoogleState(sync_service,
++                                     syncer::AUTOFILL_WALLET_DATA) !=
++      syncer::UploadState::ACTIVE) {
+     autofill_metrics::LogCardUploadEnabledMetric(
+         autofill_metrics::CardUploadEnabled::kLocalSyncEnabled,
+         signin_state_for_metrics);
+--- a/components/password_manager/core/browser/features/password_manager_features_util.cc
++++ b/components/password_manager/core/browser/features/password_manager_features_util.cc
+@@ -11,6 +11,7 @@
+ #include "components/sync/base/features.h"
+ #include "components/sync/base/user_selectable_type.h"
+ #include "components/sync/service/sync_service.h"
++#include "components/sync/service/sync_service_utils.h"
+ #include "components/sync/service/sync_user_settings.h"
+ 
+ namespace password_manager::features_util {
+@@ -22,7 +23,8 @@ bool IsUserEligibleForAccountStorage(con
+     return false;
+   }
+ 
+-  if (sync_service->IsLocalSyncEnabled()) {
++  if (syncer::GetUploadToGoogleState(sync_service, syncer::PASSWORDS) !=
++      syncer::UploadState::ACTIVE) {
+     return false;
+   }
+ 
+--- a/components/safe_browsing/core/browser/sync/sync_utils.cc
++++ b/components/safe_browsing/core/browser/sync/sync_utils.cc
+@@ -48,9 +48,9 @@ bool SyncUtils::AreSigninAndSyncSetUpFor
+ // TODO(bdea): Migrate other SB classes that define this method to call the one
+ // here instead.
+ bool SyncUtils::IsHistorySyncEnabled(syncer::SyncService* sync_service) {
+-  return sync_service && !sync_service->IsLocalSyncEnabled() &&
+-         sync_service->GetActiveDataTypes().Has(
+-             syncer::HISTORY_DELETE_DIRECTIVES);
++  return syncer::GetUploadToGoogleState(
++             sync_service, syncer::HISTORY_DELETE_DIRECTIVES) ==
++         syncer::UploadState::ACTIVE;
+ }
+ 
+ }  // namespace safe_browsing
