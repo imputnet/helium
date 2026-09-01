@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/views/location_bar/icon_label_bubble_view.cc
 +++ b/chrome/browser/ui/views/location_bar/icon_label_bubble_view.cc
-@@ -80,9 +80,7 @@ void IconLabelBubbleView::SeparatorView:
+@@ -78,9 +78,7 @@ void IconLabelBubbleView::SeparatorView:
    const SkColor separator_color = SkColorSetA(
        owner_->delegate_->GetIconLabelBubbleSurroundingForegroundColor(),
        owner_->delegate_->GetIconLabelBubbleSeparatorAlpha());
@@ -11,7 +11,7 @@
    canvas->DrawLine(gfx::PointF(x, GetLocalBounds().y()),
                     gfx::PointF(x, GetLocalBounds().bottom()), separator_color);
  }
-@@ -594,7 +592,9 @@ gfx::RoundedCornersF IconLabelBubbleView
+@@ -592,7 +590,9 @@ gfx::RoundedCornersF IconLabelBubbleView
    if (radii_.has_value()) {
      return radii_.value();
    }
@@ -22,7 +22,23 @@
  }
  
  void IconLabelBubbleView::SetCornerRadii(const gfx::RoundedCornersF& radii) {
-@@ -804,12 +804,12 @@ SkPath IconLabelBubbleView::GetHighlight
+@@ -618,8 +618,14 @@ gfx::Size IconLabelBubbleView::GetSizeFo
+ 
+   const int min_width =
+       shrinking ? image_size.width() : grow_animation_starting_width_;
++  // Match the icon-to-label spacing without shifting collapsed icons.
++  const int expanded_label_trailing_padding =
++      ShouldShowSeparator()
++          ? 0
++          : std::max(0, GetInternalSpacing() - GetInsets().right());
+   const int max_width = image_size.width() + GetInternalSpacing() +
+-                        label_width + expanded_label_additional_insets_.size();
++                        label_width + expanded_label_additional_insets_.size() +
++                        expanded_label_trailing_padding;
+ 
+   return gfx::Size(GetWidthBetween(min_width, max_width), image_size.height());
+ }
+@@ -802,12 +808,12 @@ SkPath IconLabelBubbleView::GetHighlight
    highlight_bounds = GetMirroredRect(highlight_bounds);
  
    const SkRect rect = RectToSkRect(highlight_bounds);
@@ -48,14 +64,14 @@
  
  #include <algorithm>
 +#include <array>
- #include <map>
  #include <memory>
  #include <string_view>
-@@ -207,10 +208,22 @@ int IncrementalMinimumWidth(const views:
+ #include <utility>
+@@ -182,9 +183,23 @@ LocationBarView* GetLocationBarViewForAc
+   return browser_view ? browser_view->GetLocationBarView() : nullptr;
  }
  
- // The padding between the intent chip and the other trailing decorations.
--constexpr int kIntentChipIntraItemPadding = 12;
++// The padding between intent chips and other trailing decorations.
 +constexpr int kIntentChipIntraItemPadding = 4;
  
  // The padding between the content setting icons and other trailing decorations.
@@ -76,7 +92,7 @@
  
  }  // namespace
  
-@@ -265,7 +278,10 @@ LocationBarView::LocationBarView(Browser
+@@ -239,7 +254,10 @@ LocationBarView::LocationBarView(Browser
                   !v->GetOmniboxController()->IsPopupOpen();
          }));
      views::FocusRing::Get(this)->SetOutsetFocusRingDisabled(true);
@@ -88,7 +104,7 @@
  
  #if BUILDFLAG(OS_LEVEL_GEOLOCATION_PERMISSION_SUPPORTED)
      if (features::IsOsLevelGeolocationPermissionSupportEnabled()) {
-@@ -331,9 +347,9 @@ void LocationBarView::Init() {
+@@ -305,9 +323,9 @@ void LocationBarView::Init() {
        CONTEXT_OMNIBOX_PRIMARY, views::style::STYLE_PRIMARY);
  
    const gfx::FontList& omnibox_chip_font_list = typography_provider.GetFont(
@@ -100,7 +116,7 @@
  
    auto location_icon_view =
        std::make_unique<LocationIconView>(omnibox_chip_font_list, this, this);
-@@ -482,11 +498,17 @@ void LocationBarView::Init() {
+@@ -452,11 +470,17 @@ void LocationBarView::Init() {
      page_action_items = page_actions::GetActivePageActionItems(*browser_);
    }
  
@@ -111,86 +127,15 @@
 +  });
 +
    // We don't need to bridge the new page action container with the legacy one
-   // if all page actions (i.e. up to bookmark star) are migrated.
+   // if page actions migration is enabled.
    const bool should_bridge_containers =
-       !IsPageActionMigrated(PageActionIconType::kBookmarkStar);
+       !base::FeatureList::IsEnabled(features::kPageActionsMigration);
 -  static constexpr int kBetweenIconSpacing = 8;
 +  static constexpr int kBetweenIconSpacing = kIntentChipIntraItemPadding;
    const page_actions::PageActionViewParams page_action_params{
        .icon_size =
            GetLayoutConstant(LayoutConstant::kLocationBarTrailingIconSize),
-@@ -520,53 +542,9 @@ void LocationBarView::Init() {
-     params.types_enabled.push_back(PageActionIconType::kTranslate);
-     params.types_enabled.push_back(PageActionIconType::kZoom);
- 
--    params.types_enabled.push_back(PageActionIconType::kCookieControls);
--    params.types_enabled.push_back(
--        PageActionIconType::kPaymentsOfferNotification);
-     params.types_enabled.push_back(PageActionIconType::kMemorySaver);
-     params.types_enabled.push_back(PageActionIconType::kFederation);
-   }
--  params.types_enabled.push_back(PageActionIconType::kSaveCard);
--  params.types_enabled.push_back(PageActionIconType::kSaveIban);
--  params.types_enabled.push_back(PageActionIconType::kFilledCardInformation);
--  params.types_enabled.push_back(PageActionIconType::kVirtualCardEnroll);
--  params.types_enabled.push_back(PageActionIconType::kMandatoryReauth);
--
--  if (browser_ && lens::features::IsOmniboxEntryPointEnabled()) {
--    // The persistent compact entrypoint should be positioned directly before
--    // the star icon and the prominent expanding entrypoint should be
--    // positioned in the leading position. This entrypoint will be suppressed
--    // if the AIM page action is enabled and the user meets AIM eligibility
--    // criteria, since we want to avoid both showing up when the user focuses
--    // the Omnibox.
--    if (lens::features::IsOmniboxEntrypointAlwaysVisible()) {
--      params.types_enabled.push_back(PageActionIconType::kLensOverlay);
--    } else {
--      params.types_enabled.insert(params.types_enabled.begin(),
--                                  PageActionIconType::kLensOverlay);
--    }
--  }
--
--  if (browser_ && lens::features::IsLensOverlayEduActionChipEnabled()) {
--    // Position in the leading position, like the expanding entrypoint for
--    // kLensOverlay above. While both chips may be enabled, they will not appear
--    // at the same time due to different focus behavior.
--    params.types_enabled.insert(params.types_enabled.begin(),
--                                PageActionIconType::kLensOverlayHomework);
--  }
--
--  // Because AIM eligibility can change during the lifecycle of the
--  // `LocationBarView`, the AI Mode page action is added regardless of
--  // eligibility, but its visibility is toggled to match eligibility.
--  if (browser_) {
--    // Position in the leading position, like the entrypoint for
--    // kLensOverlayHomework above. While both chips may be enabled, they will
--    // not appear at the same time due to different focus behavior. The
--    // visibility of this entrypoint is dependent on whether or not the user
--    // meets AIM eligibility criteria.
--    params.types_enabled.insert(params.types_enabled.begin(),
--                                PageActionIconType::kAiMode);
--  }
- 
-   if (browser_ && !is_popup_mode_) {
-     params.types_enabled.push_back(PageActionIconType::kBookmarkStar);
-@@ -583,16 +561,6 @@ void LocationBarView::Init() {
-       AddChildView(std::make_unique<PageActionIconContainerView>(params));
-   page_action_icon_controller_ = page_action_icon_container_->controller();
- 
--  if (browser_ && !page_action_icon_container_->children().empty() &&
--      !IsPageActionMigrated(PageActionIconType::kAiMode)) {
--    auto* first_page_action_icon_view = static_cast<PageActionIconView*>(
--        page_action_icon_container_->children().front());
--    DCHECK(first_page_action_icon_view->action_id() == kActionAiMode)
--        << "kActionAiMode must be the first child in "
--           "PageActionIconContainerView to ensure it's the left-most page "
--           "action.";
--  }
--
-   auto clear_all_button = views::CreateVectorImageButton(base::BindRepeating(
-       static_cast<void (OmniboxView::*)(const std::u16string&)>(
-           &OmniboxView::SetUserText),
-@@ -628,7 +596,7 @@ int LocationBarView::GetBorderRadius() c
+@@ -532,7 +556,7 @@ int LocationBarView::GetBorderRadius() c
  // static
  int LocationBarView::ComputeBorderRadius(gfx::Size size) {
    return ChromeLayoutProvider::Get()->GetCornerRadiusMetric(
@@ -199,7 +144,7 @@
  }
  
  // static
-@@ -855,9 +823,9 @@ void LocationBarView::Layout(PassKey) {
+@@ -759,9 +783,9 @@ void LocationBarView::Layout(PassKey) {
    // TODO(manukh): Move constants to layout_constants.cc.
    // The padding between the left edges of the location bar and the LHS icon,
    // e.g. the page info icon, the google G icon, the selected suggestion icon.
@@ -211,7 +156,7 @@
  
    // Apply indentation to align the omnibox input icon and the text with those
    // of the suggestions in the popup. However, there are two exceptions where
-@@ -876,22 +844,22 @@ void LocationBarView::Layout(PassKey) {
+@@ -780,22 +804,22 @@ void LocationBarView::Layout(PassKey) {
                               !location_icon_view_->ShouldShowLabel() &&
                               !ShouldShowKeywordBubble();
    if (should_indent) {
@@ -238,7 +183,7 @@
    }
  
    LocationBarLayout leading_decorations(LocationBarLayout::Position::kLeftEdge,
-@@ -1529,7 +1497,7 @@ int LocationBarView::GetMinimumTrailingW
+@@ -1433,7 +1457,7 @@ int LocationBarView::GetMinimumTrailingW
  }
  
  gfx::Rect LocationBarView::GetLocalBoundsWithoutEndcaps() const {
@@ -249,7 +194,7 @@
    return bounds_without_endcaps;
 --- a/chrome/browser/ui/views/location_bar/location_icon_view.cc
 +++ b/chrome/browser/ui/views/location_bar/location_icon_view.cc
-@@ -119,7 +119,7 @@ SkColor LocationIconView::GetForegroundC
+@@ -111,7 +111,7 @@ SkColor LocationIconView::GetForegroundC
  }
  
  bool LocationIconView::ShouldShowSeparator() const {
@@ -258,7 +203,7 @@
  }
  
  bool LocationIconView::ShouldShowLabelAfterAnimation() const {
-@@ -469,7 +469,8 @@ gfx::Size LocationIconView::GetMinimumSi
+@@ -464,7 +464,8 @@ gfx::Size LocationIconView::GetMinimumSi
  }
  
  void LocationIconView::SetBackgroundColor(SkColor color) {
@@ -270,7 +215,7 @@
  BEGIN_METADATA(LocationIconView)
 --- a/chrome/browser/ui/views/location_bar/location_icon_state_helper.cc
 +++ b/chrome/browser/ui/views/location_bar/location_icon_state_helper.cc
-@@ -74,22 +74,13 @@ bool ShouldShowSecurityChipText(const Lo
+@@ -73,22 +73,13 @@ bool ShouldShowSecurityChipText(const Lo
      return false;
    }
  
@@ -308,17 +253,19 @@
      case LayoutConstant::kLocationBarLeadingIconSize:
 --- a/chrome/browser/ui/views/location_bar/standard_icon_label_bubble_layout_strategy.cc
 +++ b/chrome/browser/ui/views/location_bar/standard_icon_label_bubble_layout_strategy.cc
-@@ -100,8 +100,7 @@ StandardIconLabelBubbleAnimationLayoutSt
+@@ -104,9 +104,8 @@ StandardIconLabelBubbleAnimationLayoutSt
+   // value to be, since it won't be visible.
    const int label_x =
        image_bounds_with_label.right() + host->GetInternalSpacing();
-   const int available_label_width = std::max(
+-  const int available_label_width = std::max(
 -      0, layout.host_size.width() - label_x - bubble_trailing_padding -
 -             host->GetWidthBetweenIconAndSeparator());
-+      0, layout.host_size.width() - label_x - bubble_trailing_padding);
-   gfx::Rect label_bounds(label_x, 0, available_label_width, height);
++  const int available_label_width =
++      std::max(0, layout.host_size.width() - label_x - bubble_trailing_padding);
+   gfx::Rect label_bounds(label_x, image_y, available_label_width, height);
    layout.child_layouts.emplace_back(
        host->label(),
-@@ -125,10 +124,9 @@ StandardIconLabelBubbleAnimationLayoutSt
+@@ -130,10 +129,9 @@ StandardIconLabelBubbleAnimationLayoutSt
    gfx::Rect separator_bounds(label_bounds);
    separator_bounds.Inset(
        gfx::Insets::VH((separator_bounds.height() - separator_height) / 2, 0));

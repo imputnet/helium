@@ -1,32 +1,32 @@
---- a/components/sync/engine/extension_sync/BUILD.gn
-+++ b/components/sync/engine/extension_sync/BUILD.gn
-@@ -11,6 +11,8 @@ proto_library("sync_vault_proto") {
+--- a/components/sync/engine/sync_vault/BUILD.gn
++++ b/components/sync/engine/sync_vault/BUILD.gn
+@@ -11,12 +11,17 @@ proto_library("sync_vault_proto") {
  
- source_set("extension_sync") {
+ source_set("sync_vault") {
    sources = [
 +    "sync_vault_cryptographer.cc",
 +    "sync_vault_cryptographer.h",
      "sync_vault_format.cc",
      "sync_vault_format.h",
      "sync_vault_limits.h",
-@@ -18,5 +20,8 @@ source_set("extension_sync") {
+   ]
  
-   public_deps = [ "//base" ]
- 
--  deps = [ ":sync_vault_proto" ]
-+  deps = [
-+    ":sync_vault_proto",
+-  public_deps = [ "//base" ]
++  public_deps = [
++    "//base",
 +    "//crypto",
 +  ]
+ 
+   deps = [ ":sync_vault_proto" ]
  }
 --- /dev/null
-+++ b/components/sync/engine/extension_sync/sync_vault_cryptographer.cc
-@@ -0,0 +1,148 @@
++++ b/components/sync/engine/sync_vault/sync_vault_cryptographer.cc
+@@ -0,0 +1,146 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
-+#include "components/sync/engine/extension_sync/sync_vault_cryptographer.h"
++#include "components/sync/engine/sync_vault/sync_vault_cryptographer.h"
 +
 +#include <array>
 +#include <cstdint>
@@ -76,27 +76,25 @@
 +  if (vault_key.size() != kVaultKeySize) {
 +    return base::unexpected(SyncVaultCryptoError::kInvalidKey);
 +  }
-+  const base::Uuid parsed_uuid = base::Uuid::ParseCaseInsensitive(vault_uuid);
-+  if (!parsed_uuid.is_valid() || vault_uuid.size() != 36u) {
++  if (!base::Uuid::ParseLowercase(vault_uuid).is_valid()) {
 +    return base::unexpected(SyncVaultCryptoError::kInvalidContext);
 +  }
-+  return base::WrapUnique(new SyncVaultCryptographer(
-+      vault_key.first<kVaultKeySize>(), parsed_uuid.AsLowercaseString()));
++  std::array<uint8_t, kVaultKeySize> object_key =
++      crypto::kdf::Hkdf<kVaultKeySize>(crypto::hash::kSha256, vault_key,
++                                       base::as_byte_span(vault_uuid),
++                                       base::as_byte_span(kKeyInfo));
++  auto cryptographer = base::WrapUnique(
++      new SyncVaultCryptographer(object_key, std::move(vault_uuid)));
++  crypto::SecureZeroBuffer(object_key);
++  return cryptographer;
 +}
 +
 +SyncVaultCryptographer::SyncVaultCryptographer(
-+    base::span<const uint8_t, kVaultKeySize> vault_key,
++    base::span<const uint8_t, kVaultKeySize> object_key,
 +    std::string vault_uuid)
-+    : object_key_(
-+          crypto::kdf::Hkdf<kVaultKeySize>(crypto::hash::kSha256,
-+                                           vault_key,
-+                                           base::as_byte_span(vault_uuid),
-+                                           base::as_byte_span(kKeyInfo))),
-+      vault_uuid_(std::move(vault_uuid)) {}
++    : aead_(kAlgorithm, object_key), vault_uuid_(std::move(vault_uuid)) {}
 +
-+SyncVaultCryptographer::~SyncVaultCryptographer() {
-+  crypto::SecureZeroBuffer(object_key_);
-+}
++SyncVaultCryptographer::~SyncVaultCryptographer() = default;
 +
 +SyncVaultCryptographer::TransformResult SyncVaultCryptographer::Encrypt(
 +    SyncVaultObjectRole role,
@@ -110,8 +108,8 @@
 +
 +  std::array<uint8_t, kNonceBytes> nonce;
 +  crypto::RandBytes(nonce);
-+  std::vector<uint8_t> ciphertext = crypto::aead::Seal(
-+      kAlgorithm, object_key_, plaintext, nonce, BuildAssociatedData(role));
++  std::vector<uint8_t> ciphertext =
++      aead_.Seal(plaintext, nonce, BuildAssociatedData(role));
 +  std::vector<uint8_t> container;
 +  container.reserve(nonce.size() + ciphertext.size());
 +  container.insert(container.end(), nonce.begin(), nonce.end());
@@ -133,9 +131,9 @@
 +    return base::unexpected(SyncVaultCryptoError::kObjectTooLarge);
 +  }
 +
-+  std::optional<std::vector<uint8_t>> plaintext = crypto::aead::Open(
-+      kAlgorithm, object_key_, container.subspan(kNonceBytes),
-+      container.first<kNonceBytes>(), BuildAssociatedData(role));
++  std::optional<std::vector<uint8_t>> plaintext =
++      aead_.Open(container.subspan(kNonceBytes), container.first<kNonceBytes>(),
++                 BuildAssociatedData(role));
 +  if (!plaintext) {
 +    return base::unexpected(SyncVaultCryptoError::kAuthenticationFailed);
 +  }
@@ -171,16 +169,15 @@
 +
 +}  // namespace syncer
 --- /dev/null
-+++ b/components/sync/engine/extension_sync/sync_vault_cryptographer.h
++++ b/components/sync/engine/sync_vault/sync_vault_cryptographer.h
 @@ -0,0 +1,75 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
-+#ifndef COMPONENTS_SYNC_ENGINE_EXTENSION_SYNC_SYNC_VAULT_CRYPTOGRAPHER_H_
-+#define COMPONENTS_SYNC_ENGINE_EXTENSION_SYNC_SYNC_VAULT_CRYPTOGRAPHER_H_
++#ifndef COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_CRYPTOGRAPHER_H_
++#define COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_CRYPTOGRAPHER_H_
 +
-+#include <array>
 +#include <cstddef>
 +#include <cstdint>
 +#include <memory>
@@ -189,7 +186,8 @@
 +
 +#include "base/containers/span.h"
 +#include "base/types/expected.h"
-+#include "components/sync/engine/extension_sync/sync_vault_limits.h"
++#include "components/sync/engine/sync_vault/sync_vault_limits.h"
++#include "crypto/aead.h"
 +
 +namespace syncer {
 +
@@ -235,16 +233,16 @@
 +  const std::string& vault_uuid() const { return vault_uuid_; }
 +
 + private:
-+  SyncVaultCryptographer(base::span<const uint8_t, kVaultKeySize> vault_key,
++  SyncVaultCryptographer(base::span<const uint8_t, kVaultKeySize> object_key,
 +                         std::string vault_uuid);
 +
 +  std::vector<uint8_t> BuildAssociatedData(SyncVaultObjectRole role) const;
 +  static size_t MaximumPlaintextBytes(SyncVaultObjectRole role);
 +
-+  std::array<uint8_t, kVaultKeySize> object_key_;
++  crypto::Aead aead_;
 +  const std::string vault_uuid_;
 +};
 +
 +}  // namespace syncer
 +
-+#endif  // COMPONENTS_SYNC_ENGINE_EXTENSION_SYNC_SYNC_VAULT_CRYPTOGRAPHER_H_
++#endif  // COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_CRYPTOGRAPHER_H_

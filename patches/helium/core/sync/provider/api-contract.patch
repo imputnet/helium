@@ -1,0 +1,423 @@
+--- a/extensions/common/extension_features.cc
++++ b/extensions/common/extension_features.cc
+@@ -77,6 +77,8 @@ BASE_FEATURE(kApiProxyOverrideRulesPriva
+ BASE_FEATURE(kApiRuntimeGetPlatformInfoNaClArch,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++BASE_FEATURE(kApiSyncVaultProvider, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ BASE_FEATURE(kWebRequestSecurityInfo, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ BASE_FEATURE(kWebRequestPerContextEventDispatch,
+--- a/extensions/common/extension_features.h
++++ b/extensions/common/extension_features.h
+@@ -100,6 +100,9 @@ BASE_DECLARE_FEATURE(kApiProxyOverrideRu
+ // runtime.getPlatformInfo() API.
+ BASE_DECLARE_FEATURE(kApiRuntimeGetPlatformInfoNaClArch);
+ 
++// Controls the availability of the experimental syncVaultProvider API.
++BASE_DECLARE_FEATURE(kApiSyncVaultProvider);
++
+ ///////////////////////////////////////////////////////////////////////////////
+ // Other Features
+ ///////////////////////////////////////////////////////////////////////////////
+--- a/extensions/common/features/feature_flags.cc
++++ b/extensions/common/features/feature_flags.cc
+@@ -26,6 +26,7 @@ const base::Feature* kFeatureFlags[] = {
+     &extensions_features::kApiGlicAccessFromGoogleWebpage,
+     &extensions_features::kApiMimeHandler,
+     &extensions_features::kApiGlicPrivate,
++    &extensions_features::kApiSyncVaultProvider,
+     &extensions_features::kApiContextualTasksPrivate,
+     &extensions_features::kApiOdfsConfigPrivate,
+     &extensions_features::kApiProxyOverrideRulesPrivate,
+--- a/extensions/common/mojom/api_permission_id.mojom
++++ b/extensions/common/mojom/api_permission_id.mojom
+@@ -297,6 +297,7 @@ enum APIPermissionID {
+   kBluetoothSocket = 270,
+   kBluetoothLowEnergy = 271,
+   kBluetoothPeripheral = 272,
++  kSyncVaultProvider = 273,
+ 
+   // Add new entries at the end of the enum and be sure to update the
+   // "ExtensionPermission3" enum in
+--- a/chrome/common/extensions/api/_api_features.json
++++ b/chrome/common/extensions/api/_api_features.json
+@@ -1070,6 +1070,11 @@
+       "chrome://file-manager/*"
+     ]
+   }],
++  "syncVaultProvider": {
++    "dependencies": ["permission:syncVaultProvider"],
++    "contexts": ["privileged_extension"],
++    "feature_flag": "ApiSyncVaultProvider"
++  },
+   "webAuthenticationProxy": {
+     "dependencies": ["permission:webAuthenticationProxy"],
+     "contexts": ["privileged_extension"]
+--- a/chrome/common/extensions/api/_permission_features.json
++++ b/chrome/common/extensions/api/_permission_features.json
+@@ -1156,6 +1156,13 @@
+       "81986D4F846CEDDDB962643FA501D1780DD441BB"   // http://crbug.com/40546373
+     ]
+   },
++  "syncVaultProvider": {
++    "channel": "stable",
++    "extension_types": ["extension"],
++    "min_manifest_version": 3,
++    "platforms": ["linux", "mac", "win"],
++    "feature_flag": "ApiSyncVaultProvider"
++  },
+   "wmDesksPrivate": {
+     "channel": "stable",
+     "extension_types": ["extension", "platform_app"],
+--- a/chrome/common/extensions/api/api_sources.gni
++++ b/chrome/common/extensions/api/api_sources.gni
+@@ -101,6 +101,7 @@ if (enable_extensions) {
+   ]
+ 
+   if (is_win || is_mac || is_linux) {
++    types_only_schema_sources_ += [ "sync_vault_provider.webidl" ]
+     schema_sources_ += [ "web_authentication_proxy.webidl" ]
+   }
+ 
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -5477,6 +5477,9 @@ are declared in tools/grit/grit_args.gni
+         <message name="IDS_EXTENSION_PROMPT_WARNING_VPN" desc="Permission string for access to VPN API.">
+           Access your network traffic
+         </message>
++        <message name="IDS_EXTENSION_PROMPT_WARNING_SYNC_VAULT_PROVIDER" desc="Permission string for extensions that store encrypted browser synchronization data.">
++          Act as a storage provider for your encrypted browser synchronization data
++        </message>
+ 
+         <message name="IDS_EXTENSION_PROMPT_WARNING_CONTENT_SETTINGS" desc="Permission string for access to content settings.">
+           Change and grant access to features such as geolocation, microphone, camera, cookies, etc., for all your websites and extensions, including this extension.
+--- /dev/null
++++ b/chrome/common/extensions/api/sync_vault_provider.webidl
+@@ -0,0 +1,241 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++enum SyncVaultProviderError {
++  "AUTH_REQUIRED",
++  "NOT_FOUND",
++  "CONFLICT",
++  "NETWORK_ERROR",
++  "TEMPORARY_ERROR",
++  "QUOTA_EXCEEDED",
++  "ACCESS_DENIED",
++  "INVALID_DATA",
++  "UNSUPPORTED",
++  "ABORTED"
++};
++
++enum ProviderState {
++  "READY",
++  "AUTH_REQUIRED",
++  "OFFLINE",
++  "QUOTA_EXCEEDED"
++};
++
++enum ProviderConfigurationState {
++  // Provider-owned work is continuing without user input.
++  "CONFIGURING",
++  // The provider has presented UI and is waiting for the user.
++  "PENDING_USER_ACTION",
++  // Terminal success.
++  "READY"
++};
++
++dictionary ProviderRequest {
++  required long requestId;
++};
++
++// Creation is idempotent by vaultUuid. Retrying the same UUID must return
++// success for the same logical vault rather than creating another vault.
++dictionary CreateVaultRequest {
++  required long requestId;
++  // Browser-generated stable identity. Providers store and return this value
++  // but must not treat it as authenticated.
++  required DOMString vaultUuid;
++  // Provider-visible discovery label. It is not part of vault identity or the
++  // authenticated vault format.
++  required DOMString displayName;
++};
++
++dictionary RenameVaultRequest {
++  required long requestId;
++  required DOMString vaultUuid;
++  required DOMString displayName;
++};
++
++dictionary ReadObjectRequest {
++  required long requestId;
++  required DOMString vaultUuid;
++  required DOMString objectId;
++  required long maxBytes;
++};
++
++dictionary WriteObjectRequest {
++  required long requestId;
++  required DOMString vaultUuid;
++  required DOMString objectId;
++  required ArrayBuffer data;
++  // Missing means create only if absent. Present means replace only if the
++  // provider's current revision matches this value.
++  DOMString expectedRevision;
++  // Present for immutable commit and payload objects. Providers record this
++  // value as object metadata so epoch collection never depends on parsing the
++  // browser-owned object identifier.
++  long retentionEpoch;
++};
++
++dictionary CollectEpochsRequest {
++  required long requestId;
++  required DOMString vaultUuid;
++  // Delete provider objects belonging to epochs below this value. The
++  // operation is idempotent and must not affect fixed vault metadata.
++  required long minimumRetainedEpoch;
++};
++
++dictionary WrapKeyRequest {
++  required long requestId;
++  required DOMString vaultUuid;
++  // Browser-generated 32-byte vault master key. Sent only after the user
++  // consents to account-bound key access. The provider wraps this key using
++  // its account credentials and returns |ProviderSuccess.keyEnvelope|.
++  required ArrayBuffer vaultKey;
++};
++
++dictionary UnwrapKeyRequest {
++  required long requestId;
++  required DOMString vaultUuid;
++  // Opaque provider-defined value returned by an earlier wrap request.
++  // The provider unwraps it for the current account and returns the
++  // original key as |ProviderSuccess.vaultKey|.
++  required ArrayBuffer keyEnvelope;
++};
++
++dictionary VaultInfo {
++  // Provider-visible discovery label. The browser treats this as display-only
++  // metadata and permits duplicate names.
++  required DOMString displayName;
++  // Untrusted copy of the browser-generated vault identity. The browser still
++  // authenticates the encrypted head before joining the vault.
++  required DOMString vaultUuid;
++};
++
++dictionary ProviderSuccess {
++  // CONFIGURING and PENDING_USER_ACTION keep a configuration request active
++  // and may be reported repeatedly as progress changes. A later success
++  // response with READY completes that same request.
++  ProviderConfigurationState configurationState;
++  sequence<VaultInfo> vaults;
++  ArrayBuffer data;
++  DOMString revision;
++  // Opaque account-bound wrapping of the vault key.
++  // Valid only when responding to onWrapKeyRequested.
++  ArrayBuffer keyEnvelope;
++  // Original 32-byte vault master key recovered from a key envelope.
++  // Valid only when responding to onUnwrapKeyRequested.
++  ArrayBuffer vaultKey;
++};
++
++dictionary ProviderFailure {
++  required SyncVaultProviderError error;
++  DOMString message;
++};
++
++// Exactly one of success and failure must be present. The broker also validates
++// the exact success fields permitted for the pending operation.
++dictionary ProviderResponse {
++  required long requestId;
++  ProviderSuccess success;
++  ProviderFailure failure;
++};
++
++dictionary RequestCancellation {
++  // For an asynchronous configure request, this cancels the entire lifecycle,
++  // including work continued after CONFIGURING or PENDING_USER_ACTION.
++  required long requestId;
++};
++
++// A transport hint, not authoritative state. Providers report only that a
++// vault may have changed; the browser reads and authenticates its current head.
++dictionary VaultChange {
++  required DOMString vaultUuid;
++};
++
++dictionary ProviderStateChange {
++  required ProviderState state;
++};
++
++callback ProviderRequestListener = undefined (ProviderRequest request);
++callback CreateVaultRequestListener = undefined (CreateVaultRequest request);
++callback RenameVaultRequestListener = undefined (RenameVaultRequest request);
++callback ReadObjectRequestListener = undefined (ReadObjectRequest request);
++callback WriteObjectRequestListener = undefined (WriteObjectRequest request);
++callback CollectEpochsRequestListener = undefined (CollectEpochsRequest request);
++callback WrapKeyRequestListener = undefined (WrapKeyRequest request);
++callback UnwrapKeyRequestListener = undefined (UnwrapKeyRequest request);
++callback CancelRequestListener = undefined (RequestCancellation cancellation);
++
++interface ProviderRequestEvent : ExtensionEvent {
++  static undefined addListener(ProviderRequestListener listener);
++  static undefined removeListener(ProviderRequestListener listener);
++  static boolean hasListener(ProviderRequestListener listener);
++};
++
++interface CreateVaultRequestEvent : ExtensionEvent {
++  static undefined addListener(CreateVaultRequestListener listener);
++  static undefined removeListener(CreateVaultRequestListener listener);
++  static boolean hasListener(CreateVaultRequestListener listener);
++};
++
++interface RenameVaultRequestEvent : ExtensionEvent {
++  static undefined addListener(RenameVaultRequestListener listener);
++  static undefined removeListener(RenameVaultRequestListener listener);
++  static boolean hasListener(RenameVaultRequestListener listener);
++};
++
++interface ReadObjectRequestEvent : ExtensionEvent {
++  static undefined addListener(ReadObjectRequestListener listener);
++  static undefined removeListener(ReadObjectRequestListener listener);
++  static boolean hasListener(ReadObjectRequestListener listener);
++};
++
++interface WriteObjectRequestEvent : ExtensionEvent {
++  static undefined addListener(WriteObjectRequestListener listener);
++  static undefined removeListener(WriteObjectRequestListener listener);
++  static boolean hasListener(WriteObjectRequestListener listener);
++};
++
++interface CollectEpochsRequestEvent : ExtensionEvent {
++  static undefined addListener(CollectEpochsRequestListener listener);
++  static undefined removeListener(CollectEpochsRequestListener listener);
++  static boolean hasListener(CollectEpochsRequestListener listener);
++};
++
++interface WrapKeyRequestEvent : ExtensionEvent {
++  static undefined addListener(WrapKeyRequestListener listener);
++  static undefined removeListener(WrapKeyRequestListener listener);
++  static boolean hasListener(WrapKeyRequestListener listener);
++};
++
++interface UnwrapKeyRequestEvent : ExtensionEvent {
++  static undefined addListener(UnwrapKeyRequestListener listener);
++  static undefined removeListener(UnwrapKeyRequestListener listener);
++  static boolean hasListener(UnwrapKeyRequestListener listener);
++};
++
++interface CancelRequestEvent : ExtensionEvent {
++  static undefined addListener(CancelRequestListener listener);
++  static undefined removeListener(CancelRequestListener listener);
++  static boolean hasListener(CancelRequestListener listener);
++};
++
++interface SyncVaultProvider {
++  static Promise<undefined> respond(ProviderResponse response);
++  static Promise<undefined> notifyVaultChanged(VaultChange change);
++  static Promise<undefined> notifyProviderStateChanged(
++      ProviderStateChange change);
++
++  static attribute ProviderRequestEvent onConfigureRequested;
++  static attribute ProviderRequestEvent onListVaultsRequested;
++  static attribute CreateVaultRequestEvent onCreateVaultRequested;
++  static attribute RenameVaultRequestEvent onRenameVaultRequested;
++  static attribute ReadObjectRequestEvent onReadObjectRequested;
++  static attribute WriteObjectRequestEvent onWriteObjectRequested;
++  static attribute CollectEpochsRequestEvent onCollectEpochsRequested;
++  static attribute WrapKeyRequestEvent onWrapKeyRequested;
++  static attribute UnwrapKeyRequestEvent onUnwrapKeyRequested;
++  static attribute CancelRequestEvent onCancelRequested;
++};
++
++partial interface Browser {
++  static attribute SyncVaultProvider syncVaultProvider;
++};
+--- a/chrome/common/extensions/permissions/chrome_api_permissions.cc
++++ b/chrome/common/extensions/permissions/chrome_api_permissions.cc
+@@ -54,6 +54,9 @@ constexpr APIPermissionInfo::InitInfo pe
+     {APIPermissionID::kIdentityEmail, "identity.email"},
+     {APIPermissionID::kNotifications, "notifications",
+      APIPermissionInfo::kFlagDoesNotRequireManagedSessionFullLoginWarning},
++    {APIPermissionID::kSyncVaultProvider, "syncVaultProvider",
++     APIPermissionInfo::kFlagCannotBeOptional |
++         APIPermissionInfo::kFlagRequiresManagementUIWarning},
+ 
+     // Register extension permissions.
+     {APIPermissionID::kAccessibilityFeaturesModify,
+--- a/chrome/common/extensions/permissions/chrome_permission_message_rules.cc
++++ b/chrome/common/extensions/permissions/chrome_permission_message_rules.cc
+@@ -685,6 +685,9 @@ ChromePermissionMessageRule::GetAllRules
+       {IDS_EXTENSION_PROMPT_WARNING_SYNCFILESYSTEM,
+        {APIPermissionID::kSyncFileSystem},
+        {}},
++      {IDS_EXTENSION_PROMPT_WARNING_SYNC_VAULT_PROVIDER,
++       {APIPermissionID::kSyncVaultProvider},
++       {}},
+       {IDS_EXTENSION_PROMPT_WARNING_TAB_GROUPS,
+        {APIPermissionID::kTabGroups},
+        {}},
+--- a/tools/metrics/histograms/metadata/extensions/enums.xml
++++ b/tools/metrics/histograms/metadata/extensions/enums.xml
+@@ -819,6 +819,16 @@ Called by update_extension_histograms.py
+   <int value="576" label="DICTATION_PRIVATE_ON_END_STREAM"/>
+   <int value="577" label="DICTATION_PRIVATE_ON_CONTEXT_UPDATE"/>
+   <int value="578" label="DICTATION_PRIVATE_ON_BROWSER_LOG_EVENT"/>
++  <int value="10000" label="SYNC_VAULT_PROVIDER_ON_CONFIGURE_REQUESTED"/>
++  <int value="10001" label="SYNC_VAULT_PROVIDER_ON_LIST_VAULTS_REQUESTED"/>
++  <int value="10002" label="SYNC_VAULT_PROVIDER_ON_CREATE_VAULT_REQUESTED"/>
++  <int value="10003" label="SYNC_VAULT_PROVIDER_ON_RENAME_VAULT_REQUESTED"/>
++  <int value="10004" label="SYNC_VAULT_PROVIDER_ON_READ_OBJECT_REQUESTED"/>
++  <int value="10005" label="SYNC_VAULT_PROVIDER_ON_WRITE_OBJECT_REQUESTED"/>
++  <int value="10006" label="SYNC_VAULT_PROVIDER_ON_WRAP_KEY_REQUESTED"/>
++  <int value="10007" label="SYNC_VAULT_PROVIDER_ON_UNWRAP_KEY_REQUESTED"/>
++  <int value="10008" label="SYNC_VAULT_PROVIDER_ON_CANCEL_REQUESTED"/>
++  <int value="10009" label="SYNC_VAULT_PROVIDER_ON_COLLECT_EPOCHS_REQUESTED"/>
+ </enum>
+ 
+ <!-- LINT.ThenChange(//extensions/browser/extension_event_histogram_value.h:HistogramValue) -->
+@@ -3314,6 +3324,7 @@ Called by update_extension_permission.py
+   <int value="270" label="kBluetoothSocket"/>
+   <int value="271" label="kBluetoothLowEnergy"/>
+   <int value="272" label="kBluetoothPeripheral"/>
++  <int value="273" label="kSyncVaultProvider"/>
+ </enum>
+ 
+ <enum name="ExtensionPinReason">
+--- a/extensions/browser/extension_event_histogram_value.h
++++ b/extensions/browser/extension_event_histogram_value.h
+@@ -17,6 +17,17 @@ namespace events {
+ //
+ // LINT.IfChange(HistogramValue)
+ enum HistogramValue {
++  SYNC_VAULT_PROVIDER_ON_CONFIGURE_REQUESTED = 10000,
++  SYNC_VAULT_PROVIDER_ON_LIST_VAULTS_REQUESTED = 10001,
++  SYNC_VAULT_PROVIDER_ON_CREATE_VAULT_REQUESTED = 10002,
++  SYNC_VAULT_PROVIDER_ON_RENAME_VAULT_REQUESTED = 10003,
++  SYNC_VAULT_PROVIDER_ON_READ_OBJECT_REQUESTED = 10004,
++  SYNC_VAULT_PROVIDER_ON_WRITE_OBJECT_REQUESTED = 10005,
++  SYNC_VAULT_PROVIDER_ON_WRAP_KEY_REQUESTED = 10006,
++  SYNC_VAULT_PROVIDER_ON_UNWRAP_KEY_REQUESTED = 10007,
++  SYNC_VAULT_PROVIDER_ON_CANCEL_REQUESTED = 10008,
++  SYNC_VAULT_PROVIDER_ON_COLLECT_EPOCHS_REQUESTED = 10009,
++
+   UNKNOWN = 0,
+ 
+   // Tests should use this for a stub histogram value (not UNKNOWN).
+--- a/extensions/browser/extension_function_histogram_value.h
++++ b/extensions/browser/extension_function_histogram_value.h
+@@ -58,6 +58,10 @@ namespace extensions::functions {
+ //
+ // LINT.IfChange(HistogramValue)
+ enum HistogramValue {
++  SYNCVAULTPROVIDER_RESPOND = 10000,
++  SYNCVAULTPROVIDER_NOTIFYVAULTCHANGED = 10001,
++  SYNCVAULTPROVIDER_NOTIFYPROVIDERSTATECHANGED = 10002,
++
+   UNKNOWN = 0,
+   WEBNAVIGATION_GETALLFRAMES = 1,
+   BROWSINGDATA_REMOVEWEBSQL = 2,
