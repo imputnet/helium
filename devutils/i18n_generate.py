@@ -19,7 +19,7 @@ from downloads import DownloadInfo # pylint: disable=wrong-import-order
 import utils.name_substitution_utils as namesub # pylint: disable=wrong-import-order
 
 PLATFORMS = ("windows", "macos", "linux")
-REPO_URL = "https://github.com/imputnet/openium-{repo}.git"
+REPO_URL = "https://github.com/imputnet/helium-{repo}.git"
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ONBOARDING_VERSION = DownloadInfo([ROOT_DIR / "deps.ini"])['onboarding'].version
 
@@ -122,6 +122,21 @@ def extract_strings_from_hunk(hunk, clean=False):
 
 def to_source_format(path, name, desc, meaning, message):
     """Takes an extracted XML tuple and converts it to the JSON format."""
+    # Platform patches and the pinned onboarding artifact still come from the
+    # upstream Helium repositories. Normalize their product identity while
+    # producing Openium's generated catalogue.
+    def rebrand(value):
+        if value is None:
+            return None
+        return value.replace('HELIUM', 'OPENIUM') \
+                    .replace('Helium', 'Openium') \
+                    .replace('helium', 'openium')
+
+    path = rebrand(path)
+    name = rebrand(name)
+    desc = rebrand(desc)
+    meaning = rebrand(meaning)
+    message = rebrand(message)
     context = namesub.replace_text(desc)[0]
     message = namesub.replace_text(message)[0]
 
@@ -143,9 +158,15 @@ def extract_strings(repo_root, platforms_dir):
             for source in extract_strings_from_hunk(hunk):
                 yield from to_source_format(patch.path, *source)
 
-    onboarding_path = platforms_dir / "onboarding" / "openium_onboarding_strings.grdp"
+    # The pinned onboarding build input is still hosted by the upstream Helium
+    # project. Translate its first-party identifiers while generating Openium's
+    # localization catalogue; the upstream artifact itself remains immutable.
+    onboarding_path = platforms_dir / "onboarding" / "helium_onboarding_strings.grdp"
     if onboarding_path.exists():
         onboarding_text = onboarding_path.read_text()
+        onboarding_text = onboarding_text.replace('HELIUM', 'OPENIUM') \
+                                         .replace('Helium', 'Openium') \
+                                         .replace('helium', 'openium')
         for source in extract_strings_from_hunk(onboarding_text, True):
             yield from to_source_format(
                 'components/openium_onboarding/openium_onboarding_strings.grdp', *source)
