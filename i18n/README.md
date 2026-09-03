@@ -1,5 +1,5 @@
-# Helium i18n
-This directory contains the translations for Helium browser UI strings.
+# Openium i18n
+This directory contains the translations for Openium browser UI strings.
 
 ## Files
 - `source.gen.json` - Auto-generated list of translatable strings extracted from
@@ -11,7 +11,7 @@ This directory contains the translations for Helium browser UI strings.
 
 ## Submitting translations
 **Do not open pull requests with new translations!** We run translations [in
-batches][pr], if you would like to contribute to the translation of Helium,
+batches][pr], if you would like to contribute to the translation of Openium,
 please wait for the next batch.
 
 If you are editing existing strings (e.g. you noticed some string(s) that are
@@ -23,7 +23,7 @@ best it can be. When reviewing translations for a specific language, focus on:
 - Accuracy of the translation relative to the `source` field
 - Correct preservation of `<ph>` placeholder tags
 - Appropriate formality register for the language
-- "Helium" and other brand names should not be translated
+- "Openium" and other brand names should not be translated
 
 If you notice an error or mistranslation in any of the strings, feel free
 to open a pull request to resolve it.
@@ -36,7 +36,7 @@ translators for that file. This would be preferrably done in a PR related to
 the file itself.
 
 ## Development
-When adding strings to Helium, you might need to regenerate the source
+When adding strings to Openium, you might need to regenerate the source
 file using `./devutils/i18n.py generate`. Do not generate machine translations
 of the strings, the maintainers will take care of this.
 
@@ -61,4 +61,4 @@ not by position. Each entry is an object:
 The `feminine`/`masculine` fields are only present when the
 translation genuinely differs by grammatical gender.
 
-[pr]: https://github.com/imputnet/helium/pulls?q=i18n+in%3Atitle+is%3Apr+is%3Aopen
+[pr]: https://github.com/shohail-mahmud/openium-/pulls?q=i18n+in%3Atitle+is%3Apr+is%3Aopen

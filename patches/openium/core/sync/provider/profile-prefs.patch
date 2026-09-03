@@ -1,0 +1,428 @@
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -242,6 +242,8 @@
+ #include "chrome/browser/background/extensions/background_mode_manager.h"
+ #endif
+ 
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ #include "chrome/browser/extensions/activity_log/activity_log.h"
+ #include "chrome/browser/extensions/commands/command_service.h"
+@@ -1902,6 +1904,8 @@ void RegisterProfilePrefs(user_prefs::Pr
+ 
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ 
++  browser_sync::private_sync_prefs::RegisterProfilePrefs(registry);
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+   RegisterAnimationPolicyPrefs(registry);
+   extensions::AudioAPI::RegisterUserPrefs(registry);
+--- /dev/null
++++ b/chrome/browser/sync/private_sync/private_sync_prefs.cc
+@@ -0,0 +1,266 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
++
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/base64.h"
++#include "base/json/values_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++
++namespace browser_sync::private_sync_prefs {
++
++namespace {
++
++constexpr char kSchemaVersionField[] = "schema_version";
++constexpr char kProviderKindField[] = "provider_kind";
++constexpr char kProviderIdField[] = "provider_id";
++constexpr char kVaultUuidField[] = "vault_uuid";
++constexpr char kEncryptedVaultKeyField[] = "encrypted_vault_key";
++constexpr char kKeyModeField[] = "key_mode";
++constexpr char kConsentFingerprintField[] = "consent_fingerprint";
++constexpr char kEncryptedCheckpointField[] = "encrypted_checkpoint";
++constexpr char kRecoveryKeyMode[] = "recovery_key";
++constexpr char kAccountBoundEnvelopeMode[] = "account_bound_envelope";
++constexpr char kExtensionProviderKind[] = "extension";
++
++constexpr char kAcceptedGenerationField[] = "accepted_generation";
++constexpr char kHeadDigestPrefixField[] = "head_digest_prefix";
++constexpr char kEntityCountField[] = "entity_count";
++constexpr char kStateBytesField[] = "state_bytes";
++constexpr char kLastAttemptField[] = "last_attempt";
++constexpr char kLastSuccessField[] = "last_success";
++constexpr char kLastErrorField[] = "last_error";
++
++bool IsKnownReconciliationError(int error) {
++  constexpr int kFirstError =
++      static_cast<int>(ReconciliationError::kAuthenticationRequired);
++  constexpr int kLastError = static_cast<int>(ReconciliationError::kMaxValue);
++  return error >= kFirstError && error <= kLastError;
++}
++
++}  // namespace
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterDictionaryPref(kConfiguration);
++  registry->RegisterDictionaryPref(kDiagnostics);
++}
++
++std::optional<Configuration> ReadConfiguration(const PrefService& prefs) {
++  const base::DictValue& value = prefs.GetDict(kConfiguration);
++  const std::string* provider_kind = value.FindString(kProviderKindField);
++  const std::string* provider_id = value.FindString(kProviderIdField);
++  const std::string* vault_uuid = value.FindString(kVaultUuidField);
++  const std::string* encrypted_key = value.FindString(kEncryptedVaultKeyField);
++  const std::string* key_mode = value.FindString(kKeyModeField);
++  const std::string* consent_fingerprint =
++      value.FindString(kConsentFingerprintField);
++  if (value.FindInt(kSchemaVersionField) != kCurrentSchemaVersion ||
++      !provider_kind || !provider_id || provider_id->empty() || !vault_uuid ||
++      !key_mode || !encrypted_key || !consent_fingerprint ||
++      consent_fingerprint->empty() ||
++      !base::Uuid::ParseLowercase(*vault_uuid).is_valid()) {
++    return std::nullopt;
++  }
++
++  std::optional<std::vector<uint8_t>> protected_key =
++      base::Base64Decode(*encrypted_key);
++  if (!protected_key || protected_key->empty()) {
++    return std::nullopt;
++  }
++  Configuration configuration;
++  if (*provider_kind == kExtensionProviderKind) {
++    configuration.provider.kind = private_sync::ProviderKind::kExtension;
++  } else {
++    return std::nullopt;
++  }
++  configuration.provider.id = *provider_id;
++  configuration.vault_uuid = *vault_uuid;
++  configuration.encrypted_vault_key = std::move(*protected_key);
++  if (*key_mode == kRecoveryKeyMode) {
++    configuration.key_mode = KeyMode::kRecoveryKey;
++  } else if (*key_mode == kAccountBoundEnvelopeMode) {
++    configuration.key_mode = KeyMode::kAccountBoundEnvelope;
++  } else {
++    return std::nullopt;
++  }
++  configuration.consent_fingerprint = *consent_fingerprint;
++
++  if (const std::string* encrypted_checkpoint =
++          value.FindString(kEncryptedCheckpointField)) {
++    std::optional<std::vector<uint8_t>> protected_checkpoint =
++        base::Base64Decode(*encrypted_checkpoint);
++    if (!protected_checkpoint || protected_checkpoint->empty()) {
++      return std::nullopt;
++    }
++    configuration.encrypted_checkpoint = std::move(*protected_checkpoint);
++  }
++  return configuration;
++}
++
++void WriteConfiguration(PrefService* prefs,
++                        const Configuration& configuration) {
++  base::DictValue value =
++      base::DictValue()
++          .Set(kSchemaVersionField, kCurrentSchemaVersion)
++          .Set(kProviderKindField, kExtensionProviderKind)
++          .Set(kProviderIdField, configuration.provider.id)
++          .Set(kVaultUuidField, configuration.vault_uuid)
++          .Set(kEncryptedVaultKeyField,
++               base::Base64Encode(configuration.encrypted_vault_key))
++          .Set(kKeyModeField,
++               configuration.key_mode == KeyMode::kAccountBoundEnvelope
++                   ? kAccountBoundEnvelopeMode
++                   : kRecoveryKeyMode)
++          .Set(kConsentFingerprintField, configuration.consent_fingerprint);
++  if (configuration.encrypted_checkpoint) {
++    value.Set(kEncryptedCheckpointField,
++              base::Base64Encode(*configuration.encrypted_checkpoint));
++  }
++  prefs->SetDict(kConfiguration, std::move(value));
++}
++
++void ClearConfiguration(PrefService* prefs) {
++  prefs->ClearPref(kConfiguration);
++}
++
++bool IsConfigured(const PrefService& prefs) {
++  return ReadConfiguration(prefs).has_value();
++}
++
++bool IsBlockingReconciliationError(ReconciliationError error) {
++  switch (error) {
++    case ReconciliationError::kInvalidData:
++    case ReconciliationError::kUnsupported:
++    case ReconciliationError::kRollback:
++    case ReconciliationError::kFork:
++    case ReconciliationError::kCheckpointPersistence:
++      return true;
++    case ReconciliationError::kAuthenticationRequired:
++    case ReconciliationError::kConflict:
++    case ReconciliationError::kNetwork:
++    case ReconciliationError::kTemporary:
++    case ReconciliationError::kQuotaExceeded:
++    case ReconciliationError::kAccessDenied:
++    case ReconciliationError::kAborted:
++    case ReconciliationError::kIncompleteHistory:
++      return false;
++  }
++  return true;
++}
++
++bool HasBlockingReconciliationError(const PrefService& prefs,
++                                    std::string_view vault_uuid) {
++  const base::Value* persisted = prefs.GetUserPrefValue(kDiagnostics);
++  if (!persisted) {
++    return false;
++  }
++  const base::DictValue* persisted_dict = persisted->GetIfDict();
++  if (!persisted_dict) {
++    return true;
++  }
++  const std::string* persisted_vault_uuid =
++      persisted_dict->FindString(kVaultUuidField);
++  if (!persisted_vault_uuid ||
++      !base::Uuid::ParseLowercase(*persisted_vault_uuid).is_valid()) {
++    return true;
++  }
++  if (*persisted_vault_uuid != vault_uuid) {
++    return false;
++  }
++  if (persisted_dict->FindInt(kSchemaVersionField) != kCurrentSchemaVersion) {
++    return true;
++  }
++  if (!persisted_dict->contains(kLastErrorField)) {
++    return false;
++  }
++  std::optional<int> error = persisted_dict->FindInt(kLastErrorField);
++  if (!error || !IsKnownReconciliationError(*error)) {
++    return true;
++  }
++  return IsBlockingReconciliationError(
++      static_cast<ReconciliationError>(*error));
++}
++
++std::optional<Diagnostics> ReadDiagnostics(const PrefService& prefs) {
++  const base::DictValue& value = prefs.GetDict(kDiagnostics);
++  if (value.FindInt(kSchemaVersionField) != kCurrentSchemaVersion) {
++    return std::nullopt;
++  }
++  const std::string* vault_uuid = value.FindString(kVaultUuidField);
++  if (!vault_uuid || !base::Uuid::ParseLowercase(*vault_uuid).is_valid()) {
++    return std::nullopt;
++  }
++
++  Diagnostics diagnostics;
++  diagnostics.vault_uuid = *vault_uuid;
++  if (const std::string* generation =
++          value.FindString(kAcceptedGenerationField)) {
++    base::StringToUint64(*generation, &diagnostics.accepted_generation);
++  }
++  if (const std::string* digest_prefix =
++          value.FindString(kHeadDigestPrefixField)) {
++    diagnostics.head_digest_prefix = *digest_prefix;
++  }
++  const std::string* entity_count = value.FindString(kEntityCountField);
++  const std::string* state_bytes = value.FindString(kStateBytesField);
++  if (entity_count && state_bytes) {
++    uint64_t parsed_entity_count = 0;
++    uint64_t parsed_state_bytes = 0;
++    if (base::StringToUint64(*entity_count, &parsed_entity_count) &&
++        base::StringToUint64(*state_bytes, &parsed_state_bytes)) {
++      diagnostics.state_statistics_available = true;
++      diagnostics.entity_count = parsed_entity_count;
++      diagnostics.state_bytes = parsed_state_bytes;
++    }
++  }
++  diagnostics.last_attempt =
++      base::ValueToTime(value.Find(kLastAttemptField)).value_or(base::Time());
++  diagnostics.last_success =
++      base::ValueToTime(value.Find(kLastSuccessField)).value_or(base::Time());
++  if (value.contains(kLastErrorField)) {
++    std::optional<int> error = value.FindInt(kLastErrorField);
++    if (!error || !IsKnownReconciliationError(*error)) {
++      return std::nullopt;
++    }
++    diagnostics.last_error = static_cast<ReconciliationError>(*error);
++  }
++  return diagnostics;
++}
++
++void WriteDiagnostics(PrefService* prefs, const Diagnostics& diagnostics) {
++  base::DictValue value =
++      base::DictValue()
++          .Set(kSchemaVersionField, kCurrentSchemaVersion)
++          .Set(kVaultUuidField, diagnostics.vault_uuid)
++          .Set(kAcceptedGenerationField,
++               base::NumberToString(diagnostics.accepted_generation))
++          .Set(kHeadDigestPrefixField, diagnostics.head_digest_prefix)
++          .Set(kLastAttemptField, base::TimeToValue(diagnostics.last_attempt));
++  if (diagnostics.state_statistics_available) {
++    value.Set(kEntityCountField,
++              base::NumberToString(diagnostics.entity_count));
++    value.Set(kStateBytesField, base::NumberToString(diagnostics.state_bytes));
++  }
++  if (!diagnostics.last_success.is_null()) {
++    value.Set(kLastSuccessField, base::TimeToValue(diagnostics.last_success));
++  }
++  if (diagnostics.last_error) {
++    value.Set(kLastErrorField, static_cast<int>(*diagnostics.last_error));
++  }
++  prefs->SetDict(kDiagnostics, std::move(value));
++}
++
++void ClearDiagnostics(PrefService* prefs) {
++  prefs->ClearPref(kDiagnostics);
++}
++
++}  // namespace browser_sync::private_sync_prefs
+--- /dev/null
++++ b/chrome/browser/sync/private_sync/private_sync_prefs.h
+@@ -0,0 +1,96 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PREFS_H_
++#define CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PREFS_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/time/time.h"
++#include "chrome/browser/sync/private_sync/private_sync_provider.h"
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace browser_sync::private_sync_prefs {
++
++inline constexpr char kConfiguration[] = "openium.private_sync.configuration";
++inline constexpr char kDiagnostics[] = "openium.private_sync.diagnostics";
++inline constexpr int kCurrentSchemaVersion = 1;
++
++enum class KeyMode {
++  kRecoveryKey,
++  kAccountBoundEnvelope,
++};
++
++struct Configuration {
++  private_sync::ProviderIdentity provider;
++  std::string vault_uuid;
++  std::vector<uint8_t> encrypted_vault_key;
++  KeyMode key_mode = KeyMode::kRecoveryKey;
++  std::string consent_fingerprint;
++  std::optional<std::vector<uint8_t>> encrypted_checkpoint;
++
++  bool operator==(const Configuration&) const = default;
++};
++
++enum class ReconciliationError {
++  // These values are persisted to disk. Entries should not be renumbered and
++  // numeric values should never be reused.
++  kAuthenticationRequired = 0,
++  kConflict = 1,
++  kNetwork = 2,
++  kTemporary = 3,
++  kQuotaExceeded = 4,
++  kAccessDenied = 5,
++  kInvalidData = 6,
++  kUnsupported = 7,
++  kAborted = 8,
++  kRollback = 9,
++  kFork = 10,
++  kIncompleteHistory = 11,
++  kCheckpointPersistence = 12,
++  kMaxValue = kCheckpointPersistence,
++};
++
++struct Diagnostics {
++  std::string vault_uuid;
++  uint64_t accepted_generation = 0;
++  std::string head_digest_prefix;
++  bool state_statistics_available = false;
++  uint64_t entity_count = 0;
++  uint64_t state_bytes = 0;
++  base::Time last_attempt;
++  base::Time last_success;
++  std::optional<ReconciliationError> last_error;
++
++  bool operator==(const Diagnostics&) const = default;
++};
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry);
++
++// Unknown schemas, malformed fields, and incomplete configurations are never
++// active. Callers may clear them, but must not attempt a partial migration.
++std::optional<Configuration> ReadConfiguration(const PrefService& prefs);
++void WriteConfiguration(PrefService* prefs, const Configuration& configuration);
++void ClearConfiguration(PrefService* prefs);
++bool IsConfigured(const PrefService& prefs);
++
++// Integrity and local-durability failures are sticky. They disable remote
++// reconciliation for the matching vault until the user explicitly retries;
++// transient provider and network failures remain eligible for backoff.
++bool IsBlockingReconciliationError(ReconciliationError error);
++bool HasBlockingReconciliationError(const PrefService& prefs,
++                                    std::string_view vault_uuid);
++std::optional<Diagnostics> ReadDiagnostics(const PrefService& prefs);
++void WriteDiagnostics(PrefService* prefs, const Diagnostics& diagnostics);
++void ClearDiagnostics(PrefService* prefs);
++
++}  // namespace browser_sync::private_sync_prefs
++
++#endif  // CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PREFS_H_
+--- a/chrome/browser/sync/BUILD.gn
++++ b/chrome/browser/sync/BUILD.gn
+@@ -31,6 +31,9 @@ source_set("sync") {
+     "glue/sync_start_util.h",
+     "local_or_syncable_bookmark_sync_service_factory.cc",
+     "local_or_syncable_bookmark_sync_service_factory.h",
++    "private_sync/private_sync_prefs.cc",
++    "private_sync/private_sync_prefs.h",
++    "private_sync/private_sync_provider.h",
+     "prefs/chrome_syncable_prefs_database.cc",
+     "prefs/chrome_syncable_prefs_database.h",
+     "prefs/cross_device_pref_tracker/chrome_cross_device_pref_provider.cc",
+--- /dev/null
++++ b/chrome/browser/sync/private_sync/private_sync_provider.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PROVIDER_H_
++#define CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PROVIDER_H_
++
++#include <string>
++
++namespace browser_sync::private_sync {
++
++enum class ProviderKind {
++  kExtension,
++};
++
++struct ProviderIdentity {
++  ProviderKind kind = ProviderKind::kExtension;
++  std::string id;
++
++  bool operator==(const ProviderIdentity&) const = default;
++};
++
++}  // namespace browser_sync::private_sync
++
++#endif  // CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_PROVIDER_H_

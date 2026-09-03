@@ -60,7 +60,7 @@ def b_all_patches_have_no_trailing_whitespace():
 
 def c_all_new_files_have_license_header():
     for patch in series:
-        if 'helium' not in patch:
+        if 'openium' not in patch:
             continue
 
         added_files = filter(lambda f: f.is_added_file, _read_patch(patch))
@@ -70,12 +70,12 @@ def c_all_new_files_have_license_header():
                 continue
 
             assert any('terms of the GPL-3.0 license' in str(hunk) for hunk in file), \
-                   f"File {file.path} was added in {patch}, but contains no Helium license header"
+                   f"File {file.path} was added in {patch}, but contains no Openium license header"
 
 
 def c_all_new_headers_have_correct_guard():
     for patch in series:
-        if 'helium' not in patch:
+        if 'openium' not in patch:
             continue
 
         added_files = filter(lambda f: f.is_added_file and f.path.endswith('.h'),
@@ -119,7 +119,7 @@ def c_all_new_headers_have_correct_guard():
 
 def d_no_whitespace_only_changes():
     for patch in series:
-        if 'helium' not in patch:
+        if 'openium' not in patch:
             continue
 
         for file in _read_patch(patch):

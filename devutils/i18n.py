@@ -20,7 +20,7 @@ OUT_PATH = REPO_ROOT / 'i18n' / 'source.gen.json'
 
 def parse_args():
     """CLI arg parsing"""
-    parser = argparse.ArgumentParser(description='i18n tooling for Helium')
+    parser = argparse.ArgumentParser(description='i18n tooling for Openium')
     subparsers = parser.add_subparsers(dest='command', required=True)
     base = subparsers.add_parser('generate', help='Extract translatable strings from patches')
     base.add_argument('-p',

@@ -1,0 +1,174 @@
+--- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+@@ -125,16 +125,38 @@ class FrameGrabHandle : public views::Vi
+ BEGIN_METADATA(FrameGrabHandle)
+ END_METADATA
+ 
+-bool ShouldShowNewTabButton(BrowserWindowInterface* browser) {
++bool CanCreateNewTabButton(BrowserWindowInterface* browser) {
+   // `browser` can be null in tests and `app_controller` will be null if
+   // the browser is not for an app.
+-  if (browser) {
+-    auto* const controller = web_app::AppBrowserController::From(browser);
+-    if (controller && controller->ShouldHideNewTabButton()) {
+-      return false;
+-    }
++  if (!browser) {
++    return true;
+   }
+-  return true;
++
++  auto* const app_controller = web_app::AppBrowserController::From(browser);
++  return !app_controller || !app_controller->ShouldHideNewTabButton();
++}
++
++bool ShouldShowNewTabButton(BrowserWindowInterface* browser) {
++  if (!CanCreateNewTabButton(browser)) {
++    return false;
++  }
++
++  if (!browser) {
++    return true;
++  }
++
++  auto* const layout_controller = OpeniumLayoutStateController::From(browser);
++
++  if (!layout_controller) {
++    return true;
++  }
++
++  return layout_controller->IsClassicLayout() ||
++         layout_controller->IsCompactLayout();
++}
++
++views::View* GetVisibleView(views::View* view) {
++  return view && view->GetVisible() ? view : nullptr;
+ }
+ 
+ // Updates the border of `view` if the insets need to be updated.
+@@ -232,7 +254,7 @@ HorizontalTabStripRegionViewOld::Horizon
+                                views::MaximumFlexSizeRule::kPreferred);
+   tab_strip_->SetProperty(views::kFlexBehaviorKey, tab_strip_flex_spec);
+ 
+-  if (ShouldShowNewTabButton(browser)) {
++  if (CanCreateNewTabButton(browser)) {
+     std::unique_ptr<TabStripControlButton> tab_strip_control_button =
+         std::make_unique<NewTabButton>(
+             base::BindRepeating(&TabStrip::NewTabButtonPressed,
+@@ -253,6 +275,7 @@ HorizontalTabStripRegionViewOld::Horizon
+     new_tab_button_->SetTriggerableEventFlags(
+         new_tab_button_->GetTriggerableEventFlags() |
+         ui::EF_MIDDLE_MOUSE_BUTTON);
++    new_tab_button_->SetVisible(ShouldShowNewTabButton(browser));
+   }
+ 
+   reserved_grab_handle_space_ =
+@@ -365,6 +388,14 @@ void HorizontalTabStripRegionViewOld::La
+     return;
+   }
+ 
++  if (new_tab_button_) {
++    const bool should_show_new_tab_button =
++        ShouldShowNewTabButton(tab_strip_->GetBrowserWindowInterface());
++    if (new_tab_button_->GetVisible() != should_show_new_tab_button) {
++      new_tab_button_->SetVisible(should_show_new_tab_button);
++    }
++  }
++
+   UpdateTabStripMargin();
+   LayoutSuperclass<views::AccessiblePaneView>(this);
+ 
+@@ -379,7 +410,7 @@ void HorizontalTabStripRegionViewOld::La
+     AdjustViewBoundsRect(combo_button_, leading_offset);
+   }
+ 
+-  views::View* button_to_paint_to_layer = new_tab_button_;
++  views::View* button_to_paint_to_layer = GetVisibleView(new_tab_button_);
+ 
+   if (button_to_paint_to_layer) {
+     // The button needs to be layered on top of the tabstrip to achieve
+@@ -655,7 +686,7 @@ void HorizontalTabStripRegionViewOld::Up
+   // The new tab button overlaps the tabstrip. Render it to a layer and adjust
+   // the tabstrip right margin to reserve space for it.
+   std::optional<int> tab_strip_right_margin;
+-  views::View* button_to_paint_to_layer = new_tab_button_;
++  views::View* button_to_paint_to_layer = GetVisibleView(new_tab_button_);
+ 
+   if (button_to_paint_to_layer) {
+     button_to_paint_to_layer->SetPaintToLayer();
+@@ -719,12 +750,10 @@ void HorizontalTabStripRegionViewOld::Up
+ 
+   UpdateButtonBorders();
+ 
+-  if (tab_strip_left_margin.has_value() || tab_strip_right_margin.has_value()) {
+-    tab_strip_->SetProperty(
+-        views::kMarginsKey,
+-        gfx::Insets::TLBR(0, tab_strip_left_margin.value_or(0), 0,
+-                          tab_strip_right_margin.value_or(0)));
+-  }
++  tab_strip_->SetProperty(
++      views::kMarginsKey,
++      gfx::Insets::TLBR(0, tab_strip_left_margin.value_or(0), 0,
++                        tab_strip_right_margin.value_or(0)));
+ }
+ 
+ void HorizontalTabStripRegionViewOld::AdjustViewBoundsRect(View* view,
+--- a/chrome/browser/ui/views/tabs/tab_style_views.cc
++++ b/chrome/browser/ui/views/tabs/tab_style_views.cc
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/themes/theme_properties.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/openium/openium_layout_state_controller.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -29,6 +30,7 @@
+ #include "chrome/browser/ui/views/tabs/tab/glow_hover_controller.h"
+ #include "chrome/browser/ui/views/tabs/tab_group_underline.h"
+ #include "chrome/browser/ui/views/tabs/tab_slot_controller.h"
++#include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/grit/theme_resources.h"
+ #include "third_party/skia/include/core/SkPath.h"
+ #include "third_party/skia/include/core/SkPathBuilder.h"
+@@ -46,6 +48,29 @@
+ 
+ namespace {
+ 
++bool ShouldShowTrailingSeparatorAfterLastTab(
++    BrowserWindowInterface* browser_window_interface) {
++  // Match HorizontalTabStripRegionView::ShouldShowNewTabButton().
++  if (!browser_window_interface) {
++    return true;
++  }
++
++  auto* const app_controller =
++      web_app::AppBrowserController::From(browser_window_interface);
++  if (app_controller && app_controller->ShouldHideNewTabButton()) {
++    return false;
++  }
++
++  auto* const layout_controller =
++      OpeniumLayoutStateController::From(browser_window_interface);
++  if (!layout_controller) {
++    return true;
++  }
++
++  return layout_controller->IsClassicLayout() ||
++         layout_controller->IsCompactLayout();
++}
++
+ class TabStyleViewsImpl : public TabStyleViews {
+  public:
+   explicit TabStyleViewsImpl(Tab* tab);
+@@ -692,6 +717,10 @@ float TabStyleViewsImpl::GetSeparatorOpa
+   // combo button with a non-transparent background in place of the new tab
+   // button, we should not show the trailing separator.
+   if (!adjacent_tab) {
++    if (!leading && !ShouldShowTrailingSeparatorAfterLastTab(
++                        tab()->controller()->GetBrowserWindowInterface())) {
++      return 0.0f;
++    }
+     return leading ? 0.0f : shown_separator_opacity;
+   }
+ 

@@ -77,11 +77,11 @@ PRUNING_EXCLUDE_PATTERNS = [
     'third_party/ublock/lib/lz4/lz4-block-codec.wasm',
     'third_party/ublock/lib/publicsuffixlist/wasm/publicsuffixlist.wasm',
     'third_party/ublock/web_accessible_resources/noop-1s.mp4',
-    # Exclusions for Helium onboarding
-    'components/helium_onboarding/node_modules/@esbuild/*/bin/esbuild',
-    'components/helium_onboarding/node_modules/@esbuild/*/esbuild.exe',
-    'components/helium_onboarding/node_modules/@rollup/*/rollup.*.node',
-    'components/helium_onboarding/node_modules/fsevents/fsevents.node',
+    # Exclusions for Openium onboarding
+    'components/openium_onboarding/node_modules/@esbuild/*/bin/esbuild',
+    'components/openium_onboarding/node_modules/@esbuild/*/esbuild.exe',
+    'components/openium_onboarding/node_modules/@rollup/*/rollup.*.node',
+    'components/openium_onboarding/node_modules/fsevents/fsevents.node',
     # Exclusions for safe file extensions
     '*.avif',
     '*.ttf',
@@ -140,9 +140,9 @@ DOMAIN_EXCLUDE_PREFIXES = [
     'chrome/common/extensions/api/_api_features.json',
     'extensions/common/extension_urls.cc',
     'extensions/browser/updater/safe_manifest_parser.cc',
-    # Helium components
+    # Openium components
     'third_party/ublock/',
-    'components/helium_onboarding/',
+    'components/openium_onboarding/',
 ]
 
 # pylint: enable=line-too-long

@@ -2,7 +2,7 @@
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """
-String extraction from Helium patches for translation.
+String extraction from Openium patches for translation.
 """
 
 import subprocess
@@ -19,7 +19,7 @@ from downloads import DownloadInfo # pylint: disable=wrong-import-order
 import utils.name_substitution_utils as namesub # pylint: disable=wrong-import-order
 
 PLATFORMS = ("windows", "macos", "linux")
-REPO_URL = "https://github.com/imputnet/helium-{repo}.git"
+REPO_URL = "https://github.com/imputnet/openium-{repo}.git"
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ONBOARDING_VERSION = DownloadInfo([ROOT_DIR / "deps.ini"])['onboarding'].version
 
@@ -143,12 +143,12 @@ def extract_strings(repo_root, platforms_dir):
             for source in extract_strings_from_hunk(hunk):
                 yield from to_source_format(patch.path, *source)
 
-    onboarding_path = platforms_dir / "onboarding" / "helium_onboarding_strings.grdp"
+    onboarding_path = platforms_dir / "onboarding" / "openium_onboarding_strings.grdp"
     if onboarding_path.exists():
         onboarding_text = onboarding_path.read_text()
         for source in extract_strings_from_hunk(onboarding_text, True):
             yield from to_source_format(
-                'components/helium_onboarding/helium_onboarding_strings.grdp', *source)
+                'components/openium_onboarding/openium_onboarding_strings.grdp', *source)
 
 
 def run(args, repo_root):

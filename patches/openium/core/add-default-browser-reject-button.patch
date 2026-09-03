@@ -1,0 +1,107 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -748,6 +748,11 @@ inline constexpr char kExtensionCommands
+ inline constexpr char kPluginsAlwaysOpenPdfExternally[] =
+     "plugins.always_open_pdf_externally";
+ 
++// Boolean indicating that the user has rejected setting
++// the browser as default for an indefinite amount of time.
++inline constexpr char kOpeniumDefaultBrowserRejected[] =
++    "openium.browser.default_browser_infobar_rejected";
++
+ // base::Time containing time at which the default browser infobar was last
+ // dismissed by the user.
+ inline constexpr char kDefaultBrowserInfobarLastDeclinedTime[] =
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -86,6 +86,8 @@ void RegisterBrowserPrefs(PrefRegistrySi
+   registry->RegisterIntegerPref(prefs::kDefaultBrowserDeclinedCount, 0);
+   registry->RegisterTimePref(prefs::kDefaultBrowserFirstShownTime,
+                              base::Time());
++  registry->RegisterBooleanPref(prefs::kOpeniumDefaultBrowserRejected, false);
++
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC)
+   registry->RegisterTimePref(prefs::kPdfInfoBarLastShown, base::Time());
+   registry->RegisterIntegerPref(prefs::kPdfInfoBarTimesShown, 0);
+--- a/chrome/browser/ui/startup/infobar_utils.cc
++++ b/chrome/browser/ui/startup/infobar_utils.cc
+@@ -212,6 +212,11 @@ void AddInfoBarsIfNecessary(BrowserWindo
+   }
+ #endif
+ 
++  PrefService* local_state = g_browser_process->local_state();
++  if (local_state && local_state->GetBoolean(prefs::kOpeniumDefaultBrowserRejected)) {
++    return;
++  }
++
+ #if !BUILDFLAG(IS_CHROMEOS) && !BUILDFLAG(IS_ANDROID)
+   if (is_web_app ||
+       startup_command_line.HasSwitch(switches::kNoDefaultBrowserCheck) ||
+--- a/chrome/browser/ui/startup/default_browser_prompt/default_browser_infobar_delegate.cc
++++ b/chrome/browser/ui/startup/default_browser_prompt/default_browser_infobar_delegate.cc
+@@ -7,14 +7,17 @@
+ #include <memory>
+ 
+ #include "base/types/pass_key.h"
++#include "chrome/browser/browser_process.h"
+ #include "chrome/browser/infobars/confirm_infobar_creator.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/startup/default_browser_prompt/default_browser_prompt_prefs.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/grit/branded_strings.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/infobars/core/confirm_infobar_delegate.h"
+ #include "components/infobars/core/infobar.h"
+ #include "components/omnibox/browser/vector_icons.h"
++#include "components/prefs/pref_service.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/ui_base_features.h"
+@@ -71,13 +74,15 @@ std::u16string DefaultBrowserInfoBarDele
+ }
+ 
+ int DefaultBrowserInfoBarDelegate::GetButtons() const {
+-  return BUTTON_OK;
++  return BUTTON_OK | BUTTON_CANCEL;
+ }
+ 
+ std::u16string DefaultBrowserInfoBarDelegate::GetButtonLabel(
+     InfoBarButton button) const {
+-  DCHECK_EQ(BUTTON_OK, button);
+-  return l10n_util::GetStringUTF16(IDS_DEFAULT_BROWSER_INFOBAR_OK_BUTTON_LABEL);
++  DCHECK(button == BUTTON_OK || button == BUTTON_CANCEL);
++  return l10n_util::GetStringUTF16(
++    button == BUTTON_OK ? IDS_DEFAULT_BROWSER_INFOBAR_OK_BUTTON_LABEL
++                        : IDS_CARET_BROWSING_DO_NOT_ASK);
+ }
+ 
+ bool DefaultBrowserInfoBarDelegate::Accept() {
+@@ -89,6 +94,18 @@ bool DefaultBrowserInfoBarDelegate::Acce
+   return ConfirmInfoBarDelegate::Accept();
+ }
+ 
++bool DefaultBrowserInfoBarDelegate::Cancel() {
++  PrefService* local_state = g_browser_process->local_state();
++  if (!local_state) {
++    return true;
++  }
++
++  local_state->SetBoolean(prefs::kOpeniumDefaultBrowserRejected, true);
++  ConfirmInfoBarDelegate::InfoBarDismissed();
++
++  return ConfirmInfoBarDelegate::Cancel();
++}
++
+ bool DefaultBrowserInfoBarDelegate::ShouldHideInFullscreen() const {
+   return true;
+ }
+--- a/chrome/browser/ui/startup/default_browser_prompt/default_browser_infobar_delegate.h
++++ b/chrome/browser/ui/startup/default_browser_prompt/default_browser_infobar_delegate.h
+@@ -47,6 +47,7 @@ class DefaultBrowserInfoBarDelegate : pu
+   int GetButtons() const override;
+   std::u16string GetButtonLabel(InfoBarButton button) const override;
+   bool Accept() override;
++  bool Cancel() override;
+   bool ShouldHideInFullscreen() const override;
+ 
+   // The WebContents's corresponding profile.

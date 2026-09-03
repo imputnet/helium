@@ -2,7 +2,7 @@
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """
-Translation of Helium strings using an LLM backend.
+Translation of Openium strings using an LLM backend.
 """
 
 import json
@@ -63,7 +63,7 @@ def llm_chat(prompt, data):
 
 def run_command(cmd, data):
     """Run a non-interactive CLI backend."""
-    with tempfile.TemporaryDirectory(prefix='helium-i18n-cmd-') as cwd:
+    with tempfile.TemporaryDirectory(prefix='openium-i18n-cmd-') as cwd:
         try:
             proc = subprocess.run(cmd,
                                   input=data,
