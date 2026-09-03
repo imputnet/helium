@@ -122,6 +122,7 @@ def extract_strings_from_hunk(hunk, clean=False):
 
 def to_source_format(path, name, desc, meaning, message):
     """Takes an extracted XML tuple and converts it to the JSON format."""
+
     # Platform patches and the pinned onboarding artifact still come from the
     # upstream Helium repositories. Normalize their product identity while
     # producing Openium's generated catalogue.
