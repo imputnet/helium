@@ -1,0 +1,284 @@
+--- /dev/null
++++ b/chrome/browser/extensions/api/sync_vault_provider/BUILD.gn
+@@ -0,0 +1,23 @@
++# Copyright 2026 The Helium Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import("//extensions/buildflags/buildflags.gni")
++
++assert(enable_extensions)
++
++source_set("sync_vault_provider") {
++  sources = [
++    "sync_vault_provider_service.cc",
++    "sync_vault_provider_service.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//chrome/browser/profiles:profile",
++    "//chrome/common/extensions",
++    "//components/keyed_service/core",
++    "//extensions/browser",
++    "//extensions/common",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/extensions/api/sync_vault_provider/sync_vault_provider_service.cc
+@@ -0,0 +1,153 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/extensions/api/sync_vault_provider/sync_vault_provider_service.h"
++
++#include <utility>
++
++#include "base/check.h"
++#include "chrome/browser/profiles/profile_selections.h"
++#include "chrome/common/extensions/api/sync_vault_provider/sync_vault_provider_manifest_handler.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_registry_factory.h"
++#include "extensions/common/extension.h"
++
++namespace extensions {
++
++SyncVaultProviderService::SyncVaultProviderService(
++    content::BrowserContext* browser_context)
++    : extension_registry_(ExtensionRegistry::Get(browser_context)) {
++  CHECK(extension_registry_);
++  registry_observation_.Observe(extension_registry_);
++}
++
++SyncVaultProviderService::~SyncVaultProviderService() = default;
++
++std::vector<const Extension*> SyncVaultProviderService::GetAvailableProviders()
++    const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  std::vector<const Extension*> providers;
++  for (const scoped_refptr<const Extension>& extension :
++       extension_registry_->enabled_extensions()) {
++    if (SyncVaultProviderInfo::Get(extension.get())) {
++      providers.push_back(extension.get());
++    }
++  }
++  return providers;
++}
++
++bool SyncVaultProviderService::SelectProvider(const ExtensionId& extension_id) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  const Extension* extension =
++      extension_registry_->enabled_extensions().GetByID(extension_id);
++  if (!extension || !SyncVaultProviderInfo::Get(extension)) {
++    return false;
++  }
++  if (selected_provider_id_ == extension_id) {
++    return true;
++  }
++  selected_provider_id_ = extension_id;
++  for (Observer& observer : observers_) {
++    observer.OnSyncVaultProviderSelectionChanged(selected_provider_id_);
++    observer.OnSyncVaultProviderAvailabilityChanged(true);
++  }
++  return true;
++}
++
++void SyncVaultProviderService::ClearSelectedProvider() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!selected_provider_id_) {
++    return;
++  }
++  const bool was_available = GetSelectedProvider() != nullptr;
++  selected_provider_id_.reset();
++  for (Observer& observer : observers_) {
++    observer.OnSyncVaultProviderSelectionChanged(std::nullopt);
++    if (was_available) {
++      observer.OnSyncVaultProviderAvailabilityChanged(false);
++    }
++  }
++}
++
++const Extension* SyncVaultProviderService::GetSelectedProvider() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!selected_provider_id_) {
++    return nullptr;
++  }
++  const Extension* extension =
++      extension_registry_->enabled_extensions().GetByID(*selected_provider_id_);
++  return extension && SyncVaultProviderInfo::Get(extension) ? extension
++                                                            : nullptr;
++}
++
++void SyncVaultProviderService::AddObserver(Observer* observer) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  observers_.AddObserver(observer);
++}
++
++void SyncVaultProviderService::RemoveObserver(Observer* observer) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  observers_.RemoveObserver(observer);
++}
++
++void SyncVaultProviderService::Shutdown() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  registry_observation_.Reset();
++  selected_provider_id_.reset();
++}
++
++void SyncVaultProviderService::OnExtensionLoaded(
++    content::BrowserContext* browser_context,
++    const Extension* extension) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (selected_provider_id_ && *selected_provider_id_ == extension->id() &&
++      SyncVaultProviderInfo::Get(extension)) {
++    for (Observer& observer : observers_) {
++      observer.OnSyncVaultProviderAvailabilityChanged(true);
++    }
++  }
++}
++
++void SyncVaultProviderService::OnExtensionUnloaded(
++    content::BrowserContext* browser_context,
++    const Extension* extension,
++    UnloadedExtensionReason reason) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (selected_provider_id_ && *selected_provider_id_ == extension->id()) {
++    for (Observer& observer : observers_) {
++      observer.OnSyncVaultProviderAvailabilityChanged(false);
++    }
++  }
++}
++
++// static
++SyncVaultProviderServiceFactory*
++SyncVaultProviderServiceFactory::GetInstance() {
++  static base::NoDestructor<SyncVaultProviderServiceFactory> instance;
++  return instance.get();
++}
++
++// static
++SyncVaultProviderService* SyncVaultProviderServiceFactory::GetForBrowserContext(
++    content::BrowserContext* context) {
++  return static_cast<SyncVaultProviderService*>(
++      GetInstance()->GetServiceForBrowserContext(context, /*create=*/true));
++}
++
++SyncVaultProviderServiceFactory::SyncVaultProviderServiceFactory()
++    : ProfileKeyedServiceFactory(
++          "SyncVaultProviderService",
++          ProfileSelections::BuildRedirectedInIncognito()) {
++  DependsOn(ExtensionRegistryFactory::GetInstance());
++}
++
++SyncVaultProviderServiceFactory::~SyncVaultProviderServiceFactory() = default;
++
++std::unique_ptr<KeyedService>
++SyncVaultProviderServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  return std::make_unique<SyncVaultProviderService>(context);
++}
++
++}  // namespace extensions
+--- /dev/null
++++ b/chrome/browser/extensions/api/sync_vault_provider/sync_vault_provider_service.h
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_EXTENSIONS_API_SYNC_VAULT_PROVIDER_SYNC_VAULT_PROVIDER_SERVICE_H_
++#define CHROME_BROWSER_EXTENSIONS_API_SYNC_VAULT_PROVIDER_SYNC_VAULT_PROVIDER_SERVICE_H_
++
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/no_destructor.h"
++#include "base/observer_list.h"
++#include "base/scoped_observation.h"
++#include "base/sequence_checker.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "extensions/browser/extension_registry_observer.h"
++#include "extensions/common/extension_id.h"
++
++namespace content {
++class BrowserContext;
++}
++
++namespace extensions {
++
++class Extension;
++class ExtensionRegistry;
++
++class SyncVaultProviderService : public KeyedService,
++                                 public ExtensionRegistryObserver {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnSyncVaultProviderSelectionChanged(
++        const std::optional<ExtensionId>& extension_id) {}
++    virtual void OnSyncVaultProviderAvailabilityChanged(bool available) {}
++
++   protected:
++    ~Observer() override = default;
++  };
++
++  explicit SyncVaultProviderService(content::BrowserContext* browser_context);
++  ~SyncVaultProviderService() override;
++
++  SyncVaultProviderService(const SyncVaultProviderService&) = delete;
++  SyncVaultProviderService& operator=(const SyncVaultProviderService&) = delete;
++
++  std::vector<const Extension*> GetAvailableProviders() const;
++  bool SelectProvider(const ExtensionId& extension_id);
++  void ClearSelectedProvider();
++  const Extension* GetSelectedProvider() const;
++  const std::optional<ExtensionId>& selected_provider_id() const {
++    return selected_provider_id_;
++  }
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++  // KeyedService:
++  void Shutdown() override;
++
++ private:
++  // ExtensionRegistryObserver:
++  void OnExtensionLoaded(content::BrowserContext* browser_context,
++                         const Extension* extension) override;
++  void OnExtensionUnloaded(content::BrowserContext* browser_context,
++                           const Extension* extension,
++                           UnloadedExtensionReason reason) override;
++
++  raw_ptr<ExtensionRegistry> extension_registry_;
++  std::optional<ExtensionId> selected_provider_id_;
++  base::ObserverList<Observer> observers_;
++  base::ScopedObservation<ExtensionRegistry, ExtensionRegistryObserver>
++      registry_observation_{this};
++
++  SEQUENCE_CHECKER(sequence_checker_);
++};
++
++class SyncVaultProviderServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  static SyncVaultProviderServiceFactory* GetInstance();
++  static SyncVaultProviderService* GetForBrowserContext(
++      content::BrowserContext* context);
++
++ private:
++  friend class base::NoDestructor<SyncVaultProviderServiceFactory>;
++
++  SyncVaultProviderServiceFactory();
++  ~SyncVaultProviderServiceFactory() override;
++
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++};
++
++}  // namespace extensions
++
++#endif  // CHROME_BROWSER_EXTENSIONS_API_SYNC_VAULT_PROVIDER_SYNC_VAULT_PROVIDER_SERVICE_H_
