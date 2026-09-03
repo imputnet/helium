@@ -1,0 +1,280 @@
+--- a/chrome/browser/ui/views/tabs/tab/tab_icon.cc
++++ b/chrome/browser/ui/views/tabs/tab/tab_icon.cc
+@@ -11,6 +11,7 @@
+ #include "base/time/default_tick_clock.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
++#include "cc/paint/color_filter.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/favicon/favicon_utils.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+@@ -27,6 +28,7 @@
+ #include "components/grit/components_scaled_resources.h"
+ #include "components/performance_manager/public/user_tuning/prefs.h"
+ #include "components/prefs/pref_service.h"
++#include "third_party/skia/include/effects/SkColorMatrix.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/resource/resource_bundle.h"
+ #include "ui/base/theme_provider.h"
+@@ -57,11 +59,11 @@
+ namespace {
+ 
+ constexpr int kAttentionIndicatorRadius = 3;
++constexpr float kDiscardedFaviconOpacity = 0.5f;
+ constexpr int kLoadingAnimationStrokeWidthDp = 2;
+ 
+-bool NetworkStateIsAnimated(tabs::TabNetworkState network_state) {
+-  return network_state != tabs::TabNetworkState::kNone &&
+-         network_state != tabs::TabNetworkState::kError;
++bool NetworkStateIsAnimated(tabs::TabNetworkState) {
++  return false;
+ }
+ 
+ // Helper class that manages the compositor-driven throbber animation.
+@@ -236,12 +238,7 @@ void TabIcon::StepLoadingAnimation(const
+   }
+ }
+ 
+-void TabIcon::ResizeDiscardIndicatorRadiusForWidth(int width) {
+-  increased_discard_indicator_radius_ =
+-      width >= gfx::kFaviconSize + 2 * kIncreasedDiscardIndicatorRadiusDp
+-          ? kIncreasedDiscardIndicatorRadiusDp
+-          : 0;
+-}
++void TabIcon::ResizeDiscardIndicatorRadiusForWidth(int) {}
+ 
+ void TabIcon::OnDiscardRingTreatmentEnabledChanged() {
+   discard_ring_treatment_enabled_ =
+@@ -254,13 +251,8 @@ void TabIcon::OnDiscardRingTreatmentEnab
+     was_discard_indicator_shown_ = show_discard_indicator;
+ 
+     // Directly set animations to their end states and do not animate.
+-    if (show_discard_indicator) {
+-      tab_discard_animation_.SetCurrentValue(1);
+-      favicon_size_animation_.Reset(0);
+-    } else {
+-      tab_discard_animation_.SetCurrentValue(0);
+-      favicon_size_animation_.Reset(1);
+-    }
++    tab_discard_animation_.Reset(show_discard_indicator ? 1.0 : 0.0);
++    UpdateThrobber();
+     SchedulePaint();
+   }
+ }
+@@ -284,8 +276,9 @@ void TabIcon::OnPaint(gfx::Canvas* canva
+   if (!GetShowingLoadingAnimation() && GetShowingAttentionIndicator() &&
+       !should_display_crashed_favicon_) {
+     PaintAttentionIndicatorAndIcon(canvas, GetIconToPaint(), icon_bounds);
+-  } else if (was_discard_indicator_shown_) {
+-    PaintDiscardRingAndIcon(canvas, GetIconToPaint(), icon_bounds);
++  } else if (was_discard_indicator_shown_ ||
++             tab_discard_animation_.is_animating()) {
++    PaintDiscardedFavicon(canvas, GetIconToPaint(), icon_bounds);
+   } else {
+     MaybePaintFavicon(canvas, GetIconToPaint(), icon_bounds);
+   }
+@@ -323,7 +316,6 @@ void TabIcon::OnThemeChanged() {
+ }
+ 
+ void TabIcon::AnimationProgressed(const gfx::Animation* animation) {
+-  UpdateThrobber();
+   SchedulePaint();
+ }
+ 
+@@ -366,30 +358,39 @@ void TabIcon::PaintAttentionIndicatorAnd
+   canvas->DrawCircle(circle_center, kAttentionIndicatorRadius, indicator_flags);
+ }
+ 
+-void TabIcon::PaintDiscardRingAndIcon(gfx::Canvas* canvas,
+-                                      const gfx::ImageSkia& icon,
+-                                      const gfx::Rect& icon_bounds) {
+-  // Fades in the discard ring and smaller favicon
+-  MaybePaintFavicon(canvas, icon, icon_bounds);
+-
+-  // Increase the bounds of the discard ring beyond the icon bounds if there is
+-  // enough space in the tab. This is safe because in the constructor, we have
+-  // already added insets so that the larger discard ring can expand into them
+-  // and won't be clipped, and the icon bounds will be inside those insets.
+-  gfx::Rect discard_ring_bounds = icon_bounds;
+-  discard_ring_bounds.Outset(increased_discard_indicator_radius_);
+-
+-  const ui::ColorProvider* color_provider = GetColorProvider();
+-  const views::Widget* widget = GetWidget();
+-  SkColor ring_color =
+-      color_provider->GetColor(widget && widget->ShouldPaintAsActive()
+-                                   ? kColorTabDiscardRingFrameActive
+-                                   : kColorTabDiscardRingFrameInactive);
+-
+-  // Painting Discard Ring
+-  PaintRingDottedPath(
+-      canvas, discard_ring_bounds, ring_color,
+-      /*opacity_ratio=*/tab_discard_animation_.GetCurrentValue());
++void TabIcon::PaintDiscardedFavicon(gfx::Canvas* canvas,
++                                    const gfx::ImageSkia& icon,
++                                    const gfx::Rect& bounds) {
++  TRACE_EVENT0("views", "TabIcon::PaintDiscardedFavicon");
++
++  if (icon.isNull()) {
++    return;
++  }
++
++  const double discard_fraction = tab_discard_animation_.GetCurrentValue();
++
++  // Fade the favicon to a partially transparent grayscale version while the
++  // tab is discarded. Opacity and saturation follow the same animation.
++  cc::PaintFlags flags;
++  flags.setAlphaf(gfx::Tween::FloatValueBetween(
++      discard_fraction, 1.0f, kDiscardedFaviconOpacity));
++
++  SkColorMatrix color_matrix;
++  color_matrix.setSaturation(
++      gfx::Tween::FloatValueBetween(discard_fraction, 1.0f, 0.0f));
++  // 4x5 matrix expected by cc::ColorFilter
++  float matrix_data[20];
++  color_matrix.getRowMajor(matrix_data);
++  flags.setColorFilter(cc::ColorFilter::MakeMatrix(matrix_data));
++
++  canvas->DrawImageInt(icon, 0, 0, bounds.width(), bounds.height(), bounds.x(),
++                       bounds.y(), bounds.width(), bounds.height(),
++                       /*filter=*/true, flags);
++
++  if (discard_fraction == 1.0) {
++    views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
++        kDiscardAnimationFinishes, this);
++  }
+ }
+ 
+ void TabIcon::PaintLoadingAnimation(gfx::Canvas* canvas, gfx::Rect bounds) {
+@@ -445,8 +446,7 @@ void TabIcon::MaybePaintFavicon(gfx::Can
+ 
+   std::unique_ptr<gfx::ScopedCanvas> scoped_canvas;
+ 
+-  if (GetShowingLoadingAnimation() || favicon_size_animation_.is_animating() ||
+-      was_discard_indicator_shown_) {
++  if ((false)) {
+     scoped_canvas = std::make_unique<gfx::ScopedCanvas>(canvas);
+     // The favicon is initially inset with the width of the loading-animation
+     // stroke + an additional dp to create some visual separation.
+@@ -491,14 +491,6 @@ void TabIcon::MaybePaintFavicon(gfx::Can
+   canvas->DrawImageInt(icon, 0, 0, bounds.width(), bounds.height(), bounds.x(),
+                        bounds.y(), bounds.width(), bounds.height(),
+                        /*filter=*/true);
+-
+-  // Emits a custom event when the favicon finishes shrinking and the discard
+-  // ring gets painted
+-  if (favicon_size_animation_.GetCurrentValue() == 0.0 &&
+-      tab_discard_animation_.GetCurrentValue() == 1.0) {
+-    views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
+-        kDiscardAnimationFinishes, this);
+-  }
+ }
+ 
+ bool TabIcon::GetNonDefaultFavicon() const {
+@@ -525,31 +517,12 @@ void TabIcon::SetDiscarded(bool discarde
+       is_discarded_ && discard_ring_treatment_enabled_;
+   if (was_discard_indicator_shown_ != show_discard_indicator) {
+     was_discard_indicator_shown_ = show_discard_indicator;
+-    favicon_size_animation_.SetSlideDuration(
++    tab_discard_animation_.SetSlideDuration(
+         gfx::Animation::RichAnimationDuration(base::Milliseconds(250)));
+     if (show_discard_indicator) {
+-      tab_discard_animation_.SetDuration(
+-          gfx::Animation::RichAnimationDuration(base::Seconds(1)));
+-      tab_discard_animation_.Start();
+-      favicon_size_animation_.Hide();
+-
+-      // Potentially show an IPH if a tab was discarded.
+-      const ui::ElementContext context =
+-          views::ElementTrackerViews::GetInstance()->GetContextForView(this);
+-      BrowserWindowInterface* browser = nullptr;
+-      ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
+-          [&](BrowserWindowInterface* current_browser) {
+-            if (BrowserElements::From(current_browser)->GetContext() ==
+-                context) {
+-              browser = current_browser;
+-            }
+-            return !browser;
+-          });
+-      BrowserUserEducationInterface::From(browser)->MaybeShowFeaturePromo(
+-          feature_engagement::kIPHDiscardRingFeature);
++      tab_discard_animation_.Show();
+     } else {
+-      tab_discard_animation_.Stop();
+-      favicon_size_animation_.Show();
++      tab_discard_animation_.Hide();
+     }
+   }
+ }
+@@ -605,6 +578,10 @@ bool TabIcon::GetCrashed() const {
+ }
+ 
+ void TabIcon::UpdateThrobber() {
++  if (!tab_discard_animation_.is_animating() && !layer()) {
++    return;
++  }
++
+   TRACE_EVENT0("ui", "TabIcon::UpdateThrobber");
+   base::ScopedUmaHistogramTimer timer(
+       "Tab.Icon.UpdateThrobber.Time",
+--- a/chrome/browser/ui/views/tabs/tab/tab_icon.h
++++ b/chrome/browser/ui/views/tabs/tab/tab_icon.h
+@@ -117,10 +117,11 @@ class TabIcon : public views::View, publ
+                                       const gfx::ImageSkia& icon,
+                                       const gfx::Rect& bounds);
+ 
+-  // Paints a dimmed and shrunken favicon surrounded by the discard ring
+-  void PaintDiscardRingAndIcon(gfx::Canvas* canvas,
+-                               const gfx::ImageSkia& icon,
+-                               const gfx::Rect& bounds);
++  // Paints the favicon with grayscale and opacity reflecting the discard
++  // animation.
++  void PaintDiscardedFavicon(gfx::Canvas* canvas,
++                             const gfx::ImageSkia& icon,
++                             const gfx::Rect& bounds);
+ 
+   // Paint either the indeterimate throbber or progress indicator according to
+   // current tab state.
+@@ -204,7 +205,7 @@ class TabIcon : public views::View, publ
+ 
+   // Animation used when a tab is discarded so the favicon will partially
+   // fade out
+-  gfx::LinearAnimation tab_discard_animation_;
++  gfx::SlideAnimation tab_discard_animation_;
+ 
+   // The discard indicator will be shown only if the tab is discarded and the
+   // discard ring treatment pref is enabled. Keep track of both of the component
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -1171,6 +1171,12 @@
+     <message name="IDS_SETTINGS_PERFORMANCE_DISCARD_RING_TREATMENT_ENABLED_DESCRIPTION_WITH_LEARN_LINK" desc="Label for a performance settings toggle description that controls whether the inactive tab UI is shown. Also contains a link to the help center article.">
+       A dotted circle appears around site icons.
+     </message>
++    <message name="IDS_SETTINGS_HIBERNATED_APPEARANCE_LABEL" desc="Label for a performance setting that controls whether hibernated tabs are visually differentiated.">
++      Differentiate hibernated tabs
++    </message>
++    <message name="IDS_SETTINGS_HIBERNATED_APPEARANCE_DESCRIPTION" desc="Description for a performance setting that controls whether hibernated tab icons are displayed in grayscale.">
++      Display hibernated tab icons in grayscale
++    </message>
+     <message name="IDS_SETTINGS_PERFORMANCE_TAB_HOVER_PREVIEW_CARD_LINK_TITLE" desc="Title for the link row that points to tab hover preview card apperance settings.">
+       Tab hover preview card appearance
+     </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -1297,7 +1297,7 @@ void AddPerformanceStrings(content::WebU
+       {"tabDiscardingExceptionsActiveSiteAriaDescription",
+        IDS_SETTINGS_PERFORMANCE_TAB_DISCARDING_EXCEPTIONS_ACTIVE_SITE_ARIA_DESCRIPTION},
+       {"discardRingTreatmentEnabledLabel",
+-       IDS_SETTINGS_PERFORMANCE_DISCARD_RING_TREATMENT_ENABLED_LABEL},
++       IDS_SETTINGS_HIBERNATED_APPEARANCE_LABEL},
+       {"tabHoverPreviewCardLinkTitle",
+        IDS_SETTINGS_PERFORMANCE_TAB_HOVER_PREVIEW_CARD_LINK_TITLE},
+       {"tabHoverPreviewCardLinkSubtitle",
+@@ -1320,7 +1320,7 @@ void AddPerformanceStrings(content::WebU
+       {"batterySaverModeDescription",
+        IDS_SETTINGS_PERFORMANCE_BATTERY_SAVER_MODE_SETTING_DESCRIPTION},
+       {"discardRingTreatmentEnabledDescriptionWithLearnLink",
+-       IDS_SETTINGS_PERFORMANCE_DISCARD_RING_TREATMENT_ENABLED_DESCRIPTION_WITH_LEARN_LINK},
++       IDS_SETTINGS_HIBERNATED_APPEARANCE_DESCRIPTION},
+       {"memorySaverModeDescription",
+        IDS_SETTINGS_PERFORMANCE_MEMORY_SAVER_MODE_SETTING_DESCRIPTION},
+       {"performanceInterventionEnabledDescription",
