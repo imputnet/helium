@@ -3,14 +3,6 @@
 # Copyright 2026 The Helium Authors
 # You can use, redistribute, and/or modify this source code under
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
-"""Tests for patches/helium/core/sync/engine-interface.patch
-
-This patch is supposed to introduce three new files
-(components/sync/engine/custom_sync_backend.h,
-components/sync/service/helium_sync_backend.h and
-components/sync/service/helium_sync_backend.cc) and wire a fallback to the
-Helium-provided sync backend into six existing sync engine/service files.
-"""
 
 import re
 import sys
@@ -36,9 +28,6 @@ _HELIUM_BACKEND_HEADER_PATH = (_ROOT_DIR / 'components' / 'sync' / 'service' /
 _HELIUM_BACKEND_IMPL_PATH = (_ROOT_DIR / 'components' / 'sync' / 'service' /
                              'helium_sync_backend.cc')
 
-# A single leading unified-diff marker (' ', '+', or '-') immediately followed by another
-# "--- ", "+++ ", or "@@ -N" sequence indicates a nested/leftover diff-of-diffs marker
-# that should never appear in a properly generated patch file.
 _NESTED_DIFF_MARKER_RE = re.compile(r'^[ +\-](?:--- |\+\+\+ |@@ -\d)', re.MULTILINE)
 
 _EXPECTED_MODIFIED_FILES = {
@@ -66,12 +55,6 @@ _FIRST_ADDED_FILE_HEADER_RE = re.compile(
 
 
 def _added_files_preamble():
-    """Returns exactly the "add new file" hunk for custom_sync_backend.h.
-
-    This is extracted using only the hunk's own (well-formed) header and
-    declared line count, so it is independently parseable regardless of
-    whatever content follows it later in the file.
-    """
     text = _read_patch_text()
     match = _FIRST_ADDED_FILE_HEADER_RE.match(text)
     assert match, 'Patch does not start with a well-formed "add new file" diff header'
@@ -93,27 +76,12 @@ def _added_lines_text(patched_file):
     return '\n'.join(line.value.rstrip('\n') for line in patched_file[0])
 
 
-# -----------------------------------------------------------------------------------
-# Basic file sanity
-# -----------------------------------------------------------------------------------
-
-
 def test_patch_file_exists():
     assert _PATCH_PATH.is_file()
 
 
 def test_patch_file_ends_with_trailing_newline():
-    # devutils/validate_patches.py's _load_all_patches() treats a patch file that does
-    # not end with a newline as a validation failure.
     assert _read_patch_text().endswith('\n')
-
-
-# -----------------------------------------------------------------------------------
-# components/sync/engine/custom_sync_backend.h addition.
-#
-# This is the one purely-added-file hunk in the patch whose diff syntax remains
-# well-formed on its own, so it can be parsed and checked in isolation.
-# -----------------------------------------------------------------------------------
 
 
 def test_custom_sync_backend_addition_is_well_formed():
@@ -158,13 +126,6 @@ def test_custom_sync_backend_includes_required_headers():
     assert '#include <string>' in text
 
 
-# -----------------------------------------------------------------------------------
-# Cross-check against the tracked Helium shim source files
-# (components/sync/service/helium_sync_backend.{h,cc}), which mirror what the
-# corresponding (currently corrupted, see below) hunks of the patch are meant to add.
-# -----------------------------------------------------------------------------------
-
-
 def test_tracked_helium_sync_backend_header_declares_factory_function():
     text = _HELIUM_BACKEND_HEADER_PATH.read_text(encoding=ENCODING)
     assert '#include "components/sync/engine/custom_sync_backend.h"' in text
@@ -180,40 +141,18 @@ def test_tracked_helium_sync_backend_impl_default_is_noop():
     assert 'return nullptr;' in text
 
 
-# -----------------------------------------------------------------------------------
-# Whole-file integrity regression tests.
-#
-# The patch is meant to be a single, self-contained unified diff that adds three new
-# files and wires up six existing engine/service files (see _EXPECTED_ADDED_FILES /
-# _EXPECTED_MODIFIED_FILES above). The tests below currently fail because the
-# committed patch contains leftover, un-collapsed diff-of-diffs markers past the
-# custom_sync_backend.h addition (e.g. " --- a/...", "-@@ ... @@", "+@@ ... @@"),
-# which makes it unparsable/unusable by patch(1), git apply, and
-# devutils/validate_patches.py alike.
-# -----------------------------------------------------------------------------------
-
-
 def test_patch_has_no_leftover_meta_diff_markers():
-    """The patch must not contain nested/duplicated diff markers.
-
-    A correctly generated patch never has a content line whose leading
-    " "/"+"/"-" prefix is immediately followed by another "--- ", "+++ ", or
-    "@@ -N" sequence; that pattern only appears when a diff-of-diffs was pasted
-    into the file without being collapsed into final file content.
-    """
     matches = _NESTED_DIFF_MARKER_RE.findall(_read_patch_text())
     assert not matches, (
-        f'Found {len(matches)} leftover meta-diff marker(s) in the patch file: {matches}. '
-        'The patch content was not fully resolved from a diff-of-diffs.')
+        f'Found {len(matches)} leftover meta-diff marker(s) in patch. '
+        'This means there are messy diff markers that need cleanup.')
 
 
 def test_full_patch_file_is_a_valid_unified_diff():
     try:
         unidiff.PatchSet.from_filename(str(_PATCH_PATH), encoding=ENCODING)
     except UnidiffParseError as exc:
-        pytest.fail(
-            f'patches/helium/core/sync/engine-interface.patch is not a valid unified '
-            f'diff and cannot be applied: {exc}')
+        pytest.fail(f'Patch file is not valid and cannot be applied: {exc}')
 
 
 def test_patch_declares_all_expected_added_and_modified_files():
@@ -229,9 +168,6 @@ def test_patch_declares_all_expected_added_and_modified_files():
 
 
 def test_sync_engine_backend_fallback_wiring_text_present():
-    """Sanity check that the intended fallback-to-Helium-shim wiring exists somewhere
-    in the patch text, independent of whether it is nested inside correctly-formed
-    diff syntax (see test_full_patch_file_is_a_valid_unified_diff)."""
     text = _read_patch_text()
     assert '#include "components/sync/service/helium_sync_backend.h"' in text
     assert 'if (params.custom_sync_backend) {' in text
