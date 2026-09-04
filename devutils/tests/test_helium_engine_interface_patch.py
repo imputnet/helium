@@ -212,8 +212,8 @@ def test_full_patch_file_is_a_valid_unified_diff():
         unidiff.PatchSet.from_filename(str(_PATCH_PATH), encoding=ENCODING)
     except UnidiffParseError as exc:
         pytest.fail(
-            f'patches/helium/core/sync/engine-interface.patch is not a valid unified diff '
-            f'and cannot be applied: {exc}')
+            f'patches/helium/core/sync/engine-interface.patch is not a valid unified '
+            f'diff and cannot be applied: {exc}')
 
 
 def test_patch_declares_all_expected_added_and_modified_files():
