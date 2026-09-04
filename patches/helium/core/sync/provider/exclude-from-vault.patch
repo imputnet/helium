@@ -1,0 +1,673 @@
+--- a/chrome/browser/extensions/api/chrome_extensions_api_client.cc
++++ b/chrome/browser/extensions/api/chrome_extensions_api_client.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/favicon/favicon_utils.h"
+ #include "chrome/browser/supervised_user/supervised_user_extensions_delegate_impl.h"
+ #include "chrome/browser/supervised_user/supervised_user_service_factory.h"
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
+ #include "chrome/browser/tab_list/tab_list_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+@@ -123,12 +124,16 @@ void ChromeExtensionsAPIClient::AddAddit
+     std::map<settings_namespace::Namespace,
+              raw_ptr<ValueStoreCache, CtnExperimental>>* caches) {
+   // Add support for chrome.storage.sync.
++  Profile* profile = Profile::FromBrowserContext(context);
+   (*caches)[settings_namespace::SYNC] =
+-      new SyncValueStoreCache(factory, observer, context->GetPath());
++      new SyncValueStoreCache(
++          factory, observer, context->GetPath(),
++          browser_sync::private_sync_prefs::GetActiveExtensionProviderId(
++              *profile->GetPrefs()));
+ 
+   // Add support for chrome.storage.managed.
+-  (*caches)[settings_namespace::MANAGED] = new ManagedValueStoreCache(
+-      *Profile::FromBrowserContext(context), factory, observer);
++  (*caches)[settings_namespace::MANAGED] =
++      new ManagedValueStoreCache(*profile, factory, observer);
+ }
+ 
+ void ChromeExtensionsAPIClient::AttachWebContentsHelpers(
+--- a/chrome/browser/extensions/api/storage/sync_storage_backend.cc
++++ b/chrome/browser/extensions/api/storage/sync_storage_backend.cc
+@@ -57,17 +57,73 @@ SyncStorageBackend::SyncStorageBackend(
+     const SettingsStorageQuotaEnforcer::Limits& quota,
+     SequenceBoundSettingsChangedCallback observer,
+     syncer::DataType sync_type,
+-    const syncer::SyncableService::StartSyncFlare& flare)
++    const syncer::SyncableService::StartSyncFlare& flare,
++    std::optional<ExtensionId> pending_excluded_extension_id)
+     : storage_factory_(std::move(storage_factory)),
+       quota_(quota),
+       observer_(std::move(observer)),
+       sync_type_(sync_type),
+-      flare_(flare) {
++      flare_(flare),
++      pending_excluded_extension_id_(
++          std::move(pending_excluded_extension_id)) {
+   DCHECK(IsOnBackendSequence());
+   DCHECK(sync_type_ == syncer::EXTENSION_SETTINGS ||
+          sync_type_ == syncer::APP_SETTINGS);
+ }
+ 
++void SyncStorageBackend::SetExcludedExtension(
++    std::optional<ExtensionId> extension_id) {
++  DCHECK(IsOnBackendSequence());
++  pending_excluded_extension_id_ = std::move(extension_id);
++  if (!sync_processor_ ||
++      excluded_extension_id_ == pending_excluded_extension_id_) {
++    return;
++  }
++
++  std::optional<ExtensionId> previously_excluded_extension_id =
++      std::exchange(excluded_extension_id_, pending_excluded_extension_id_);
++  if (previously_excluded_extension_id) {
++    auto storage = storage_objs_.find(*previously_excluded_extension_id);
++    if (storage != storage_objs_.end()) {
++      std::optional<syncer::ModelError> error =
++          storage->second->StartSyncing(
++              EmptyDict(),
++              CreateSettingsSyncProcessor(*previously_excluded_extension_id));
++      if (error) {
++        storage->second->StopSyncing();
++      }
++    }
++  }
++
++  if (!excluded_extension_id_) {
++    return;
++  }
++  SyncableSettingsStorage* storage = GetOrCreateStorageWithSyncData(
++      *excluded_extension_id_, EmptyDict());
++  storage->StopSyncing();
++
++  value_store::ValueStore::ReadResult settings = storage->Get();
++  if (!settings.status().ok()) {
++    LOG(WARNING) << "Failed to read settings for excluded extension "
++                 << *excluded_extension_id_ << ": "
++                 << settings.status().message;
++    return;
++  }
++  syncer::SyncChangeList deletions;
++  for (auto setting : settings.settings()) {
++    deletions.push_back(settings_sync_util::CreateDelete(
++        *excluded_extension_id_, setting.first, sync_type_));
++  }
++  if (!deletions.empty()) {
++    std::optional<syncer::ModelError> error =
++        sync_processor_->ProcessSyncChanges(FROM_HERE, deletions);
++    if (error) {
++      LOG(WARNING) << "Failed to remove settings for excluded extension "
++                   << *excluded_extension_id_ << ": " << error->ToString();
++    }
++  }
++}
++
+ SyncStorageBackend::~SyncStorageBackend() = default;
+ 
+ value_store::ValueStore* SyncStorageBackend::GetStorage(
+@@ -101,7 +157,7 @@ SyncableSettingsStorage* SyncStorageBack
+   SyncableSettingsStorage* raw_syncable_storage = syncable_storage.get();
+   storage_objs_[extension_id] = std::move(syncable_storage);
+ 
+-  if (sync_processor_.get()) {
++  if (sync_processor_.get() && excluded_extension_id_ != extension_id) {
+     std::optional<syncer::ModelError> error =
+         raw_syncable_storage->StartSyncing(
+             std::move(sync_data), CreateSettingsSyncProcessor(extension_id));
+@@ -140,6 +196,9 @@ syncer::SyncDataList SyncStorageBackend:
+   // For tests, all storage areas are kept in memory in `storage_objs_`.
+   for (const auto& storage_obj : storage_objs_) {
+     ExtensionId extension_id = storage_obj.first;
++    if (excluded_extension_id_ == extension_id) {
++      continue;
++    }
+ 
+     value_store::ValueStore::ReadResult maybe_settings =
+         GetOrCreateStorageWithSyncData(extension_id, EmptyDict())->Get();
+@@ -165,12 +224,19 @@ std::optional<syncer::ModelError> SyncSt
+   DCHECK(sync_processor.get());
+ 
+   sync_processor_ = std::move(sync_processor);
++  excluded_extension_id_ = pending_excluded_extension_id_;
+ 
+   // Group the initial sync data by extension id.
+   std::map<ExtensionId, base::DictValue> grouped_sync_data;
++  syncer::SyncChangeList excluded_data_deletions;
+ 
+   for (const syncer::SyncData& sync_data : initial_sync_data) {
+     SettingSyncData data(sync_data);
++    if (excluded_extension_id_ == data.extension_id()) {
++      excluded_data_deletions.push_back(settings_sync_util::CreateDelete(
++          data.extension_id(), data.key(), type));
++      continue;
++    }
+     base::DictValue& settings = grouped_sync_data[data.extension_id()];
+     DCHECK(!settings.Find(data.key()))
+         << "Duplicate settings for " << data.extension_id() << "/"
+@@ -178,12 +244,26 @@ std::optional<syncer::ModelError> SyncSt
+     settings.Set(data.key(), data.ExtractValue());
+   }
+ 
++  if (!excluded_data_deletions.empty()) {
++    std::optional<syncer::ModelError> error =
++        sync_processor_->ProcessSyncChanges(FROM_HERE,
++                                            excluded_data_deletions);
++    if (error.has_value()) {
++      return error;
++    }
++  }
++
+   // Start syncing all existing storage areas.  Any storage areas created in
+   // the future will start being synced as part of the creation process.
+   for (const auto& storage_obj : storage_objs_) {
+     const ExtensionId& extension_id = storage_obj.first;
+     SyncableSettingsStorage* storage = storage_obj.second.get();
+ 
++    if (excluded_extension_id_ == extension_id) {
++      storage->StopSyncing();
++      continue;
++    }
++
+     auto group = grouped_sync_data.find(extension_id);
+     std::optional<syncer::ModelError> error;
+     if (group != grouped_sync_data.end()) {
+@@ -220,9 +300,17 @@ std::optional<syncer::ModelError> SyncSt
+   // The raw pointers are safe because ownership of each item is passed to
+   // storage->ProcessSyncChanges.
+   std::map<ExtensionId, SettingSyncDataList*> grouped_sync_data;
++  syncer::SyncChangeList excluded_data_deletions;
+ 
+   for (const syncer::SyncChange& change : sync_changes) {
+     std::unique_ptr<SettingSyncData> data(new SettingSyncData(change));
++    if (excluded_extension_id_ == data->extension_id()) {
++      if (change.change_type() != syncer::SyncChange::ACTION_DELETE) {
++        excluded_data_deletions.push_back(settings_sync_util::CreateDelete(
++            data->extension_id(), data->key(), sync_type_));
++      }
++      continue;
++    }
+     SettingSyncDataList*& group = grouped_sync_data[data->extension_id()];
+     if (!group) {
+       group = new SettingSyncDataList();
+@@ -230,6 +318,15 @@ std::optional<syncer::ModelError> SyncSt
+     group->push_back(std::move(data));
+   }
+ 
++  if (!excluded_data_deletions.empty()) {
++    std::optional<syncer::ModelError> error =
++        sync_processor_->ProcessSyncChanges(from_here,
++                                            excluded_data_deletions);
++    if (error) {
++      return error;
++    }
++  }
++
+   // Create any storage areas that don't exist yet but have sync data.
+   for (const auto& group : grouped_sync_data) {
+     SyncableSettingsStorage* storage =
+@@ -277,6 +374,7 @@ void SyncStorageBackend::StopSyncing(syn
+   }
+ 
+   sync_processor_.reset();
++  excluded_extension_id_.reset();
+ }
+ 
+ std::unique_ptr<SettingsSyncProcessor>
+--- a/chrome/browser/extensions/api/storage/sync_storage_backend.h
++++ b/chrome/browser/extensions/api/storage/sync_storage_backend.h
+@@ -7,6 +7,7 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <set>
+ #include <string>
+ 
+@@ -47,7 +48,8 @@ class SyncStorageBackend final : public
+       const SettingsStorageQuotaEnforcer::Limits& quota,
+       SequenceBoundSettingsChangedCallback observer,
+       syncer::DataType sync_type,
+-      const syncer::SyncableService::StartSyncFlare& flare);
++      const syncer::SyncableService::StartSyncFlare& flare,
++      std::optional<ExtensionId> pending_excluded_extension_id = std::nullopt);
+ 
+   SyncStorageBackend(const SyncStorageBackend&) = delete;
+   SyncStorageBackend& operator=(const SyncStorageBackend&) = delete;
+@@ -56,6 +58,7 @@ class SyncStorageBackend final : public
+ 
+   value_store::ValueStore* GetStorage(const ExtensionId& extension_id);
+   void DeleteStorage(const ExtensionId& extension_id);
++  void SetExcludedExtension(std::optional<ExtensionId> extension_id);
+ 
+   // syncer::SyncableService implementation.
+   void WaitUntilReadyToSync(base::OnceClosure done) override;
+@@ -110,6 +113,9 @@ class SyncStorageBackend final : public
+ 
+   syncer::SyncableService::StartSyncFlare flare_;
+ 
++  std::optional<ExtensionId> pending_excluded_extension_id_;
++  std::optional<ExtensionId> excluded_extension_id_;
++
+   base::WeakPtrFactory<SyncStorageBackend> weak_ptr_factory_{this};
+ };
+ 
+--- a/chrome/browser/extensions/api/storage/sync_value_store_cache.cc
++++ b/chrome/browser/extensions/api/storage/sync_value_store_cache.cc
+@@ -43,7 +43,8 @@ SettingsStorageQuotaEnforcer::Limits Get
+ SyncValueStoreCache::SyncValueStoreCache(
+     scoped_refptr<value_store::ValueStoreFactory> factory,
+     SettingsChangedCallback observer,
+-    const base::FilePath& profile_path)
++    const base::FilePath& profile_path,
++    std::optional<ExtensionId> excluded_extension_id)
+     : initialized_(false) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+ 
+@@ -57,7 +58,7 @@ SyncValueStoreCache::SyncValueStoreCache
+                      GetSequenceBoundSettingsChangedCallback(
+                          base::SequencedTaskRunner::GetCurrentDefault(),
+                          std::move(observer)),
+-                     profile_path));
++                     profile_path, std::move(excluded_extension_id)));
+ }
+ 
+ SyncValueStoreCache::~SyncValueStoreCache() {
+@@ -83,6 +84,16 @@ syncer::SyncableService* SyncValueStoreC
+   }
+ }
+ 
++void SyncValueStoreCache::SetExcludedExtension(
++    std::optional<ExtensionId> extension_id) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  GetBackendTaskRunner()->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          &SyncValueStoreCache::SetExcludedExtensionOnBackend,
++          base::Unretained(this), std::move(extension_id)));
++}
++
+ void SyncValueStoreCache::RunWithValueStoreForExtension(
+     StorageCallback callback,
+     scoped_refptr<const Extension> extension) {
+@@ -102,7 +113,8 @@ void SyncValueStoreCache::DeleteStorageS
+ void SyncValueStoreCache::InitOnBackend(
+     scoped_refptr<value_store::ValueStoreFactory> factory,
+     SequenceBoundSettingsChangedCallback observer,
+-    const base::FilePath& profile_path) {
++    const base::FilePath& profile_path,
++    std::optional<ExtensionId> excluded_extension_id) {
+   DCHECK(IsOnBackendSequence());
+   DCHECK(!initialized_);
+   app_backend_ = std::make_unique<SyncStorageBackend>(
+@@ -111,8 +123,16 @@ void SyncValueStoreCache::InitOnBackend(
+   extension_backend_ = std::make_unique<SyncStorageBackend>(
+       std::move(factory), GetSyncQuotaLimits(), std::move(observer),
+       syncer::EXTENSION_SETTINGS,
+-      sync_start_util::GetFlareForSyncableService(profile_path));
++      sync_start_util::GetFlareForSyncableService(profile_path),
++      std::move(excluded_extension_id));
+   initialized_ = true;
+ }
+ 
++void SyncValueStoreCache::SetExcludedExtensionOnBackend(
++    std::optional<ExtensionId> extension_id) {
++  DCHECK(IsOnBackendSequence());
++  DCHECK(initialized_);
++  extension_backend_->SetExcludedExtension(std::move(extension_id));
++}
++
+ }  // namespace extensions
+--- a/chrome/browser/extensions/api/storage/sync_value_store_cache.h
++++ b/chrome/browser/extensions/api/storage/sync_value_store_cache.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_EXTENSIONS_API_STORAGE_SYNC_VALUE_STORE_CACHE_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ 
+ #include "base/memory/scoped_refptr.h"
+@@ -40,7 +41,9 @@ class SyncValueStoreCache : public Value
+  public:
+   SyncValueStoreCache(scoped_refptr<value_store::ValueStoreFactory> factory,
+                       SettingsChangedCallback observer,
+-                      const base::FilePath& profile_path);
++                      const base::FilePath& profile_path,
++                      std::optional<ExtensionId> excluded_extension_id =
++                          std::nullopt);
+ 
+   SyncValueStoreCache(const SyncValueStoreCache&) = delete;
+   SyncValueStoreCache& operator=(const SyncValueStoreCache&) = delete;
+@@ -50,6 +53,8 @@ class SyncValueStoreCache : public Value
+   base::WeakPtr<SyncValueStoreCache> AsWeakPtr();
+   syncer::SyncableService* GetSyncableService(syncer::DataType type);
+ 
++  void SetExcludedExtension(std::optional<ExtensionId> extension_id);
++
+   // ValueStoreCache implementation:
+   void RunWithValueStoreForExtension(
+       StorageCallback callback,
+@@ -59,7 +64,10 @@ class SyncValueStoreCache : public Value
+  private:
+   void InitOnBackend(scoped_refptr<value_store::ValueStoreFactory> factory,
+                      SequenceBoundSettingsChangedCallback observer,
+-                     const base::FilePath& profile_path);
++                     const base::FilePath& profile_path,
++                     std::optional<ExtensionId> excluded_extension_id);
++  void SetExcludedExtensionOnBackend(
++      std::optional<ExtensionId> extension_id);
+ 
+   bool initialized_;
+   std::unique_ptr<SyncStorageBackend> app_backend_;
+--- a/chrome/browser/extensions/sync/extension_sync_service.cc
++++ b/chrome/browser/extensions/sync/extension_sync_service.cc
+@@ -9,6 +9,7 @@
+ #include "base/auto_reset.h"
+ #include "base/containers/flat_set.h"
+ #include "base/feature_list.h"
++#include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/one_shot_event.h"
+@@ -17,6 +18,7 @@
+ #include "chrome/browser/extensions/extension_management.h"
+ #include "chrome/browser/extensions/extension_service.h"
+ #include "chrome/browser/extensions/extension_util.h"
++#include "chrome/browser/extensions/api/storage/sync_value_store_cache.h"
+ #include "chrome/browser/extensions/launch_util.h"
+ #include "chrome/browser/extensions/sync/account_extension_tracker.h"
+ #include "chrome/browser/extensions/sync/extension_sync_data.h"
+@@ -24,11 +26,14 @@
+ #include "chrome/browser/extensions/sync/extension_sync_util.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sync/glue/sync_start_util.h"
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
+ #include "chrome/common/extensions/extension_constants.h"
+ #include "chrome/common/extensions/sync_helper.h"
+ #include "components/sync/model/sync_change.h"
+ #include "components/sync/protocol/entity_data.h"
+ #include "extensions/browser/app_sorting.h"
++#include "extensions/browser/api/storage/settings_namespace.h"
++#include "extensions/browser/api/storage/storage_frontend.h"
+ #include "extensions/browser/blocklist_extension_prefs.h"
+ #include "extensions/browser/disable_reason.h"
+ #include "extensions/browser/extension_registrar.h"
+@@ -180,6 +185,12 @@ ExtensionSyncService::ExtensionSyncServi
+   prefs_observation_.Observe(ExtensionPrefs::Get(profile_));
+   extension_management_observation_.Observe(
+       ExtensionManagementFactory::GetForBrowserContext(profile_));
++  pref_change_registrar_.Init(profile_->GetPrefs());
++  pref_change_registrar_.Add(
++      browser_sync::private_sync_prefs::kConfiguration,
++      base::BindRepeating(
++          &ExtensionSyncService::OnPrivateSyncConfigurationChanged,
++          base::Unretained(this)));
+ }
+ 
+ ExtensionSyncService::~ExtensionSyncService() = default;
+@@ -192,7 +203,14 @@ ExtensionSyncService* ExtensionSyncServi
+ 
+ void ExtensionSyncService::SyncExtensionChangeIfNeeded(
+     const Extension& extension) {
+-  if (ignore_updates_ || !ShouldSync(extension)) {
++  if (ignore_updates_) {
++    return;
++  }
++  if (IsPrivateSyncProvider(extension.id())) {
++    RemovePrivateSyncProviderData(extension);
++    return;
++  }
++  if (!ShouldSync(extension)) {
+     return;
+   }
+ 
+@@ -225,6 +243,12 @@ ExtensionSyncService::MergeDataAndStartS
+   LOG_IF(FATAL, type != syncer::EXTENSIONS && type != syncer::APPS)
+       << "Got " << type << " DataType";
+ 
++  if (type == syncer::EXTENSIONS) {
++    active_private_sync_provider_id_ =
++        browser_sync::private_sync_prefs::GetActiveExtensionProviderId(
++            *profile_->GetPrefs());
++  }
++
+   SyncBundle* bundle = GetSyncBundle(type);
+   bundle->StartSyncing(std::move(sync_processor));
+ 
+@@ -256,6 +280,9 @@ ExtensionSyncService::MergeDataAndStartS
+ 
+ void ExtensionSyncService::StopSyncing(syncer::DataType type) {
+   GetSyncBundle(type)->Reset();
++  if (type == syncer::EXTENSIONS) {
++    active_private_sync_provider_id_.reset();
++  }
+ }
+ 
+ syncer::SyncDataList ExtensionSyncService::GetAllSyncDataForTesting(
+@@ -389,6 +416,12 @@ void ExtensionSyncService::ApplySyncData
+   // Apply the sync data, filtering out any items where we have more
+   // recent local changes.
+   for (const ExtensionSyncData& extension_sync_data : sync_data_list) {
++    // Provider records are never valid local changes. Tombstone them even if
++    // an older installation left NeedsSync set for this extension ID.
++    if (IsPrivateSyncProvider(extension_sync_data.id())) {
++      ApplySyncData(extension_sync_data);
++      continue;
++    }
+     // If the extension has local state that needs to be synced, ignore this
+     // change (we assume the local state is more recent).
+     if (!ExtensionPrefs::Get(profile_)->NeedsSync(extension_sync_data.id())) {
+@@ -408,6 +441,19 @@ void ExtensionSyncService::ApplySyncData
+     const ExtensionSyncData& extension_sync_data) {
+   const std::string& id = extension_sync_data.id();
+ 
++  syncer::DataType type =
++      extension_sync_data.is_app() ? syncer::APPS : syncer::EXTENSIONS;
++  SyncBundle* bundle = GetSyncBundle(type);
++  DCHECK(bundle->IsSyncing());
++
++  if (IsPrivateSyncProvider(id)) {
++    // Record the remote entity before deleting it so SyncBundle can emit a
++    // tombstone. This also removes provider records written by older builds.
++    bundle->ApplySyncData(extension_sync_data);
++    bundle->PushSyncDeletion(id, extension_sync_data.GetSyncData());
++    return;
++  }
++
+   // Remove all deprecated bookmark apps immediately, as they aren't loaded into
+   // the extensions system at all (and thus cannot be looked up).
+   if (extension_sync_data.is_deprecated_bookmark_app()) {
+@@ -434,10 +480,6 @@ void ExtensionSyncService::ApplySyncData
+   // sync data, so that we don't end up notifying ourselves.
+   base::AutoReset<bool> ignore_updates(&ignore_updates_, true);
+ 
+-  syncer::DataType type =
+-      extension_sync_data.is_app() ? syncer::APPS : syncer::EXTENSIONS;
+-  SyncBundle* bundle = GetSyncBundle(type);
+-  DCHECK(bundle->IsSyncing());
+   if (extension && !IsCorrectSyncType(*extension, type)) {
+     // The installed item isn't the same type as the sync data item, so we need
+     // to remove the sync data item; otherwise it will be a zombie that will
+@@ -860,10 +902,70 @@ bool ExtensionSyncService::ShouldReceive
+     return false;
+   }
+ 
++  if (IsPrivateSyncProvider(extension.id())) {
++    return false;
++  }
++
+   // Otherwise, defer to the general extension sync calculation.
+   return extensions::sync_util::ShouldSync(profile_, &extension);
+ }
+ 
++bool ExtensionSyncService::IsPrivateSyncProvider(
++    const extensions::ExtensionId& extension_id) const {
++  return active_private_sync_provider_id_ == extension_id;
++}
++
++void ExtensionSyncService::RemovePrivateSyncProviderData(
++    const Extension& extension) {
++  syncer::DataType type =
++      extension.is_app() ? syncer::APPS : syncer::EXTENSIONS;
++  SyncBundle* bundle = GetSyncBundle(type);
++  if (bundle->IsSyncing()) {
++    bundle->PushSyncDeletion(extension.id(),
++                             CreateSyncData(extension).GetSyncData());
++  } else if (system_->is_ready() && !flare_.is_null()) {
++    flare_.Run(type);
++  }
++  ExtensionPrefs::Get(profile_)->SetNeedsSync(extension.id(), false);
++}
++
++void ExtensionSyncService::OnPrivateSyncConfigurationChanged() {
++  const std::optional<extensions::ExtensionId> provider_id =
++      browser_sync::private_sync_prefs::GetActiveExtensionProviderId(
++          *profile_->GetPrefs());
++  SyncBundle* extension_bundle = GetSyncBundle(syncer::EXTENSIONS);
++  if (extension_bundle->IsSyncing() &&
++      active_private_sync_provider_id_ != provider_id) {
++    std::optional<extensions::ExtensionId> previous_provider_id =
++        std::exchange(active_private_sync_provider_id_, provider_id);
++    ExtensionRegistry* registry = ExtensionRegistry::Get(profile_);
++    if (previous_provider_id) {
++      const Extension* previous_provider =
++          registry->GetInstalledExtension(*previous_provider_id);
++      if (previous_provider) {
++        SyncExtensionChangeIfNeeded(*previous_provider);
++      }
++    }
++    if (provider_id) {
++      const Extension* provider = registry->GetInstalledExtension(*provider_id);
++      if (provider) {
++        RemovePrivateSyncProviderData(*provider);
++      }
++    }
++  }
++
++  extensions::StorageFrontend* frontend =
++      extensions::StorageFrontend::GetIfExists(profile_);
++  if (!frontend) {
++    return;
++  }
++  auto* sync_cache = static_cast<extensions::SyncValueStoreCache*>(
++      frontend->GetValueStoreCache(extensions::settings_namespace::SYNC));
++  if (sync_cache) {
++    sync_cache->SetExcludedExtension(provider_id);
++  }
++}
++
+ bool ExtensionSyncService::ShouldSync(const Extension& extension) const {
+   // Only extensions associated with the signed in user's account should be
+   // synced for transport mode. Note that syncable component extensions are an
+--- a/chrome/browser/extensions/sync/extension_sync_service.h
++++ b/chrome/browser/extensions/sync/extension_sync_service.h
+@@ -19,6 +19,7 @@
+ #include "base/version.h"
+ #include "chrome/browser/extensions/extension_management.h"
+ #include "chrome/browser/extensions/sync/sync_bundle.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "components/sync/model/model_error.h"
+ #include "components/sync/model/syncable_service.h"
+@@ -153,6 +154,13 @@ class ExtensionSyncService : public sync
+   // uploaded to sync (ShouldSync returns false).
+   bool ShouldReceiveSyncData(const extensions::Extension& extension) const;
+ 
++  // The configured provider is part of the sync transport. Its installation
++  // state and private storage must not be carried inside its own vault.
++  bool IsPrivateSyncProvider(const extensions::ExtensionId& extension_id) const;
++  void RemovePrivateSyncProviderData(
++      const extensions::Extension& extension);
++  void OnPrivateSyncConfigurationChanged();
++
+   // Returns if the given `extension` should be synced by this class (i.e. it
+   // can be uploaded to the sync server).
+   bool ShouldSync(const extensions::Extension& extension) const;
+@@ -176,6 +184,8 @@ class ExtensionSyncService : public sync
+   base::ScopedObservation<extensions::ExtensionManagement,
+                           extensions::ExtensionManagement::Observer>
+       extension_management_observation_{this};
++  PrefChangeRegistrar pref_change_registrar_;
++  std::optional<extensions::ExtensionId> active_private_sync_provider_id_;
+ 
+   // When this is set to true, any incoming updates (from the observers as well
+   // as from explicit SyncExtensionChangeIfNeeded calls) are ignored. This is
+--- a/chrome/browser/sync/BUILD.gn
++++ b/chrome/browser/sync/BUILD.gn
+@@ -78,6 +78,7 @@ source_set("sync") {
+     "//components/keyed_service/core",
+     "//components/prefs",
+     "//components/sessions:session_id",
++    "//components/sync/base",
+     "//components/sync/model",
+     "//components/sync/service",
+     "//components/sync_device_info",
+--- a/chrome/browser/sync/private_sync/private_sync_prefs.cc
++++ b/chrome/browser/sync/private_sync/private_sync_prefs.cc
+@@ -16,6 +16,7 @@
+ #include "components/crx_file/id_util.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
++#include "components/sync/base/pref_names.h"
+ 
+ namespace browser_sync::private_sync_prefs {
+ 
+@@ -131,6 +132,19 @@ bool IsConfigured(const PrefService& pre
+   return ReadConfiguration(prefs).has_value();
+ }
+ 
++std::optional<std::string> GetActiveExtensionProviderId(
++    const PrefService& prefs) {
++  if (prefs.GetBoolean(syncer::prefs::kEnableLocalSyncBackend)) {
++    return std::nullopt;
++  }
++  const std::optional<Configuration> configuration = ReadConfiguration(prefs);
++  if (!configuration ||
++      configuration->provider.kind != private_sync::ProviderKind::kExtension) {
++    return std::nullopt;
++  }
++  return configuration->provider.id;
++}
++
+ bool IsBlockingReconciliationError(ReconciliationError error) {
+   switch (error) {
+     case ReconciliationError::kInvalidData:
+--- a/chrome/browser/sync/private_sync/private_sync_prefs.h
++++ b/chrome/browser/sync/private_sync/private_sync_prefs.h
+@@ -79,6 +79,9 @@ std::optional<Configuration> ReadConfigu
+ void WriteConfiguration(PrefService* prefs, const Configuration& configuration);
+ void ClearConfiguration(PrefService* prefs);
+ bool IsConfigured(const PrefService& prefs);
++// Returns the configured extension provider unless local Sync is selected.
++std::optional<std::string> GetActiveExtensionProviderId(
++    const PrefService& prefs);
+ 
+ // Integrity and local-durability failures are sticky. They disable remote
+ // reconciliation for the matching vault until the user explicitly retries;
+--- a/extensions/browser/api/storage/storage_frontend.cc
++++ b/extensions/browser/api/storage/storage_frontend.cc
+@@ -193,6 +193,11 @@ StorageFrontend* StorageFrontend::Get(Br
+ }
+ 
+ // static
++StorageFrontend* StorageFrontend::GetIfExists(BrowserContext* context) {
++  return BrowserContextKeyedAPIFactory<StorageFrontend>::GetIfExists(context);
++}
++
++// static
+ std::unique_ptr<StorageFrontend> StorageFrontend::CreateForTesting(
+     scoped_refptr<value_store::ValueStoreFactory> storage_factory,
+     BrowserContext* context) {
+--- a/extensions/browser/api/storage/storage_frontend.h
++++ b/extensions/browser/api/storage/storage_frontend.h
+@@ -77,6 +77,9 @@ class StorageFrontend : public BrowserCo
+   // Returns the current instance for `context`.
+   static StorageFrontend* Get(content::BrowserContext* context);
+ 
++  // Returns the current instance without creating it.
++  static StorageFrontend* GetIfExists(content::BrowserContext* context);
++
+   // Creates with a specific `storage_factory`.
+   static std::unique_ptr<StorageFrontend> CreateForTesting(
+       scoped_refptr<value_store::ValueStoreFactory> storage_factory,
