@@ -1,0 +1,429 @@
+--- a/components/favicon/core/favicon_handler.cc
++++ b/components/favicon/core/favicon_handler.cc
+@@ -280,22 +280,31 @@ void FaviconHandler::SetFavicon(const GU
+   NotifyFaviconUpdated(icon_url, icon_type, image);
+ }
+ 
+-void FaviconHandler::MaybeDeleteFaviconMappings() {
++void FaviconHandler::FinishWithoutFavicon() {
+   DCHECK(candidates_received_);
+   DCHECK(got_favicon_from_history_);
++  DCHECK(final_candidates_);
++
++  current_candidate_index_ = final_candidates_->size();
++  best_favicon_ = DownloadedFavicon();
+ 
+-  // The order of these conditions is important because we want the feature
+-  // state to be checked at the very end.
+   if (!error_other_than_404_found_ &&
+       notification_icon_type_ != favicon_base::IconType::kInvalid) {
+     if (service_ && !delegate_->IsOffTheRecord()) {
+       service_->DeleteFaviconMappings(page_urls_, notification_icon_type_);
+     }
+ 
+-    delegate_->OnFaviconDeleted(last_page_url_, handler_type_);
+-
+     notification_icon_url_ = GURL();
+     notification_icon_type_ = favicon_base::IconType::kInvalid;
++    delegate_->OnFaviconDeleted(last_page_url_, handler_type_);
++    return;
++  }
++
++  // Completion must also be reported for pages that had no cached favicon.
++  if (notification_icon_type_ == favicon_base::IconType::kInvalid) {
++    delegate_->OnFaviconUnavailable(
++        last_page_url_, handler_type_,
++        /*clear_saved_favicon=*/!error_other_than_404_found_);
+   }
+ }
+ 
+@@ -337,6 +346,13 @@ void FaviconHandler::OnUpdateCandidates(
+     return;
+   }
+ 
++  // Native pages can use browser-provided favicons without declaring icons.
++  // The driver passes a manifest URL only to handlers that support it.
++  if (candidates.empty() && manifest_url.is_empty() &&
++      !page_url.SchemeIsHTTPOrHTTPS()) {
++    return;
++  }
++
+   // `candidates or `manifest_url` could have been modified via Javascript. If
+   // neither changed, ignore the call.
+   if (candidates_received_ && manifest_url_ == manifest_url &&
+@@ -490,7 +506,7 @@ void FaviconHandler::OnGotInitialHistory
+   if (final_candidates_->empty()) {
+     // The page lists no candidates that match our target `icon_types_`, so
+     // check if any existing mappings should be deleted.
+-    MaybeDeleteFaviconMappings();
++    FinishWithoutFavicon();
+     return;
+   }
+ 
+@@ -529,7 +545,9 @@ void FaviconHandler::OnDidDownloadFavico
+       if (service_) {
+         service_->UnableToDownloadFavicon(image_url);
+       }
+-    } else if (http_status_code != 0) {
++    } else if (http_status_code != 0 || id != 0) {
++      // A real download can fail without an HTTP response (status 0).
++      // A zero `id` identifies a skipped, previously failed download.
+       // `http_status_code` might be HTTP_OK here, but this is still
+       // considered an error since `bitmaps` is empty.
+       error_other_than_404_found_ = true;
+@@ -566,7 +584,8 @@ void FaviconHandler::OnDidDownloadFavico
+   } else {
+     if (best_favicon_.candidate.icon_type == favicon_base::IconType::kInvalid) {
+       // No valid icon found, so check if mappings should be deleted.
+-      MaybeDeleteFaviconMappings();
++      FinishWithoutFavicon();
++      return;
+     } else {
+       // We have either found the ideal candidate or run out of candidates.
+       // No more icons to request, set the favicon from the candidate. The
+@@ -641,6 +660,11 @@ void FaviconHandler::OnFaviconDataForIni
+ 
+   if (final_candidates_) {
+     OnGotInitialHistoryDataAndIconURLCandidates();
++  } else if (notification_icon_type_ == favicon_base::IconType::kInvalid) {
++    // A stopped load may never send candidates. Reconsider retention now that
++    // the history lookup has finished.
++    delegate_->OnFaviconUnavailable(last_page_url_, handler_type_,
++                                    /*clear_saved_favicon=*/false);
+   }
+ }
+ 
+@@ -711,7 +735,9 @@ void FaviconHandler::OnFaviconData(
+     NotifyFaviconUpdated(favicon_bitmap_results);
+   }
+ 
+-  if (has_expired_or_incomplete_result) {
++  // Also retry if the cached data did not produce an image to notify.
++  if (has_expired_or_incomplete_result ||
++      notification_icon_type_ == favicon_base::IconType::kInvalid) {
+     ScheduleImageDownload(current_candidate()->icon_url,
+                           current_candidate()->icon_type);
+   }
+--- a/components/favicon/core/favicon_handler.h
++++ b/components/favicon/core/favicon_handler.h
+@@ -123,6 +123,14 @@ class FaviconHandler {
+     virtual void OnFaviconDeleted(
+         const GURL& page_url,
+         FaviconDriverObserver::NotificationIconType notification_icon_type) = 0;
++
++    // Notifies that history or candidate processing finished without a usable
++    // favicon. `clear_saved_favicon` is true only after candidate processing
++    // finishes without an error that would preserve an existing favicon.
++    virtual void OnFaviconUnavailable(
++        const GURL& page_url,
++        FaviconDriverObserver::NotificationIconType notification_icon_type,
++        bool clear_saved_favicon) {}
+   };
+ 
+   // `service` may be null (which means favicons are not saved). If `service`
+@@ -159,6 +167,17 @@ class FaviconHandler {
+   // data from the CoreFaviconService. Reserved for testing.
+   bool HasPendingTasksForTest();
+ 
++  // True after history and received candidates finish without a usable icon.
++  // A stopped load can finish without candidates if `waiting_for_candidates`
++  // is false; received candidates may still be waiting for a manifest.
++  bool IsFaviconKnownMissing(const GURL& page_url,
++                            bool waiting_for_candidates) const {
++    return page_url == last_page_url_ && got_favicon_from_history_ &&
++           notification_icon_type_ == favicon_base::IconType::kInvalid &&
++           (final_candidates_ ? !current_candidate()
++                              : !candidates_received_ && !waiting_for_candidates);
++  }
++
+   // Get the maximal icon size in pixels for a handler of type `handler_type`.
+   // `candidates_from_web_manifest` represents whether the icons are coming
+   // from a Web Manifest.
+@@ -261,12 +280,10 @@ class FaviconHandler {
+                   const gfx::Image& image,
+                   favicon_base::IconType icon_type);
+ 
+-  // Deletes the favicon mappings for `page_urls_`, if:
+-  // - We're not in incognito.
+-  // - A mapping is known to exist (reflected by `notification_icon_type_`).
+-  // - All download attempts returned 404s OR no relevant candidate was
+-  //   provided (as per `icon_types_`).
+-  void MaybeDeleteFaviconMappings();
++  // Finishes candidate processing without a new favicon. Deletes known
++  // mappings outside incognito unless a download error requires keeping them.
++  // Updates the completion state before any delegate notification.
++  void FinishWithoutFavicon();
+ 
+   // Notifies `driver_` that FaviconHandler found an icon which matches the
+   // `handler_type_` criteria. NotifyFaviconUpdated() can be called multiple
+--- a/components/favicon/core/favicon_driver_impl.cc
++++ b/components/favicon/core/favicon_driver_impl.cc
+@@ -53,6 +53,17 @@ bool FaviconDriverImpl::HasPendingTasksF
+   return false;
+ }
+ 
++bool FaviconDriverImpl::FaviconIsKnownMissing(
++    const GURL& page_url,
++    bool waiting_for_candidates) const {
++  for (const auto& handler : handlers_) {
++    if (!handler->IsFaviconKnownMissing(page_url, waiting_for_candidates)) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ void FaviconDriverImpl::SetFaviconOutOfDateForPage(const GURL& url,
+                                                    bool force_reload) {
+   if (favicon_service_) {
+--- a/components/favicon/core/favicon_driver_impl.h
++++ b/components/favicon/core/favicon_driver_impl.h
+@@ -44,6 +44,12 @@ class FaviconDriverImpl : public Favicon
+   explicit FaviconDriverImpl(CoreFaviconService* favicon_service);
+   ~FaviconDriverImpl() override;
+ 
++  // True when all handlers finished without a usable favicon. If
++  // `waiting_for_candidates` is false, only history needs to finish when no
++  // candidates have been received.
++  bool FaviconIsKnownMissing(const GURL& page_url,
++                            bool waiting_for_candidates) const;
++
+   // Informs CoreFaviconService that the favicon for `url` is out of date. If
+   // `force_reload` is true, then discard information about favicon download
+   // failures.
+--- a/third_party/blink/renderer/core/frame/local_frame.cc
++++ b/third_party/blink/renderer/core/frame/local_frame.cc
+@@ -3412,9 +3412,9 @@ void LocalFrame::UpdateFaviconURL(mojom:
+       1 << static_cast<int>(
+           mojom::blink::FaviconIconType::kTouchPrecomposedIcon);
+   Vector<IconURL> icon_urls = GetDocument()->IconURLs(icon_types_mask);
+-  if (icon_urls.empty())
+-    return;
+ 
++  // An empty list also completes favicon discovery, for example when CSP
++  // blocks the default favicon and the document declares no other icons.
+   Vector<mojom::blink::FaviconURLPtr> urls;
+   urls.reserve(icon_urls.size());
+   for (const auto& icon_url : icon_urls) {
+--- a/components/favicon/content/content_favicon_driver.cc
++++ b/components/favicon/content/content_favicon_driver.cc
+@@ -16,6 +16,7 @@
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/page.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "third_party/blink/public/mojom/manifest/manifest.mojom.h"
+ #include "ui/gfx/image/image.h"
+ 
+@@ -48,6 +49,21 @@ GURL ContentFaviconDriver::GetActiveURL(
+   return entry ? entry->GetURL() : GURL();
+ }
+ 
++bool ContentFaviconDriver::ShouldWaitForFavicon() const {
++  if (FaviconIsValid()) {
++    return false;
++  }
++
++  auto* const rfh = web_contents()->GetPrimaryMainFrame();
++  // A stopped load may still receive history results. Normal completion sends
++  // candidates after the loading state changes, with downloads finishing later.
++  const bool waiting_for_candidates =
++      web_contents()->IsLoading() ||
++      rfh->IsDocumentOnLoadCompletedInMainFrame();
++  return !FaviconIsKnownMissing(rfh->GetLastCommittedURL(),
++                               waiting_for_candidates);
++}
++
+ GURL ContentFaviconDriver::GetManifestURL(content::RenderFrameHost* rfh) {
+   DocumentManifestData* document_data =
+       DocumentManifestData::GetOrCreateForCurrentDocument(rfh);
+@@ -163,6 +179,23 @@ void ContentFaviconDriver::OnFaviconDele
+                                 content::FaviconStatus().image);
+ }
+ 
++void ContentFaviconDriver::OnFaviconUnavailable(
++    const GURL& page_url,
++    FaviconDriverObserver::NotificationIconType notification_icon_type,
++    bool clear_saved_favicon) {
++  content::NavigationEntry* entry =
++      web_contents()->GetController().GetLastCommittedEntry();
++  if (notification_icon_type == FaviconDriverObserver::NON_TOUCH_16_DIP &&
++      entry && entry->GetURL() == page_url) {
++    // Reloads can preserve a valid entry favicon even when history has no copy.
++    if (clear_saved_favicon && entry->GetFavicon().valid) {
++      OnFaviconDeleted(page_url, notification_icon_type);
++      return;
++    }
++    web_contents()->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
++  }
++}
++
+ void ContentFaviconDriver::DidUpdateFaviconURL(
+     content::RenderFrameHost* rfh,
+     const std::vector<blink::mojom::FaviconURLPtr>& candidates,
+@@ -245,7 +278,10 @@ void ContentFaviconDriver::DidFinishNavi
+   DocumentManifestData* document_data =
+       DocumentManifestData::GetOrCreateForCurrentDocument(
+           navigation_handle->GetRenderFrameHost());
+-  document_data->has_manifest_url = navigation_data->has_manifest_url;
++  // A restored document already has its manifest data.
++  if (!navigation_handle->IsServedFromBackForwardCache()) {
++    document_data->has_manifest_url = navigation_data->has_manifest_url;
++  }
+ 
+   // Wait till the user navigates to a new URL to start checking the cache
+   // again. The cache may be ignored for non-reload navigations (e.g.
+@@ -260,6 +296,15 @@ void ContentFaviconDriver::DidFinishNavi
+ 
+   // Get the favicon, either from history or request it from the net.
+   FetchFavicon(url, navigation_handle->IsSameDocument());
++
++  // A loaded document restored from BFCache does not send another favicon
++  // update. Reuse its candidates, including an empty list, to finish the lookup.
++  auto* const rfh = navigation_handle->GetRenderFrameHost();
++  if (navigation_handle->IsServedFromBackForwardCache() &&
++      rfh->IsDocumentOnLoadCompletedInMainFrame()) {
++    OnUpdateCandidates(url, FaviconURLsFromContentFaviconURLs(rfh->FaviconURLs()),
++                       GetManifestURL(rfh));
++  }
+ }
+ 
+ NAVIGATION_HANDLE_USER_DATA_KEY_IMPL(
+--- a/components/favicon/content/content_favicon_driver.h
++++ b/components/favicon/content/content_favicon_driver.h
+@@ -39,6 +39,9 @@ class ContentFaviconDriver
+   bool FaviconIsValid() const override;
+   GURL GetActiveURL() override;
+ 
++  // Whether to wait for this page's favicon before showing a fallback.
++  bool ShouldWaitForFavicon() const;
++
+   GURL GetManifestURL(content::RenderFrameHost* rfh);
+ 
+  protected:
+@@ -88,6 +91,10 @@ class ContentFaviconDriver
+   void OnFaviconDeleted(const GURL& page_url,
+                         FaviconDriverObserver::NotificationIconType
+                             notification_icon_type) override;
++  void OnFaviconUnavailable(
++      const GURL& page_url,
++      FaviconDriverObserver::NotificationIconType notification_icon_type,
++      bool clear_saved_favicon) override;
+ 
+   // content::WebContentsObserver implementation.
+   void DidUpdateFaviconURL(
+--- a/chrome/browser/ui/tab_ui_helper.cc
++++ b/chrome/browser/ui/tab_ui_helper.cc
+@@ -25,11 +25,13 @@
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/favicon/content/content_favicon_driver.h"
+ #include "components/security_interstitials/content/security_interstitial_tab_helper.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/tabs/public/tab_network_state.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/url_constants.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -188,6 +190,7 @@ ui::ImageModel TabUIHelper::GetFavicon()
+   if (wc_listener) {
+     if (const std::optional<tab_groups::DeferredTabState>& deferred_tab_state =
+             wc_listener->deferred_tab_state()) {
++      retained_favicon_ = gfx::Image();
+       return deferred_tab_state.value().favicon();
+     }
+   }
+@@ -199,19 +202,58 @@ ui::ImageModel TabUIHelper::GetFavicon()
+     const gfx::ImageSkia home_tab_icon =
+         web_app_browser_controller->GetHomeTabIcon();
+     if (!home_tab_icon.isNull()) {
++      retained_favicon_ = gfx::Image();
+       return ui::ImageModel::FromImageSkia(home_tab_icon);
+     } else {
+       gfx::ImageSkia fallback_home_icon =
+           web_app_browser_controller->GetFallbackHomeTabIcon();
+       if (!fallback_home_icon.isNull()) {
++        retained_favicon_ = gfx::Image();
+         return ui::ImageModel::FromImageSkia(fallback_home_icon);
+       }
+     }
+   }
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
+-  return ui::ImageModel::FromImage(
+-      favicon::TabFaviconFromWebContents(web_contents()));
++  content::WebContents* const contents = web_contents();
++  gfx::Image favicon = favicon::TabFaviconFromWebContents(contents);
++  auto* const rfh = contents->GetPrimaryMainFrame();
++  const auto* entry = contents->GetController().GetLastCommittedEntry();
++  // Discard preserves the navigation entry but replaces the live document.
++  // Use the entry until a document commits, including after WasDiscarded()
++  // resets at the start of the restoration navigation.
++  const bool use_saved_entry = entry && rfh->GetLastCommittedURL().is_empty();
++  const GURL& page_url =
++      use_saved_entry ? entry->GetURL() : rfh->GetLastCommittedURL();
++  const url::Origin page_origin =
++      use_saved_entry ? url::Origin::Create(page_url)
++                      : rfh->GetLastCommittedOrigin();
++  const auto* driver =
++      favicon::ContentFaviconDriver::FromWebContents(contents);
++  if (!driver || !page_url.SchemeIsHTTPOrHTTPS() || rfh->IsErrorDocument() ||
++      (use_saved_entry && entry->GetPageType() == content::PAGE_TYPE_ERROR)) {
++    retained_favicon_ = gfx::Image();
++    return ui::ImageModel::FromImage(favicon);
++  }
++
++  if (driver->FaviconIsValid()) {
++    // A saved URL cannot recover an opaque document's origin.
++    if (!use_saved_entry) {
++      retained_favicon_origin_ = page_origin;
++    }
++    retained_favicon_ = retained_favicon_origin_.IsSameOriginWith(page_origin)
++                            ? favicon
++                            : gfx::Image();
++    return ui::ImageModel::FromImage(favicon);
++  }
++
++  if (!retained_favicon_origin_.IsSameOriginWith(page_origin) ||
++      (!use_saved_entry && !driver->ShouldWaitForFavicon())) {
++    retained_favicon_ = gfx::Image();
++  }
++  return ui::ImageModel::FromImage(retained_favicon_.IsEmpty()
++                                      ? favicon
++                                      : retained_favicon_);
+ }
+ 
+ bool TabUIHelper::ShouldHideThrobber() const {
+--- a/chrome/browser/ui/tab_ui_helper.h
++++ b/chrome/browser/ui/tab_ui_helper.h
+@@ -17,6 +17,8 @@
+ #include "components/tabs/public/tab_network_state.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++#include "ui/gfx/image/image.h"
++#include "url/origin.h"
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+ class Browser;
+@@ -67,6 +69,7 @@ class TabUIHelper : public tabs::Content
+ 
+   // Get the favicon of the tab. It will return a favicon from history service
+   // if it needs to, otherwise, it will return the favicon of the WebContents.
++  // Retains the previous same-origin favicon while a replacement is pending.
+   ui::ImageModel GetFavicon();
+ 
+   // Return true if the throbber should be hidden during a page load.
+@@ -131,6 +134,10 @@ class TabUIHelper : public tabs::Content
+   bool needs_attention_ = false;
+   base::CallbackListSubscription pin_tab_subscription_;
+ 
++  // Keep retention with the tab so it survives view recreation and discards.
++  gfx::Image retained_favicon_;
++  url::Origin retained_favicon_origin_;
++
+   base::RepeatingClosureList tab_ui_change_callbacks_;
+ 
+   ui::ScopedUnownedUserData<TabUIHelper> scoped_unowned_user_data_;
