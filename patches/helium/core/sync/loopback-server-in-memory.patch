@@ -1,15 +1,59 @@
 --- a/components/sync/engine/loopback_server/loopback_server.cc
 +++ b/components/sync/engine/loopback_server/loopback_server.cc
-@@ -56,7 +56,7 @@ namespace {
+@@ -17,11 +17,13 @@
+ #include "base/logging.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/numerics/clamped_math.h"
++#include "base/numerics/safe_conversions.h"
+ #include "base/rand_util.h"
+ #include "base/sequence_checker.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/string_view_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/task_traits.h"
+@@ -56,9 +58,37 @@ namespace {
  
  constexpr char kHistogramSuffix[] = "LoopBackServer";
  
 -constexpr int kCurrentLoopbackServerProtoVersion = 1;
-+constexpr int kCurrentLoopbackServerProtoVersion = 1;  // Patch guard.
  constexpr int kKeystoreKeyLength = 16;
  
++std::unique_ptr<LoopbackServerEntity> DecodeStateEntity(
++    const sync_pb::LoopbackServerEntity& serialized,
++    int64_t last_version) {
++  if (!serialized.has_type() ||
++      serialized.type() == sync_pb::LoopbackServerEntity::UNKNOWN ||
++      !serialized.has_entity() || !serialized.has_data_type()) {
++    return nullptr;
++  }
++  const auto& proto = serialized.entity();
++  if (!proto.has_id_string() || proto.id_string().empty() ||
++      !proto.has_version() || proto.version() < 0 ||
++      proto.version() > last_version) {
++    return nullptr;
++  }
++  auto entity = LoopbackServerEntity::CreateEntityFromProto(serialized);
++  if (!entity || entity->GetId() != proto.id_string() ||
++      static_cast<int64_t>(entity->GetDataType()) != serialized.data_type() ||
++      entity->IsDeleted() != proto.deleted() ||
++      entity->IsFolder() != proto.folder()) {
++    return nullptr;
++  }
++  // These types use specialized entities when processing later commits.
++  if (serialized.type() == sync_pb::LoopbackServerEntity::UNIQUE &&
++      (entity->GetDataType() == BOOKMARKS || entity->GetDataType() == NIGORI)) {
++    return nullptr;
++  }
++  return entity;
++}
++
  // Properties of the bookmark bar permanent folders.
-@@ -266,13 +266,17 @@ bool SortByVersion(const LoopbackServerE
+ constexpr char kBookmarkBarFolderServerTag[] = "bookmark_bar";
+ constexpr char kBookmarkBarFolderName[] = "Bookmark Bar";
+@@ -266,13 +296,17 @@ bool SortByVersion(const LoopbackServerE
  
  }  // namespace
  
@@ -29,7 +73,7 @@
    DCHECK(!persistent_file_.empty());
    Init();
  }
-@@ -369,9 +373,17 @@ void LoopbackServer::SaveEntity(std::uni
+@@ -369,9 +403,17 @@ void LoopbackServer::SaveEntity(std::uni
  net::HttpStatusCode LoopbackServer::HandleCommand(
      const sync_pb::ClientToServerMessage& message,
      sync_pb::ClientToServerResponse* response) {
@@ -47,7 +91,7 @@
    response->Clear();
  
    if (bag_of_chips_.has_value()) {
-@@ -403,6 +415,7 @@ net::HttpStatusCode LoopbackServer::Hand
+@@ -403,6 +445,7 @@ net::HttpStatusCode LoopbackServer::Hand
          break;
        case sync_pb::ClientToServerMessage::CLEAR_SERVER_DATA:
          ClearServerData();
@@ -55,7 +99,7 @@
          response->mutable_clear_server_data();
          success = true;
          break;
-@@ -440,14 +453,16 @@ net::HttpStatusCode LoopbackServer::Hand
+@@ -440,14 +483,16 @@ net::HttpStatusCode LoopbackServer::Hand
        // Avoid tests waiting too long after throttling is disabled.
        response->mutable_client_command()->set_throttle_delay_seconds(1);
      } else {
@@ -74,7 +118,7 @@
  }
  
  void LoopbackServer::EnableStrongConsistencyWithConflictDetectionModel() {
-@@ -463,8 +478,8 @@ void LoopbackServer::AddNewKeystoreKeyFo
+@@ -463,8 +508,8 @@ void LoopbackServer::AddNewKeystoreKeyFo
  }
  
  void LoopbackServer::FlushToDisk() {
@@ -85,52 +129,137 @@
    }
  }
  
-@@ -974,33 +989,69 @@ bool LoopbackServer::DeSerializeState(
+@@ -948,30 +993,80 @@ void LoopbackServer::SerializeState(sync
+   }
+ }
  
+-bool LoopbackServer::DeSerializeState(
+-    const sync_pb::LoopbackServerProto& proto) {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  DCHECK_EQ(proto.version(), kCurrentLoopbackServerProtoVersion);
+-
+-  store_birthday_ = proto.store_birthday();
+-  version_ = proto.last_version_assigned();
+-  for (int i = 0; i < proto.keystore_keys_size(); ++i) {
+-    const auto& key = proto.keystore_keys(i);
+-    keystore_keys_.emplace_back(key.begin(), key.end());
++// static
++bool LoopbackServer::DecodeState(const sync_pb::LoopbackServerProto& proto,
++                                 EntityMap* out) {
++  if (!proto.has_version() ||
++      proto.version() != kCurrentLoopbackServerProtoVersion ||
++      !proto.has_store_birthday() || proto.store_birthday() < 0 ||
++      !proto.has_last_version_assigned() || proto.last_version_assigned() < 0) {
++    return false;
+   }
+-  for (int i = 0; i < proto.entities_size(); ++i) {
++
++  // Build the replacement state separately so an invalid entry leaves the
++  // current state unchanged.
++  EntityMap entities;
++  std::set<std::string_view> entity_ids;
++  for (const sync_pb::LoopbackServerEntity& serialized_entity :
++       proto.entities()) {
+     std::unique_ptr<LoopbackServerEntity> entity =
+-        LoopbackServerEntity::CreateEntityFromProto(proto.entities(i));
+-    // Silently drop entities that cannot be successfully deserialized.
+-    if (entity) {
+-      entities_[proto.entities(i).entity().id_string()] = std::move(entity);
++        DecodeStateEntity(serialized_entity, proto.last_version_assigned());
++    if (!entity) {
++      return false;
++    }
++    const std::string& id = serialized_entity.entity().id_string();
++    const bool unique = out ? entities.emplace(id, std::move(entity)).second
++                            : entity_ids.insert(id).second;
++    if (!unique) {
++      return false;
+     }
+   }
++  if (out) {
++    *out = std::move(entities);
++  }
++  return true;
++}
+ 
+-  // Report success regardless of if some entities were dropped.
++bool LoopbackServer::DeSerializeState(
++    const sync_pb::LoopbackServerProto& proto,
++    bool allow_partial_load) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  EntityMap entities;
++  if (allow_partial_load) {
++    DCHECK_EQ(proto.version(), kCurrentLoopbackServerProtoVersion);
++    for (const auto& serialized : proto.entities()) {
++      auto entity = LoopbackServerEntity::CreateEntityFromProto(serialized);
++      if (entity) {
++        entities[serialized.entity().id_string()] = std::move(entity);
++      }
++    }
++  } else if (!DecodeState(proto, &entities)) {
++    return false;
++  }
++  std::vector<std::vector<uint8_t>> keystore_keys;
++  keystore_keys.reserve(proto.keystore_keys_size());
++  for (const std::string& key : proto.keystore_keys()) {
++    keystore_keys.emplace_back(key.begin(), key.end());
++  }
++  store_birthday_ = proto.store_birthday();
++  version_ = proto.last_version_assigned();
++  keystore_keys_ = std::move(keystore_keys);
++  entities_ = std::move(entities);
+   return true;
+ }
+ 
++// static
++bool LoopbackServer::IsStateValid(const sync_pb::LoopbackServerProto& proto) {
++  return DecodeState(proto, nullptr);
++}
++
++// static
++bool LoopbackServer::IsEntityValid(
++    const sync_pb::LoopbackServerEntity& serialized_entity,
++    int64_t last_version_assigned) {
++  return DecodeStateEntity(serialized_entity, last_version_assigned) != nullptr;
++}
++
  std::optional<std::string> LoopbackServer::SerializeData() {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
--  sync_pb::LoopbackServerProto proto;
--  SerializeState(&proto);
--  std::string data;
--  if (!proto.SerializeToString(&data)) {
-+  std::optional<std::string> data = SerializeStateToString();
-+  if (!data) {
-     DVLOG(1) << "Loopback sync proto could not be serialized";
-     return std::nullopt;
-   }
-   UMA_HISTOGRAM_MEMORY_KB(
-       "Sync.Local.FileSizeKB",
-       base::saturated_cast<base::Histogram::Sample32>(
--          base::ClampDiv(base::ClampAdd(data.size(), 512), 1024)));
-+          base::ClampDiv(base::ClampAdd(data->size(), 512), 1024)));
+   sync_pb::LoopbackServerProto proto;
+@@ -988,19 +1083,62 @@ std::optional<std::string> LoopbackServe
    return data;
  }
  
-+std::optional<std::string> LoopbackServer::SerializeStateToString() const {
++std::optional<std::vector<uint8_t>> LoopbackServer::SerializeStateToBytes()
++    const {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  sync_pb::LoopbackServerProto proto;
 +  SerializeState(&proto);
-+  std::string data;
-+  if (!proto.SerializeToString(&data)) {
++  if (!base::IsValueInRangeForNumericType<int>(proto.ByteSizeLong())) {
++    return std::nullopt;
++  }
++  std::vector<uint8_t> data(proto.ByteSizeLong());
++  if (!proto.SerializeToArray(data.data(),
++                              base::checked_cast<int>(data.size()))) {
 +    return std::nullopt;
 +  }
 +  return data;
 +}
 +
 +bool LoopbackServer::LoadStateFromString(std::string_view serialized) {
++  return LoadStateFromBytes(base::as_byte_span(serialized));
++}
++
++bool LoopbackServer::LoadStateFromBytes(base::span<const uint8_t> serialized) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  sync_pb::LoopbackServerProto proto;
 +  if (serialized.empty() ||
-+      !proto.ParseFromArray(serialized.data(), serialized.size()) ||
-+      proto.version() != kCurrentLoopbackServerProtoVersion) {
++      !base::IsValueInRangeForNumericType<int>(serialized.size()) ||
++      !proto.ParseFromArray(serialized.data(), serialized.size())) {
 +    return false;
 +  }
 +
-+  version_ = 0;
-+  store_birthday_ = 0;
-+  entities_.clear();
-+  keystore_keys_.clear();
-+  return DeSerializeState(proto);
++  return DeSerializeState(proto, /*allow_partial_load=*/false);
 +}
 +
 +size_t LoopbackServer::GetEntityCount() const {
@@ -161,20 +290,42 @@
  
    // Ensures local sync file can be opened, read, and is not being written to.
    // Also makes sure file will not be written to during serialization.
+@@ -1022,7 +1160,7 @@ bool LoopbackServer::LoadStateFromFile()
+   if (base::ReadFileToString(persistent_file_, &serialized)) {
+     sync_pb::LoopbackServerProto proto;
+     if (serialized.length() > 0 && proto.ParseFromString(serialized)) {
+-      return DeSerializeState(proto);
++      return DeSerializeState(proto, /*allow_partial_load=*/true);
+     }
+     DVLOG(1) << "Loopback sync cannot parse the persistent state file ("
+              << persistent_file_ << ").";
 --- a/components/sync/engine/loopback_server/loopback_server.h
 +++ b/components/sync/engine/loopback_server/loopback_server.h
-@@ -11,6 +11,7 @@
+@@ -11,8 +11,10 @@
  #include <memory>
  #include <optional>
  #include <string>
 +#include <string_view>
  #include <vector>
  
++#include "base/containers/span.h"
  #include "base/files/file_path.h"
-@@ -40,6 +41,11 @@ namespace syncer {
+ #include "base/files/important_file_writer.h"
+ #include "base/functional/callback.h"
+@@ -26,6 +28,7 @@
+ 
+ namespace sync_pb {
+ class DeletionOrigin;
++class LoopbackServerEntity;
+ class LoopbackServerProto;
+ class EntitySpecifics;
+ class SyncEntity;
+@@ -40,6 +43,13 @@ namespace syncer {
  // A loopback version of the Sync server used for local profile serialization.
  class LoopbackServer : public base::ImportantFileWriter::DataSerializer {
   public:
++  static constexpr int kCurrentLoopbackServerProtoVersion = 1;  // Patch guard.
++
 +  struct CommandResult {
 +    net::HttpStatusCode status;
 +    bool state_changed;
@@ -183,7 +334,7 @@
    class ObserverForTests {
     public:
      virtual ~ObserverForTests() = default;
-@@ -54,6 +60,9 @@ class LoopbackServer : public base::Impo
+@@ -54,6 +64,9 @@ class LoopbackServer : public base::Impo
          const sync_pb::DeletionOrigin& deletion_origin) = 0;
    };
  
@@ -193,7 +344,7 @@
    explicit LoopbackServer(const base::FilePath& persistent_file);
    ~LoopbackServer() override;
  
-@@ -63,6 +72,13 @@ class LoopbackServer : public base::Impo
+@@ -63,6 +76,13 @@ class LoopbackServer : public base::Impo
        const sync_pb::ClientToServerMessage& message,
        sync_pb::ClientToServerResponse* response);
  
@@ -207,20 +358,42 @@
    // Enables strong consistency model (i.e. server detects conflicts).
    void EnableStrongConsistencyWithConflictDetectionModel();
  
-@@ -96,6 +112,12 @@ class LoopbackServer : public base::Impo
+@@ -96,6 +116,19 @@ class LoopbackServer : public base::Impo
    static int GetMigrationVersionFromProgressTokenForTesting(
        const std::string& token);
  
 +  // Serializes or restores the complete server state without touching disk.
 +  // LoadStateFromString() replaces the current in-memory state.
-+  std::optional<std::string> SerializeStateToString() const;
++  std::optional<std::vector<uint8_t>> SerializeStateToBytes() const;
 +  bool LoadStateFromString(std::string_view serialized);
++  bool LoadStateFromBytes(base::span<const uint8_t> serialized);
++  // Returns whether every field and entity can be reconstructed without loss.
++  static bool IsStateValid(const sync_pb::LoopbackServerProto& proto);
++  // Returns whether one serialized entity can be reconstructed at the given
++  // authoritative server version.
++  static bool IsEntityValid(const sync_pb::LoopbackServerEntity& entity,
++                            int64_t last_version_assigned);
 +  size_t GetEntityCount() const;
 +
    const std::vector<std::vector<uint8_t>>& GetKeystoreKeysForTesting() const {
      return keystore_keys_;
    }
-@@ -287,7 +309,8 @@ class LoopbackServer : public base::Impo
+@@ -246,7 +279,13 @@ class LoopbackServer : public base::Impo
+   void SerializeState(sync_pb::LoopbackServerProto* proto) const;
+ 
+   // Populates the server state from `proto`. Returns true iff successful.
+-  bool DeSerializeState(const sync_pb::LoopbackServerProto& proto);
++  bool DeSerializeState(const sync_pb::LoopbackServerProto& proto,
++                        bool allow_partial_load);
++
++  // Validates without retaining entities when `out` is null. Otherwise replaces
++  // `out` only after the complete state has been decoded successfully.
++  static bool DecodeState(const sync_pb::LoopbackServerProto& proto,
++                          EntityMap* out);
+ 
+   // Schedules committing state to disk at some later time. Repeat calls are
+   // batched together. Outstanding scheduled writes are committed at shutdown.
+@@ -287,7 +326,8 @@ class LoopbackServer : public base::Impo
    const base::FilePath persistent_file_;
  
    // Used to limit the rate of file rewrites due to updates.
@@ -230,3 +403,347 @@
  
    // Used to verify that LoopbackServer is only used from one sequence.
    SEQUENCE_CHECKER(sequence_checker_);
+--- a/components/sync/engine/BUILD.gn
++++ b/components/sync/engine/BUILD.gn
+@@ -2,6 +2,15 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//third_party/protobuf/proto_library.gni")
++
++proto_library("loopback_server_state_delta_proto") {
++  proto_in_dir = "//"
++  sources = [ "loopback_server/loopback_server_state_delta.proto" ]
++  deps = [ "//components/sync/protocol" ]
++  extra_configs = [ "//build/config/compiler:wexit_time_destructors" ]
++}
++
+ static_library("engine") {
+   sources = [
+     "active_devices_invalidation_info.cc",
+@@ -99,6 +108,8 @@ static_library("engine") {
+     "loopback_server/loopback_server.h",
+     "loopback_server/loopback_server_entity.cc",
+     "loopback_server/loopback_server_entity.h",
++    "loopback_server/loopback_server_state_delta.cc",
++    "loopback_server/loopback_server_state_delta.h",
+     "loopback_server/persistent_bookmark_entity.cc",
+     "loopback_server/persistent_bookmark_entity.h",
+     "loopback_server/persistent_permanent_entity.cc",
+@@ -177,6 +188,7 @@ static_library("engine") {
+   ]
+ 
+   deps = [
++    ":loopback_server_state_delta_proto",
+     "//base:i18n",
+     "//build:branding_buildflags",
+     "//components/autofill/core/browser:payments_sync_utils",
+--- /dev/null
++++ b/components/sync/engine/loopback_server/loopback_server_state_delta.cc
+@@ -0,0 +1,247 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/sync/engine/loopback_server/loopback_server_state_delta.h"
++
++#include <algorithm>
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/containers/span.h"
++#include "base/numerics/safe_conversions.h"
++#include "components/sync/engine/loopback_server/loopback_server.h"
++#include "components/sync/engine/loopback_server/loopback_server_state_delta.pb.h"
++#include "components/sync/protocol/loopback_server.pb.h"
++
++namespace syncer {
++
++namespace {
++
++using EntityIndex = std::map<std::string_view, int, std::less<>>;
++
++template <typename Message>
++base::expected<Message, SyncVaultStateCodecError> ParseBoundedProto(
++    base::span<const uint8_t> serialized) {
++  // Protobuf's array API takes an int. This is a representation bound, not a
++  // configured quota on the dataset.
++  if (serialized.empty()) {
++    return base::unexpected(SyncVaultStateCodecError::kMalformed);
++  }
++  if (!base::IsValueInRangeForNumericType<int>(serialized.size())) {
++    return base::unexpected(SyncVaultStateCodecError::kLimitExceeded);
++  }
++  Message message;
++  if (!message.ParseFromArray(serialized.data(),
++                              base::checked_cast<int>(serialized.size()))) {
++    return base::unexpected(SyncVaultStateCodecError::kMalformed);
++  }
++  return message;
++}
++
++template <typename Message>
++SyncVaultStateCodecResult SerializeBoundedProto(const Message& message) {
++  const size_t size = message.ByteSizeLong();
++  if (size == 0) {
++    return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++  }
++  if (!base::IsValueInRangeForNumericType<int>(size)) {
++    return base::unexpected(SyncVaultStateCodecError::kLimitExceeded);
++  }
++  std::vector<uint8_t> serialized(size);
++  if (!message.SerializeToArray(serialized.data(),
++                                base::checked_cast<int>(size))) {
++    return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++  }
++  return serialized;
++}
++
++EntityIndex IndexState(const sync_pb::LoopbackServerProto& state) {
++  EntityIndex entities;
++  for (int index = 0; index < state.entities_size(); ++index) {
++    entities.emplace(state.entities(index).entity().id_string(), index);
++  }
++  return entities;
++}
++
++base::expected<void, SyncVaultStateCodecError> ValidateState(
++    const sync_pb::LoopbackServerProto& state) {
++  if (!state.has_version()) {
++    return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++  }
++  if (state.version() != LoopbackServer::kCurrentLoopbackServerProtoVersion) {
++    return base::unexpected(SyncVaultStateCodecError::kUnsupportedVersion);
++  }
++  if (!LoopbackServer::IsStateValid(state)) {
++    return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++  }
++
++  return base::ok();
++}
++
++}  // namespace
++
++SyncVaultStateValidationResult LoopbackServerStateCodec::ValidateSnapshot(
++    base::span<const uint8_t> state) const {
++  auto parsed = ParseBoundedProto<sync_pb::LoopbackServerProto>(state);
++  if (!parsed.has_value()) {
++    return base::unexpected(parsed.error());
++  }
++  auto validation = ValidateState(parsed.value());
++  if (!validation.has_value()) {
++    return base::unexpected(validation.error());
++  }
++  return base::ok();
++}
++
++namespace {
++
++class LoopbackStateReconstruction final
++    : public SyncVaultStateCodec::Reconstruction {
++ public:
++  explicit LoopbackStateReconstruction(sync_pb::LoopbackServerProto state)
++      : base_(std::move(state)),
++        base_entities_(IndexState(base_)),
++        current_last_version_(base_.last_version_assigned()),
++        current_keystore_keys_(base_.keystore_keys().begin(),
++                               base_.keystore_keys().end()) {}
++
++  SyncVaultStateValidationResult ApplyDelta(
++      base::span<const uint8_t> serialized_delta) override;
++  SyncVaultStateCodecResult Finish() const override;
++
++ private:
++  sync_pb::LoopbackServerProto base_;
++  EntityIndex base_entities_;
++  // Keep only the latest change for each ID, then build the full state once.
++  // A nullopt entry means the entity was removed.
++  std::map<std::string, std::optional<sync_pb::LoopbackServerEntity>> overlay_;
++  int64_t current_last_version_;
++  std::vector<std::string> current_keystore_keys_;
++};
++
++SyncVaultStateValidationResult LoopbackStateReconstruction::ApplyDelta(
++    base::span<const uint8_t> serialized_delta) {
++  auto find_current_entity =
++      [&](const std::string& id) -> const sync_pb::LoopbackServerEntity* {
++    const auto changed = overlay_.find(id);
++    if (changed != overlay_.end()) {
++      return changed->second ? &*changed->second : nullptr;
++    }
++    const auto original = base_entities_.find(id);
++    return original == base_entities_.end()
++               ? nullptr
++               : &base_.entities(base::checked_cast<int>(original->second));
++  };
++
++  auto delta =
++      ParseBoundedProto<sync_pb::LoopbackServerStateDelta>(serialized_delta);
++  if (!delta.has_value()) {
++    return base::unexpected(delta.error());
++  }
++  if (!delta->has_format_version() || !delta->has_last_version_assigned()) {
++    return base::unexpected(SyncVaultStateCodecError::kMalformed);
++  }
++  if (delta->format_version() != kLoopbackStateDeltaFormatVersion) {
++    return base::unexpected(SyncVaultStateCodecError::kUnsupportedVersion);
++  }
++  if (delta->last_version_assigned() < current_last_version_) {
++    return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++  }
++
++  // Deltas may append keys, but must preserve the existing keys in order.
++  if (!std::ranges::starts_with(delta->keystore_keys(), current_keystore_keys_)) {
++    return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++  }
++
++  // An ID cannot be changed twice, or both removed and updated, in one delta.
++  std::set<std::string> changed_ids;
++  for (const std::string& id : delta->removed_entity_ids()) {
++    if (id.empty() || !changed_ids.insert(id).second ||
++        !find_current_entity(id)) {
++      return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++    }
++  }
++
++  for (int index = 0; index < delta->upserted_entities_size(); ++index) {
++    const sync_pb::LoopbackServerEntity& entity =
++        delta->upserted_entities(index);
++    const std::string& id = entity.entity().id_string();
++    if (id.empty() || !changed_ids.insert(id).second ||
++        !LoopbackServer::IsEntityValid(entity,
++                                       delta->last_version_assigned())) {
++      return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++    }
++    // Every changed entry must advance past the previous server version.
++    if (entity.entity().version() <= current_last_version_) {
++      return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++    }
++  }
++
++  const bool same_keystore_keys =
++      std::ranges::equal(current_keystore_keys_, delta->keystore_keys());
++  if (changed_ids.empty() &&
++      current_last_version_ == delta->last_version_assigned() &&
++      same_keystore_keys) {
++    return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++  }
++
++  for (const std::string& id : delta->removed_entity_ids()) {
++    overlay_.insert_or_assign(id, std::nullopt);
++  }
++  for (auto& entity : *delta->mutable_upserted_entities()) {
++    const std::string id = entity.entity().id_string();
++    overlay_.insert_or_assign(id, std::move(entity));
++  }
++  current_last_version_ = delta->last_version_assigned();
++  current_keystore_keys_.assign(delta->keystore_keys().begin(),
++                                delta->keystore_keys().end());
++  return base::ok();
++}
++
++SyncVaultStateCodecResult LoopbackStateReconstruction::Finish() const {
++  sync_pb::LoopbackServerProto resulting;
++  resulting.set_version(base_.version());
++  resulting.set_store_birthday(base_.store_birthday());
++  resulting.set_last_version_assigned(current_last_version_);
++  for (const std::string& key : current_keystore_keys_) {
++    resulting.add_keystore_keys(key);
++  }
++  for (const sync_pb::LoopbackServerEntity& entity : base_.entities()) {
++    const std::string& id = entity.entity().id_string();
++    const auto replacement = overlay_.find(id);
++    if (replacement == overlay_.end()) {
++      resulting.add_entities()->CopyFrom(entity);
++    } else if (replacement->second) {
++      resulting.add_entities()->CopyFrom(*replacement->second);
++    }
++  }
++  for (const auto& [id, entity] : overlay_) {
++    if (entity && !base_entities_.contains(id)) {
++      resulting.add_entities()->CopyFrom(*entity);
++    }
++  }
++  if (!ValidateState(resulting).has_value()) {
++    return base::unexpected(SyncVaultStateCodecError::kInvalidValue);
++  }
++  return SerializeBoundedProto(resulting);
++}
++
++}  // namespace
++
++SyncVaultStateCodec::ReconstructionResult
++LoopbackServerStateCodec::StartReconstruction(
++    base::span<const uint8_t> base_state) const {
++  auto parsed = ParseBoundedProto<sync_pb::LoopbackServerProto>(base_state);
++  if (!parsed.has_value()) {
++    return base::unexpected(parsed.error());
++  }
++  return std::make_unique<LoopbackStateReconstruction>(
++      std::move(parsed.value()));
++}
++
++}  // namespace syncer
+--- /dev/null
++++ b/components/sync/engine/loopback_server/loopback_server_state_delta.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SYNC_ENGINE_LOOPBACK_SERVER_LOOPBACK_SERVER_STATE_DELTA_H_
++#define COMPONENTS_SYNC_ENGINE_LOOPBACK_SERVER_LOOPBACK_SERVER_STATE_DELTA_H_
++
++#include "components/sync/engine/sync_vault/sync_vault_state_codec.h"
++
++namespace syncer {
++inline constexpr uint32_t kLoopbackStateDeltaFormatVersion = 1;
++
++// Strict codec for serialized LoopbackServerProto snapshots. Validation uses
++// LoopbackServer's real entity reconstruction path so replay cannot silently
++// discard malformed entities.
++class LoopbackServerStateCodec final : public SyncVaultStateCodec {
++ public:
++  LoopbackServerStateCodec() = default;
++  ~LoopbackServerStateCodec() override = default;
++
++  SyncVaultStateValidationResult ValidateSnapshot(
++      base::span<const uint8_t> state) const override;
++  ReconstructionResult StartReconstruction(
++      base::span<const uint8_t> base_state) const override;
++};
++
++}  // namespace syncer
++
++#endif  // COMPONENTS_SYNC_ENGINE_LOOPBACK_SERVER_LOOPBACK_SERVER_STATE_DELTA_H_
+--- /dev/null
++++ b/components/sync/engine/loopback_server/loopback_server_state_delta.proto
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++syntax = "proto2";
++
++option optimize_for = LITE_RUNTIME;
++
++package sync_pb;
++
++import "components/sync/protocol/loopback_server.proto";
++
++// A semantic update to a serialized LoopbackServerProto. Immutable snapshot
++// metadata is inherited from the base; entity changes are resulting values and
++// removals rather than replayable client requests.
++message LoopbackServerStateDelta {
++  optional uint32 format_version = 1;
++  optional int64 last_version_assigned = 2;
++  // Complete resulting key list. Existing keys remain an unchanged prefix;
++  // resets use a full snapshot instead of a delta.
++  repeated bytes keystore_keys = 3;
++  repeated LoopbackServerEntity upserted_entities = 4;
++  repeated string removed_entity_ids = 5;
++}
