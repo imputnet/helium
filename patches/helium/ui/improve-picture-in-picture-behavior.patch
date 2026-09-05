@@ -1,0 +1,533 @@
+--- a/chrome/browser/picture_in_picture/BUILD.gn
++++ b/chrome/browser/picture_in_picture/BUILD.gn
+@@ -36,0 +37 @@
++      "auto_picture_in_picture_display_helper.h",
+@@ -144,0 +146,3 @@
++  }
++  if (is_mac) {
++    sources += [ "auto_picture_in_picture_display_helper_mac.mm" ]
+--- /dev/null
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_display_helper.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_DISPLAY_HELPER_H_
++#define CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_DISPLAY_HELPER_H_
++
++#include <stdint.h>
++
++#include <optional>
++
++namespace picture_in_picture {
++
++std::optional<int64_t> GetFocusedApplicationDisplayId();
++
++}  // namespace picture_in_picture
++
++#endif  // CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_DISPLAY_HELPER_H_
+--- /dev/null
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_display_helper_mac.mm
+@@ -0,0 +1,94 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/picture_in_picture/auto_picture_in_picture_display_helper.h"
++
++#import <AppKit/AppKit.h>
++#include <ApplicationServices/ApplicationServices.h>
++
++#include "base/apple/scoped_cftyperef.h"
++#include "base/process/process_handle.h"
++#include "ui/display/display.h"
++#include "ui/display/screen.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace picture_in_picture {
++
++std::optional<int64_t> GetFocusedApplicationDisplayId() {
++  NSRunningApplication* frontmost_application =
++      NSWorkspace.sharedWorkspace.frontmostApplication;
++  if (!frontmost_application) {
++    return std::nullopt;
++  }
++
++  const pid_t frontmost_process_id = frontmost_application.processIdentifier;
++  if (!frontmost_process_id ||
++      frontmost_process_id == base::GetCurrentProcId()) {
++    return std::nullopt;
++  }
++
++  auto* screen = display::Screen::Get();
++  if (!screen) {
++    return std::nullopt;
++  }
++
++  base::apple::ScopedCFTypeRef<CFArrayRef> window_infos(
++      CGWindowListCopyWindowInfo(
++          kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
++          kCGNullWindowID));
++  if (!window_infos) {
++    return std::nullopt;
++  }
++
++  const CFIndex count = CFArrayGetCount(window_infos.get());
++  for (CFIndex index = 0; index < count; ++index) {
++    CFDictionaryRef window_info = reinterpret_cast<CFDictionaryRef>(
++        CFArrayGetValueAtIndex(window_infos.get(), index));
++    if (!window_info) {
++      continue;
++    }
++
++    CFNumberRef owner_process_id_ref = reinterpret_cast<CFNumberRef>(
++        CFDictionaryGetValue(window_info, kCGWindowOwnerPID));
++    int owner_process_id = 0;
++    if (!owner_process_id_ref ||
++        !CFNumberGetValue(owner_process_id_ref, kCFNumberIntType,
++                          &owner_process_id) ||
++        owner_process_id != frontmost_process_id) {
++      continue;
++    }
++
++    CFNumberRef layer_ref = reinterpret_cast<CFNumberRef>(
++        CFDictionaryGetValue(window_info, kCGWindowLayer));
++    int layer = 0;
++    if (!layer_ref || !CFNumberGetValue(layer_ref, kCFNumberIntType, &layer) ||
++        layer != 0) {
++      continue;
++    }
++
++    CFDictionaryRef bounds_ref = reinterpret_cast<CFDictionaryRef>(
++        CFDictionaryGetValue(window_info, kCGWindowBounds));
++    CGRect bounds = CGRectZero;
++    if (!bounds_ref ||
++        !CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds) ||
++        CGRectIsEmpty(bounds)) {
++      continue;
++    }
++
++    const gfx::Rect window_bounds(static_cast<int>(bounds.origin.x),
++                                  static_cast<int>(bounds.origin.y),
++                                  static_cast<int>(bounds.size.width),
++                                  static_cast<int>(bounds.size.height));
++    const display::Display display = screen->GetDisplayMatching(window_bounds);
++    if (!display.is_valid()) {
++      continue;
++    }
++
++    return display.id();
++  }
++
++  return std::nullopt;
++}
++
++}  // namespace picture_in_picture
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.cc
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.cc
+@@ -6,0 +7,9 @@
++#include <stdint.h>
++
++#include <optional>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "build/build_config.h"
++#include "chrome/browser/profiles/profile.h"
+@@ -8,0 +18 @@
++#include "chrome/browser/ui/browser_list.h"
+@@ -9,0 +20,3 @@
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
+@@ -11,0 +25,4 @@
++#include "content/public/browser/visibility.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/display/display.h"
++#include "ui/display/screen.h"
+@@ -12,0 +28,84 @@
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/picture_in_picture/auto_picture_in_picture_display_helper.h"
++#endif
++
++namespace {
++
++std::optional<int64_t> GetBrowserDisplayId(Browser* browser) {
++  if (!browser || !browser->window()) {
++    return std::nullopt;
++  }
++
++  auto* screen = display::Screen::Get();
++  if (!screen) {
++    return std::nullopt;
++  }
++
++  const display::Display display =
++      screen->GetDisplayNearestWindow(browser->window()->GetNativeWindow());
++  if (!display.is_valid()) {
++    return std::nullopt;
++  }
++
++  return display.id();
++}
++
++std::optional<int64_t> GetActiveBrowserDisplayId() {
++  Browser* active_browser = chrome::FindLastActive();
++  if (!active_browser || !active_browser->IsActive()) {
++    return std::nullopt;
++  }
++
++  return GetBrowserDisplayId(active_browser);
++}
++
++std::optional<int64_t> GetCursorDisplayId() {
++  auto* screen = display::Screen::Get();
++  if (!screen) {
++    return std::nullopt;
++  }
++
++  const display::Display display =
++      screen->GetDisplayNearestPoint(screen->GetCursorScreenPoint());
++  if (!display.is_valid()) {
++    return std::nullopt;
++  }
++
++  return display.id();
++}
++
++std::optional<int64_t> GetFocusedDisplayIdForAutoPipSuppression() {
++  std::optional<int64_t> focused_display_id = GetActiveBrowserDisplayId();
++  if (focused_display_id) {
++    return focused_display_id;
++  }
++
++#if BUILDFLAG(IS_MAC)
++  focused_display_id = picture_in_picture::GetFocusedApplicationDisplayId();
++  if (focused_display_id) {
++    return focused_display_id;
++  }
++#endif
++
++  return GetCursorDisplayId();
++}
++
++bool AreKnownDifferentDisplays(std::optional<int64_t> first_display_id,
++                               std::optional<int64_t> second_display_id) {
++  return first_display_id && second_display_id &&
++         *first_display_id != *second_display_id;
++}
++
++bool IsAutoPictureInPictureOnFocusLossEnabled(
++    content::WebContents* web_contents) {
++  Browser* browser = chrome::FindBrowserWithTab(web_contents);
++  if (!browser) {
++    return true;
++  }
++
++  return browser->profile()->GetPrefs()->GetBoolean(
++      prefs::kHeliumAutoPictureInPictureOnFocusLoss);
++}
++
++}  // namespace
++
+@@ -27 +128,2 @@
+-                                                std::move(callback)) {}
++                                                std::move(callback)),
++      content::WebContentsObserver(web_contents) {}
+@@ -42,0 +158 @@
++  BrowserList::AddObserver(this);
+@@ -55,0 +172,2 @@
++  weak_ptr_factory_.InvalidateWeakPtrs();
++  BrowserList::RemoveObserver(this);
+@@ -90,0 +209,85 @@
++  UpdateAndNotifyIfTabActivationChanged();
++}
++
++void AutoPictureInPictureTabStripObserverHelper::OnVisibilityChanged(
++    content::Visibility visibility) {
++  if (!is_observing_ || visibility != content::Visibility::VISIBLE) {
++    return;
++  }
++
++  UpdateAndNotifyIfTabActivationChanged(
++      /*treat_visible_contents_as_active=*/true);
++}
++
++void AutoPictureInPictureTabStripObserverHelper::OnBrowserRemoved(
++    Browser* browser) {
++  if (IsActivationChangeForObservedTab(browser)) {
++    weak_ptr_factory_.InvalidateWeakPtrs();
++  }
++}
++
++void AutoPictureInPictureTabStripObserverHelper::OnBrowserSetLastActive(
++    Browser* browser) {
++  if (!IsActivationChangeForObservedTab(browser)) {
++    return;
++  }
++
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&AutoPictureInPictureTabStripObserverHelper::
++                         UpdateAndNotifyIfBrowserActivationChanged,
++                     weak_ptr_factory_.GetWeakPtr(),
++                     browser));
++}
++
++void AutoPictureInPictureTabStripObserverHelper::OnBrowserNoLongerActive(
++    Browser* browser) {
++  if (!IsActivationChangeForObservedTab(browser)) {
++    return;
++  }
++
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&AutoPictureInPictureTabStripObserverHelper::
++                         UpdateAndNotifyIfFocusLossShouldTriggerAutoPip,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++bool AutoPictureInPictureTabStripObserverHelper::
++    IsActivationChangeForObservedTab(Browser* browser) const {
++  auto* current_tab_strip_model = GetCurrentTabStripModel();
++  return browser->tab_strip_model() == observed_tab_strip_model_ ||
++         browser->tab_strip_model() == current_tab_strip_model;
++}
++
++void AutoPictureInPictureTabStripObserverHelper::
++    UpdateAndNotifyIfBrowserActivationChanged(Browser* browser) {
++  if (!IsActivationChangeForObservedTab(browser)) {
++    return;
++  }
++
++  UpdateAndNotifyIfTabActivationChanged(
++      /*treat_visible_contents_as_active=*/true);
++}
++
++void AutoPictureInPictureTabStripObserverHelper::
++    UpdateAndNotifyIfFocusLossShouldTriggerAutoPip() {
++  if (!IsAutoPictureInPictureOnFocusLossEnabled(GetObservedWebContents())) {
++    return;
++  }
++
++  if (ShouldIgnoreFocusLossForDifferentDisplay()) {
++    return;
++  }
++
++  UpdateAndNotifyIfTabActivationChanged();
++}
++
++void AutoPictureInPictureTabStripObserverHelper::
++    UpdateAndNotifyIfTabActivationChanged(
++        bool treat_visible_contents_as_active) {
++  auto* current_tab_strip_model = GetCurrentTabStripModel();
++  if (current_tab_strip_model != observed_tab_strip_model_) {
++    ObserveTabStripModel(current_tab_strip_model);
++  }
++
+@@ -92 +296,2 @@
+-  UpdateIsTabActivated(current_tab_strip_model);
++  UpdateIsTabActivated(current_tab_strip_model,
++                       treat_visible_contents_as_active);
+@@ -99,0 +302,7 @@
++bool AutoPictureInPictureTabStripObserverHelper::
++    ShouldIgnoreFocusLossForDifferentDisplay() const {
++  return AreKnownDifferentDisplays(
++      GetBrowserDisplayId(chrome::FindBrowserWithTab(GetObservedWebContents())),
++      GetFocusedDisplayIdForAutoPipSuppression());
++}
++
+@@ -100,2 +305,3 @@ void AutoPictureInPictureTabStripObserverHelper::UpdateIsTabActivated(
+-void AutoPictureInPictureTabStripObserverHelper::UpdateIsTabActivated(
+-    const TabStripModel* tab_strip_model) {
++void AutoPictureInPictureTabStripObserverHelper::UpdateIsTabActivated(
++    const TabStripModel* tab_strip_model,
++    bool treat_visible_contents_as_active) {
+@@ -117,0 +335,11 @@
++    Browser* browser = chrome::FindBrowserWithTab(GetObservedWebContents());
++    const bool contents_are_visible =
++        GetObservedWebContents()->GetVisibility() ==
++        content::Visibility::VISIBLE;
++    if (!browser ||
++        (!browser->IsActive() &&
++         !(treat_visible_contents_as_active && contents_are_visible))) {
++      is_tab_activated_ = false;
++      return;
++    }
++
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.h
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_tab_strip_observer_helper.h
+@@ -10,0 +11 @@
++#include "base/memory/weak_ptr.h"
+@@ -11,0 +13 @@
++#include "chrome/browser/ui/browser_list_observer.h"
+@@ -12,0 +15,2 @@
++#include "content/public/browser/visibility.h"
++#include "content/public/browser/web_contents_observer.h"
+@@ -26,0 +29,2 @@
++      public BrowserListObserver,
++      public content::WebContentsObserver,
+@@ -41,0 +45,8 @@
++  // BrowserListObserver:
++  void OnBrowserRemoved(Browser* browser) override;
++  void OnBrowserSetLastActive(Browser* browser) override;
++  void OnBrowserNoLongerActive(Browser* browser) override;
++
++  // content::WebContentsObserver:
++  void OnVisibilityChanged(content::Visibility visibility) override;
++
+@@ -48 +60,13 @@
+-  void UpdateIsTabActivated(const TabStripModel* tab_strip_model);
++  void UpdateIsTabActivated(const TabStripModel* tab_strip_model,
++                            bool treat_visible_contents_as_active = false);
++
++  bool IsActivationChangeForObservedTab(Browser* browser) const;
++
++  void UpdateAndNotifyIfBrowserActivationChanged(Browser* browser);
++
++  void UpdateAndNotifyIfFocusLossShouldTriggerAutoPip();
++
++  void UpdateAndNotifyIfTabActivationChanged(
++      bool treat_visible_contents_as_active = false);
++
++  bool ShouldIgnoreFocusLossForDifferentDisplay() const;
+@@ -62 +80 @@
+-  // True if the tab is the activated tab on its tab strip.
++  // True if the tab is the activated tab in the active browser window.
+@@ -67 +85,4 @@
+-};
++
++  base::WeakPtrFactory<AutoPictureInPictureTabStripObserverHelper>
++      weak_ptr_factory_{this};
++};
+--- a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
++++ b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
+@@ -500,12 +500,8 @@ gfx::Rect PictureInPictureWindowManager::CalculateOuterWindowBounds(
+   int window_diff_width = work_area.right() - window_bounds.width();
+   int window_diff_height = work_area.bottom() - window_bounds.height();
+ 
+-  // Keep a margin distance of 2% the average of the two window size
+-  // differences, keeping the margins consistent.
+-  int buffer = (window_diff_width + window_diff_height) / 2 * 0.02;
+-
+   gfx::Point default_origin =
+-      gfx::Point(window_diff_width - buffer, window_diff_height - buffer);
++      gfx::Point(window_diff_width, window_diff_height);
+   window_bounds.set_origin(default_origin);
+ 
+   return window_bounds;
+--- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
++++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+@@ -1816,6 +1816,13 @@ void NativeWidgetNSWindowBridge::SetCanAppearInExistingFullscreenSpaces(
+   if (can_appear_in_existing_fullscreen_spaces) {
+     if (@available(macOS 13.0, *)) {
+       collectionBehavior &= ~NSWindowCollectionBehaviorPrimary;
++      collectionBehavior &= ~NSWindowCollectionBehaviorAuxiliary;
++      // `CanJoinAllApplications` depends on activation independence, so
++      // callers that need it must enable activation independence before
++      // enabling fullscreen Spaces behavior.
++      if ([window_ activationIndependence]) {
++        collectionBehavior |= NSWindowCollectionBehaviorCanJoinAllApplications;
++      }
+     }
+     collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
+     collectionBehavior &= ~NSWindowCollectionBehaviorFullScreenPrimary;
+@@ -1822,5 +1827,7 @@ void NativeWidgetNSWindowBridge::SetCanAppearInExistingFullscreenSpaces(
+     if (@available(macOS 13.0, *)) {
+       collectionBehavior |= NSWindowCollectionBehaviorPrimary;
++      collectionBehavior &= ~NSWindowCollectionBehaviorAuxiliary;
++      collectionBehavior &= ~NSWindowCollectionBehaviorCanJoinAllApplications;
+     }
+     collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+     collectionBehavior &= ~NSWindowCollectionBehaviorFullScreenAuxiliary;
+--- a/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
++++ b/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
+@@ -383,6 +383,9 @@ std::unique_ptr<VideoOverlayWindowViews> VideoOverlayWindowViews::Create(
+   // resized to fit the video that is embedded right afterwards, anyway.
+   params.bounds = gfx::Rect(overlay_window->GetMinimumSize());
+   params.z_order = ui::ZOrderLevel::kFloatingWindow;
++  // The PiP window should accept mouse events without becoming the key window.
++  // Otherwise macOS Space switches can focus PiP instead of the browser.
++  params.activatable = views::Widget::InitParams::Activatable::kNo;
+   params.visible_on_all_workspaces = true;
+   params.remove_standard_frame = true;
+   params.name = "PictureInPictureWindow";
+@@ -402,4 +402,13 @@ std::unique_ptr<VideoOverlayWindowViews> VideoOverlayWindowViews::Create(
+  overlay_window->Init(std::move(params));
+  overlay_window->OnRootViewReady();
+-
++
++#if BUILDFLAG(IS_MAC)
++  // Establish the macOS PiP Space flags before the first show. ShowInactive()
++  // reapplies them on every show because the calls are idempotent and future
++  // show paths should not lose fullscreen Space eligibility.
++  overlay_window->SetActivationIndependence(true);
++  // Make PiP eligible for macOS fullscreen app Spaces, not only desktop Spaces.
++  overlay_window->SetCanAppearInExistingFullscreenSpaces(true);
++#endif
++
+ #if BUILDFLAG(IS_WIN)
+@@ -543,12 +551,8 @@ gfx::Rect VideoOverlayWindowViews::CalculateAndUpdateWindowBounds() {
+   int window_diff_width = work_area.right() - window_size.width();
+   int window_diff_height = work_area.bottom() - window_size.height();
+ 
+-  // Keep a margin distance of 2% the average of the two window size
+-  // differences, keeping the margins consistent.
+-  int buffer = (window_diff_width + window_diff_height) / 2 * 0.02;
+-
+   gfx::Point default_origin =
+-      gfx::Point(window_diff_width - buffer, window_diff_height - buffer);
++      gfx::Point(window_diff_width, window_diff_height);
+ 
+   if (has_been_shown_) {
+     // Make sure window is displayed entirely in the work area.
+@@ -1767,4 +1772,9 @@ void VideoOverlayWindowViews::ShowInactive() {
+   views::Widget::SetVisibleOnAllWorkspaces(true);
++#if BUILDFLAG(IS_MAC)
++  // Keep later show paths aligned with the first-show setup in Create().
++  SetActivationIndependence(true);
++  SetCanAppearInExistingFullscreenSpaces(true);
++#endif
+ #if BUILDFLAG(IS_CHROMEOS)
+   non_client_view()->frame_view()->UpdateWindowRoundedCorners();
+ #endif
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -862,0 +863,5 @@
++// A boolean pref set to true if Auto PiP should trigger when the active browser
++// window loses focus.
++inline constexpr char kHeliumAutoPictureInPictureOnFocusLoss[] =
++    "helium.browser.auto_picture_in_picture_on_focus_loss";
++
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -128,0 +129,3 @@
++  registry->RegisterBooleanPref(
++      prefs::kHeliumAutoPictureInPictureOnFocusLoss, true);
++
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -213,0 +214,2 @@
++      settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumAutoPictureInPictureOnFocusLoss] =
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -315,0 +316,3 @@
++  <message name="IDS_SETTINGS_AUTO_PICTURE_IN_PICTURE_ON_FOCUS_LOSS" desc="Label for the toggle that allows videos in the active browser window to enter Picture-in-Picture automatically when the user switches to another window or app.">
++    Automatically use Picture-in-Picture when switching windows or apps
++  </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -534,0 +535,2 @@
++      {"autoPictureInPictureOnFocusLoss",
++       IDS_SETTINGS_AUTO_PICTURE_IN_PICTURE_ON_FOCUS_LOSS},
+--- a/chrome/browser/resources/settings/appearance_page/appearance_behavior_page.html
++++ b/chrome/browser/resources/settings/appearance_page/appearance_behavior_page.html
+@@ -13,0 +14,5 @@
++  <settings-toggle-button class="hr" id="autoPictureInPictureOnFocusLoss"
++      pref="{{prefs.helium.browser.auto_picture_in_picture_on_focus_loss}}"
++      label="$i18n{autoPictureInPictureOnFocusLoss}">
++  </settings-toggle-button>
++
