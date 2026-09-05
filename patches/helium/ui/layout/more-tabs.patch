@@ -1,0 +1,1552 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -4443,6 +4443,10 @@ static_library("ui") {
+       "views/tabs/groups/avatar_container_view.h",
+       "views/tabs/groups/manage_sharing_row.cc",
+       "views/tabs/groups/manage_sharing_row.h",
++      "views/tabs/more_tabs_button.cc",
++      "views/tabs/more_tabs_button.h",
++      "views/tabs/more_tabs_popup_view.cc",
++      "views/tabs/more_tabs_popup_view.h",
+       "views/tabs/new_tab_button.cc",
+       "views/tabs/new_tab_button.h",
+       "views/tabs/overflow_view.cc",
+Index: src/chrome/browser/ui/browser_element_identifiers.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_element_identifiers.cc
++++ src/chrome/browser/ui/browser_element_identifiers.cc
+@@ -58,6 +58,9 @@ DEFINE_ELEMENT_IDENTIFIER_VALUE(kFooterW
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kMemorySaverChipElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kMerchantTrustChipElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kMultiContentsViewElementId);
++DEFINE_ELEMENT_IDENTIFIER_VALUE(kMoreTabsButtonElementId);
++DEFINE_ELEMENT_IDENTIFIER_VALUE(kMoreTabsPopupElementId);
++DEFINE_ELEMENT_IDENTIFIER_VALUE(kMoreTabsPopupRowElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kGlicButtonElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kGlicOsWidgetKeyboardShortcutElementId);
+ DEFINE_ELEMENT_IDENTIFIER_VALUE(kGlicOsToggleElementId);
+Index: src/chrome/browser/ui/browser_element_identifiers.h
+===================================================================
+--- src.orig/chrome/browser/ui/browser_element_identifiers.h
++++ src/chrome/browser/ui/browser_element_identifiers.h
+@@ -66,6 +66,9 @@ DECLARE_ELEMENT_IDENTIFIER_VALUE(kFooter
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kMemorySaverChipElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kMerchantTrustChipElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kMultiContentsViewElementId);
++DECLARE_ELEMENT_IDENTIFIER_VALUE(kMoreTabsButtonElementId);
++DECLARE_ELEMENT_IDENTIFIER_VALUE(kMoreTabsPopupElementId);
++DECLARE_ELEMENT_IDENTIFIER_VALUE(kMoreTabsPopupRowElementId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kNotificationContentSettingImageView);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kHatsNextWebDialogId);
+ DECLARE_ELEMENT_IDENTIFIER_VALUE(kGlicButtonElementId);
+Index: src/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
++++ src/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/ui/views/tabs/browser_tab_strip_controller.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/glic_button.h"
++#include "chrome/browser/ui/views/tabs/more_tabs_button.h"
+ #include "chrome/browser/ui/views/tabs/new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/tab_search_button.h"
+ #include "chrome/browser/ui/views/tabs/tab_search_container.h"
+@@ -69,6 +70,8 @@
+ 
+ namespace {
+ 
++constexpr int kMoreTabsButtonSpacing = 2;
++
+ class FrameGrabHandle : public views::View {
+   METADATA_HEADER(FrameGrabHandle, views::View)
+ 
+@@ -118,6 +121,31 @@ bool ShouldShowNewTabButton(BrowserWindo
+   return true;
+ }
+ 
++bool ShouldShowMoreTabsButton(TabStrip* tab_strip) {
++  if (!tab_strip || !tab_strip->GetBrowserWindowInterface() ||
++      !tab_strip->controller()) {
++    return false;
++  }
++
++  auto* layout_controller = HeliumLayoutStateController::From(
++      tab_strip->GetBrowserWindowInterface());
++  if (!layout_controller || !layout_controller->ShouldDisplayToolbarTabStrip()) {
++    return false;
++  }
++
++  TabStripController* controller = tab_strip->controller();
++  for (int i = 0; i < controller->GetCount(); ++i) {
++    if (controller->IsTabPinned(i)) {
++      continue;
++    }
++    if (controller->IsModelIndexForcedHidden(i)) {
++      return true;
++    }
++  }
++
++  return false;
++}
++
+ // Updates the border of `view` if the insets need to be updated.
+ void UpdateBorderInsetsIfNeeded(views::View* view,
+                                 const gfx::Insets& new_border_insets) {
+@@ -311,6 +339,17 @@ HorizontalTabStripRegionView::Horizontal
+     new_tab_button_->SetTriggerableEventFlags(
+         new_tab_button_->GetTriggerableEventFlags() |
+         ui::EF_MIDDLE_MOUSE_BUTTON);
++
++    auto more_tabs_button = std::make_unique<MoreTabsButton>(
++        tab_strip_->controller(),
++        base::BindRepeating(&TabStripController::OnMoreTabsButtonPressed,
++                            base::Unretained(tab_strip_->controller())),
++        base::BindRepeating(&TabStripController::OnMoreTabsButtonHovered,
++                            base::Unretained(tab_strip_->controller())),
++        browser);
++    more_tabs_button_ = AddChildView(std::move(more_tabs_button));
++    more_tabs_button_->SetVisible(ShouldShowMoreTabsButton(tab_strip_));
++    tab_strip_->controller()->SetMoreTabsButtonAnchor(more_tabs_button_);
+   }
+ 
+   reserved_grab_handle_space_ =
+@@ -343,12 +382,18 @@ HorizontalTabStripRegionView::Horizontal
+ HorizontalTabStripRegionView::~HorizontalTabStripRegionView() {
+   // These objects have pointers to TabStripController, which is also destoroyed
+   // by this class. Remove child views that hold raw_ptr to TabStripController.
++  if (tab_strip_ && tab_strip_->controller()) {
++    tab_strip_->controller()->SetMoreTabsButtonAnchor(nullptr);
++  }
+   if (tab_strip_action_container_) {
+     RemoveChildViewT(std::exchange(tab_strip_action_container_, nullptr));
+   }
+   if (new_tab_button_) {
+     RemoveChildViewT(std::exchange(new_tab_button_, nullptr));
+   }
++  if (more_tabs_button_) {
++    RemoveChildViewT(std::exchange(more_tabs_button_, nullptr));
++  }
+   if (tab_search_container_) {
+     RemoveChildViewT(std::exchange(tab_search_container_, nullptr));
+   }
+@@ -362,6 +407,10 @@ bool HorizontalTabStripRegionView::IsPos
+   if (new_tab_button_ && IsHitInView(new_tab_button_, point)) {
+     return false;
+   }
++  if (more_tabs_button_ && more_tabs_button_->GetVisible() &&
++      IsHitInView(more_tabs_button_, point)) {
++    return false;
++  }
+ 
+   if (render_tab_search_before_tab_strip_ && tab_search_container_ &&
+       IsHitInView(tab_search_container_, point)) {
+@@ -412,6 +461,10 @@ views::View::Views HorizontalTabStripReg
+     children.emplace_back(new_tab_button_.get());
+   }
+ 
++  if (more_tabs_button_) {
++    children.emplace_back(more_tabs_button_.get());
++  }
++
+   if (tab_search_container_) {
+     children.emplace_back(tab_search_container_.get());
+   }
+@@ -439,11 +492,14 @@ void HorizontalTabStripRegionView::Layou
+     return;
+   }
+ 
++  if (more_tabs_button_) {
++    more_tabs_button_->SetVisible(ShouldShowMoreTabsButton(tab_strip_));
++  }
++
++  UpdateTabStripMargin();
++
+   const bool tab_search_container_before_tab_strip =
+       tab_search_container_ && render_tab_search_before_tab_strip_;
+-  if (tab_search_container_before_tab_strip) {
+-    UpdateTabStripMargin();
+-  }
+ 
+   LayoutSuperclass<views::AccessiblePaneView>(this);
+ 
+@@ -463,12 +519,10 @@ void HorizontalTabStripRegionView::Layou
+                          product_specifications_button_width);
+   }
+ 
+-  views::View* button_to_paint_to_layer = new_tab_button_;
+-
+-  if (button_to_paint_to_layer) {
++  if (new_tab_button_) {
+     // The button needs to be layered on top of the tabstrip to achieve
+     // negative margins.
+-    gfx::Size button_size = button_to_paint_to_layer->GetPreferredSize();
++    gfx::Size button_size = new_tab_button_->GetPreferredSize();
+ 
+     // The y position is measured from the bottom of the tabstrip, and then
+     // padding and button height are removed.
+@@ -480,9 +534,14 @@ void HorizontalTabStripRegionView::Layou
+     gfx::Point button_new_position = gfx::Point(x, 0);
+     gfx::Rect button_new_bounds = gfx::Rect(button_new_position, button_size);
+ 
+-    // If the tabsearch button is before the tabstrip container, then manually
+-    // set the bounds.
+-    button_to_paint_to_layer->SetBoundsRect(button_new_bounds);
++    new_tab_button_->SetBoundsRect(button_new_bounds);
++
++    if (more_tabs_button_ && more_tabs_button_->GetVisible()) {
++      const gfx::Size more_tabs_size = more_tabs_button_->GetPreferredSize();
++      const int more_tabs_x = button_new_bounds.right() + kMoreTabsButtonSpacing;
++      more_tabs_button_->SetBoundsRect(
++          gfx::Rect(gfx::Point(more_tabs_x, 0), more_tabs_size));
++    }
+   }
+ }
+ 
+@@ -669,6 +728,9 @@ void HorizontalTabStripRegionView::Updat
+   if (new_tab_button_) {
+     UpdateBorderInsetsIfNeeded(new_tab_button_, border_insets);
+   }
++  if (more_tabs_button_ && more_tabs_button_->GetVisible()) {
++    UpdateBorderInsetsIfNeeded(more_tabs_button_, border_insets);
++  }
+   if (tab_search_container_) {
+     UpdateBorderInsetsIfNeeded(tab_search_container_->tab_search_button(),
+                                border_insets);
+@@ -689,18 +751,25 @@ void HorizontalTabStripRegionView::Updat
+   // The new tab button overlaps the tabstrip. Render it to a layer and adjust
+   // the tabstrip right margin to reserve space for it.
+   std::optional<int> tab_strip_right_margin;
+-  views::View* button_to_paint_to_layer = new_tab_button_;
+-
+-  if (button_to_paint_to_layer) {
+-    button_to_paint_to_layer->SetPaintToLayer();
+-    button_to_paint_to_layer->layer()->SetFillsBoundsOpaquely(false);
++  if (new_tab_button_) {
++    new_tab_button_->SetPaintToLayer();
++    new_tab_button_->layer()->SetFillsBoundsOpaquely(false);
+     // Inset between the tabstrip and new tab button should be reduced to
+     // account for extra spacing.
+-    button_to_paint_to_layer->SetProperty(views::kViewIgnoredByLayoutKey, true);
++    new_tab_button_->SetProperty(views::kViewIgnoredByLayoutKey, true);
+ 
+     tab_strip_right_margin =
+-        button_to_paint_to_layer->GetPreferredSize().width() +
++        new_tab_button_->GetPreferredSize().width() +
+         GetLayoutConstant(LayoutConstant::kTabStripPadding);
++
++    if (more_tabs_button_ && more_tabs_button_->GetVisible()) {
++      more_tabs_button_->SetPaintToLayer();
++      more_tabs_button_->layer()->SetFillsBoundsOpaquely(false);
++      more_tabs_button_->SetProperty(views::kViewIgnoredByLayoutKey, true);
++      tab_strip_right_margin = tab_strip_right_margin.value() +
++                               kMoreTabsButtonSpacing +
++                               more_tabs_button_->GetPreferredSize().width();
++    }
+   }
+ 
+   // If the tab search button is before the tab strip, it also overlaps the
+Index: src/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h
++++ src/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h
+@@ -20,6 +20,7 @@ namespace views {
+ class Button;
+ }
+ class NewTabButton;
++class MoreTabsButton;
+ class TabStripActionContainer;
+ class TabSearchButton;
+ class TabStrip;
+@@ -145,6 +146,7 @@ class HorizontalTabStripRegionView final
+   raw_ptr<TabStrip> tab_strip_ = nullptr;
+   raw_ptr<TabStripScrollContainer> tab_strip_scroll_container_ = nullptr;
+   raw_ptr<views::Button> new_tab_button_ = nullptr;
++  raw_ptr<MoreTabsButton> more_tabs_button_ = nullptr;
+   raw_ptr<TabSearchContainer> tab_search_container_ = nullptr;
+   raw_ptr<ProductSpecificationsButton> product_specifications_button_ = nullptr;
+ 
+Index: src/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ src/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <limits>
+ #include <memory>
++#include <numeric>
+ #include <optional>
+ #include <utility>
+ 
+@@ -55,6 +56,7 @@
+ #include "chrome/browser/ui/views/frame/browser_widget.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/compact_tab_group_popup_view.h"
++#include "chrome/browser/ui/views/tabs/more_tabs_popup_view.h"
+ #include "chrome/browser/ui/views/tabs/tab.h"
+ #include "chrome/browser/ui/views/tabs/tab_context_menu_controller.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+@@ -153,6 +155,10 @@ bool IsDirectGroupHeaderToggleOrigin(Tog
+          origin == ToggleTabGroupCollapsedStateOrigin::kGesture;
+ }
+ 
++constexpr size_t kMaxVisibleNonPinnedEntries = 10;
++constexpr base::TimeDelta kMoreTabsClickSuppressDuration =
++    base::Milliseconds(250);
++
+ }  // namespace
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -174,6 +180,7 @@ BrowserTabStripController::BrowserTabStr
+ }
+ 
+ BrowserTabStripController::~BrowserTabStripController() {
++  CloseMoreTabsPopup();
+   CloseCompactTabGroupPopup();
+ 
+   // When we get here the TabStrip is being deleted. We need to explicitly
+@@ -220,11 +227,37 @@ void BrowserTabStripController::InitFrom
+     split_tabs::SplitTabData* data = model_->GetSplitData(split_id);
+     tabstrip_->OnSplitCreated(data->GetIndexRange().ToIntVector(), split_id);
+   }
++
++  tab_recency_.clear();
++  overflow_tabs_.clear();
++  recency_tick_ = 0;
++  for (int i = 0; i < model_->count(); ++i) {
++    tab_recency_[model_->GetTabAtIndex(i)] = ++recency_tick_;
++  }
++  if (tabs::TabInterface* active_tab = model_->GetActiveTab()) {
++    MarkTabUsed(active_tab);
++  }
++
++  if (auto* layout_controller =
++          HeliumLayoutStateController::From(browser_view_->browser())) {
++    helium_layout_subscription_ = layout_controller->RegisterOnStateChanged(
++        base::BindRepeating(&BrowserTabStripController::OnHeliumLayoutStateChanged,
++                            weak_ptr_factory_.GetWeakPtr()));
++  }
++  RecomputeMoreTabsState();
+ }
+ 
+ void BrowserTabStripController::Reset() {
++  CloseMoreTabsPopup();
+   CloseCompactTabGroupPopup();
+ 
++  helium_layout_subscription_ = {};
++  tab_recency_.clear();
++  overflow_tabs_.clear();
++  recency_tick_ = 0;
++  more_tabs_popup_opened_time_ = base::TimeTicks();
++  more_tabs_popup_opened_by_hover_ = false;
++
+   // Stop observing.
+   model_->RemoveObserver(this);
+   tabstrip_ = nullptr;
+@@ -273,12 +306,30 @@ bool BrowserTabStripController::IsTabPin
+   return model_->ContainsIndex(model_index) && model_->IsTabPinned(model_index);
+ }
+ 
++bool BrowserTabStripController::IsModelIndexForcedHidden(int model_index) const {
++  if (!model_->ContainsIndex(model_index)) {
++    return false;
++  }
++
++  // Grouped tabs stay in the main strip until group-aware overflow is
++  // implemented.
++  if (model_->GetTabGroupForTab(model_index).has_value()) {
++    return false;
++  }
++
++  return overflow_tabs_.contains(model_->GetTabAtIndex(model_index));
++}
++
+ bool BrowserTabStripController::IsBrowserClosing() const {
+   return model_->closing_all();
+ }
+ 
+ void BrowserTabStripController::SelectTab(int model_index,
+                                           const ui::Event& event) {
++  if (model_->ContainsIndex(model_index)) {
++    MarkTabUsed(model_->GetTabAtIndex(model_index));
++  }
++
+   std::unique_ptr<viz::PeakGpuMemoryTracker> tracker =
+       content::PeakGpuMemoryTrackerFactory::Create(
+           viz::PeakGpuMemoryTracker::Usage::CHANGE_TAB);
+@@ -576,7 +627,34 @@ void BrowserTabStripController::CreateNe
+   }
+ }
+ 
++void BrowserTabStripController::SetMoreTabsButtonAnchor(
++    views::View* more_tabs_button_anchor) {
++  more_tabs_button_anchor_ = more_tabs_button_anchor;
++  if (!more_tabs_button_anchor_) {
++    CloseMoreTabsPopup();
++  }
++  RecomputeMoreTabsState();
++}
++
++void BrowserTabStripController::OnMoreTabsButtonHovered() {
++  OpenMoreTabsPopup(/*opened_by_hover=*/true);
++}
++
++void BrowserTabStripController::OnMoreTabsButtonPressed(const ui::Event& event) {
++  if (ShouldSuppressMoreTabsClick()) {
++    return;
++  }
++
++  if (more_tabs_popup_widget_) {
++    CloseMoreTabsPopup();
++    return;
++  }
++
++  OpenMoreTabsPopup(/*opened_by_hover=*/false);
++}
++
+ void BrowserTabStripController::OnStartedDragging() {
++  CloseMoreTabsPopup();
+   CloseCompactTabGroupPopup();
+ 
+   if (!immersive_reveal_lock_.get()) {
+@@ -718,6 +796,7 @@ void BrowserTabStripController::OnTabStr
+       for (const auto& contents : change.GetInsert()->contents) {
+         DCHECK(model_->ContainsIndex(contents.index));
+         tabs_to_add.emplace_back(contents.tab, contents.index);
++        tab_recency_.try_emplace(contents.tab, 0);
+       }
+       AddTabs(tabs_to_add);
+       break;
+@@ -731,6 +810,8 @@ void BrowserTabStripController::OnTabStr
+             TabStripModelChange::RemoveReason::kInsertedIntoSidePanel) {
+           tabstrip_->StopAnimating();
+         }
++        tab_recency_.erase(contents.tab);
++        overflow_tabs_.erase(contents.tab);
+       }
+       break;
+     }
+@@ -756,6 +837,7 @@ void BrowserTabStripController::OnTabStr
+   }
+ 
+   if (tab_strip_model->empty()) {
++    RecomputeMoreTabsState();
+     return;
+   }
+ 
+@@ -766,6 +848,7 @@ void BrowserTabStripController::OnTabStr
+     tabs::TabInterface* const new_tab_interface = selection.new_tab;
+     std::optional<size_t> index = selection.new_model.active();
+     if (new_contents && new_tab_interface && index.has_value()) {
++      MarkTabUsed(new_tab_interface);
+       TabUIHelper::From(new_tab_interface)->SetWasActiveAtLeastOnce();
+       SetTabDataAt(index.value());
+     }
+@@ -778,6 +861,8 @@ void BrowserTabStripController::OnTabStr
+   if (selection.active_tab_changed()) {
+     CloseCompactTabGroupPopup();
+   }
++
++  RecomputeMoreTabsState();
+ }
+ 
+ void BrowserTabStripController::OnTabWillBeAdded() {
+@@ -786,6 +871,8 @@ void BrowserTabStripController::OnTabWil
+ 
+ void BrowserTabStripController::OnTabWillBeRemoved(tabs::TabInterface* tab,
+                                                    int index) {
++  tab_recency_.erase(tab);
++  overflow_tabs_.erase(tab);
+   tabstrip_->OnTabWillBeRemoved(tab->GetContents(), index);
+ }
+ 
+@@ -862,6 +949,8 @@ void BrowserTabStripController::OnTabGro
+       break;
+     }
+   }
++
++  RecomputeMoreTabsState();
+ }
+ 
+ void BrowserTabStripController::OnTabChangedAt(tabs::TabInterface* tab,
+@@ -873,6 +962,7 @@ void BrowserTabStripController::OnTabCha
+ void BrowserTabStripController::OnTabPinnedStateChanged(tabs::TabInterface* tab,
+                                                         int model_index) {
+   SetTabDataAt(model_index);
++  RecomputeMoreTabsState();
+ }
+ 
+ void BrowserTabStripController::OnTabBlockedStateChanged(
+@@ -896,6 +986,8 @@ void BrowserTabStripController::TabGroup
+   if (new_group.has_value()) {
+     tabstrip_->OnGroupContentsChanged(new_group.value());
+   }
++
++  RecomputeMoreTabsState();
+ }
+ 
+ void BrowserTabStripController::OnTabNeedsAttentionChanged(int index,
+@@ -951,6 +1043,8 @@ void BrowserTabStripController::OnSplitT
+     tabstrip_->OnSplitContentsChanged(split_indices);
+     tabstrip_->StopAnimating();
+   }
++
++  RecomputeMoreTabsState();
+ }
+ 
+ void BrowserTabStripController::OnTabGroupFocusChanged(
+@@ -1023,6 +1117,9 @@ void BrowserTabStripController::ToggleCo
+     return;
+   }
+ 
++  // Keep compact floating surfaces mutually exclusive.
++  CloseMoreTabsPopup();
++
+   if (compact_tab_group_popup_widget_ && compact_tab_group_popup_group_ == group) {
+     CloseCompactTabGroupPopup();
+     return;
+@@ -1066,6 +1163,274 @@ void BrowserTabStripController::OnCompac
+   compact_tab_group_popup_group_.reset();
+ }
+ 
++bool BrowserTabStripController::IsEligibleForMoreTabs(
++    const tabs::TabInterface* tab,
++    int model_index) const {
++  if (!tab || !model_->ContainsIndex(model_index) ||
++      model_->IsTabPinned(model_index) || !IsCompactTabGroupPopupMode()) {
++    return false;
++  }
++
++  // Short-term: grouped tabs stay in the main strip so compact group headers
++  // remain stable and folder popups keep working.
++  return !model_->GetTabGroupForTab(model_index).has_value();
++}
++
++void BrowserTabStripController::MarkTabUsed(const tabs::TabInterface* tab) {
++  if (!tab) {
++    return;
++  }
++
++  tab_recency_[tab] = ++recency_tick_;
++}
++
++std::vector<const tabs::TabInterface*>
++BrowserTabStripController::GetOverflowTabsForPopup() const {
++  std::vector<const tabs::TabInterface*> overflow_tabs;
++  overflow_tabs.reserve(overflow_tabs_.size());
++  for (const tabs::TabInterface* tab : overflow_tabs_) {
++    const int model_index = model_->GetIndexOfTab(tab);
++    if (!IsEligibleForMoreTabs(tab, model_index)) {
++      continue;
++    }
++    overflow_tabs.push_back(tab);
++  }
++
++  std::sort(
++      overflow_tabs.begin(), overflow_tabs.end(),
++      [this](const tabs::TabInterface* lhs, const tabs::TabInterface* rhs) {
++        const uint64_t lhs_recency =
++            tab_recency_.contains(lhs) ? tab_recency_.at(lhs) : 0;
++        const uint64_t rhs_recency =
++            tab_recency_.contains(rhs) ? tab_recency_.at(rhs) : 0;
++        if (lhs_recency != rhs_recency) {
++          return lhs_recency > rhs_recency;
++        }
++        return model_->GetIndexOfTab(lhs) > model_->GetIndexOfTab(rhs);
++      });
++
++  return overflow_tabs;
++}
++
++void BrowserTabStripController::RecomputeMoreTabsState() {
++  if (!tabstrip_) {
++    overflow_tabs_.clear();
++    return;
++  }
++
++  base::flat_set<const tabs::TabInterface*> live_tabs;
++  for (int i = 0; i < model_->count(); ++i) {
++    const tabs::TabInterface* tab = model_->GetTabAtIndex(i);
++    live_tabs.insert(tab);
++    tab_recency_.try_emplace(tab, 0);
++  }
++  for (auto it = tab_recency_.begin(); it != tab_recency_.end();) {
++    if (!live_tabs.contains(it->first)) {
++      it = tab_recency_.erase(it);
++    } else {
++      ++it;
++    }
++  }
++
++  base::flat_set<const tabs::TabInterface*> new_overflow_tabs;
++  const bool should_compute_overflow =
++      IsCompactTabGroupPopupMode() && more_tabs_button_anchor_;
++  if (should_compute_overflow) {
++    // Groups are currently always kept in the strip. Deduct their count from
++    // the visible non-pinned budget so groups don't get squeezed into tiny
++    // slivers as ungrouped tabs accumulate.
++    base::flat_set<tab_groups::TabGroupId> visible_groups;
++    for (int i = 0; i < model_->count(); ++i) {
++      if (model_->IsTabPinned(i)) {
++        continue;
++      }
++
++      std::optional<tab_groups::TabGroupId> group = model_->GetTabGroupForTab(i);
++      if (!group.has_value()) {
++        continue;
++      }
++
++      visible_groups.insert(group.value());
++    }
++
++    const size_t visible_group_entry_count = visible_groups.size();
++    size_t max_visible_ungrouped_entries = 0;
++    if (kMaxVisibleNonPinnedEntries > visible_group_entry_count) {
++      max_visible_ungrouped_entries =
++          kMaxVisibleNonPinnedEntries - visible_group_entry_count;
++    }
++
++    struct OverflowOwner {
++      std::vector<const tabs::TabInterface*> tabs;
++      uint64_t recency = 0;
++      int first_index = 0;
++      bool contains_active = false;
++    };
++
++    std::vector<OverflowOwner> owners;
++    const tabs::TabInterface* active_tab = model_->GetActiveTab();
++
++    for (int i = 0; i < model_->count(); ++i) {
++      const tabs::TabInterface* tab = model_->GetTabAtIndex(i);
++      if (!IsEligibleForMoreTabs(tab, i)) {
++        continue;
++      }
++
++      owners.push_back(OverflowOwner{});
++      OverflowOwner& owner = owners.back();
++      owner.first_index = i;
++      owner.tabs.push_back(tab);
++      owner.recency = std::max(owner.recency, tab_recency_[tab]);
++      owner.contains_active = owner.contains_active || tab == active_tab;
++    }
++
++    if (owners.size() > max_visible_ungrouped_entries) {
++      std::vector<size_t> owner_indices(owners.size());
++      std::iota(owner_indices.begin(), owner_indices.end(), 0);
++
++      base::flat_set<size_t> kept_owner_indices;
++      for (size_t index : owner_indices) {
++        if (!owners[index].contains_active) {
++          continue;
++        }
++        kept_owner_indices.insert(index);
++        break;
++      }
++
++      size_t target_visible_owners = max_visible_ungrouped_entries;
++      if (target_visible_owners == 0 && !kept_owner_indices.empty()) {
++        target_visible_owners = 1;
++      }
++
++      std::sort(
++          owner_indices.begin(), owner_indices.end(),
++          [&owners](size_t lhs, size_t rhs) {
++            if (owners[lhs].recency != owners[rhs].recency) {
++              return owners[lhs].recency > owners[rhs].recency;
++            }
++            return owners[lhs].first_index > owners[rhs].first_index;
++          });
++
++      for (size_t index : owner_indices) {
++        if (kept_owner_indices.size() >= target_visible_owners) {
++          break;
++        }
++        kept_owner_indices.insert(index);
++      }
++
++      for (size_t i = 0; i < owners.size(); ++i) {
++        if (kept_owner_indices.contains(i)) {
++          continue;
++        }
++        new_overflow_tabs.insert(owners[i].tabs.begin(), owners[i].tabs.end());
++      }
++    }
++  }
++
++  const bool overflow_changed = overflow_tabs_ != new_overflow_tabs;
++  if (overflow_changed) {
++    overflow_tabs_ = std::move(new_overflow_tabs);
++    tabstrip_->InvalidateLayout();
++    tabstrip_->SchedulePaint();
++  }
++
++  if (more_tabs_popup_widget_ && overflow_tabs_.empty()) {
++    CloseMoreTabsPopup();
++  }
++}
++
++void BrowserTabStripController::OpenMoreTabsPopup(bool opened_by_hover) {
++  if (more_tabs_popup_widget_ || !more_tabs_button_anchor_ ||
++      !IsCompactTabGroupPopupMode()) {
++    return;
++  }
++
++  if (GetOverflowTabsForPopup().empty()) {
++    return;
++  }
++
++  CloseCompactTabGroupPopup();
++  more_tabs_popup_widget_ = MoreTabsPopupView::Show(
++      model_, more_tabs_button_anchor_,
++      base::BindRepeating(
++          [](base::WeakPtr<BrowserTabStripController> controller) {
++            if (!controller) {
++              return std::vector<const tabs::TabInterface*>();
++            }
++            return controller->GetOverflowTabsForPopup();
++          },
++          weak_ptr_factory_.GetWeakPtr()),
++      base::BindRepeating(&BrowserTabStripController::SelectMoreTabsTab,
++                          weak_ptr_factory_.GetWeakPtr()),
++      base::BindRepeating(&BrowserTabStripController::CloseMoreTabsTab,
++                          weak_ptr_factory_.GetWeakPtr()),
++      base::BindOnce(&BrowserTabStripController::OnMoreTabsPopupClosed,
++                     weak_ptr_factory_.GetWeakPtr()));
++  if (!more_tabs_popup_widget_) {
++    return;
++  }
++
++  more_tabs_popup_opened_by_hover_ = opened_by_hover;
++  more_tabs_popup_opened_time_ = base::TimeTicks::Now();
++}
++
++void BrowserTabStripController::CloseMoreTabsPopup() {
++  more_tabs_popup_opened_by_hover_ = false;
++  more_tabs_popup_opened_time_ = base::TimeTicks();
++
++  if (!more_tabs_popup_widget_) {
++    return;
++  }
++
++  more_tabs_popup_widget_->Close();
++  more_tabs_popup_widget_ = nullptr;
++}
++
++void BrowserTabStripController::OnMoreTabsPopupClosed() {
++  more_tabs_popup_widget_ = nullptr;
++  more_tabs_popup_opened_by_hover_ = false;
++  more_tabs_popup_opened_time_ = base::TimeTicks();
++}
++
++void BrowserTabStripController::SelectMoreTabsTab(
++    const tabs::TabInterface* tab) {
++  const int model_index = model_->GetIndexOfTab(tab);
++  if (model_index == TabStripModel::kNoTab) {
++    return;
++  }
++
++  MarkTabUsed(tab);
++  model_->ActivateTabAt(
++      model_index,
++      TabStripUserGestureDetails(TabStripUserGestureDetails::GestureType::kOther));
++}
++
++void BrowserTabStripController::CloseMoreTabsTab(const tabs::TabInterface* tab) {
++  const int model_index = model_->GetIndexOfTab(tab);
++  if (model_index == TabStripModel::kNoTab) {
++    return;
++  }
++
++  model_->CloseWebContentsAt(model_index,
++                             TabCloseTypes::CLOSE_USER_GESTURE |
++                                 TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
++}
++
++bool BrowserTabStripController::ShouldSuppressMoreTabsClick() const {
++  return more_tabs_popup_widget_ && more_tabs_popup_opened_by_hover_ &&
++         (base::TimeTicks::Now() - more_tabs_popup_opened_time_) <
++             kMoreTabsClickSuppressDuration;
++}
++
++void BrowserTabStripController::OnHeliumLayoutStateChanged(
++    HeliumLayoutStateController* controller) {
++  if (!controller || !controller->ShouldDisplayToolbarTabStrip()) {
++    CloseCompactTabGroupPopup();
++    CloseMoreTabsPopup();
++  }
++  RecomputeMoreTabsState();
++}
++
+ void BrowserTabStripController::SetTabDataAt(int model_index) {
+   tabstrip_->SetTabData(model_index,
+                         TabRendererData::FromTabInModel(model_, model_index));
+Index: src/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
++++ src/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
+@@ -8,8 +8,12 @@
+ #include <memory>
+ #include <vector>
+ 
++#include "base/callback_list.h"
++#include "base/containers/flat_map.h"
++#include "base/containers/flat_set.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
+ #include "chrome/browser/ui/tabs/hover_tab_selector.h"
+ #include "chrome/browser/ui/tabs/tab_menu_model_factory.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -25,6 +29,7 @@
+ 
+ class BrowserFrameView;
+ class BrowserWindowInterface;
++class HeliumLayoutStateController;
+ class Tab;
+ class TabGroup;
+ 
+@@ -33,6 +38,7 @@ class TabInterface;
+ }  // namespace tabs
+ 
+ namespace views {
++class View;
+ class Widget;
+ }
+ 
+@@ -70,6 +76,7 @@ class BrowserTabStripController : public
+   std::optional<int> GetActiveIndex() const override;
+   bool IsTabSelected(int model_index) const override;
+   bool IsTabPinned(int model_index) const override;
++  bool IsModelIndexForcedHidden(int model_index) const override;
+   bool IsBrowserClosing() const override;
+   void SelectTab(int model_index, const ui::Event& event) override;
+   void RecordMetricsOnTabSelectionChange(
+@@ -98,6 +105,9 @@ class BrowserTabStripController : public
+   void OnDropIndexUpdate(std::optional<int> index, bool drop_before) override;
+   void CreateNewTab(NewTabTypes context) override;
+   void CreateNewTabWithLocation(const std::u16string& loc) override;
++  void SetMoreTabsButtonAnchor(views::View* more_tabs_button_anchor) override;
++  void OnMoreTabsButtonHovered() override;
++  void OnMoreTabsButtonPressed(const ui::Event& event) override;
+   void OnStartedDragging() override;
+   void OnStoppedDragging() override;
+   void OnKeyboardFocusedTabChanged(std::optional<int> index) override;
+@@ -172,6 +182,18 @@ class BrowserTabStripController : public
+   void ToggleCompactTabGroupPopup(tab_groups::TabGroupId group);
+   void CloseCompactTabGroupPopup();
+   void OnCompactTabGroupPopupClosed();
++  bool IsEligibleForMoreTabs(const tabs::TabInterface* tab,
++                             int model_index) const;
++  void MarkTabUsed(const tabs::TabInterface* tab);
++  std::vector<const tabs::TabInterface*> GetOverflowTabsForPopup() const;
++  void RecomputeMoreTabsState();
++  void OpenMoreTabsPopup(bool opened_by_hover);
++  void CloseMoreTabsPopup();
++  void OnMoreTabsPopupClosed();
++  void SelectMoreTabsTab(const tabs::TabInterface* tab);
++  void CloseMoreTabsTab(const tabs::TabInterface* tab);
++  bool ShouldSuppressMoreTabsClick() const;
++  void OnHeliumLayoutStateChanged(HeliumLayoutStateController* controller);
+ 
+   // Invokes tabstrip_->SetTabData.
+   void SetTabDataAt(int model_index);
+@@ -214,6 +236,14 @@ class BrowserTabStripController : public
+ 
+   raw_ptr<views::Widget> compact_tab_group_popup_widget_ = nullptr;
+   std::optional<tab_groups::TabGroupId> compact_tab_group_popup_group_;
++  raw_ptr<views::View> more_tabs_button_anchor_ = nullptr;
++  raw_ptr<views::Widget> more_tabs_popup_widget_ = nullptr;
++  base::flat_map<const tabs::TabInterface*, uint64_t> tab_recency_;
++  base::flat_set<const tabs::TabInterface*> overflow_tabs_;
++  uint64_t recency_tick_ = 0;
++  base::TimeTicks more_tabs_popup_opened_time_;
++  bool more_tabs_popup_opened_by_hover_ = false;
++  base::CallbackListSubscription helium_layout_subscription_;
+ 
+   std::unique_ptr<TabMenuModelFactory> menu_model_factory_;
+ 
+Index: src/chrome/browser/ui/views/tabs/more_tabs_button.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/tabs/more_tabs_button.cc
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/more_tabs_button.h"
++
++#include <utility>
++
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/views/tabs/tab_strip_controller.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/view_class_properties.h"
++
++MoreTabsButton::MoreTabsButton(TabStripController* tab_strip_controller,
++                               PressedCallback pressed_callback,
++                               base::RepeatingClosure hovered_callback,
++                               BrowserWindowInterface* browser_window_interface)
++    : TabStripControlButton(tab_strip_controller,
++                            std::move(pressed_callback),
++                            kChevronRightIcon,
++                            Edge::kNone,
++                            Edge::kNone),
++      hovered_callback_(std::move(hovered_callback)) {
++  SetProperty(views::kElementIdentifierKey, kMoreTabsButtonElementId);
++
++  const std::u16string more_tabs_text =
++      l10n_util::GetStringUTF16(IDS_TOOLTIP_OVERFLOW_BUTTON);
++  SetTooltipText(more_tabs_text);
++  GetViewAccessibility().SetName(more_tabs_text);
++}
++
++MoreTabsButton::~MoreTabsButton() = default;
++
++void MoreTabsButton::StateChanged(ButtonState old_state) {
++  TabStripControlButton::StateChanged(old_state);
++
++  if (old_state == STATE_NORMAL && GetState() == STATE_HOVERED &&
++      !hovered_callback_.is_null()) {
++    hovered_callback_.Run();
++  }
++}
++
++BEGIN_METADATA(MoreTabsButton)
++END_METADATA
+Index: src/chrome/browser/ui/views/tabs/more_tabs_button.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/tabs/more_tabs_button.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_BUTTON_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_BUTTON_H_
++
++#include "base/functional/callback_forward.h"
++#include "chrome/browser/ui/views/tabs/tab_strip_control_button.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++
++class BrowserWindowInterface;
++class TabStripController;
++
++class MoreTabsButton : public TabStripControlButton {
++  METADATA_HEADER(MoreTabsButton, TabStripControlButton)
++
++ public:
++  MoreTabsButton(TabStripController* tab_strip_controller,
++                 PressedCallback pressed_callback,
++                 base::RepeatingClosure hovered_callback,
++                 BrowserWindowInterface* browser_window_interface);
++  MoreTabsButton(const MoreTabsButton&) = delete;
++  MoreTabsButton& operator=(const MoreTabsButton&) = delete;
++  ~MoreTabsButton() override;
++
++ protected:
++  // views::Button:
++  void StateChanged(ButtonState old_state) override;
++
++ private:
++  base::RepeatingClosure hovered_callback_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_BUTTON_H_
+Index: src/chrome/browser/ui/views/tabs/more_tabs_popup_view.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/tabs/more_tabs_popup_view.cc
+@@ -0,0 +1,295 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/more_tabs_popup_view.h"
++
++#include <algorithm>
++#include <memory>
++#include <utility>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/tabs/tab_renderer_data.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/tabs/more_tabs_row_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_scroll_bar.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/accessibility/ax_node_data.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
++#include "ui/compositor/layer.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/view.h"
++#include "ui/views/view_class_properties.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++constexpr int kPopupWidth = 320;
++constexpr int kPopupMaxHeight = 360;
++constexpr int kPopupCornerRadius = 10;
++constexpr int kPopupBorderThickness = 1;
++constexpr auto kPopupOuterInsets = gfx::Insets::VH(4, 4);
++constexpr auto kPopupContentInsets = gfx::Insets::VH(10, 10);
++constexpr int kPopupRowSpacing = 4;
++
++}  // namespace
++
++BEGIN_METADATA(MoreTabsPopupView)
++END_METADATA
++
++// static
++views::Widget* MoreTabsPopupView::Show(TabStripModel* model,
++                                       views::View* anchor_view,
++                                       TabListCallback tabs_callback,
++                                       TabCallback on_select_tab,
++                                       TabCallback on_close_tab,
++                                       base::OnceClosure on_popup_closed) {
++  if (!anchor_view || !anchor_view->GetWidget()) {
++    return nullptr;
++  }
++
++  auto popup_contents = std::unique_ptr<MoreTabsPopupView>(
++      new MoreTabsPopupView(model, anchor_view, std::move(tabs_callback),
++                            std::move(on_select_tab),
++                            std::move(on_close_tab),
++                            std::move(on_popup_closed)));
++
++  auto* widget = new views::Widget();
++  views::Widget::InitParams params(
++      views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET,
++      views::Widget::InitParams::TYPE_POPUP);
++  params.parent = anchor_view->GetWidget()->GetNativeView();
++  params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++  params.activatable = views::Widget::InitParams::Activatable::kYes;
++  params.accept_events = true;
++  params.bounds = gfx::Rect(0, 0, 1, 1);
++
++  widget->Init(std::move(params));
++  auto* popup_view = widget->SetContentsView(std::move(popup_contents));
++  popup_view->UpdateWidgetBounds();
++  widget->Show();
++  widget->Activate();
++  return widget;
++}
++
++MoreTabsPopupView::MoreTabsPopupView(TabStripModel* model,
++                                     views::View* anchor_view,
++                                     TabListCallback tabs_callback,
++                                     TabCallback on_select_tab,
++                                     TabCallback on_close_tab,
++                                     base::OnceClosure on_popup_closed)
++    : model_(model),
++      anchor_view_(anchor_view),
++      tabs_callback_(std::move(tabs_callback)),
++      on_select_tab_(std::move(on_select_tab)),
++      on_close_tab_(std::move(on_close_tab)),
++      on_popup_closed_(std::move(on_popup_closed)) {
++  CHECK(model_);
++
++  SetProperty(views::kElementIdentifierKey, kMoreTabsPopupElementId);
++
++  SetFocusBehavior(FocusBehavior::ALWAYS);
++  GetViewAccessibility().SetRole(ax::mojom::Role::kDialog);
++  GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_TAB_SEARCH_OPEN_TABS));
++
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++  layer()->SetRoundedCornerRadius(gfx::RoundedCornersF(kPopupCornerRadius));
++  layer()->SetIsFastRoundedCorner(true);
++  layer()->SetMasksToBounds(true);
++
++  auto* root_layout = SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical));
++  root_layout->set_inside_border_insets(kPopupOuterInsets);
++
++  auto rows_container = std::make_unique<views::View>();
++  auto* rows_layout = rows_container->SetLayoutManager(
++      std::make_unique<views::BoxLayout>(views::BoxLayout::Orientation::kVertical));
++  rows_layout->set_inside_border_insets(kPopupContentInsets);
++  rows_layout->set_between_child_spacing(kPopupRowSpacing);
++
++  auto scroll_view = std::make_unique<views::ScrollView>();
++  scroll_view->SetUseContentsPreferredSize(true);
++  scroll_view->SetBackgroundColor(std::nullopt);
++  scroll_view->SetHorizontalScrollBarMode(
++      views::ScrollView::ScrollBarMode::kDisabled);
++  scroll_view->SetVerticalScrollBar(
++      std::make_unique<VerticalTabStripScrollBar>());
++  scroll_view->SetDrawOverflowIndicator(false);
++  scroll_view->ClipHeightTo(/*min_height=*/0, /*max_height=*/kPopupMaxHeight);
++  scroll_view->SetBorder(nullptr);
++
++  rows_container_ = rows_container.get();
++  scroll_view->SetContents(std::move(rows_container));
++  scroll_view_ = AddChildView(std::move(scroll_view));
++
++  model_->AddObserver(this);
++  RebuildRows();
++}
++
++MoreTabsPopupView::~MoreTabsPopupView() {
++  if (views::Widget* widget = GetWidget()) {
++    widget->RemoveObserver(this);
++  }
++
++  model_->RemoveObserver(this);
++
++  if (on_popup_closed_) {
++    std::move(on_popup_closed_).Run();
++  }
++}
++
++bool MoreTabsPopupView::OnKeyPressed(const ui::KeyEvent& event) {
++  if (event.key_code() == ui::VKEY_ESCAPE) {
++    ClosePopup(views::Widget::ClosedReason::kEscKeyPressed);
++    return true;
++  }
++
++  return views::View::OnKeyPressed(event);
++}
++
++void MoreTabsPopupView::AddedToWidget() {
++  views::View::AddedToWidget();
++
++  if (views::Widget* widget = GetWidget()) {
++    widget->AddObserver(this);
++  }
++
++  UpdatePopupColors();
++  UpdateWidgetBounds();
++}
++
++void MoreTabsPopupView::OnThemeChanged() {
++  views::View::OnThemeChanged();
++  UpdatePopupColors();
++}
++
++void MoreTabsPopupView::OnWidgetActivationChanged(views::Widget* widget,
++                                                  bool active) {
++  if (!active) {
++    ClosePopup(views::Widget::ClosedReason::kLostFocus);
++  }
++}
++
++void MoreTabsPopupView::OnWidgetDestroying(views::Widget* widget) {
++  widget->RemoveObserver(this);
++}
++
++void MoreTabsPopupView::RebuildRows() {
++  rows_container_->RemoveAllChildViews();
++
++  for (const tabs::TabInterface* tab : tabs_callback_.Run()) {
++    const int model_index = model_->GetIndexOfTab(tab);
++    if (model_index == TabStripModel::kNoTab) {
++      continue;
++    }
++
++    rows_container_->AddChildView(std::make_unique<MoreTabsRowView>(
++        tab, TabRendererData::FromTabInModel(model_, model_index),
++        base::BindRepeating(&MoreTabsPopupView::SelectTabFromRow,
++                            base::Unretained(this)),
++        base::BindRepeating(&MoreTabsPopupView::CloseTabFromRow,
++                            base::Unretained(this))));
++  }
++
++  if (rows_container_->children().empty()) {
++    ClosePopup(views::Widget::ClosedReason::kUnspecified);
++    return;
++  }
++
++  rows_container_->InvalidateLayout();
++  PreferredSizeChanged();
++  UpdateWidgetBounds();
++}
++
++void MoreTabsPopupView::UpdatePopupColors() {
++  if (!GetColorProvider()) {
++    return;
++  }
++
++  const SkColor background_color =
++      GetColorProvider()->GetColor(ui::kColorMenuBackground);
++  const SkColor outline_color = GetColorProvider()->GetColor(ui::kColorMenuBorder);
++
++  SetBackground(
++      views::CreateRoundedRectBackground(background_color, kPopupCornerRadius));
++  SetBorder(views::CreateRoundedRectBorder(
++      kPopupBorderThickness, kPopupCornerRadius, outline_color));
++
++  rows_container_->SetBackground(nullptr);
++}
++
++void MoreTabsPopupView::UpdateWidgetBounds() {
++  if (!anchor_view_ || !GetWidget()) {
++    return;
++  }
++
++  GetWidget()->SetBounds(GetPopupBoundsForAnchor(anchor_view_->GetBoundsInScreen()));
++}
++
++gfx::Rect MoreTabsPopupView::GetPopupBoundsForAnchor(
++    const gfx::Rect& anchor_bounds) const {
++  gfx::Size preferred_size = GetPreferredSize();
++  preferred_size.set_width(kPopupWidth);
++
++  const int x = std::max(0, anchor_bounds.right() - preferred_size.width());
++  return gfx::Rect(x, anchor_bounds.bottom(), preferred_size.width(),
++                   preferred_size.height());
++}
++
++void MoreTabsPopupView::SelectTabFromRow(const tabs::TabInterface* tab) {
++  if (!on_select_tab_.is_null()) {
++    on_select_tab_.Run(tab);
++  }
++  ClosePopup(views::Widget::ClosedReason::kUnspecified);
++}
++
++void MoreTabsPopupView::CloseTabFromRow(const tabs::TabInterface* tab) {
++  if (!on_close_tab_.is_null()) {
++    on_close_tab_.Run(tab);
++  }
++}
++
++void MoreTabsPopupView::ClosePopup(views::Widget::ClosedReason reason) {
++  if (views::Widget* widget = GetWidget()) {
++    widget->CloseWithReason(reason);
++  }
++}
++
++void MoreTabsPopupView::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  if (selection.active_tab_changed()) {
++    ClosePopup(views::Widget::ClosedReason::kLostFocus);
++    return;
++  }
++
++  if (change.type() != TabStripModelChange::kSelectionOnly) {
++    RebuildRows();
++  }
++}
++
++void MoreTabsPopupView::OnTabChangedAt(tabs::TabInterface* tab,
++                                       int model_index,
++                                       TabChangeType change_type) {
++  RebuildRows();
++}
++
++void MoreTabsPopupView::OnTabGroupChanged(const TabGroupChange& change) {
++  RebuildRows();
++}
+Index: src/chrome/browser/ui/views/tabs/more_tabs_popup_view.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/tabs/more_tabs_popup_view.h
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_POPUP_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_POPUP_VIEW_H_
++
++#include <vector>
++
++#include "base/functional/callback_forward.h"
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
++
++class TabStripModel;
++
++namespace tabs {
++class TabInterface;
++}
++
++namespace views {
++class ScrollView;
++}
++
++class MoreTabsPopupView : public views::View,
++                          public TabStripModelObserver,
++                          public views::WidgetObserver {
++  METADATA_HEADER(MoreTabsPopupView, views::View)
++
++ public:
++  using TabListCallback =
++      base::RepeatingCallback<std::vector<const tabs::TabInterface*>()>;
++  using TabCallback = base::RepeatingCallback<void(const tabs::TabInterface*)>;
++
++  static views::Widget* Show(TabStripModel* model,
++                             views::View* anchor_view,
++                             TabListCallback tabs_callback,
++                             TabCallback on_select_tab,
++                             TabCallback on_close_tab,
++                             base::OnceClosure on_popup_closed);
++
++  MoreTabsPopupView(const MoreTabsPopupView&) = delete;
++  MoreTabsPopupView& operator=(const MoreTabsPopupView&) = delete;
++  ~MoreTabsPopupView() override;
++
++  // views::View:
++  bool OnKeyPressed(const ui::KeyEvent& event) override;
++  void AddedToWidget() override;
++  void OnThemeChanged() override;
++
++  // views::WidgetObserver:
++  void OnWidgetActivationChanged(views::Widget* widget, bool active) override;
++  void OnWidgetDestroying(views::Widget* widget) override;
++
++ private:
++  MoreTabsPopupView(TabStripModel* model,
++                    views::View* anchor_view,
++                    TabListCallback tabs_callback,
++                    TabCallback on_select_tab,
++                    TabCallback on_close_tab,
++                    base::OnceClosure on_popup_closed);
++
++  void RebuildRows();
++  void UpdatePopupColors();
++  void UpdateWidgetBounds();
++
++  gfx::Rect GetPopupBoundsForAnchor(const gfx::Rect& anchor_bounds) const;
++
++  void SelectTabFromRow(const tabs::TabInterface* tab);
++  void CloseTabFromRow(const tabs::TabInterface* tab);
++  void ClosePopup(views::Widget::ClosedReason reason);
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabChangedAt(tabs::TabInterface* tab,
++                      int model_index,
++                      TabChangeType change_type) override;
++  void OnTabGroupChanged(const TabGroupChange& change) override;
++
++  const raw_ptr<TabStripModel> model_;
++  raw_ptr<views::View> anchor_view_ = nullptr;
++  raw_ptr<views::ScrollView> scroll_view_ = nullptr;
++  raw_ptr<views::View> rows_container_ = nullptr;
++
++  TabListCallback tabs_callback_;
++  TabCallback on_select_tab_;
++  TabCallback on_close_tab_;
++  base::OnceClosure on_popup_closed_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_MORE_TABS_POPUP_VIEW_H_
+Index: src/chrome/browser/ui/views/tabs/tab_container_controller.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_container_controller.h
++++ src/chrome/browser/ui/views/tabs/tab_container_controller.h
+@@ -38,6 +38,10 @@ class TabContainerController {
+   // associated classes) when a tab is being opened, closed, pinned or unpinned.
+   virtual int NumPinnedTabsInModel() const = 0;
+ 
++  // Returns true if the tab at `index` should be force-hidden from the
++  // horizontal tab strip even though it still exists in the model.
++  virtual bool IsModelIndexForcedHidden(int index) const = 0;
++
+   // Notifies controller of a drop index update.
+   virtual void OnDropIndexUpdate(std::optional<int> index,
+                                  bool drop_before) = 0;
+Index: src/chrome/browser/ui/views/tabs/tab_container_impl.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_container_impl.cc
++++ src/chrome/browser/ui/views/tabs/tab_container_impl.cc
+@@ -739,13 +739,16 @@ void TabContainerImpl::SetTabSlotVisibil
+     if (last_tab_group.has_value() &&
+         (!tab || tab->group() != last_tab_group)) {
+       TabGroupViews* group_view = group_views_.at(last_tab_group.value()).get();
++      const bool is_group_collapsed =
++          controller_->IsGroupCollapsed(last_tab_group.value());
++      const bool should_show_header = last_tab_visible || is_group_collapsed;
+ 
+       // If we change the visibility of a group header, we must recalculate that
+       // group's underline bounds.
+-      if (last_tab_visible != group_view->header()->GetVisible()) {
++      if (should_show_header != group_view->header()->GetVisible()) {
+         visibility_changed_groups.insert(last_tab_group.value());
+       }
+-      group_view->header()->SetVisible(last_tab_visible);
++      group_view->header()->SetVisible(should_show_header);
+ 
+       // Hide underlines if they would underline an invisible tab, but don't
+       // show underlines if they're hidden during a header drag session.
+@@ -759,7 +762,7 @@ void TabContainerImpl::SetTabSlotVisibil
+     }
+ 
+     std::optional<tab_groups::TabGroupId> current_group = tab->group();
+-    last_tab_visible = ShouldTabBeVisible(tab);
++    const bool tab_would_be_visible = ShouldTabBeVisible(tab);
+     last_tab_group = tab->closing() ? std::nullopt : current_group;
+ 
+     // Collapsed tabs disappear once they've reached their minimum size. This
+@@ -769,7 +772,13 @@ void TabContainerImpl::SetTabSlotVisibil
+         (current_group.has_value() &&
+          controller_->IsGroupCollapsed(current_group.value()) &&
+          tab->bounds().width() <= tab->tab_style()->GetTabOverlap());
+-    const bool should_be_visible = is_collapsed ? false : last_tab_visible;
++    const std::optional<int> model_index = GetModelIndexOf(tab);
++    const bool is_forced_hidden =
++        model_index.has_value() &&
++        controller_->IsModelIndexForcedHidden(model_index.value());
++    const bool should_be_visible =
++        is_forced_hidden ? false : (is_collapsed ? false : tab_would_be_visible);
++    last_tab_visible = should_be_visible;
+ 
+     // If we change the visibility of a tab in a group, we must recalculate that
+     // group's underline bounds.
+Index: src/chrome/browser/ui/views/tabs/tab_container_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_container_unittest.cc
++++ src/chrome/browser/ui/views/tabs/tab_container_unittest.cc
+@@ -113,6 +113,10 @@ class FakeTabContainerController final :
+     return tab_strip_controller_->GetCount();
+   }
+ 
++  bool IsModelIndexForcedHidden(int index) const override {
++    return tab_strip_controller_->IsModelIndexForcedHidden(index);
++  }
++
+   void OnDropIndexUpdate(std::optional<int> index, bool drop_before) override {
+     tab_strip_controller_->OnDropIndexUpdate(index, drop_before);
+   }
+Index: src/chrome/browser/ui/views/tabs/tab_strip.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_strip.cc
++++ src/chrome/browser/ui/views/tabs/tab_strip.cc
+@@ -1620,6 +1620,10 @@ int TabStrip::NumPinnedTabsInModel() con
+   return controller_->GetCount();
+ }
+ 
++bool TabStrip::IsModelIndexForcedHidden(int index) const {
++  return controller_->IsModelIndexForcedHidden(index);
++}
++
+ void TabStrip::OnDropIndexUpdate(const std::optional<int> index,
+                                  const bool drop_before) {
+   controller_->OnDropIndexUpdate(index, drop_before);
+Index: src/chrome/browser/ui/views/tabs/tab_strip.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_strip.h
++++ src/chrome/browser/ui/views/tabs/tab_strip.h
+@@ -250,6 +250,7 @@ class TabStrip : public views::View,
+   bool IsValidModelIndex(int index) const override;
+   std::optional<int> GetActiveIndex() const override;
+   int NumPinnedTabsInModel() const override;
++  bool IsModelIndexForcedHidden(int index) const override;
+   void OnDropIndexUpdate(std::optional<int> index, bool drop_before) override;
+   bool IsBrowserClosing() const override;
+   std::optional<int> GetFirstTabInGroup(
+Index: src/chrome/browser/ui/views/tabs/tab_strip_controller.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_strip_controller.h
++++ src/chrome/browser/ui/views/tabs/tab_strip_controller.h
+@@ -28,6 +28,10 @@ namespace gfx {
+ class Point;
+ }
+ 
++namespace views {
++class View;
++}
++
+ namespace tab_groups {
+ enum class TabGroupColorId;
+ class TabGroupId;
+@@ -74,6 +78,10 @@ class TabStripController {
+   // Returns true if the selected index is pinned.
+   virtual bool IsTabPinned(int index) const = 0;
+ 
++  // Returns true if the tab should be hidden from the visible tab strip even
++  // though it still exists in the model.
++  virtual bool IsModelIndexForcedHidden(int index) const { return false; }
++
+   // Returns true if all tabs are currently being closed.
+   virtual bool IsBrowserClosing() const = 0;
+ 
+@@ -161,6 +169,15 @@ class TabStripController {
+   // search-result page for `location`.
+   virtual void CreateNewTabWithLocation(const std::u16string& location) = 0;
+ 
++  // Configures the optional anchor button used for compact "more tabs" UI.
++  virtual void SetMoreTabsButtonAnchor(views::View* more_tabs_button_anchor) {}
++
++  // Called when the compact "more tabs" button is hovered.
++  virtual void OnMoreTabsButtonHovered() {}
++
++  // Called when the compact "more tabs" button is pressed.
++  virtual void OnMoreTabsButtonPressed(const ui::Event& event) {}
++
+   // Notifies controller that the user started dragging this tabstrip's tabs.
+   virtual void OnStartedDragging() = 0;
+ 
+Index: src/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
++++ src/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
+@@ -261,6 +261,7 @@ TabStripLayoutHelper::CalculateIdealBoun
+           : std::nullopt;
+ 
+   std::vector<TabWidthConstraints> tab_widths;
++  int current_model_index = 0;
+   for (int i = 0; i < static_cast<int>(slots_.size()); i++) {
+     auto active =
+         (i == active_tab_slot_index || i == active_split_tab_slot_index)
+@@ -271,8 +272,16 @@ TabStripLayoutHelper::CalculateIdealBoun
+                       ? TabPinned::kPinned
+                       : TabPinned::kUnpinned;
+ 
+-    // A collapsed tab animates closed like a closed tab.
+-    auto open = (slots_[i].state.IsClosed() || SlotIsCollapsedTab(i))
++    const TabSlot& slot = slots_[i];
++    const bool is_model_tab =
++        slot.type == TabSlotView::ViewType::kTab && !slot.state.IsClosed();
++    const bool is_forced_hidden =
++        is_model_tab &&
++        controller_->IsModelIndexForcedHidden(current_model_index);
++
++    // Collapsed or overflow-hidden tabs animate closed like closed tabs.
++    auto open = (slot.state.IsClosed() || SlotIsCollapsedTab(i) ||
++                 is_forced_hidden)
+                     ? TabOpen::kClosed
+                     : TabOpen::kOpen;
+     TabLayoutState state =
+@@ -280,6 +289,10 @@ TabStripLayoutHelper::CalculateIdealBoun
+     TabSizeInfo size_info = slots_[i].view->GetTabSizeInfo();
+ 
+     tab_widths.emplace_back(state, size_info);
++
++    if (is_model_tab) {
++      ++current_model_index;
++    }
+   }
+ 
+   return CalculateTabBounds(tab_widths, available_width);
