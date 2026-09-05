@@ -33,7 +33,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/extensions/api/sync_vault_provider/sync_vault_provider_service.cc
-@@ -0,0 +1,862 @@
+@@ -0,0 +1,968 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -50,6 +50,8 @@
 +#include "base/functional/bind.h"
 +#include "base/memory/ptr_util.h"
 +#include "base/strings/strcat.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
 +#include "base/uuid.h"
 +#include "chrome/browser/profiles/profile_selections.h"
 +#include "chrome/common/extensions/api/sync_vault_provider/sync_vault_provider_manifest_handler.h"
@@ -60,7 +62,9 @@
 +#include "extensions/browser/event_router_factory.h"
 +#include "extensions/browser/extension_registry.h"
 +#include "extensions/browser/extension_registry_factory.h"
++#include "extensions/browser/process_manager_factory.h"
 +#include "extensions/common/extension.h"
++#include "third_party/blink/public/mojom/service_worker/service_worker_database.mojom.h"
 +
 +namespace extensions {
 +
@@ -68,8 +72,12 @@
 +
 +namespace provider_api = api::sync_vault_provider;
 +
++constexpr base::TimeDelta kProviderRequestTimeout = base::Minutes(2);
 +constexpr size_t kMaximumDisplayNameBytes = 128;
 +constexpr size_t kMaximumFailureMessageBytes = 16 * 1024;
++constexpr size_t kMaximumPendingRequests = 64;
++constexpr char kProviderRequestKeepaliveActivity[] =
++    "syncVaultProvider.request";
 +
 +bool IsValidVaultUuid(const std::string& value) {
 +  return base::Uuid::ParseLowercase(value).is_valid();
@@ -254,6 +262,7 @@
 +    return;
 +  }
 +
++  configuration_timeout_.Stop();
 +  active_configuration_request_id_.reset();
 +  DispatchCancellation(request_id);
 +}
@@ -463,6 +472,7 @@
 +    return;
 +  }
 +  if (it->second.type == RequestType::kConfigure) {
++    configuration_timeout_.Stop();
 +    active_configuration_request_id_.reset();
 +  }
 +  ResponseCallback callback = TakeRequestCallback(request_id);
@@ -512,12 +522,17 @@
 +    }
 +  }
 +  if (request_type == RequestType::kConfigure && !result.has_value()) {
++    configuration_timeout_.Stop();
 +    active_configuration_request_id_.reset();
 +  }
 +  ResponseCallback callback = TakeRequestCallback(request_id);
++  if (request_type == RequestType::kConfigure && result.has_value()) {
++    UpdateConfigurationTimeout(result->success->configuration_state);
++  }
 +  if (request_type == RequestType::kConfigure && result.has_value() &&
 +      result->success->configuration_state ==
 +          provider_api::ProviderConfigurationState::kReady) {
++    configuration_timeout_.Stop();
 +    active_configuration_request_id_.reset();
 +    selected_provider_state_ = provider_api::ProviderState::kReady;
 +    for (Observer& observer : observers_) {
@@ -532,6 +547,7 @@
 +std::optional<std::string>
 +SyncVaultProviderService::HandleConfigurationResponse(Response response) {
 +  if (!response.has_value()) {
++    configuration_timeout_.Stop();
 +    active_configuration_request_id_.reset();
 +    for (Observer& observer : observers_) {
 +      observer.OnSyncVaultProviderConfigurationFailed(response.error());
@@ -546,6 +562,7 @@
 +      success.key_envelope || success.vault_key) {
 +    return "The configuration progress response is invalid.";
 +  }
++  UpdateConfigurationTimeout(success.configuration_state);
 +  if (success.configuration_state !=
 +      provider_api::ProviderConfigurationState::kReady) {
 +    for (Observer& observer : observers_) {
@@ -554,6 +571,7 @@
 +    }
 +    return std::nullopt;
 +  }
++  configuration_timeout_.Stop();
 +  active_configuration_request_id_.reset();
 +  selected_provider_state_ = provider_api::ProviderState::kReady;
 +  for (Observer& observer : observers_) {
@@ -648,14 +666,28 @@
 +        request_id, provider_api::SyncVaultProviderError::kUnsupported)));
 +    return 0;
 +  }
++  if (pending_requests_.size() >= kMaximumPendingRequests) {
++    std::move(callback).Run(base::unexpected(MakeFailure(
++        request_id, provider_api::SyncVaultProviderError::kTemporaryError)));
++    return 0;
++  }
++
 +  const bool inserted =
 +      pending_requests_
 +          .emplace(request_id, PendingRequest{type, std::move(callback),
 +                                              maximum_response_bytes})
 +          .second;
 +  CHECK(inserted);
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&SyncVaultProviderService::OnRequestTimeout,
++                     weak_ptr_factory_.GetWeakPtr(), request_id),
++      kProviderRequestTimeout);
 +  auto event = std::make_unique<Event>(histogram_value, event_name,
 +                                       std::move(event_args), browser_context_);
++  event->did_dispatch_callback =
++      base::BindRepeating(&SyncVaultProviderService::OnRequestDispatched,
++                          weak_ptr_factory_.GetWeakPtr(), request_id);
 +  event_router_->DispatchEventToExtension(provider->id(), std::move(event));
 +  return request_id;
 +}
@@ -696,6 +728,78 @@
 +  next_request_id_ =
 +      result == std::numeric_limits<RequestId>::max() ? 1 : result + 1;
 +  return result;
++}
++
++void SyncVaultProviderService::OnRequestDispatched(RequestId request_id,
++                                                   const EventTarget& target) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (target.service_worker_version_id ==
++      blink::mojom::kInvalidServiceWorkerVersionId) {
++    return;
++  }
++  auto request = pending_requests_.find(request_id);
++  if (request == pending_requests_.end() || !selected_provider_id_ ||
++      target.extension_id != *selected_provider_id_) {
++    return;
++  }
++
++  WorkerId worker_id{
++      target.extension_id,
++      content::ChildProcessId::FromUnsafeValue(target.render_process_id),
++      target.service_worker_version_id, target.worker_thread_id};
++  for (const auto& keepalive : request->second.worker_keepalives) {
++    if (keepalive->worker_id() == worker_id) {
++      return;
++    }
++  }
++  request->second.worker_keepalives.push_back(
++      std::make_unique<ServiceWorkerKeepalive>(
++          browser_context_, std::move(worker_id),
++          content::ServiceWorkerExternalRequestTimeoutType::kDefault,
++          Activity::EVENT, kProviderRequestKeepaliveActivity));
++}
++
++void SyncVaultProviderService::OnRequestTimeout(RequestId request_id) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  auto it = pending_requests_.find(request_id);
++  if (it == pending_requests_.end()) {
++    return;
++  }
++  if (it->second.type == RequestType::kConfigure) {
++    configuration_timeout_.Stop();
++    active_configuration_request_id_.reset();
++  }
++  ResponseCallback callback = TakeRequestCallback(request_id);
++  DispatchCancellation(request_id);
++  std::move(callback).Run(base::unexpected(MakeFailure(
++      request_id, provider_api::SyncVaultProviderError::kTemporaryError)));
++}
++
++void SyncVaultProviderService::UpdateConfigurationTimeout(
++    provider_api::ProviderConfigurationState state) {
++  if (state != provider_api::ProviderConfigurationState::kConfiguring) {
++    configuration_timeout_.Stop();
++    return;
++  }
++  CHECK(active_configuration_request_id_);
++  configuration_timeout_.Start(
++      FROM_HERE, kProviderRequestTimeout,
++      base::BindOnce(&SyncVaultProviderService::OnConfigurationTimeout,
++                     weak_ptr_factory_.GetWeakPtr(),
++                     *active_configuration_request_id_));
++}
++
++void SyncVaultProviderService::OnConfigurationTimeout(RequestId request_id) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (active_configuration_request_id_ != request_id) {
++    return;
++  }
++  ProviderFailure failure = MakeFailure(
++      request_id, provider_api::SyncVaultProviderError::kTemporaryError);
++  CancelConfiguration(request_id);
++  for (Observer& observer : observers_) {
++    observer.OnSyncVaultProviderConfigurationFailed(failure);
++  }
 +}
 +
 +SyncVaultProviderService::ResponseCallback
@@ -799,6 +903,7 @@
 +      active_configuration_request_id_;
 +  auto pending = std::move(pending_requests_);
 +  pending_requests_.clear();
++  configuration_timeout_.Stop();
 +  active_configuration_request_id_.reset();
 +  if (configuration_to_cancel && !pending.contains(*configuration_to_cancel)) {
 +    DispatchCancellation(*configuration_to_cancel);
@@ -885,6 +990,7 @@
 +          ProfileSelections::BuildRedirectedInIncognito()) {
 +  DependsOn(EventRouterFactory::GetInstance());
 +  DependsOn(ExtensionRegistryFactory::GetInstance());
++  DependsOn(ProcessManagerFactory::GetInstance());
 +}
 +
 +SyncVaultProviderServiceFactory::~SyncVaultProviderServiceFactory() = default;
@@ -898,7 +1004,7 @@
 +}  // namespace extensions
 --- /dev/null
 +++ b/chrome/browser/extensions/api/sync_vault_provider/sync_vault_provider_service.h
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,254 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -920,6 +1026,7 @@
 +#include "base/observer_list.h"
 +#include "base/scoped_observation.h"
 +#include "base/sequence_checker.h"
++#include "base/timer/timer.h"
 +#include "base/types/expected.h"
 +#include "base/values.h"
 +#include "chrome/browser/profiles/profile_keyed_service_factory.h"
@@ -927,6 +1034,7 @@
 +#include "components/keyed_service/core/keyed_service.h"
 +#include "extensions/browser/extension_event_histogram_value.h"
 +#include "extensions/browser/extension_registry_observer.h"
++#include "extensions/browser/service_worker/service_worker_keepalive.h"
 +#include "extensions/common/extension_id.h"
 +
 +namespace content {
@@ -938,6 +1046,7 @@
 +class EventRouter;
 +class Extension;
 +class ExtensionRegistry;
++struct EventTarget;
 +
 +class SyncVaultProviderService : public KeyedService,
 +                                 public ExtensionRegistryObserver {
@@ -1065,13 +1174,13 @@
 +    kCollectEpochs,
 +    kWrapKey,
 +    kUnwrapKey,
-+    kMaxValue = kUnwrapKey,
 +  };
 +
 +  struct PendingRequest {
 +    RequestType type;
 +    ResponseCallback callback;
 +    size_t maximum_response_bytes = 0;
++    std::vector<std::unique_ptr<ServiceWorkerKeepalive>> worker_keepalives;
 +  };
 +
 +  RequestId Dispatch(RequestId request_id,
@@ -1087,6 +1196,11 @@
 +  void DispatchCancellation(RequestId request_id);
 +  void CancelConfiguration(RequestId request_id);
 +  RequestId NewRequestId();
++  void OnRequestDispatched(RequestId request_id, const EventTarget& target);
++  void OnRequestTimeout(RequestId request_id);
++  void UpdateConfigurationTimeout(
++      api::sync_vault_provider::ProviderConfigurationState state);
++  void OnConfigurationTimeout(RequestId request_id);
 +  ResponseCallback TakeRequestCallback(RequestId request_id);
 +  std::optional<std::string> HandleConfigurationResponse(Response response);
 +  std::optional<std::string> ValidateSuccessResponse(
@@ -1114,6 +1228,8 @@
 +  std::optional<api::sync_vault_provider::ProviderState>
 +      selected_provider_state_;
 +  std::optional<RequestId> active_configuration_request_id_;
++  // Bounds background configuration work, not time spent waiting for the user.
++  base::OneShotTimer configuration_timeout_;
 +  std::map<RequestId, PendingRequest> pending_requests_;
 +  RequestId next_request_id_ = 1;
 +  base::ObserverList<Observer> observers_;
