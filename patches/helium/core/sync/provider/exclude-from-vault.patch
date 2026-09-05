@@ -30,7 +30,24 @@
  void ChromeExtensionsAPIClient::AttachWebContentsHelpers(
 --- a/chrome/browser/extensions/api/storage/sync_storage_backend.cc
 +++ b/chrome/browser/extensions/api/storage/sync_storage_backend.cc
-@@ -57,17 +57,73 @@ SyncStorageBackend::SyncStorageBackend(
+@@ -25,6 +25,16 @@ namespace extensions {
+ 
+ namespace {
+ 
++constexpr net::BackoffEntry::Policy kExclusionCleanupBackoffPolicy = {
++    .num_errors_to_ignore = 0,
++    .initial_delay_ms = 30 * 1000,
++    .multiply_factor = 2.0,
++    .jitter_factor = 0.2,
++    .maximum_backoff_ms = 30 * 60 * 1000,
++    .entry_lifetime_ms = -1,
++    .always_use_initial_delay = false,
++};
++
+ void AddAllSyncData(const ExtensionId& extension_id,
+                     const base::DictValue& src,
+                     syncer::DataType type,
+@@ -57,17 +67,94 @@ SyncStorageBackend::SyncStorageBackend(
      const SettingsStorageQuotaEnforcer::Limits& quota,
      SequenceBoundSettingsChangedCallback observer,
      syncer::DataType sync_type,
@@ -43,8 +60,8 @@
        sync_type_(sync_type),
 -      flare_(flare) {
 +      flare_(flare),
-+      pending_excluded_extension_id_(
-+          std::move(pending_excluded_extension_id)) {
++      pending_excluded_extension_id_(std::move(pending_excluded_extension_id)),
++      exclusion_cleanup_backoff_(&kExclusionCleanupBackoffPolicy) {
    DCHECK(IsOnBackendSequence());
    DCHECK(sync_type_ == syncer::EXTENSION_SETTINGS ||
           sync_type_ == syncer::APP_SETTINGS);
@@ -61,6 +78,8 @@
 +
 +  std::optional<ExtensionId> previously_excluded_extension_id =
 +      std::exchange(excluded_extension_id_, pending_excluded_extension_id_);
++  exclusion_cleanup_timer_.Stop();
++  exclusion_cleanup_backoff_.Reset();
 +  if (previously_excluded_extension_id) {
 +    auto storage = storage_objs_.find(*previously_excluded_extension_id);
 +    if (storage != storage_objs_.end()) {
@@ -74,7 +93,12 @@
 +    }
 +  }
 +
-+  if (!excluded_extension_id_) {
++  RemoveExcludedSettings();
++}
++
++void SyncStorageBackend::RemoveExcludedSettings() {
++  DCHECK(IsOnBackendSequence());
++  if (!sync_processor_ || !excluded_extension_id_) {
 +    return;
 +  }
 +  SyncableSettingsStorage* storage = GetOrCreateStorageWithSyncData(
@@ -82,10 +106,13 @@
 +  storage->StopSyncing();
 +
 +  value_store::ValueStore::ReadResult settings = storage->Get();
++  // Keep retrying cleanup while this provider remains excluded. The local
++  // storage is stopped before reading, so failures cannot upload its changes.
 +  if (!settings.status().ok()) {
 +    LOG(WARNING) << "Failed to read settings for excluded extension "
 +                 << *excluded_extension_id_ << ": "
 +                 << settings.status().message;
++    ScheduleExclusionCleanupRetry();
 +    return;
 +  }
 +  syncer::SyncChangeList deletions;
@@ -99,14 +126,25 @@
 +    if (error) {
 +      LOG(WARNING) << "Failed to remove settings for excluded extension "
 +                   << *excluded_extension_id_ << ": " << error->ToString();
++      ScheduleExclusionCleanupRetry();
++      return;
 +    }
 +  }
++  exclusion_cleanup_timer_.Stop();
++  exclusion_cleanup_backoff_.Reset();
++}
++
++void SyncStorageBackend::ScheduleExclusionCleanupRetry() {
++  exclusion_cleanup_backoff_.InformOfRequest(/*succeeded=*/false);
++  exclusion_cleanup_timer_.Start(
++      FROM_HERE, exclusion_cleanup_backoff_.GetTimeUntilRelease(), this,
++      &SyncStorageBackend::RemoveExcludedSettings);
 +}
 +
  SyncStorageBackend::~SyncStorageBackend() = default;
  
  value_store::ValueStore* SyncStorageBackend::GetStorage(
-@@ -101,7 +157,7 @@ SyncableSettingsStorage* SyncStorageBack
+@@ -101,7 +188,7 @@ SyncableSettingsStorage* SyncStorageBack
    SyncableSettingsStorage* raw_syncable_storage = syncable_storage.get();
    storage_objs_[extension_id] = std::move(syncable_storage);
  
@@ -115,7 +153,7 @@
      std::optional<syncer::ModelError> error =
          raw_syncable_storage->StartSyncing(
              std::move(sync_data), CreateSettingsSyncProcessor(extension_id));
-@@ -140,6 +196,9 @@ syncer::SyncDataList SyncStorageBackend:
+@@ -140,6 +227,9 @@ syncer::SyncDataList SyncStorageBackend:
    // For tests, all storage areas are kept in memory in `storage_objs_`.
    for (const auto& storage_obj : storage_objs_) {
      ExtensionId extension_id = storage_obj.first;
@@ -125,7 +163,7 @@
  
      value_store::ValueStore::ReadResult maybe_settings =
          GetOrCreateStorageWithSyncData(extension_id, EmptyDict())->Get();
-@@ -165,12 +224,19 @@ std::optional<syncer::ModelError> SyncSt
+@@ -165,12 +255,19 @@ std::optional<syncer::ModelError> SyncSt
    DCHECK(sync_processor.get());
  
    sync_processor_ = std::move(sync_processor);
@@ -145,7 +183,7 @@
      base::DictValue& settings = grouped_sync_data[data.extension_id()];
      DCHECK(!settings.Find(data.key()))
          << "Duplicate settings for " << data.extension_id() << "/"
-@@ -178,12 +244,26 @@ std::optional<syncer::ModelError> SyncSt
+@@ -178,12 +275,26 @@ std::optional<syncer::ModelError> SyncSt
      settings.Set(data.key(), data.ExtractValue());
    }
  
@@ -172,14 +210,19 @@
      auto group = grouped_sync_data.find(extension_id);
      std::optional<syncer::ModelError> error;
      if (group != grouped_sync_data.end()) {
-@@ -220,9 +300,17 @@ std::optional<syncer::ModelError> SyncSt
-   // The raw pointers are safe because ownership of each item is passed to
-   // storage->ProcessSyncChanges.
-   std::map<ExtensionId, SettingSyncDataList*> grouped_sync_data;
+@@ -217,25 +328,40 @@ std::optional<syncer::ModelError> SyncSt
+   DCHECK(sync_processor_.get());
+ 
+   // Group changes by extension, to pass all changes in a single method call.
+-  // The raw pointers are safe because ownership of each item is passed to
+-  // storage->ProcessSyncChanges.
+-  std::map<ExtensionId, SettingSyncDataList*> grouped_sync_data;
++  std::map<ExtensionId, std::unique_ptr<SettingSyncDataList>> grouped_sync_data;
 +  syncer::SyncChangeList excluded_data_deletions;
  
    for (const syncer::SyncChange& change : sync_changes) {
      std::unique_ptr<SettingSyncData> data(new SettingSyncData(change));
+-    SettingSyncDataList*& group = grouped_sync_data[data->extension_id()];
 +    if (excluded_extension_id_ == data->extension_id()) {
 +      if (change.change_type() != syncer::SyncChange::ACTION_DELETE) {
 +        excluded_data_deletions.push_back(settings_sync_util::CreateDelete(
@@ -187,10 +230,11 @@
 +      }
 +      continue;
 +    }
-     SettingSyncDataList*& group = grouped_sync_data[data->extension_id()];
++    auto& group = grouped_sync_data[data->extension_id()];
      if (!group) {
-       group = new SettingSyncDataList();
-@@ -230,6 +318,15 @@ std::optional<syncer::ModelError> SyncSt
+-      group = new SettingSyncDataList();
++      group = std::make_unique<SettingSyncDataList>();
+     }
      group->push_back(std::move(data));
    }
  
@@ -204,9 +248,26 @@
 +  }
 +
    // Create any storage areas that don't exist yet but have sync data.
-   for (const auto& group : grouped_sync_data) {
+-  for (const auto& group : grouped_sync_data) {
++  for (auto& group : grouped_sync_data) {
      SyncableSettingsStorage* storage =
-@@ -277,6 +374,7 @@ void SyncStorageBackend::StopSyncing(syn
+         GetOrCreateStorageWithSyncData(group.first, EmptyDict());
+     std::optional<syncer::ModelError> error =
+-        storage->ProcessSyncChanges(base::WrapUnique(group.second));
++        storage->ProcessSyncChanges(std::move(group.second));
+     if (error.has_value()) {
+       storage->StopSyncing();
+     }
+@@ -269,6 +395,8 @@ void SyncStorageBackend::StopSyncing(syn
+   DCHECK(IsOnBackendSequence());
+   DCHECK(type == syncer::EXTENSION_SETTINGS || type == syncer::APP_SETTINGS);
+   DCHECK_EQ(sync_type_, type);
++  exclusion_cleanup_timer_.Stop();
++  exclusion_cleanup_backoff_.Reset();
+ 
+   for (const auto& storage_obj : storage_objs_) {
+     // Some storage areas may have already stopped syncing if they had areas
+@@ -277,6 +405,7 @@ void SyncStorageBackend::StopSyncing(syn
    }
  
    sync_processor_.reset();
@@ -216,7 +277,7 @@
  std::unique_ptr<SettingsSyncProcessor>
 --- a/chrome/browser/extensions/api/storage/sync_storage_backend.h
 +++ b/chrome/browser/extensions/api/storage/sync_storage_backend.h
-@@ -7,6 +7,7 @@
+@@ -7,11 +7,13 @@
  
  #include <map>
  #include <memory>
@@ -224,7 +285,21 @@
  #include <set>
  #include <string>
  
-@@ -47,7 +48,8 @@ class SyncStorageBackend final : public
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
+ #include "base/values.h"
+ #include "components/sync/model/syncable_service.h"
+ #include "components/value_store/value_store_factory.h"
+@@ -19,6 +21,7 @@
+ #include "extensions/browser/api/storage/settings_storage_quota_enforcer.h"
+ #include "extensions/buildflags/buildflags.h"
+ #include "extensions/common/extension_id.h"
++#include "net/base/backoff_entry.h"
+ 
+ static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
+ 
+@@ -47,7 +50,8 @@ class SyncStorageBackend final : public
        const SettingsStorageQuotaEnforcer::Limits& quota,
        SequenceBoundSettingsChangedCallback observer,
        syncer::DataType sync_type,
@@ -234,7 +309,7 @@
  
    SyncStorageBackend(const SyncStorageBackend&) = delete;
    SyncStorageBackend& operator=(const SyncStorageBackend&) = delete;
-@@ -56,6 +58,7 @@ class SyncStorageBackend final : public
+@@ -56,6 +60,7 @@ class SyncStorageBackend final : public
  
    value_store::ValueStore* GetStorage(const ExtensionId& extension_id);
    void DeleteStorage(const ExtensionId& extension_id);
@@ -242,12 +317,23 @@
  
    // syncer::SyncableService implementation.
    void WaitUntilReadyToSync(base::OnceClosure done) override;
-@@ -110,6 +113,9 @@ class SyncStorageBackend final : public
+@@ -73,6 +78,8 @@ class SyncStorageBackend final : public
+       const syncer::EntityData& entity_data) const override;
+ 
+  private:
++  void RemoveExcludedSettings();
++  void ScheduleExclusionCleanupRetry();
+   // Gets a weak reference to the storage area for a given extension,
+   // initializing sync with some initial data if sync enabled.
+   SyncableSettingsStorage* GetOrCreateStorageWithSyncData(
+@@ -110,6 +117,11 @@ class SyncStorageBackend final : public
  
    syncer::SyncableService::StartSyncFlare flare_;
  
 +  std::optional<ExtensionId> pending_excluded_extension_id_;
 +  std::optional<ExtensionId> excluded_extension_id_;
++  net::BackoffEntry exclusion_cleanup_backoff_;
++  base::OneShotTimer exclusion_cleanup_timer_;
 +
    base::WeakPtrFactory<SyncStorageBackend> weak_ptr_factory_{this};
  };
