@@ -1,0 +1,704 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -651,6 +651,11 @@ inline constexpr char kHeliumCenteredLoc
+ inline constexpr char kHeliumMinimalLocationBar[] =
+     "helium.browser.minimal_location_bar";
+ 
++// A boolean pref set to true if loading progress should be shown in the
++// location bar.
++inline constexpr char kHeliumShowProgressBar[] =
++    "helium.browser.show_progress_bar";
++
+ // A boolean pref set to true if a Home button to open the Home pages should be
+ // visible on the toolbar.
+ inline constexpr char kShowHomeButton[] = "browser.show_home_button";
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -135,6 +135,8 @@ void RegisterBrowserUserPrefs(user_prefs
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumMinimalLocationBar, false);
+ 
++  registry->RegisterBooleanPref(prefs::kHeliumShowProgressBar, true);
++
+   registry->RegisterBooleanPref(prefs::kHomePageIsNewTabPage, true,
+                                 pref_registration_flags);
+   registry->RegisterBooleanPref(prefs::kShowHomeButton, false,
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -310,6 +310,9 @@
+     <message name="IDS_SETTINGS_MINIMAL_LOCATION_BAR" desc="Label for the toggle that enables the minimal URL in the address bar, showing only the site origin.">
+       Minimal URL in the address bar
+     </message>
++    <message name="IDS_SETTINGS_SHOW_PROGRESS_BAR" desc="Label for the toggle that shows loading progress in the address bar.">
++      Show loading progress in the address bar
++    </message>
+     <message name="IDS_SETTINGS_BROWSER_ZEN_MODE" desc="Label for the toggle that enables zen mode, hiding browser chrome until hover.">
+       Frameless mode
+     </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -612,6 +612,7 @@ void AddAppearanceStrings(content::WebUI
+       {"centeredLocationBar", IDS_SETTINGS_CENTERED_LOCATION_BAR},
+       {"verticalCollapseShortcut", IDS_SETTINGS_VERTICAL_COLLAPSE_SHORTCUT},
+       {"minimalLocationBar", IDS_SETTINGS_MINIMAL_LOCATION_BAR},
++      {"showProgressBar", IDS_SETTINGS_SHOW_PROGRESS_BAR},
+       {"shiftRightClickContextMenu",
+        IDS_SETTINGS_SHIFT_RIGHT_CLICK_CONTEXT_MENU},
+       {"showZoomIndicator", IDS_SETTINGS_SHOW_ZOOM_INDICATOR},
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -227,6 +227,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumMinimalLocationBar] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumShowProgressBar] =
++      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumZenMode] = settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumZenModeSidebarPinned] =
+       settings_api::PrefType::kBoolean;
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+@@ -88,6 +88,10 @@ export function getHtml(this: SettingsAp
+           pref-key="helium.browser.minimal_location_bar"
+           label="$i18n{minimalLocationBar}">
+       </settings-toggle-button>
++      <settings-toggle-button class="hr"
++          pref-key="helium.browser.show_progress_bar"
++          label="$i18n{showProgressBar}">
++      </settings-toggle-button>
+     </div>
+     <settings-toggle-button class="hr"
+         pref-key="helium.browser.zen_mode"
+--- /dev/null
++++ b/chrome/browser/ui/views/location_bar/location_bar_progress_view.cc
+@@ -0,0 +1,407 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/location_bar/location_bar_progress_view.h"
++
++#include <algorithm>
++#include <cmath>
++#include <iterator>
++
++#include "base/functional/bind.h"
++#include "base/memory/ref_counted.h"
++#include "base/time/time.h"
++#include "cc/paint/paint_filter.h"
++#include "cc/paint/paint_flags.h"
++#include "cc/paint/paint_shader.h"
++#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/web_contents.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "third_party/skia/include/core/SkPath.h"
++#include "third_party/skia/include/core/SkRRect.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/animation/animation_container.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/gfx/geometry/skia_conversions.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/widget/widget.h"
++#include "url/gurl.h"
++
++namespace {
++
++struct ProgressGeometry {
++  float bar_height = 1.25f;
++  float shine_height = 0.5f;
++  float glow_height = 4.0f;
++  float glow_sigma = 4.0f;
++  float edge_glow_radius = 2.5f;
++  float glow_head_width = 280.0f;
++  float exit_feather_width = 140.0f;
++  float glow_exit_outset_in_sigmas = 3.0f;
++};
++
++constexpr ProgressGeometry kGeometry;
++
++struct ProgressAppearance {
++  float shine_white_mix = 0.36f;
++  double line_opacity = 0.64;
++  double line_exit_opacity = 0.45;
++  double glow_min_opacity = 0.50;
++  double glow_max_opacity = 0.88;
++  double glow_tail_opacity = 0.18;
++  double glow_mid_opacity = 0.68;
++  double head_min_opacity = 0.48;
++  double head_max_opacity = 0.84;
++  double head_tail_opacity = 0.16;
++  double head_mid_opacity = 0.68;
++  SkScalar gradient_positions[4] = {0.0f, 0.45f, 0.82f, 1.0f};
++};
++
++constexpr ProgressAppearance kAppearance;
++
++// Progress and animation.
++constexpr double kMinimumVisibleProgress = 0.05;
++constexpr double kProgressExitStart = 0.90;
++constexpr double kProgressRestingPulse = 0.5;
++constexpr base::TimeDelta kProgressAnimationDuration = base::Milliseconds(180);
++constexpr base::TimeDelta kProgressPulseDuration = base::Milliseconds(700);
++constexpr base::TimeDelta kProgressFadeDuration = base::Milliseconds(320);
++
++SkColor WithOpacity(SkColor color, double opacity) {
++  return SkColorSetA(
++      color,
++      static_cast<SkAlpha>(std::clamp(opacity, 0.0, 1.0) * SK_AlphaOPAQUE));
++}
++
++SkColor4f WithOpacity4f(SkColor color, double opacity) {
++  return SkColor4f::FromColor(WithOpacity(color, opacity));
++}
++
++}  // namespace
++
++LocationBarProgressView::LocationBarProgressView(PrefService* pref_service)
++    : progress_animation_(this), pulse_animation_(this), fade_animation_(this) {
++  SetCanProcessEventsWithinSubtree(false);
++  SetFlipCanvasOnPaintForRTLUI(true);
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++  SetVisible(false);
++  GetViewAccessibility().SetIsIgnored(true);
++  auto container = base::MakeRefCounted<gfx::AnimationContainer>();
++  progress_animation_.SetContainer(container.get());
++  pulse_animation_.SetContainer(container.get());
++  fade_animation_.SetContainer(container.get());
++  progress_animation_.SetTweenType(gfx::Tween::EASE_OUT);
++  pulse_animation_.SetTweenType(gfx::Tween::EASE_IN_OUT);
++  fade_animation_.SetTweenType(gfx::Tween::EASE_OUT);
++
++  pref_change_registrar_.Init(pref_service);
++  pref_change_registrar_.Add(
++      prefs::kHeliumShowProgressBar,
++      base::BindRepeating(&LocationBarProgressView::SyncFromWebContents,
++                          base::Unretained(this)));
++}
++
++LocationBarProgressView::~LocationBarProgressView() = default;
++
++void LocationBarProgressView::SetWebContents(content::WebContents* contents) {
++  if (contents == web_contents()) {
++    return;
++  }
++
++  Observe(contents);
++  SyncFromWebContents();
++}
++
++void LocationBarProgressView::SetLocationBarFocused(bool focused) {
++  if (location_bar_focused_ == focused) {
++    return;
++  }
++  location_bar_focused_ = focused;
++  UpdateVisibility();
++}
++
++double LocationBarProgressView::GetDisplayedProgress() const {
++  return progress_animation_.CurrentValueBetween(progress_start_,
++                                                 progress_target_);
++}
++
++void LocationBarProgressView::BeginLoading(double progress) {
++  ResetState();
++  has_active_progress_ = true;
++  fade_animation_.Reset(1.0);
++  pulse_animation_.Reset(kProgressRestingPulse);
++
++  UpdateVisibility();
++  if (!std::isfinite(progress)) {
++    progress = kMinimumVisibleProgress;
++  }
++  SetProgress(std::max(progress, kMinimumVisibleProgress));
++}
++
++void LocationBarProgressView::SetProgress(double progress) {
++  DCHECK(progress >= 0.0 && progress <= 1.0);
++  if (progress <= progress_target_) {
++    return;
++  }
++
++  progress_start_ = GetDisplayedProgress();
++  progress_target_ = progress;
++  progress_animation_.Reset(0.0);
++  progress_animation_.SetSlideDuration(
++      gfx::Animation::RichAnimationDuration(kProgressAnimationDuration));
++  progress_animation_.Show();
++}
++
++void LocationBarProgressView::FinishLoading() {
++  if (!has_active_progress_ || finishing_) {
++    return;
++  }
++  finishing_ = true;
++  if (!progress_animation_.is_animating() && GetDisplayedProgress() >= 1.0) {
++    StartFadeOut();
++  } else {
++    SetProgress(1.0);
++  }
++}
++
++void LocationBarProgressView::StartFadeOut() {
++  if (fade_animation_.is_animating()) {
++    return;
++  }
++  pulse_animation_.Reset(kProgressRestingPulse);
++  fade_animation_.SetSlideDuration(
++      gfx::Animation::RichAnimationDuration(kProgressFadeDuration));
++  fade_animation_.Hide();
++}
++
++void LocationBarProgressView::ResetState() {
++  progress_animation_.Reset(0.0);
++  pulse_animation_.Reset(0.0);
++  fade_animation_.Reset(0.0);
++  progress_start_ = 0.0;
++  progress_target_ = 0.0;
++  has_active_progress_ = false;
++  finishing_ = false;
++  UpdateVisibility();
++}
++
++void LocationBarProgressView::UpdateVisibility() {
++  SetVisible(IsProgressBarEnabled() && has_active_progress_ &&
++             !location_bar_focused_);
++}
++
++bool LocationBarProgressView::IsProgressBarEnabled() const {
++  return pref_change_registrar_.prefs()->GetBoolean(
++      prefs::kHeliumShowProgressBar);
++}
++
++void LocationBarProgressView::SyncFromWebContents() {
++  content::WebContents* contents = web_contents();
++  if (IsProgressBarEnabled() && contents && contents->ShouldShowLoadingUI() &&
++      contents->GetVisibleURL().SchemeIsHTTPOrHTTPS()) {
++    BeginLoading(contents->GetLoadProgress());
++  } else {
++    ResetState();
++  }
++}
++
++void LocationBarProgressView::DidStartNavigation(
++    content::NavigationHandle* navigation_handle) {
++  if (!navigation_handle->IsInPrimaryMainFrame() ||
++      navigation_handle->IsSameDocument()) {
++    return;
++  }
++
++  if (!IsProgressBarEnabled() ||
++      !navigation_handle->GetURL().SchemeIsHTTPOrHTTPS()) {
++    ResetState();
++    return;
++  }
++
++  BeginLoading(kMinimumVisibleProgress);
++}
++
++void LocationBarProgressView::LoadProgressChanged(double progress) {
++  if (has_active_progress_ && !finishing_) {
++    SetProgress(progress);
++  }
++}
++
++void LocationBarProgressView::DidStopLoading() {
++  FinishLoading();
++}
++
++void LocationBarProgressView::WebContentsDestroyed() {
++  ResetState();
++}
++
++void LocationBarProgressView::OnPaint(gfx::Canvas* canvas) {
++  const double progress = GetDisplayedProgress();
++  if (progress <= 0.0) {
++    return;
++  }
++
++  const double fade = fade_animation_.GetCurrentValue();
++  const double pulse = pulse_animation_.GetCurrentValue();
++  const float progress_width =
++      static_cast<float>(width()) * static_cast<float>(progress);
++  if (progress_width <= 0.0f) {
++    return;
++  }
++  const SkColor primary_color =
++      GetColorProvider()->GetColor(ui::kColorSysPrimary);
++  const SkColor shine_color = color_utils::AlphaBlend(
++      SK_ColorWHITE, primary_color, kAppearance.shine_white_mix);
++
++  canvas->Save();
++  const SkScalar corner_radius = LocationBarView::ComputeBorderRadius(size());
++  const SkRRect clip = SkRRect::MakeRectXY(
++      gfx::RectToSkRect(GetLocalBounds()), corner_radius, corner_radius);
++  canvas->ClipPath(SkPath::RRect(clip), /*do_anti_alias=*/true);
++
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  flags.setStyle(cc::PaintFlags::kFill_Style);
++
++  const float bottom = static_cast<float>(height());
++  const float exit_progress = finishing_ ? static_cast<float>(1.0 - fade) : 0.0f;
++  const float glow_head =
++      progress_width +
++      exit_progress *
++          (kGeometry.glow_head_width +
++           kGeometry.glow_exit_outset_in_sigmas * kGeometry.glow_sigma);
++  const float glow_shader_start = glow_head - kGeometry.glow_head_width;
++  const float glow_start = std::max(0.0f, glow_shader_start);
++  const float glow_end = std::min(static_cast<float>(width()), glow_head);
++  const float glow_width = std::max(0.0f, glow_end - glow_start);
++  const double pulsing_glow_opacity = gfx::Tween::DoubleValueBetween(
++      pulse, kAppearance.glow_min_opacity, kAppearance.glow_max_opacity);
++  const double glow_opacity = fade * pulsing_glow_opacity;
++  const SkColor4f glow_colors[] = {
++      WithOpacity4f(primary_color, 0.0),
++      WithOpacity4f(primary_color, glow_opacity * kAppearance.glow_tail_opacity),
++      WithOpacity4f(primary_color, glow_opacity * kAppearance.glow_mid_opacity),
++      WithOpacity4f(primary_color, glow_opacity),
++  };
++  const SkPoint glow_points[] = {
++      SkPoint::Make(glow_shader_start, bottom),
++      SkPoint::Make(glow_head, bottom),
++  };
++
++  const float line_fade_start =
++      -kGeometry.exit_feather_width +
++      exit_progress * (progress_width + kGeometry.exit_feather_width);
++  const SkPoint line_fade_points[] = {
++      SkPoint::Make(line_fade_start, bottom),
++      SkPoint::Make(line_fade_start + kGeometry.exit_feather_width, bottom),
++  };
++  const double line_opacity = gfx::Tween::DoubleValueBetween(
++      fade, kAppearance.line_exit_opacity, kAppearance.line_opacity);
++  const SkColor4f line_fade_colors[] = {
++      WithOpacity4f(primary_color, 0.0),
++      WithOpacity4f(primary_color, line_opacity),
++  };
++  flags.setColor(SK_ColorWHITE);
++  flags.setShader(cc::PaintShader::MakeLinearGradient(
++      line_fade_points, line_fade_colors, nullptr, std::size(line_fade_colors),
++      SkTileMode::kClamp));
++  canvas->DrawRoundRect(
++      gfx::RectF(0, bottom - kGeometry.bar_height, progress_width,
++                 kGeometry.bar_height),
++      kGeometry.bar_height / 2.0f, flags);
++
++  flags.setBlendMode(SkBlendMode::kScreen);
++  flags.setShader(cc::PaintShader::MakeLinearGradient(
++      glow_points, glow_colors, kAppearance.gradient_positions,
++      std::size(glow_colors), SkTileMode::kClamp));
++  flags.setImageFilter(sk_make_sp<cc::BlurPaintFilter>(
++      kGeometry.glow_sigma, kGeometry.glow_sigma, SkTileMode::kDecal, nullptr));
++  canvas->DrawRoundRect(
++      gfx::RectF(glow_start, bottom - kGeometry.glow_height, glow_width,
++                 kGeometry.glow_height),
++      kGeometry.glow_height / 2.0f, flags);
++
++  flags.setShader(nullptr);
++  flags.setColor(WithOpacity(shine_color, glow_opacity));
++  canvas->DrawCircle(
++      gfx::PointF(glow_head, bottom - kGeometry.bar_height / 2.0f),
++      kGeometry.edge_glow_radius, flags);
++
++  flags.setImageFilter(nullptr);
++  const double pulsing_head_opacity = gfx::Tween::DoubleValueBetween(
++      pulse, kAppearance.head_min_opacity, kAppearance.head_max_opacity);
++  const double head_opacity = fade * pulsing_head_opacity;
++  const SkColor4f head_colors[] = {
++      WithOpacity4f(primary_color, 0.0),
++      WithOpacity4f(primary_color, head_opacity * kAppearance.head_tail_opacity),
++      WithOpacity4f(primary_color, head_opacity * kAppearance.head_mid_opacity),
++      WithOpacity4f(shine_color, head_opacity),
++  };
++  flags.setColor(SK_ColorWHITE);
++  flags.setShader(cc::PaintShader::MakeLinearGradient(
++      glow_points, head_colors, kAppearance.gradient_positions,
++      std::size(head_colors), SkTileMode::kClamp));
++  canvas->DrawRoundRect(
++      gfx::RectF(glow_start, bottom - kGeometry.bar_height, glow_width,
++                 kGeometry.bar_height),
++      kGeometry.bar_height / 2.0f, flags);
++  canvas->DrawRoundRect(
++      gfx::RectF(glow_start, bottom - kGeometry.bar_height, glow_width,
++                 kGeometry.shine_height),
++      kGeometry.shine_height / 2.0f, flags);
++  canvas->Restore();
++}
++
++void LocationBarProgressView::VisibilityChanged(views::View* starting_from,
++                                                bool is_visible) {
++  views::View::VisibilityChanged(starting_from, is_visible);
++  const bool visible = is_visible && IsDrawn() && GetWidget() &&
++                       GetWidget()->IsVisible();
++  const base::TimeDelta duration =
++      gfx::Animation::RichAnimationDuration(kProgressPulseDuration);
++  if (visible && has_active_progress_ && !finishing_ && !duration.is_zero()) {
++    if (!pulse_animation_.is_animating()) {
++      pulse_animation_.SetThrobDuration(duration);
++      pulse_animation_.StartThrobbing(-1);
++    }
++    return;
++  }
++
++  pulse_animation_.Reset(kProgressRestingPulse);
++}
++
++void LocationBarProgressView::AnimationProgressed(
++    const gfx::Animation* animation) {
++  if (animation == &progress_animation_ && finishing_ &&
++      GetDisplayedProgress() >= kProgressExitStart) {
++    StartFadeOut();
++  }
++  SchedulePaint();
++}
++
++void LocationBarProgressView::AnimationEnded(
++    const gfx::Animation* animation) {
++  SchedulePaint();
++  if (animation == &progress_animation_ && finishing_) {
++    StartFadeOut();
++  } else if (animation == &fade_animation_) {
++    ResetState();
++  }
++}
++
++void LocationBarProgressView::AnimationCanceled(const gfx::Animation*) {
++  SchedulePaint();
++}
++
++BEGIN_METADATA(LocationBarProgressView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/location_bar/location_bar_progress_view.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_LOCATION_BAR_LOCATION_BAR_PROGRESS_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_LOCATION_BAR_LOCATION_BAR_PROGRESS_VIEW_H_
++
++#include "components/prefs/pref_change_registrar.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/slide_animation.h"
++#include "ui/gfx/animation/throb_animation.h"
++#include "ui/views/view.h"
++
++class PrefService;
++
++class LocationBarProgressView : public views::View,
++                                public content::WebContentsObserver,
++                                public gfx::AnimationDelegate {
++  METADATA_HEADER(LocationBarProgressView, views::View)
++
++ public:
++  explicit LocationBarProgressView(PrefService* pref_service);
++  LocationBarProgressView(const LocationBarProgressView&) = delete;
++  LocationBarProgressView& operator=(const LocationBarProgressView&) = delete;
++  ~LocationBarProgressView() override;
++
++  void SetWebContents(content::WebContents* contents);
++  void SetLocationBarFocused(bool focused);
++
++ private:
++  double GetDisplayedProgress() const;
++  void BeginLoading(double progress);
++  void SetProgress(double progress);
++  void FinishLoading();
++  void StartFadeOut();
++  void ResetState();
++  void UpdateVisibility();
++  bool IsProgressBarEnabled() const;
++  void SyncFromWebContents();
++
++  // content::WebContentsObserver:
++  void DidStartNavigation(
++      content::NavigationHandle* navigation_handle) override;
++  void LoadProgressChanged(double progress) override;
++  void DidStopLoading() override;
++  void WebContentsDestroyed() override;
++
++  // views::View:
++  void OnPaint(gfx::Canvas* canvas) override;
++  void VisibilityChanged(views::View* starting_from, bool is_visible) override;
++
++  // gfx::AnimationDelegate:
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override;
++  void AnimationCanceled(const gfx::Animation* animation) override;
++
++  gfx::SlideAnimation progress_animation_;
++  gfx::ThrobAnimation pulse_animation_;
++  gfx::SlideAnimation fade_animation_;
++  PrefChangeRegistrar pref_change_registrar_;
++  double progress_start_ = 0.0;
++  double progress_target_ = 0.0;
++  bool has_active_progress_ = false;
++  bool location_bar_focused_ = false;
++  bool finishing_ = false;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_LOCATION_BAR_LOCATION_BAR_PROGRESS_VIEW_H_
+--- a/chrome/browser/ui/views/location_bar/BUILD.gn
++++ b/chrome/browser/ui/views/location_bar/BUILD.gn
+@@ -85,6 +85,8 @@ source_set("impl") {
+       "lens_overlay_homework_page_action_controller.cc",
+       "location_bar_bubble_delegate_view.cc",
+       "location_bar_layout.cc",
++      "location_bar_progress_view.cc",
++      "location_bar_progress_view.h",
+       "location_bar_view.cc",
+       "location_icon_state_helper.cc",
+       "location_icon_view.cc",
+@@ -103,6 +105,7 @@ source_set("impl") {
+     public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+ 
+     deps += [
++      "//cc/paint",
+       "//chrome/app:generated_resources",
+       "//chrome/app/vector_icons",
+       "//chrome/browser:primitives",
+@@ -156,6 +159,7 @@ source_set("impl") {
+       "//chrome/browser/ui/window_metadata",
+       "//chrome/browser/web_applications",
+       "//chrome/browser/web_applications:features",
++      "//chrome/common",
+       "//components/autofill/core/common:features",
+       "//components/commerce/core:feature_list",
+       "//components/contextual_search:public",
+@@ -169,6 +173,7 @@ source_set("impl") {
+       "//components/omnibox/browser:vector_icons",
+       "//components/omnibox/common",
+       "//components/performance_manager",
++      "//components/prefs",
+       "//components/record_replay/core/browser",
+       "//components/record_replay/core/common",
+       "//components/safe_browsing/core/common:features",
+@@ -190,6 +195,7 @@ source_set("impl") {
+       "//ui/gfx",
+       "//ui/native_theme",
+       "//ui/strings:ui_strings_grit",
++      "//url",
+     ]
+   }
+ }
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.h
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.h
+@@ -71,6 +71,7 @@ class Browser;
+ class BrowserWindowInterface;
+ class CommandUpdater;
+ class ContentSettingBubbleModelDelegate;
++class LocationBarProgressView;
+ class OmniboxController;
+ class OmniboxContextMenu;
+ enum class OmniboxPart;
+@@ -627,6 +628,9 @@ class LocationBarView
+   // A label to show the AI Mode hint text.
+   raw_ptr<views::Label> ai_mode_hint_label_ = nullptr;
+ 
++  // Progress bar painted over the bottom of the location bar.
++  raw_ptr<LocationBarProgressView> loading_progress_view_ = nullptr;
++
+   // Animation to change whole location bar background color on hover.
+   gfx::SlideAnimation hover_animation_{this};
+ 
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -63,6 +63,7 @@
+ #include "chrome/browser/ui/views/location_bar/content_setting_image_view.h"
+ #include "chrome/browser/ui/views/location_bar/extension_debugger_warning_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_layout.h"
++#include "chrome/browser/ui/views/location_bar/location_bar_progress_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_util.h"
+ #include "chrome/browser/ui/views/location_bar/location_icon_view.h"
+ #include "chrome/browser/ui/views/location_bar/omnibox_popup_file_selector.h"
+@@ -543,6 +544,10 @@ void LocationBarView::Init() {
+   ai_mode_hint_label->SetVisible(false);
+   ai_mode_hint_label_ = AddChildView(std::move(ai_mode_hint_label));
+ 
++  loading_progress_view_ = AddChildView(
++      std::make_unique<LocationBarProgressView>(profile_->GetPrefs()));
++  loading_progress_view_->SetLocationBarFocused(IsFocusWithin());
++
+   // Initialize the location entry. We do this to avoid a black flash which is
+   // visible when the location entry has just been initialized.
+   Update(nullptr);
+@@ -666,11 +671,13 @@ const OmniboxController* LocationBarView
+ }
+ 
+ void LocationBarView::AddedToWidget() {
+-  if (lens::features::IsOmniboxEntryPointEnabled() && browser_ &&
+-      GetFocusManager()) {
++  if (GetFocusManager()) {
+     CHECK(!focus_manager_);
+     focus_manager_ = GetFocusManager();
+     focus_manager_->AddFocusChangeListener(this);
++    if (loading_progress_view_) {
++      loading_progress_view_->SetLocationBarFocused(IsFocusWithin());
++    }
+   }
+ }
+ 
+@@ -683,6 +690,14 @@ void LocationBarView::RemovedFromWidget(
+ }
+ 
+ void LocationBarView::OnDidChangeFocus(views::View* before, views::View* now) {
++  if (loading_progress_view_) {
++    loading_progress_view_->SetLocationBarFocused(now && Contains(now));
++  }
++
++  if (!lens::features::IsOmniboxEntryPointEnabled() || !browser_) {
++    return;
++  }
++
+   // TODO(crbug.com/376283383): Remove this once Lens Overlay is migrated to the
+   // new page actions design.
+ 
+@@ -1044,6 +1059,8 @@ void LocationBarView::Layout(PassKey) {
+     position_view(omnibox_additional_text_view_, omnibox_additional_text_width);
+   }
+ 
++  loading_progress_view_->SetBoundsRect(GetLocalBounds());
++
+   LayoutSuperclass<View>(this);
+ }
+ 
+@@ -1077,6 +1094,7 @@ bool LocationBarView::HasSecurityStateCh
+ 
+ void LocationBarView::Update(WebContents* contents) {
+   TRACE_EVENT("omnibox", "LocationBarView::Update");
++  loading_progress_view_->SetWebContents(GetWebContents());
+   if (contents) {
+     page_action_icon_controller_->UpdateWebContents(contents);
+   }
+@@ -2042,6 +2060,8 @@ const LocationBarModel* LocationBarView:
+ }
+ 
+ void LocationBarView::OnOmniboxFocused() {
++  loading_progress_view_->SetLocationBarFocused(true);
++
+   if (views::FocusRing::Get(this)) {
+     views::FocusRing::Get(this)->Refresh();
+   }
+@@ -2066,6 +2086,8 @@ void LocationBarView::OpenOmniboxPopup(b
+ }
+ 
+ void LocationBarView::OnOmniboxBlurred() {
++  loading_progress_view_->SetLocationBarFocused(IsFocusWithin());
++
+   if (views::FocusRing::Get(this)) {
+     views::FocusRing::Get(this)->Refresh();
+   }
