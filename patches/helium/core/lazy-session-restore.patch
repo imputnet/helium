@@ -1,0 +1,436 @@
+--- a/chrome/browser/performance_manager/public/background_tab_loading_policy.h
++++ b/chrome/browser/performance_manager/public/background_tab_loading_policy.h
+@@ -19,7 +19,8 @@ namespace performance_manager::policies
+ bool CanScheduleLoadForRestoredTabs();
+ 
+ // Schedules the restored WebContents in |web_contents| to be loaded when
+-// appropriate. Invoked from the UI thread. Asserts that
++// appropriate. An empty batch completes the restore if no previously scheduled
++// tabs remain to be loaded. Invoked from the UI thread. Asserts that
+ // CanScheduleLoadForRestoredTabs() is true.
+ void ScheduleLoadForRestoredTabs(
+     std::vector<content::WebContents*> web_contents);
+--- a/chrome/browser/performance_manager/policies/background_tab_loading_policy.cc
++++ b/chrome/browser/performance_manager/policies/background_tab_loading_policy.cc
+@@ -94,8 +94,6 @@ void ScheduleLoadForRestoredTabs(
+   TRACE_EVENT("browser", "ScheduleLoadForRestoredTabs", "tabs_count",
+               web_contents_vector.size());
+ 
+-  DCHECK(!web_contents_vector.empty());
+-
+   std::vector<BackgroundTabLoadingPolicy::PageNodeData> page_node_data_vector;
+   page_node_data_vector.reserve(web_contents_vector.size());
+   for (content::WebContents* content : web_contents_vector) {
+--- a/chrome/browser/sessions/session_restore_stats_collector.cc
++++ b/chrome/browser/sessions/session_restore_stats_collector.cc
+@@ -204,6 +204,11 @@ void SessionRestoreStatsCollector::Rende
+ }
+ 
+ void SessionRestoreStatsCollector::RegisterObserverForTab(WebContents* tab) {
++  // Count unloaded background tabs, but do not wait for their first paint.
++  if (tab->GetVisibility() == content::Visibility::HIDDEN && !tab->IsLoading()) {
++    return;
++  }
++
+   content::RenderWidgetHost* rwh = GetRenderWidgetHost(tab);
+ 
+   // If we don't have a RenderWidgetHost, we can't track paints for the tab so
+--- a/chrome/browser/sessions/session_restore_delegate.cc
++++ b/chrome/browser/sessions/session_restore_delegate.cc
+@@ -84,21 +84,27 @@ bool SessionRestoreDelegate::RestoredTab
+ void SessionRestoreDelegate::RestoreTabs(
+     const std::vector<RestoredTab>& tabs,
+     const base::TimeTicks& restore_started) {
+-  if (tabs.empty())
+-    return;
+-
+-  SessionRestoreStatsCollector::GetOrCreateInstance(
+-      restore_started,
+-      std::make_unique<
+-          SessionRestoreStatsCollector::UmaStatsReportingDelegate>())
+-      ->TrackTabs(tabs);
+-
++  // Load visible tabs (including split partners) and track any already loading.
+   std::vector<content::WebContents*> web_contents_vector;
+   web_contents_vector.reserve(tabs.size());
+   for (const auto& tab : tabs) {
+-    CHECK(tab.contents());
+-    web_contents_vector.push_back(tab.contents());
++    content::WebContents* contents = tab.contents();
++    CHECK(contents);
++    if (contents->GetVisibility() != content::Visibility::HIDDEN ||
++        contents->IsLoading()) {
++      web_contents_vector.push_back(contents);
++    }
+   }
++
++  if (!tabs.empty()) {
++    SessionRestoreStatsCollector::GetOrCreateInstance(
++        restore_started,
++        std::make_unique<
++            SessionRestoreStatsCollector::UmaStatsReportingDelegate>())
++        ->TrackTabs(tabs);
++  }
++
++  // Let the policy finish restore tracking even when no tabs need loading.
+   performance_manager::policies::ScheduleLoadForRestoredTabs(
+       std::move(web_contents_vector));
+ }
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser.h"
+ #include "chrome/common/buildflags.h"
++#include "components/favicon/content/content_favicon_driver.h"
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_group.h"
+@@ -290,9 +291,18 @@ WebContents* AddRestoredTab(
+       last_active_time_ticks, last_active_time, session_storage_namespace,
+       user_agent_override, extra_data, initially_hidden, from_session_restore);
+ 
+-  return AddRestoredTabImpl(std::move(web_contents), browser, tab_index, group,
+-                            select, pin, from_session_restore,
+-                            is_active_browser);
++  WebContents* contents = AddRestoredTabImpl(
++      std::move(web_contents), browser, tab_index, group, select, pin,
++      from_session_restore, is_active_browser);
++  if (!select) {
++    // Restore the cached favicon without loading the background tab.
++    if (favicon::ContentFaviconDriver* favicon_driver =
++            favicon::ContentFaviconDriver::FromWebContents(contents)) {
++      favicon_driver->FetchFavicon(favicon_driver->GetActiveURL(),
++                                   /*is_same_document=*/false);
++    }
++  }
++  return contents;
+ }
+ 
+ WebContents* ReplaceRestoredTab(
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -558,8 +558,8 @@ class SessionRestoreImpl : public Browse
+                   [](RestoredTab& tab) { return tab.contents() == nullptr; });
+ 
+     if (succeeded) {
+-      // Sort the tabs in the order they should be restored, and start loading
+-      // them.
++      // Sort into loading priority. Only selected tabs and their active split
++      // partners load; background tabs remain unloaded until activation.
+       std::stable_sort(restored_tabs.begin(), restored_tabs.end());
+       SessionRestoreDelegate::RestoreTabs(restored_tabs, restore_started_);
+     }
+@@ -1020,50 +1020,61 @@ class SessionRestoreImpl : public Browse
+     // base::Time) can be mapped onto the TimeTicks timeline WebContents wants.
+     const base::Time now = base::Time::Now();
+     const base::TimeTicks now_ticks = base::TimeTicks::Now();
+-    for (int i = 0; i < static_cast<int>(window.tabs.size()); ++i) {
++    const bool restore_selected_first = initial_tab_count == 0;
++    int tab_index = initial_tab_count;
++    auto restore_tab = [&](int i) {
+       const sessions::SessionTab& tab = *(window.tabs[i]);
+ 
+-      // Loads are scheduled for each restored tab unless the tab is going to
+-      // be selected as ShowBrowser() will load the selected tab.
+-      bool is_selected_tab =
+-          (initial_tab_count == 0) && (i == selected_tab_index);
++      const bool is_selected_tab =
++          restore_selected_first && (i == selected_tab_index);
+ 
+       // Convert the last active time because WebContents needs a TimeTicks.
+       const base::TimeTicks last_active_time_ticks =
+           now_ticks - (now - tab.last_active_time);
+ 
+-      // If the browser already has tabs, we want to restore the new ones after
+-      // the existing ones. E.g. this happens in Win8 Metro where we merge
+-      // windows or when launching a hosted app from the app launcher.
+-      int tab_index = i + initial_tab_count;
+       RestoreTab(tab, browser, is_active_browser, restored_tabs, new_group_ids,
+                  &tabs_by_split_id, tab_index, is_selected_tab,
+                  last_active_time_ticks, tab.last_active_time,
+                  did_show_browser);
++    };
++
++    if (restore_selected_first) {
++      // An empty tab strip activates and loads its first insertion.
++      restore_tab(selected_tab_index);
++    }
++    for (int i = 0; i < static_cast<int>(window.tabs.size()); ++i) {
++      if (window.tabs[i]->navigations.empty()) {
++        continue;
++      }
++      if (!restore_selected_first || i != selected_tab_index) {
++        restore_tab(i);
++      }
++      // Skipped tabs must not leave gaps in the insertion indices.
++      ++tab_index;
+     }
+ 
+-      for (const auto& pair : tabs_by_split_id) {
+-        const split_tabs::SplitTabId split_id = pair.first;
+-        const std::vector<tabs::TabInterface*> tab_contents_list = pair.second;
+-        std::vector<int> tab_index_list;
+-        for (auto* tab : tab_contents_list) {
+-          tab_index_list.push_back(
+-              browser->GetTabStripModel()->GetIndexOfTab(tab));
+-        }
++    for (const auto& [split_id, tabs] : tabs_by_split_id) {
++      // Only pairs are supported. A tab may have been skipped during restore.
++      if (tabs.size() != 2) {
++        continue;
++      }
+ 
+-        // The number of supported split tabs is 2. Do not attempt to restore
+-        // more than this to future proof it.
+-        if (tab_contents_list.size() == 2) {
+-          browser->tab_strip_model()->RestoreSplit(
+-              split_id, tab_index_list, split_tabs::SplitTabVisualData());
+-        }
++      std::vector<int> tab_indices;
++      for (auto* tab : tabs) {
++        tab_indices.push_back(browser->tab_strip_model()->GetIndexOfTab(tab));
+       }
++      // RestoreSplit() needs tab-strip order, not restoration order.
++      std::ranges::sort(tab_indices);
++      browser->tab_strip_model()->RestoreSplit(
++          split_id, tab_indices, split_tabs::SplitTabVisualData());
++    }
+   }
+ 
+-  // |tab_index| is ignored for pinned tabs which will always be pushed behind
+-  // the last existing pinned tab. If |is_selected_tab| is true the tab will be
+-  // shown after loading, otherwise it's loaded hidden. |last_active_time| is
+-  // the value to use to set the last time the WebContents was made active.
++  // |tab_index| is constrained to the pinned region for pinned tabs.
++  // If |is_selected_tab| is true, the tab is shown and loaded; otherwise, it
++  // remains unloaded until activated.
++  // |last_active_time| is the value to use to set the last time the WebContents
++  // was made active.
+   void RestoreTab(const sessions::SessionTab& tab,
+                   Browser* browser,
+                   bool is_active_browser,
+@@ -1084,7 +1095,9 @@ class SessionRestoreImpl : public Browse
+       return;
+     }
+ 
+-    SessionRestore::NotifySessionRestoreStartedLoadingTabs();
++    if (is_selected_tab) {
++      SessionRestore::NotifySessionRestoreStartedLoadingTabs();
++    }
+     int selected_index = GetNavigationIndexToSelect(tab);
+ 
+     RecordAppLaunchForTab(browser, tab, selected_index);
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -13,6 +13,7 @@
+ 
+ #include "base/auto_reset.h"
+ #include "base/command_line.h"
++#include "base/containers/span.h"
+ #include "base/debug/dump_without_crashing.h"
+ #include "base/functional/bind.h"
+ #include "base/notreached.h"
+@@ -35,6 +36,7 @@
+ #include "chrome/browser/signin/account_consistency_mode_manager.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+@@ -62,6 +64,8 @@
+ #include "components/custom_handlers/protocol_handler_registry.h"
+ #include "components/helium_services/pref_names.h"
+ #include "components/prefs/pref_service.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/signin/public/base/signin_switches.h"
+ #include "content/public/browser/child_process_security_policy.h"
+ #include "content/public/browser/dom_storage_context.h"
+@@ -419,6 +423,25 @@ Browser* StartupBrowserCreatorImpl::Open
+       continue;
+     }
+ 
++    // Pinned tabs from the startup-tab provider do not pass through the session
++    // restore tab loader, so add background ones without loading them.
++    if (!first_tab && tab.type == StartupTab::Type::kPinned) {
++      sessions::SerializedNavigationEntry navigation;
++      navigation.set_index(0);
++      navigation.set_virtual_url(tab.url);
++      chrome::AddRestoredTab(
++          browser, base::span_from_ref(navigation),
++          browser->tab_strip_model()->IndexOfFirstNonPinnedTab(),
++          /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
++          /*group=*/std::nullopt, /*select=*/false, /*pin=*/true,
++          /*last_active_time_ticks=*/base::TimeTicks(),
++          /*last_active_time=*/base::Time(), /*storage_namespace=*/nullptr,
++          /*user_agent_override=*/sessions::SerializedUserAgentOverride(),
++          /*extra_data=*/{}, /*from_session_restore=*/false,
++          /*is_active_browser=*/std::nullopt);
++      continue;
++    }
++
+     int add_types = first_tab ? AddTabTypes::ADD_ACTIVE : AddTabTypes::ADD_NONE;
+     add_types |= AddTabTypes::ADD_FORCE_INDEX;
+     if (tab.type == StartupTab::Type::kPinned) {
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -368,6 +368,12 @@ sessions::LiveTab* BrowserLiveTabContext
+ 
+   CHECK(web_contents);
+ 
++  // Leave background tabs in a restored window unloaded until activation.
++  if (original_session_type == sessions::tab_restore::Type::WINDOW &&
++      is_restoring_group_or_window && !select) {
++    return sessions::ContentLiveTab::GetOrCreateForWebContents(web_contents);
++  }
++
+   if (performance_manager::policies::CanScheduleLoadForRestoredTabs()) {
+     performance_manager::policies::ScheduleLoadForRestoredTabs({web_contents});
+   } else {
+--- a/components/sessions/core/tab_restore_service_helper.cc
++++ b/components/sessions/core/tab_restore_service_helper.cc
+@@ -983,33 +983,56 @@ std::vector<LiveTab*> TabRestoreServiceH
+                         static_cast<int>(window.tabs.size())
+                 ? window.selected_tab_index
+                 : 0;
+-        const SessionID selected_tab_id = window.tabs[selected_tab_index]->id;
+-
+         std::map<SessionID, LiveTab*> restored_tab_map;
+         std::map<split_tabs::SplitTabId, std::vector<raw_ptr<Tab>>>
+             window_split_tabs;
+         std::map<tab_groups::TabGroupId, std::vector<Tab*>> tabs_by_group;
++        // Saved groups reopen as a batch without respecting insertion indices,
++        // so preserve the original append order for windows containing them.
++        const bool restore_selected_first =
++            context->GetTabCount() == 0 &&
++            std::ranges::none_of(window.tabs, [](const auto& tab) {
++              return tab->saved_group_id.has_value();
++            });
+ 
+-        for (const auto& tab : window.tabs) {
+-          const bool select_tab = tab->id == selected_tab_id;
++        auto restore_tab = [&](int tab_index) {
++          const auto& tab = window.tabs[tab_index];
++          const int insertion_index =
++              restore_selected_first ? tab_index : context->GetTabCount();
+           LiveTab* restored_tab = context->AddRestoredTab(
+-              *tab.get(), context->GetTabCount(), select_tab,
++              *tab, insertion_index, tab_index == selected_tab_index,
+               /*restored_from_group_or_window_context=*/true, entry.type);
+ 
+           if (restored_tab) {
+-            client_->OnTabRestored(
+-                tab->navigations.at(tab->current_navigation_index)
+-                    .virtual_url());
+-            live_tabs.push_back(restored_tab);
+             restored_tab_map[tab->id] = restored_tab;
+           }
++        };
++
++        if (restore_selected_first) {
++          // An empty tab strip activates and loads its first insertion.
++          restore_tab(selected_tab_index);
++        }
+ 
++        // Restore remaining tabs and collect results in the original order.
++        for (int i = 0; i < static_cast<int>(window.tabs.size()); ++i) {
++          if (!restore_selected_first || i != selected_tab_index) {
++            restore_tab(i);
++          }
++          const auto& tab = window.tabs[i];
+           if (tab->split_id.has_value()) {
+             window_split_tabs[tab->split_id.value()].push_back(tab.get());
+           }
+           if (tab->group.has_value()) {
+             tabs_by_group[tab->group.value()].push_back(tab.get());
+           }
++
++          const auto restored_tab = restored_tab_map.find(tab->id);
++          if (restored_tab != restored_tab_map.end()) {
++            client_->OnTabRestored(
++                tab->navigations.at(tab->current_navigation_index)
++                    .virtual_url());
++            live_tabs.push_back(restored_tab->second);
++          }
+         }
+ 
+         MapSavedGroupTabsToLiveTabs(context, window.tab_groups, tabs_by_group,
+--- a/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
++++ b/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
+@@ -23,7 +23,6 @@
+ #include "chrome/browser/ui/thumbnails/thumbnail_scheduler_impl.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "content/public/browser/browser_thread.h"
+-#include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/render_view_host.h"
+ #include "content/public/browser/render_widget_host.h"
+@@ -192,11 +191,8 @@ class ThumbnailTabHelper::TabStateTracke
+ 
+   // ThumbnailImage::Delegate:
+   void ThumbnailImageBeingObservedChanged(bool is_being_observed) override {
++    // Do not load restored or discarded tabs for thumbnail observation.
+     capture_driver_.UpdateThumbnailVisibility(is_being_observed);
+-    // Do not attempt to reload discarded tabs for thumbnail observation events.
+-    if (is_being_observed && !web_contents()->WasDiscarded()) {
+-      web_contents()->GetController().LoadIfNecessary();
+-    }
+   }
+ 
+   ThumbnailImage::CaptureReadiness GetCaptureReadiness() const override {
+--- a/chrome/browser/ui/tabs/tab_data.h
++++ b/chrome/browser/ui/tabs/tab_data.h
+@@ -62,6 +62,9 @@ struct TabData {
+   bool is_tab_discarded = false;
+   GURL last_committed_url;
+ 
++  // Uses the inactive favicon treatment without changing discard status.
++  bool is_restored_and_unloaded = false;
++
+   // Alert properties:
+   std::optional<TabAlert> alert_state;
+ 
+--- a/chrome/browser/ui/tabs/tab_data.cc
++++ b/chrome/browser/ui/tabs/tab_data.cc
+@@ -23,6 +23,8 @@
+ #include "components/collaboration/public/messaging/messaging_backend_service.h"
+ #include "components/tabs/public/tab_alert.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ namespace tabs {
+@@ -58,6 +60,11 @@ TabData TabData::FromTabInterface(tabs::
+   tab_data.blocked = tab_interface->IsBlocked();
+ 
+   content::WebContents* const web_contents = tab_interface->GetContents();
++  content::NavigationController& controller = web_contents->GetController();
++  const content::NavigationEntry* entry = controller.GetLastCommittedEntry();
++  tab_data.is_restored_and_unloaded =
++      controller.NeedsReload() && entry && entry->IsRestored();
++
+   ThumbnailTabHelper* const thumbnail_tab_helper =
+       ThumbnailTabHelper::FromWebContents(web_contents);
+   tab_data.thumbnail =
+@@ -99,6 +106,7 @@ bool TabData::operator==(const TabData&
+          network_state == other.network_state &&
+          is_tab_discarded == other.is_tab_discarded &&
+          last_committed_url == other.last_committed_url &&
++         is_restored_and_unloaded == other.is_restored_and_unloaded &&
+          alert_state == other.alert_state && pinned == other.pinned &&
+          blocked == other.blocked && thumbnail == other.thumbnail &&
+          tab_resource_usage == other.tab_resource_usage;
+--- a/chrome/browser/ui/views/tabs/tab/tab_icon.cc
++++ b/chrome/browser/ui/views/tabs/tab/tab_icon.cc
+@@ -162,7 +162,7 @@ void TabIcon::SetData(const tabs::TabDat
+   SetIcon(data.favicon, data.should_themify_favicon);
+   SetNetworkState(data.network_state);
+   SetCrashed(data.is_crashed);
+-  SetDiscarded(data.should_show_discard_status);
++  SetDiscarded(data.should_show_discard_status || data.is_restored_and_unloaded);
+   has_tab_data_ = true;
+ 
+   UpdateThrobber();
