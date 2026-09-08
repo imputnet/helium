@@ -12,7 +12,18 @@
  // Enables a compositor-driven rotation animation for the tab load throbber.
 --- a/chrome/browser/ui/ui_features.cc
 +++ b/chrome/browser/ui/ui_features.cc
-@@ -42,6 +42,16 @@ bool HeliumUseCompactLocationWidth() {
+@@ -16,6 +16,10 @@
+ #include "content/public/common/content_features.h"
+ #include "ui/base/ui_base_features.h"
+ 
++#if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
++#endif
++
+ #if !BUILDFLAG(IS_ANDROID)
+ namespace {
+ 
+@@ -42,6 +46,19 @@ bool HeliumUseCompactLocationWidth() {
    return base::FeatureList::IsEnabled(kHeliumCompactLocationWidth);
  }
  
@@ -21,6 +32,9 @@
 +bool HeliumNativeFrameAvailable() {
 +#if BUILDFLAG(IS_MAC)
 +  return base::FeatureList::IsEnabled(kHeliumNativeFrameMaterials);
++#elif BUILDFLAG(IS_WIN)
++  return base::win::GetVersion() >= base::win::Version::WIN11_22H2 &&
++         base::FeatureList::IsEnabled(kHeliumNativeFrameMaterials);
 +#else
 +  return false;
 +#endif
@@ -49,7 +63,7 @@
 +    {helium::kHeliumNativeFrameMaterialsCommandLine, "Native frame materials",
 +     "Enables an option to apply native materials to the browser frame "
 +     "surfaces. May cause UI clarity issues. Helium flag.",
-+     kOsMac, FEATURE_VALUE_TYPE(features::kHeliumNativeFrameMaterials)},
++     kOsMac | kOsWin, FEATURE_VALUE_TYPE(features::kHeliumNativeFrameMaterials)},
      // platform
  #endif  // CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_
 --- a/chrome/common/pref_names.h
@@ -206,7 +220,7 @@
 +#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_NATIVE_FRAME_MATERIALS_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium/native_frame_materials.cc
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,65 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -223,10 +237,14 @@
 +#include "ui/views/view.h"
 +#include "ui/views/widget/widget.h"
 +
++#if BUILDFLAG(IS_WIN)
++#include "ui/native_theme/native_theme.h"
++#endif
++
 +namespace helium {
 +
 +bool ShouldUseNativeFrameMaterials(const BrowserView* browser_view) {
-+#if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
 +  if (!features::HeliumNativeFrameAvailable() || !browser_view) {
 +    return false;
 +  }
@@ -235,6 +253,16 @@
 +  if (browser_view->GetIsWebAppType()) {
 +    return false;
 +  }
++
++#if BUILDFLAG(IS_WIN)
++  // Picture-in-picture windows have their own frame. Keep contrast themes
++  // opaque, as Chromium does for the Mica titlebar.
++  if (browser_view->GetIsPictureInPictureType() ||
++      ui::NativeTheme::GetInstanceForNativeUi()->preferred_contrast() !=
++          ui::NativeTheme::PreferredContrast::kNoPreference) {
++    return false;
++  }
++#endif
 +
 +  const Profile* profile = browser_view->GetProfile();
 +  return profile &&
@@ -405,11 +433,12 @@
  #include "chrome/browser/ui/web_applications/app_browser_controller.h"
  #include "chrome/common/chrome_switches.h"
  #include "ui/base/hit_test.h"
-@@ -203,7 +205,11 @@ void BrowserWidget::InitBrowserWidget()
+@@ -203,9 +205,15 @@ void BrowserWidget::InitBrowserWidget()
      }
    }
  
 -  if (features::IsGlassFrameEnabled()) {
++#if BUILDFLAG(IS_MAC)
 +  // The widget must enter the translucent compositing path at creation time so
 +  // the native-materials pref can be toggled live. If an initially opaque
 +  // widget is made translucent later, the Chromium layer tree can keep painting
@@ -417,7 +446,23 @@
 +  if (features::HeliumNativeFrameAvailable()) {
      params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
    }
++#endif
  
+   Init(std::move(params));
+ 
+@@ -546,9 +554,11 @@ bool BrowserWidget::RegenerateFrameOnThe
+   // on new tab. (see crbug.com/40646694)
+   // With Mica, toggling titlebar accent colors in the native theme needs a
+   // frame regen to switch between the system-drawn and custom-drawn titlebars.
++  // Native acrylic also needs to update transparency for contrast themes.
+   need_regenerate |=
+       (theme_change_type == BrowserThemeChangeType::kBrowserTheme ||
+-       SystemTitlebarCanUseMicaMaterial()) &&
++       SystemTitlebarCanUseMicaMaterial() ||
++       features::HeliumNativeFrameAvailable()) &&
+       !IsFullscreen();
+ #else
+   need_regenerate |= theme_change_type == BrowserThemeChangeType::kBrowserTheme;
 --- a/chrome/browser/ui/views/frame/browser_native_widget_mac.h
 +++ b/chrome/browser/ui/views/frame/browser_native_widget_mac.h
 @@ -7,24 +7,20 @@
@@ -1461,3 +1506,193 @@
  
    bool IsDragging() const;
  
+--- a/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc
++++ b/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/ui/views/frame/system_menu_insertion_delegate_win.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/windows_caption_button.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/win/app_icon.h"
+ #include "chrome/browser/win/titlebar_config.h"
+@@ -384,6 +385,20 @@ bool BrowserDesktopWindowTreeHostWin::Ge
+ 
+ bool BrowserDesktopWindowTreeHostWin::GetDwmFrameInsetsInPixels(
+     gfx::Insets* insets) const {
++  if (helium::ShouldUseNativeFrameMaterials(browser_view_)) {
++    // Negative margins extend the backdrop behind every frame surface,
++    // including the toolbar and vertical tab strip.
++    *insets = gfx::Insets(-1);
++    return true;
++  }
++
++  if (features::HeliumNativeFrameAvailable() && browser_view_ &&
++      !browser_view_->GetIsNormalType()) {
++    // Also reset the full-window extension for popup frames when disabled.
++    *insets = gfx::Insets();
++    return true;
++  }
++
+   // For "normal" windows on Aero, we always need to reset the glass area
+   // correctly, even if we're not currently showing the native frame (e.g.
+   // because a theme is showing), so we explicitly check for that case rather
+@@ -570,6 +585,9 @@ bool BrowserDesktopWindowTreeHostWin::Sh
+ bool BrowserDesktopWindowTreeHostWin::ShouldWindowContentsBeTransparent()
+     const {
+   CHECK(browser_view_);
++  if (helium::ShouldUseNativeFrameMaterials(browser_view_)) {
++    return true;
++  }
+   return !ShouldBrowserCustomDrawTitlebar(browser_view_) &&
+          views::DesktopWindowTreeHostWin::ShouldWindowContentsBeTransparent();
+ }
+--- a/chrome/browser/ui/views/frame/browser_frame_view_win.cc
++++ b/chrome/browser/ui/views/frame/browser_frame_view_win.cc
+@@ -25,6 +25,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/minimize_button_metrics_win.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/browser/ui/views/tabs/new_tab_button.h"
+ #include "chrome/browser/ui/views/tabs/tab.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+@@ -32,7 +33,6 @@
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/web_applications/web_app_icon_manager.h"
+ #include "chrome/browser/web_applications/web_app_provider.h"
+-#include "chrome/browser/win/mica_titlebar.h"
+ #include "chrome/browser/win/titlebar_config.h"
+ #include "content/public/browser/web_contents.h"
+ #include "skia/ext/image_operations.h"
+@@ -496,9 +496,7 @@ void BrowserFrameViewWin::ResetWindowCon
+ 
+ void BrowserFrameViewWin::OnThemeChanged() {
+   BrowserFrameView::OnThemeChanged();
+-  if (!ShouldBrowserCustomDrawTitlebar(GetBrowserView())) {
+-    SetSystemMicaTitlebarAttributes();
+-  }
++  UpdateSystemBackdrop();
+ }
+ 
+ gfx::RoundedCornersF BrowserFrameViewWin::GetWindowRoundedCorners() const {
+@@ -549,9 +547,19 @@ bool BrowserFrameViewWin::IsMaximized()
+ 
+ void BrowserFrameViewWin::OnPaint(gfx::Canvas* canvas) {
+   TRACE_EVENT0("views.frame", "BrowserFrameViewWin::OnPaint");
+-  if (ShouldBrowserCustomDrawTitlebar(GetBrowserView())) {
++  if (helium::ShouldUseNativeFrameMaterials(GetBrowserView())) {
++    // Tint the acrylic with the browser theme without covering the backdrop.
++    const bool is_dark = browser_widget()->GetColorMode() ==
++                         ui::ColorProviderKey::ColorMode::kDark;
++    canvas->DrawColor(SkColorSetA(GetTitlebarColor(), is_dark ? 0x8C : 0xCC));
++  } else if (ShouldBrowserCustomDrawTitlebar(GetBrowserView())) {
+     PaintTitlebar(canvas);
+   }
++
++  if (ShouldShowWindowTitle(TitlebarType::kCustom) && window_title_) {
++    window_title_->SetEnabledColor(
++        GetCaptionColor(BrowserFrameActiveState::kUseCurrent));
++  }
+ }
+ 
+ void BrowserFrameViewWin::Layout(PassKey) {
+@@ -734,13 +742,14 @@ bool BrowserFrameViewWin::ShouldShowWind
+ }
+ 
+ void BrowserFrameViewWin::TabletModeChanged() {
+-  if (!ShouldBrowserCustomDrawTitlebar(GetBrowserView())) {
+-    SetSystemMicaTitlebarAttributes();
+-  }
++  UpdateSystemBackdrop();
+ }
+ 
+-void BrowserFrameViewWin::SetSystemMicaTitlebarAttributes() {
+-  CHECK(SystemTitlebarCanUseMicaMaterial());
++void BrowserFrameViewWin::UpdateSystemBackdrop() {
++  if (!features::HeliumNativeFrameAvailable() &&
++      ShouldBrowserCustomDrawTitlebar(GetBrowserView())) {
++    return;
++  }
+ 
+   const BOOL dark_titlebar_enabled = browser_widget()->GetColorMode() ==
+                                      ui::ColorProviderKey::ColorMode::kDark;
+@@ -748,9 +757,15 @@ void BrowserFrameViewWin::SetSystemMicaT
+                         DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_titlebar_enabled,
+                         sizeof(dark_titlebar_enabled));
+ 
+-  const DWM_SYSTEMBACKDROP_TYPE dwm_backdrop_type =
+-      GetBrowserView()->GetTabStripVisible() ? DWMSBT_TABBEDWINDOW
+-                                             : DWMSBT_MAINWINDOW;
++  // Restore the normal DWM fallback when acrylic is disabled, or the tabbed
++  // Mica backdrop when Chromium's system titlebar experiment is active.
++  DWM_SYSTEMBACKDROP_TYPE dwm_backdrop_type = DWMSBT_MAINWINDOW;
++  if (helium::ShouldUseNativeFrameMaterials(GetBrowserView())) {
++    dwm_backdrop_type = DWMSBT_TRANSIENTWINDOW;
++  } else if (!ShouldBrowserCustomDrawTitlebar(GetBrowserView()) &&
++             GetBrowserView()->GetTabStripVisible()) {
++    dwm_backdrop_type = DWMSBT_TABBEDWINDOW;
++  }
+   DwmSetWindowAttribute(views::HWNDForWidget(browser_widget()),
+                         DWMWA_SYSTEMBACKDROP_TYPE, &dwm_backdrop_type,
+                         sizeof(dwm_backdrop_type));
+@@ -824,11 +839,6 @@ void BrowserFrameViewWin::PaintTitlebar(
+                          titlebar_rect.y(), frame_overlay_image.width() * scale,
+                          frame_overlay_image.height() * scale, true);
+   }
+-
+-  if (ShouldShowWindowTitle(TitlebarType::kCustom) && window_title_) {
+-    window_title_->SetEnabledColor(
+-        GetCaptionColor(BrowserFrameActiveState::kUseCurrent));
+-  }
+ }
+ 
+ void BrowserFrameViewWin::LayoutTitleBar() {
+--- a/chrome/browser/ui/views/frame/browser_frame_view_win.h
++++ b/chrome/browser/ui/views/frame/browser_frame_view_win.h
+@@ -151,8 +151,8 @@ class BrowserFrameViewWin : public Brows
+   // Called when the device enters or exits tablet mode.
+   void TabletModeChanged();
+ 
+-  // Sets DWM attributes for rendering the system-drawn Mica titlebar.
+-  void SetSystemMicaTitlebarAttributes();
++  // Sets DWM attributes for the Mica titlebar or native acrylic frame.
++  void UpdateSystemBackdrop();
+ 
+   // Paint various sub-components of this view.
+   void PaintTitlebar(gfx::Canvas* canvas) const;
+--- a/chrome/browser/win/titlebar_config.cc
++++ b/chrome/browser/win/titlebar_config.cc
+@@ -8,10 +8,12 @@
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/browser/win/mica_titlebar.h"
+ 
+ bool ShouldBrowserCustomDrawTitlebar(BrowserView* browser_view) {
+-  return !ShouldDefaultThemeUseMicaTitlebar() ||
++  return helium::ShouldUseNativeFrameMaterials(browser_view) ||
++         !ShouldDefaultThemeUseMicaTitlebar() ||
+          !ThemeServiceFactory::GetForProfile(browser_view->GetProfile())
+               ->UsingSystemTheme() ||
+          (!browser_view->browser()->is_type_normal() &&
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1132,6 +1132,16 @@ BrowserView::BrowserView(Browser* browse
+ #endif
+ 
+   registrar_.Init(GetProfile()->GetPrefs());
++#if BUILDFLAG(IS_WIN)
++  registrar_.Add(
++      prefs::kHeliumNativeFrameMaterials,
++      base::BindRepeating(
++          [](BrowserView* view) {
++            view->browser_widget()->FrameTypeChanged();
++            view->browser_widget()->ThemeChanged();
++          },
++          base::Unretained(this)));
++#endif
+   registrar_.Add(
+       prefs::kFullscreenAllowed,
+       base::BindRepeating(&BrowserView::UpdateFullscreenAllowedFromPolicy,
