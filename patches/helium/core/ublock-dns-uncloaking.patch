@@ -1,0 +1,551 @@
+--- a/extensions/common/api/_permission_features.json
++++ b/extensions/common/api/_permission_features.json
+@@ -239,6 +239,15 @@
+   ],
+   "dns": [
+     {
++      "channel": "stable",
++      "extension_types": ["extension"],
++      "location": "component",
++      "component_extensions_auto_granted": false,
++      "allowlist": [
++        "70C2895ED505C532A80761F0928B821B103D0786"  // Helium uBlock Origin component
++      ]
++    },
++    {
+       "channel": "dev",
+       "extension_types": ["extension", "platform_app"]
+     },
+--- a/extensions/common/api/dns.webidl
++++ b/extensions/common/api/dns.webidl
+@@ -2,22 +2,31 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-dictionary ResolveCallbackResolveInfo {
+-  // The result code. Zero indicates success.
+-  required long resultCode;
++enum ResolveFlag { "canonical_name" };
+ 
+-  // A string representing the IP address literal. Supplied only if resultCode
+-  // indicates success.
+-  DOMString address;
++dictionary DNSRecord {
++  required sequence<DOMString> addresses;
++
++  // The canonical hostname in lowercase without a trailing root dot.
++  // Omitted when not requested or unavailable, including an empty name.
++  DOMString canonicalName;
+ };
+ 
+ // Use the <code>chrome.dns</code> API for dns resolution.
+ interface Dns {
+   // Resolves the given hostname or IP address literal.
++  // Rejects on resolution failure.
++  // The canonical_name flag requests the final hostname from the configured
++  // resolver, respecting the browser's Secure DNS settings.
+   // |hostname| : The hostname to resolve.
+-  // |Returns|: Promise that resolves when the resolution operation completes.
+-  // |PromiseValue|: resolveInfo
+-  static Promise<ResolveCallbackResolveInfo> resolve(DOMString hostname);
++  // |flags|: Optional resolution flags.
++  // |requestUrl|: The request URL used for proxy selection. Required unless
++  // hostname is an IP literal. Resolution is skipped with ERR_DNS_DIRECT_ONLY
++  // unless proxy selection succeeds with a direct connection or SOCKS4 proxy.
++  // |PromiseValue|: record
++  static Promise<DNSRecord> resolve(
++      DOMString hostname, optional sequence<ResolveFlag> flags,
++      optional DOMString requestUrl);
+ };
+ 
+ partial interface Browser {
+--- a/extensions/browser/api/dns/dns_api.h
++++ b/extensions/browser/api/dns/dns_api.h
+@@ -5,20 +5,27 @@
+ #ifndef EXTENSIONS_BROWSER_API_DNS_DNS_API_H_
+ #define EXTENSIONS_BROWSER_API_DNS_DNS_API_H_
+ 
++#include <optional>
++#include <string>
++
++#include "base/timer/timer.h"
+ #include "extensions/browser/extension_function.h"
+ #include "extensions/buildflags/buildflags.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
+ #include "net/base/address_list.h"
+ #include "net/dns/public/host_resolver_results.h"
++#include "net/proxy_resolution/proxy_info.h"
+ #include "services/network/public/cpp/resolve_host_client_base.h"
+ #include "services/network/public/mojom/network_context.mojom.h"
++#include "services/network/public/mojom/proxy_lookup_client.mojom.h"
+ 
+ static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
+ 
+ namespace extensions {
+ 
+ class DnsResolveFunction : public ExtensionFunction,
+-                           public network::ResolveHostClientBase {
++                           public network::ResolveHostClientBase,
++                           public network::mojom::ProxyLookupClient {
+  public:
+   DECLARE_EXTENSION_FUNCTION("dns.resolve", DNS_RESOLVE)
+ 
+@@ -29,8 +36,16 @@ class DnsResolveFunction : public Extens
+ 
+   // ExtensionFunction:
+   ResponseAction Run() override;
++  void OnBrowserContextShutdown() override;
+ 
+  private:
++  void ResolveHost();
++
++  // network::mojom::ProxyLookupClient implementation:
++  void OnProxyLookupComplete(
++      int32_t net_error,
++      const std::optional<net::ProxyInfo>& proxy_info) override;
++
+   // network::mojom::ResolveHostClient implementation:
+   void OnComplete(
+       int result,
+@@ -38,8 +53,14 @@ class DnsResolveFunction : public Extens
+       const net::AddressList& resolved_addresses,
+       const net::HostResolverEndpointResults& alternative_endpoints) override;
+ 
+-  // A reference to `this` must be taken while the request is being made on this
+-  // receiver so the object is alive when the request completes.
++  std::string hostname_;
++  bool include_canonical_name_ = false;
++  bool request_pending_ = false;
++  base::OneShotTimer proxy_lookup_timer_;
++
++  // One reference keeps `this` alive while request_pending_ is true, until
++  // OnComplete() or OnBrowserContextShutdown() releases it.
++  mojo::Receiver<network::mojom::ProxyLookupClient> proxy_receiver_{this};
+   mojo::Receiver<network::mojom::ResolveHostClient> receiver_{this};
+ };
+ 
+--- a/extensions/browser/api/dns/dns_api.cc
++++ b/extensions/browser/api/dns/dns_api.cc
+@@ -4,20 +4,29 @@
+ 
+ #include "extensions/browser/api/dns/dns_api.h"
+ 
++#include <algorithm>
++
+ #include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
+ #include "base/values.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "extensions/common/api/dns.h"
+ #include "net/base/host_port_pair.h"
++#include "net/base/ip_address.h"
+ #include "net/base/net_errors.h"
+-#include "net/base/network_isolation_key.h"
++#include "net/base/network_anonymization_key.h"
++#include "net/base/proxy_chain.h"
++#include "net/base/proxy_server.h"
+ #include "net/dns/public/resolve_error_info.h"
++#include "url/gurl.h"
+ #include "url/origin.h"
+ 
+ using content::BrowserThread;
+-using extensions::api::dns::ResolveCallbackResolveInfo;
++using extensions::api::dns::DNSRecord;
+ 
+ namespace Resolve = extensions::api::dns::Resolve;
+ 
+@@ -32,9 +41,110 @@ ExtensionFunction::ResponseAction DnsRes
+   std::optional<Resolve::Params> params = Resolve::Params::Create(args());
+   EXTENSION_FUNCTION_VALIDATE(params);
+ 
++  hostname_ = params->hostname;
++  include_canonical_name_ =
++      params->flags &&
++      std::ranges::contains(*params->flags,
++                            api::dns::ResolveFlag::kCanonicalName);
++
++  GURL request_url;
++  if (params->request_url) {
++    request_url = GURL(*params->request_url);
++    if (!request_url.is_valid() ||
++        (!request_url.SchemeIsHTTPOrHTTPS() &&
++         !request_url.SchemeIsWSOrWSS()) ||
++        !base::EqualsCaseInsensitiveASCII(
++            net::HostPortPair::FromURL(request_url).host(), hostname_)) {
++      return RespondNow(Error("The request URL must match the DNS hostname."));
++    }
++  } else {
++    net::IPAddress address;
++    if (!address.AssignFromIPLiteral(hostname_)) {
++      return RespondNow(Error("A request URL is required for DNS resolution."));
++    }
++  }
++
++  if (!browser_context()) {
++    return RespondNow(Error(net::ErrorToString(net::ERR_ABORTED)));
++  }
++
++  // Balanced in OnComplete() or OnBrowserContextShutdown().
++  AddRef();
++  request_pending_ = true;
++  if (request_url.is_valid()) {
++    auto proxy_client = proxy_receiver_.BindNewPipeAndPassRemote();
++    proxy_receiver_.set_disconnect_handler(
++        base::BindOnce(&DnsResolveFunction::OnProxyLookupComplete,
++                       base::Unretained(this), net::ERR_ABORTED, std::nullopt));
++    // Bound the extra wait for uncloaking even if proxy resolution stalls.
++    proxy_lookup_timer_.Start(
++        FROM_HERE, base::Seconds(5),
++        base::BindOnce(&DnsResolveFunction::OnProxyLookupComplete,
++                       base::Unretained(this), net::ERR_TIMED_OUT,
++                       std::nullopt));
++    browser_context()
++        ->GetDefaultStoragePartition()
++        ->GetNetworkContext()
++        ->LookUpProxyForURL(request_url,
++                            net::NetworkAnonymizationKey::CreateSameSite(
++                                net::SchemefulSite(extension_->origin())),
++                            std::move(proxy_client));
++  } else {
++    // IP literals need no hostname lookup, including the capability probe.
++    ResolveHost();
++  }
++  return RespondLater();
++}
++
++void DnsResolveFunction::OnBrowserContextShutdown() {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  proxy_lookup_timer_.Stop();
++  proxy_receiver_.reset();
++  receiver_.reset();
++  if (!request_pending_) {
++    return;
++  }
++  request_pending_ = false;
++  Release();  // Added in Run().
++}
++
++void DnsResolveFunction::OnProxyLookupComplete(
++    int32_t net_error,
++    const std::optional<net::ProxyInfo>& proxy_info) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  proxy_lookup_timer_.Stop();
++  proxy_receiver_.reset();
++  // Like uBlock's Firefox proxyInfo check, allow local DNS for direct
++  // connections and SOCKS4. HTTP/HTTPS and SOCKS5 resolve the target remotely.
++  bool local_dns = false;
++  if (net_error == net::OK && proxy_info && !proxy_info->is_empty()) {
++    const auto& chain = proxy_info->proxy_chain();
++    local_dns = chain.is_direct() ||
++                (chain.is_single_proxy() &&
++                 chain.First().scheme() == net::ProxyServer::SCHEME_SOCKS4);
++  }
++  if (!local_dns) {
++    OnComplete(net::ERR_DNS_DIRECT_ONLY,
++               net::ResolveErrorInfo(net::ERR_DNS_DIRECT_ONLY),
++               net::AddressList(), net::HostResolverEndpointResults());
++    return;
++  }
++  ResolveHost();
++}
++
++void DnsResolveFunction::ResolveHost() {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!browser_context()) {
++    OnComplete(net::ERR_ABORTED, net::ResolveErrorInfo(net::ERR_ABORTED),
++               net::AddressList(), net::HostResolverEndpointResults());
++    return;
++  }
++  auto parameters = network::mojom::ResolveHostParameters::New();
++  parameters->include_canonical_name_for_uncloaking = include_canonical_name_;
++
+   // Intentionally pass host only (no scheme or non-zero port) to only get a
+   // basic resolution for the hostname itself.
+-  net::HostPortPair host_port_pair(params->hostname, 0);
++  net::HostPortPair host_port_pair(hostname_, 0);
+   net::SchemefulSite site = net::SchemefulSite(extension_->origin());
+   browser_context()
+       ->GetDefaultStoragePartition()
+@@ -43,15 +153,11 @@ ExtensionFunction::ResponseAction DnsRes
+           network::mojom::HostResolverHost::NewHostPortPair(
+               std::move(host_port_pair)),
+           net::NetworkAnonymizationKey::CreateSameSite(std::move(site)),
+-          nullptr, receiver_.BindNewPipeAndPassRemote());
++          std::move(parameters), receiver_.BindNewPipeAndPassRemote());
+   receiver_.set_disconnect_handler(base::BindOnce(
+       &DnsResolveFunction::OnComplete, base::Unretained(this),
+       net::ERR_NAME_NOT_RESOLVED, net::ResolveErrorInfo(net::ERR_FAILED),
+       net::AddressList(), net::HostResolverEndpointResults()));
+-
+-  // Balanced in OnComplete().
+-  AddRef();
+-  return RespondLater();
+ }
+ 
+ void DnsResolveFunction::OnComplete(
+@@ -60,17 +166,37 @@ void DnsResolveFunction::OnComplete(
+     const net::AddressList& resolved_addresses,
+     const net::HostResolverEndpointResults& alternative_endpoints) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!request_pending_) {
++    return;
++  }
++  request_pending_ = false;
++  proxy_lookup_timer_.Stop();
++  proxy_receiver_.reset();
+   receiver_.reset();
+ 
+-  ResolveCallbackResolveInfo resolve_info;
+-  resolve_info.result_code = resolve_error_info.error;
+-  if (result == net::OK) {
+-    DCHECK(!resolved_addresses.empty());
+-    resolve_info.address = resolved_addresses.front().ToStringWithoutPort();
++  if (result != net::OK) {
++    Respond(Error(net::ErrorToString(result)));
++  } else {
++    DNSRecord record;
++    for (const auto& address : resolved_addresses) {
++      auto ip = address.ToStringWithoutPort();
++      if (!std::ranges::contains(record.addresses, ip)) {
++        record.addresses.push_back(std::move(ip));
++      }
++    }
++    if (include_canonical_name_ && !resolved_addresses.dns_aliases().empty()) {
++      std::string canonical_name =
++          base::ToLowerASCII(resolved_addresses.dns_aliases().front());
++      if (!canonical_name.empty() && canonical_name.back() == '.') {
++        canonical_name.pop_back();
++      }
++      if (!canonical_name.empty()) {
++        record.canonical_name = std::move(canonical_name);
++      }
++    }
++    Respond(ArgumentList(Resolve::Results::Create(record)));
+   }
+ 
+-  Respond(ArgumentList(Resolve::Results::Create(resolve_info)));
+-
+   Release();  // Added in Run().
+ }
+ 
+--- a/extensions/renderer/api/web_request_natives.cc
++++ b/extensions/renderer/api/web_request_natives.cc
+@@ -30,6 +30,12 @@ namespace extensions {
+ 
+ namespace {
+ 
++bool IsBundledUBlock(const Extension* extension) {
++  return extension &&
++         extension->location() == mojom::ManifestLocation::kComponent &&
++         Manifest::IsUBlockComponent(extension->id());
++}
++
+ // Parses a webRequest.RequestFilter into a WebRequestParsedFilter, or returns
+ // nullopt if the browser would also reject it.
+ std::optional<WebRequestParsedFilter> ParseListenerFilter(
+@@ -66,6 +72,11 @@ WebRequestNatives::~WebRequestNatives()
+ 
+ void WebRequestNatives::AddRoutes() {
+   RouteHandlerFunction(
++      "ShouldExposeBlockingPromiseSupport",
++      base::BindRepeating(
++          &WebRequestNatives::ShouldExposeBlockingPromiseSupport,
++          base::Unretained(this)));
++  RouteHandlerFunction(
+       "AllowAsyncResponsesForAllEvents",
+       base::BindRepeating(&WebRequestNatives::AllowAsyncResponsesForAllEvents,
+                           base::Unretained(this)));
+@@ -97,10 +108,17 @@ void WebRequestNatives::AllowAsyncRespon
+   bool always_allowed_async_handlers =
+       extension && extension->manifest_version() >= 3 &&
+       Manifest::IsPolicyLocation(extension->location());
++  always_allowed_async_handlers |= IsBundledUBlock(extension);
+ 
+   args.GetReturnValue().Set(always_allowed_async_handlers);
+ }
+ 
++void WebRequestNatives::ShouldExposeBlockingPromiseSupport(
++    const v8::FunctionCallbackInfo<v8::Value>& args) {
++  CHECK_EQ(0, args.Length());
++  args.GetReturnValue().Set(IsBundledUBlock(context()->extension()));
++}
++
+ void WebRequestNatives::IsPerContextEventDispatchEnabled(
+     const v8::FunctionCallbackInfo<v8::Value>& args) {
+   CHECK_EQ(0, args.Length());
+--- a/extensions/renderer/api/web_request_natives.h
++++ b/extensions/renderer/api/web_request_natives.h
+@@ -43,6 +43,9 @@ class WebRequestNatives : public ObjectB
+   void AllowAsyncResponsesForAllEvents(
+       const v8::FunctionCallbackInfo<v8::Value>& args);
+ 
++  void ShouldExposeBlockingPromiseSupport(
++      const v8::FunctionCallbackInfo<v8::Value>& args);
++
+   void IsPerContextEventDispatchEnabled(
+       const v8::FunctionCallbackInfo<v8::Value>& args);
+ 
+--- a/extensions/renderer/resources/web_request_event.js
++++ b/extensions/renderer/resources/web_request_event.js
+@@ -9,6 +9,8 @@ var webRequestInternal = getInternalApi(
+ var webRequestNatives = requireNative('web_request_natives');
+ const allowAsyncResponsesForAllEvents =
+     webRequestNatives.AllowAsyncResponsesForAllEvents();
++const exposeBlockingPromiseSupport =
++    webRequestNatives.ShouldExposeBlockingPromiseSupport();
+ const isServiceWorkerContext =
+     requireNative('service_worker_natives').IsServiceWorkerContext();
+ const usePerContextEventDispatch =
+@@ -553,6 +555,13 @@ WebRequestEventImpl.prototype.getRules =
+ 
+ function WebRequestEvent() {
+   privates(WebRequestEvent).constructPrivate(this, arguments);
++  if (exposeBlockingPromiseSupport) {
++    $Object.defineProperty(this, 'supportsBlockingPromises', {
++      __proto__: null,
++      value: allowAsyncResponsesForAllEvents,
++      enumerable: true,
++    });
++  }
+ }
+ 
+ // Our util code requires we construct a new WebRequestEvent via a call to
+--- a/net/base/address_family.h
++++ b/net/base/address_family.h
+@@ -33,7 +33,10 @@ enum {
+   HOST_RESOLVER_DEFAULT_FAMILY_SET_DUE_TO_NO_IPV6 = 1 << 2,
+   // The resolver should avoid resolving using multicast protocols (LLMNR or
+   // mDNS).
+-  HOST_RESOLVER_AVOID_MULTICAST = 1 << 3
++  HOST_RESOLVER_AVOID_MULTICAST = 1 << 3,
++  // Keep extension DNS uncloaking requests in separate jobs and cache entries.
++  // Unlike CANONNAME, this does not force selection of the system resolver.
++  HOST_RESOLVER_CANONNAME_FOR_UNCLOAKING = 1 << 4
+ };
+ typedef int HostResolverFlags;
+ 
+--- a/net/dns/host_resolver.h
++++ b/net/dns/host_resolver.h
+@@ -456,6 +456,13 @@ class NET_EXPORT HostResolver {
+     // is found to be fine for usage.
+     bool include_canonical_name = false;
+ 
++    // Used by the extension DNS API for CNAME uncloaking. Return one final
++    // A/AAAA record name without overriding configured resolver selection or
++    // Secure DNS policy. If address families have different final names, return
++    // the lexicographically first. Only supported for address queries; must not
++    // be combined with include_canonical_name.
++    bool include_canonical_name_for_uncloaking = false;
++
+     // Hint to the resolver that resolution is only being requested for loopback
+     // hosts.
+     bool loopback_only = false;
+--- a/net/dns/host_resolver.cc
++++ b/net/dns/host_resolver.cc
+@@ -566,6 +566,14 @@ HostResolverFlags HostResolver::Paramete
+   HostResolverFlags flags = 0;
+   if (parameters.include_canonical_name)
+     flags |= HOST_RESOLVER_CANONNAME;
++
++  if (parameters.include_canonical_name_for_uncloaking) {
++    DCHECK(!parameters.include_canonical_name);
++    DCHECK(IsAddressType(parameters.dns_query_type));
++    DCHECK_NE(parameters.source, HostResolverSource::MULTICAST_DNS);
++    flags |= HOST_RESOLVER_CANONNAME_FOR_UNCLOAKING;
++  }
++
+   if (parameters.loopback_only)
+     flags |= HOST_RESOLVER_LOOPBACK_ONLY;
+   if (parameters.avoid_multicast_resolution)
+--- a/net/dns/host_resolver_manager.cc
++++ b/net/dns/host_resolver_manager.cc
+@@ -886,7 +886,9 @@ HostCache::Entry HostResolverManager::Re
+     }
+   }
+ 
+-  bool resolve_canonname = job_key.flags & HOST_RESOLVER_CANONNAME;
++  bool resolve_canonname =
++      job_key.flags & (HOST_RESOLVER_CANONNAME |
++                      HOST_RESOLVER_CANONNAME_FOR_UNCLOAKING);
+   bool default_family_due_to_no_ipv6 =
+       job_key.flags & HOST_RESOLVER_DEFAULT_FAMILY_SET_DUE_TO_NO_IPV6;
+ 
+--- a/net/dns/host_resolver_manager_job.cc
++++ b/net/dns/host_resolver_manager_job.cc
+@@ -750,10 +750,18 @@ void HostResolverManager::Job::StartSyst
+                          key_.GetTargetNetwork());
+   }
+ 
++  HostResolverFlags system_flags = key_.flags;
++  if (system_flags & HOST_RESOLVER_CANONNAME_FOR_UNCLOAKING) {
++    // Request AI_CANONNAME only after normal policy has selected a system
++    // lookup. Keep the distinct uncloaking flag in the job and host-cache key.
++    system_flags &= ~HOST_RESOLVER_CANONNAME_FOR_UNCLOAKING;
++    system_flags |= HOST_RESOLVER_CANONNAME;
++  }
++
+   system_task_ = HostResolverSystemTask::Create(
+       std::string(key_.host.GetHostnameWithoutBrackets()),
+       HostResolver::DnsQueryTypeSetToAddressFamily(key_.query_types),
+-      key_.flags, priority(), resolver_->host_resolver_system_params_, net_log_,
++      system_flags, priority(), resolver_->host_resolver_system_params_, net_log_,
+       key_.GetTargetNetwork(), std::move(cache_params));
+ 
+   // Start() could be called from within Resolve(), hence it must NOT directly
+--- a/net/dns/host_resolver_manager_request_impl.cc
++++ b/net/dns/host_resolver_manager_request_impl.cc
+@@ -391,9 +391,23 @@ void HostResolverManager::RequestImpl::F
+   endpoint_results_ = results_->GetEndpoints();
+   fixed_up_dns_alias_results_ = results_->aliases();
+ 
++  if (parameters().include_canonical_name_for_uncloaking) {
++    // DNS results retain the final A/AAAA record names separately from the
++    // unordered alias chain. If the address families have different final
++    // names, return the lexicographically first one for a stable result.
++    if (!results_->canonical_names().empty()) {
++      fixed_up_dns_alias_results_ = {*results_->canonical_names().begin()};
++    } else if (results_->source() != HostCache::Entry::SOURCE_UNKNOWN ||
++               fixed_up_dns_alias_results_.size() > 1) {
++      // Legacy system results (and IP literals) store just the canonical name
++      // in aliases(). Never guess from a DNS alias chain when its final name is
++      // unavailable, e.g. for a restored cache entry without that field.
++      fixed_up_dns_alias_results_.clear();
++    }
++
+   // Skip fixups for `include_canonical_name` requests. Just use the
+   // canonical name exactly as it was received from the system resolver.
+-  if (parameters().include_canonical_name) {
++  } else if (parameters().include_canonical_name) {
+     DCHECK_LE(fixed_up_dns_alias_results_.size(), 1u);
+   } else {
+     fixed_up_dns_alias_results_ =
+--- a/services/network/host_resolver.cc
++++ b/services/network/host_resolver.cc
+@@ -60,6 +60,8 @@ ConvertOptionalParameters(
+       break;
+   }
+   parameters.include_canonical_name = mojo_parameters->include_canonical_name;
++  parameters.include_canonical_name_for_uncloaking =
++      mojo_parameters->include_canonical_name_for_uncloaking;
+   parameters.loopback_only = mojo_parameters->loopback_only;
+   parameters.is_speculative = mojo_parameters->is_speculative;
+   parameters.secure_dns_policy =
+--- a/services/network/public/mojom/host_resolver.mojom
++++ b/services/network/public/mojom/host_resolver.mojom
+@@ -256,6 +256,12 @@ struct ResolveHostParameters {
+   // |false|.
+   bool include_canonical_name = false;
+ 
++  // Return one final canonical name in dns_aliases while preserving
++  // configured resolver selection and Secure DNS policy. If address
++  // families have different final names, return the lexicographically
++  // first. Only for address queries, without include_canonical_name.
++  bool include_canonical_name_for_uncloaking = false;
++
+   // Hint to the resolver that resolution is only being requested for loopback
+   // hosts.
+   bool loopback_only = false;
