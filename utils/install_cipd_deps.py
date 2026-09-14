@@ -12,14 +12,19 @@ import sys
 
 def dependency_paths(host_os, host_cpu, remote_exec=False):
     """Select host tools and optional Linux remote-worker tools."""
+    cpu = host_cpu.lower()
+    if cpu in ("arm64", "aarch64"):
+        arch = "arm64"
+    elif cpu in ("x86_64", "amd64", "x64"):
+        arch = "amd64"
+    else:
+        raise ValueError(f"Unsupported build CPU: {host_cpu}")
+
     if host_os == "linux":
         gn_dep = "src/buildtools/linux64"
         typescript = "src/third_party/typescript/linux-amd64/src"
     elif host_os == "darwin":
         gn_dep = "src/buildtools/mac"
-        arch = "arm64"
-        if host_cpu == "x86_64":
-            arch = "amd64"
         typescript = f"src/third_party/typescript/mac-{arch}/src"
     elif host_os == "win32":
         gn_dep = "src/buildtools/win"
@@ -27,7 +32,11 @@ def dependency_paths(host_os, host_cpu, remote_exec=False):
     else:
         raise ValueError(f"Unsupported build host: {host_os}")
 
-    paths = [gn_dep, "src/third_party/siso/cipd", typescript]
+    go_os = {"linux": "linux", "darwin": "mac", "win32": "windows"}[host_os]
+    paths = [
+        gn_dep, "src/third_party/siso/cipd", typescript,
+        f"src/third_party/dawn/tools/golang/{go_os}-{arch}"
+    ]
     if remote_exec:
         linux_typescript = "src/third_party/typescript/linux-amd64/src"
         if linux_typescript not in paths:
@@ -42,6 +51,9 @@ def selected_packages(src_dir, names):
 
     deps_file = src_dir / "DEPS"
     deps = gclient_eval.Parse(deps_file.read_text(), str(deps_file))["deps"]
+    dawn_deps_file = src_dir / "third_party/dawn/DEPS"
+    dawn_deps = gclient_eval.Parse(dawn_deps_file.read_text(), str(dawn_deps_file))["deps"]
+    deps.update({f"src/third_party/dawn/{name}": dep for name, dep in dawn_deps.items()})
     for name in names:
         dep = deps[name]
         if dep.get("dep_type") != "cipd":
