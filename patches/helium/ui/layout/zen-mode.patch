@@ -2317,7 +2317,7 @@
  #include "chrome/browser/ui/web_applications/app_browser_controller.h"
  #include "chrome/browser/ui/web_applications/navigation_capturing_process.h"
  #include "chrome/browser/ui/web_applications/web_app_launch_navigation_handle_user_data.h"
-@@ -187,6 +192,64 @@ bool ShouldForceCaptivePortalSigninIntoC
+@@ -187,6 +192,76 @@
  }
  #endif  // BUILDFLAG(IS_CHROMEOS)
  
@@ -2366,7 +2366,8 @@
 +         !IsTabChromeRevealedInZenMode(*layout_controller, params);
 +}
 +
-+void MaybeShowZenModeNewTabCreatedToast(const NavigateParams& params) {
++void MaybeShowZenModeNewTabCreatedToast(const NavigateParams& params,
++                                        content::WebContents* new_contents) {
 +  if (!ShouldShowNewTabToastInZenMode(params)) {
 +    return;
 +  }
@@ -2374,19 +2375,30 @@
 +  ToastController* const toast_controller =
 +      params.browser->GetFeatures().toast_controller();
 +  if (toast_controller) {
-+    toast_controller->MaybeShowToast(
-+        ToastParams(ToastId::kZenModeNewTabCreated));
++    ToastParams toast_params(ToastId::kZenModeNewTabCreated);
++    toast_params.body_action_callback = base::BindOnce(
++        [](base::WeakPtr<BrowserWindowInterface> browser,
++           base::WeakPtr<tabs::TabInterface> tab) {
++          // The tab may have closed or moved to another window in the meantime.
++          if (browser && tab &&
++              tab->GetBrowserWindowInterface() == browser.get()) {
++            browser->GetTabStripModel()->ActivateTab(tab.get());
++          }
++        },
++        params.browser->GetWeakPtr(),
++        tabs::TabInterface::GetFromContents(new_contents)->GetWeakPtr());
++    toast_controller->MaybeShowToast(std::move(toast_params));
 +  }
 +}
 +
  // Change some of the navigation parameters based on the particular URL.
  // Returns true on success. Otherwise, if changing params leads the browser
  // into an erroneous state, returns false.
-@@ -995,6 +1058,7 @@ base::WeakPtr<content::NavigationHandle>
+@@ -995,6 +1070,7 @@
      params->browser->GetBrowserForMigrationOnly()->tab_strip_model()->AddTab(
          std::move(tab_to_insert), params->tabstrip_index, params->transition,
          params->tabstrip_add_types, group);
-+    MaybeShowZenModeNewTabCreatedToast(*params);
++    MaybeShowZenModeNewTabCreatedToast(*params, contents_to_navigate_or_insert);
  
      // For NEW_SPLIT_VIEW, pair the new tab with the active tab. The
      // "already split" case is handled in Browser::OpenURLFromTab().
@@ -2427,3 +2439,327 @@
  
    return side_panel->IsRightAligned()
               ? gfx::RoundedCornersF(generic_radius, generic_radius,
+--- a/chrome/browser/ui/toasts/toast_controller.cc
++++ b/chrome/browser/ui/toasts/toast_controller.cc
+@@ -132,7 +132,8 @@
+ }
+ 
+ bool ToastController::MaybeShowToast(ToastParams params) {
+-  if (!CanShowToast(params.toast_id)) {
++  // Per-instance body actions are actionable even without a specification button.
++  if (!params.body_action_callback && !CanShowToast(params.toast_id)) {
+     RecordToastFailedToShow(params.toast_id);
+     return false;
+   }
+@@ -290,7 +291,7 @@
+       std::move(params.toast_close_callback);
+   const bool is_actionable =
+       current_toast_spec->action_button_string_id().has_value() ||
+-      current_toast_spec->has_menu();
++      current_toast_spec->has_menu() || params.body_action_callback;
+   base::TimeDelta timeout =
+       is_actionable ? kToastWithActionTimeout : kToastDefaultTimeout;
+ 
+@@ -332,6 +333,10 @@
+       ShouldRenderToastOverWebContents(),
+       base::BindRepeating(&RecordToastDismissReason, params.toast_id));
+ 
++  if (params.body_action_callback) {
++    toast_view->AddBodyAction(std::move(params.body_action_callback));
++  }
++
+   if (spec->has_close_button()) {
+     toast_view->AddCloseButton(
+         base::BindRepeating(&RecordToastCloseButtonClicked, params.toast_id));
+--- a/chrome/browser/ui/toasts/toast_controller.h
++++ b/chrome/browser/ui/toasts/toast_controller.h
+@@ -68,6 +68,8 @@
+   std::optional<ui::ImageModel> image_override;
+   std::unique_ptr<ui::MenuModel> menu_model;
+   base::ScopedClosureRunner toast_close_callback;
++  // Makes the entire toast body an action button.
++  base::OnceClosure body_action_callback;
+ };
+ 
+ // Manages the toast that is displayed for a particular browser. Only one toast
+--- a/chrome/browser/ui/toasts/toast_controller_unittest.cc
++++ b/chrome/browser/ui/toasts/toast_controller_unittest.cc
+@@ -6,15 +6,19 @@
+ 
+ #include <memory>
+ 
++#include "base/functional/callback_helpers.h"
+ #include "base/test/task_environment.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/ui/toasts/api/toast_id.h"
+ #include "chrome/browser/ui/toasts/api/toast_registry.h"
+ #include "chrome/browser/ui/toasts/api/toast_specification.h"
+ #include "chrome/browser/ui/toasts/toast_features.h"
++#include "chrome/browser/ui/toasts/toast_metrics.h"
+ #include "chrome/browser/ui/toasts/toast_view.h"
++#include "chrome/common/pref_names.h"
+ #include "chrome/test/base/testing_browser_process.h"
+ #include "chrome/test/base/testing_profile_manager.h"
++#include "components/prefs/pref_service.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "content/public/test/browser_task_environment.h"
+ #include "testing/gmock/include/gmock/gmock.h"
+@@ -277,3 +281,27 @@
+   task_environment().FastForwardBy(ToastController::kToastDefaultTimeout / 2);
+   EXPECT_TRUE(controller->IsShowingToast());
+ }
++
++TEST_F(ToastControllerUnitTest, BodyActionAllowedByActionableOnlyPreference) {
++  toast_registry()->RegisterToast(
++      ToastId::kZenModeNewTabCreated,
++      ToastSpecification::Builder(vector_icons::kEmailOldIcon, kTestStringResId)
++          .Build());
++  auto* local_state = TestingBrowserProcess::GetGlobal()->local_state();
++  local_state->SetInteger(
++      prefs::kToastAlertLevel,
++      static_cast<int>(toasts::ToastAlertLevel::kActionable));
++  auto controller = std::make_unique<TestToastController>(toast_registry());
++
++  EXPECT_CALL(*controller, CreateToast).Times(0);
++  EXPECT_FALSE(controller->MaybeShowToast(
++      ToastParams(ToastId::kZenModeNewTabCreated)));
++  ::testing::Mock::VerifyAndClear(controller.get());
++
++  ToastParams params(ToastId::kZenModeNewTabCreated);
++  params.body_action_callback = base::DoNothing();
++  EXPECT_CALL(*controller, CreateToast);
++  EXPECT_TRUE(controller->MaybeShowToast(std::move(params)));
++  EXPECT_TRUE(controller->IsShowingToast());
++  local_state->ClearPref(prefs::kToastAlertLevel);
++}
+--- a/chrome/browser/ui/toasts/toast_view.cc
++++ b/chrome/browser/ui/toasts/toast_view.cc
+@@ -27,7 +27,9 @@
+ #include "ui/compositor/layer.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/animation/animation_builder.h"
++#include "ui/views/background.h"
+ #include "ui/views/border.h"
++#include "ui/views/controls/button/button.h"
+ #include "ui/views/controls/button/image_button.h"
+ #include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/highlight_path_generator.h"
+@@ -35,6 +37,7 @@
+ #include "ui/views/controls/menu/menu_item_view.h"
+ #include "ui/views/controls/menu/menu_model_adapter.h"
+ #include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/layout/fill_layout.h"
+ #include "ui/views/layout/flex_layout.h"
+ #include "ui/views/layout/flex_layout_types.h"
+ #include "ui/views/layout/layout_provider.h"
+@@ -52,6 +55,29 @@
+ constexpr ui::ColorId kToastForegroundColorId =
+     kColorTabForegroundActiveFrameActive;
+ 
++// Retains the normal toast layout while providing native button input and
++// focus.
++class ToastBodyButton : public views::Button {
++  METADATA_HEADER(ToastBodyButton, views::Button)
++
++ public:
++  explicit ToastBodyButton(PressedCallback callback)
++      : views::Button(std::move(callback)) {}
++
++ private:
++  void StateChanged(ButtonState old_state) override {
++    views::Button::StateChanged(old_state);
++    SetBackground(
++        GetState() == STATE_HOVERED || GetState() == STATE_PRESSED
++            ? views::CreateRoundedRectBackground(
++                  ui::kColorSysStateHoverOnSubtle, kBubbleCornerRadius)
++            : nullptr);
++  }
++};
++
++BEGIN_METADATA(ToastBodyButton)
++END_METADATA
++
+ gfx::Transform GetScaleTransformation(gfx::Rect bounds) {
+   gfx::Transform transform;
+   transform.Translate(bounds.CenterPoint().x(), 0);
+@@ -141,6 +167,11 @@
+   action_button_callback_ = std::move(action_button_callback);
+ }
+ 
++void ToastView::AddBodyAction(base::OnceClosure callback) {
++  CHECK(!body_action_callback_);
++  body_action_callback_ = std::move(callback);
++}
++
+ void ToastView::AddCloseButton(base::RepeatingClosure close_callback) {
+   CHECK(!has_close_button_);
+   has_close_button_ = true;
+@@ -323,7 +354,34 @@
+       top_margin, lp->GetDistanceMetric(DISTANCE_TOAST_BUBBLE_MARGIN_LEFT),
+       total_vertical_margins - top_margin, right_margin));
+ 
+-  if (has_action_button_ || has_close_button_ || menu_model_) {
++  if (body_action_callback_) {
++    CHECK(!has_action_button_ && !has_close_button_ && !menu_model_);
++    auto button = std::make_unique<ToastBodyButton>(base::BindRepeating(
++        [](ToastView* toast) {
++          if (!toast->body_action_callback_) {
++            return;
++          }
++          auto callback = std::move(toast->body_action_callback_);
++          // Activating a tab may destroy the toast. Close it before the action.
++          toast->Close(ToastCloseReason::kActionButton);
++          std::move(callback).Run();
++        },
++        base::Unretained(this)));
++    button->GetViewAccessibility().SetName(toast_text_);
++    button->SetLayoutManager(std::make_unique<views::FlexLayout>())
++        ->SetOrientation(views::LayoutOrientation::kHorizontal);
++    button->SetBorder(views::CreateEmptyBorder(margins()));
++    icon_view_->SetCanProcessEventsWithinSubtree(false);
++    label_->SetCanProcessEventsWithinSubtree(false);
++    button->AddChildView(RemoveChildViewT(icon_view_.get()));
++    button->AddChildView(RemoveChildViewT(label_.get()));
++    SetInitiallyFocusedView(AddChildView(std::move(button)));
++    SetLayoutManager(std::make_unique<views::FillLayout>());
++    set_margins(gfx::Insets());
++  }
++
++  if (body_action_callback_ || has_action_button_ || has_close_button_ ||
++      menu_model_) {
+     SetFocusTraversesOut(true);
+   } else {
+     set_focus_traversable_from_anchor_view(false);
+--- a/chrome/browser/ui/toasts/toast_view.h
++++ b/chrome/browser/ui/toasts/toast_view.h
+@@ -81,6 +81,10 @@
+   // views::BubbleDialogDelegateView::CreateBubble).
+   void AddMenu(std::unique_ptr<ui::MenuModel> model);
+ 
++  // Makes the whole body clickable. Must be called before Init and cannot be
++  // combined with other toast buttons or a menu.
++  void AddBodyAction(base::OnceClosure callback);
++
+   // views::BubbleDialogDelegate:
+   views::ClientView* CreateClientView(views::Widget* widget) override;
+ 
+@@ -133,6 +137,7 @@
+   bool has_close_button_ = false;
+   bool has_action_button_ = false;
+   std::u16string action_button_text_;
++  base::OnceClosure body_action_callback_;
+   base::RepeatingClosure action_button_callback_;
+   base::RepeatingClosure close_button_callback_;
+   base::RepeatingCallback<void(ToastCloseReason)> toast_close_callback_;
+--- a/chrome/browser/ui/toasts/toast_view_browsertest.cc
++++ b/chrome/browser/ui/toasts/toast_view_browsertest.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ 
+ #include "base/functional/callback_helpers.h"
++#include "base/test/bind.h"
+ #include "chrome/browser/ui/test/test_browser_dialog.h"
+ #include "chrome/browser/ui/views/chrome_layout_provider.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -16,9 +17,13 @@
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/ui_base_features.h"
++#include "ui/events/event.h"
+ #include "ui/gfx/image/image_unittest_util.h"
+ #include "ui/menus/simple_menu_model.h"
+ #include "ui/strings/grit/ui_strings.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/view_utils.h"
+ #include "ui/views/window/dialog_client_view.h"
+ 
+ namespace {
+@@ -42,6 +47,7 @@
+     bool add_action_button = false;
+     bool add_menu = false;
+     bool add_image_override = false;
++    bool add_body_action = false;
+   };
+ 
+   void ConfigureToast(const ToastOptions& options) { options_ = options; }
+@@ -74,6 +80,10 @@
+     if (options_.add_menu) {
+       toast->AddMenu(std::make_unique<TestMenuModel>());
+     }
++    if (options_.add_body_action) {
++      toast->AddBodyAction(
++          base::BindLambdaForTesting([this] { ++body_action_count_; }));
++    }
+     toast_ = toast.get();
+     widget_ = views::BubbleDialogDelegateView::CreateBubble(std::move(toast));
+     widget_->ShowInactive();
+@@ -97,6 +107,7 @@
+     widget_ = nullptr;
+   }
+ 
++  int body_action_count() const { return body_action_count_; }
+   views::View* anchor_view() { return anchor_view_; }
+   toasts::ToastView* toast() { return toast_; }
+ 
+@@ -105,6 +116,7 @@
+   raw_ptr<toasts::ToastView> toast_;
+   raw_ptr<views::Widget> widget_;
+   ToastOptions options_;
++  int body_action_count_ = 0;
+ };
+ 
+ IN_PROC_BROWSER_TEST_F(ToastViewTest, InvokeUi_Basic) {
+@@ -179,3 +191,52 @@
+ }
+ 
+ }  // namespace
++
++IN_PROC_BROWSER_TEST_F(ToastViewTest, BodyAction) {
++  ConfigureToast({.add_body_action = true});
++  ShowUi("");
++  ASSERT_TRUE(VerifyUi());
++  auto* button =
++      views::AsViewClass<views::Button>(toast()->label_for_testing()->parent());
++  ASSERT_TRUE(button);
++  EXPECT_EQ(button->GetBoundsInScreen(), toast()->GetBoundsInScreen());
++
++  EXPECT_EQ(button,
++            toast()->GetEventHandlerForPoint(button->bounds().CenterPoint()));
++  EXPECT_EQ(button, button->GetEventHandlerForPoint(
++                        toast()->label_for_testing()->bounds().CenterPoint()));
++  EXPECT_EQ(button,
++            button->GetEventHandlerForPoint(
++                toast()->icon_view_for_testing()->bounds().CenterPoint()));
++
++  button->SetState(views::Button::STATE_HOVERED);
++  EXPECT_TRUE(button->background());
++  button->SetState(views::Button::STATE_NORMAL);
++  EXPECT_FALSE(button->background());
++
++  const gfx::PointF point(button->GetLocalBounds().CenterPoint());
++  ui::MouseEvent right_press(ui::EventType::kMousePressed, point, point,
++                             base::TimeTicks(), ui::EF_RIGHT_MOUSE_BUTTON,
++                             ui::EF_RIGHT_MOUSE_BUTTON);
++  button->OnMousePressed(right_press);
++  ui::MouseEvent right_release(ui::EventType::kMouseReleased, point, point,
++                               base::TimeTicks(), ui::EF_RIGHT_MOUSE_BUTTON,
++                               ui::EF_RIGHT_MOUSE_BUTTON);
++  button->OnMouseReleased(right_release);
++  EXPECT_EQ(0, body_action_count());
++
++  ui::MouseEvent press(ui::EventType::kMousePressed, point, point,
++                       base::TimeTicks(), ui::EF_LEFT_MOUSE_BUTTON,
++                       ui::EF_LEFT_MOUSE_BUTTON);
++  ui::MouseEvent release(ui::EventType::kMouseReleased, point, point,
++                         base::TimeTicks(), ui::EF_LEFT_MOUSE_BUTTON,
++                         ui::EF_LEFT_MOUSE_BUTTON);
++  button->OnMousePressed(press);
++  button->OnMouseReleased(release);
++  EXPECT_EQ(1, body_action_count());
++  // A second click during the closing animation must not run the action again.
++  button->OnMousePressed(press);
++  button->OnMouseReleased(release);
++  EXPECT_EQ(1, body_action_count());
++  DismissUi();
++}
