@@ -25,7 +25,17 @@
    registry->RegisterBooleanPref(prefs::kShowHomeButton, false,
 --- a/chrome/browser/ui/views/toolbar/toolbar_view.h
 +++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
-@@ -347,6 +347,11 @@ class ToolbarView : public views::Access
+@@ -266,6 +266,9 @@ class ToolbarView : public views::Access
+   // Updates glic button parenting after hiding glic actor task icon.
+   void FinalizeHideGlicActorTaskIcon();
+ 
++  // Repositions the centered address bar after its parent's bounds are applied.
++  void UpdateLocationBarCentering();
++
+  protected:
+   // This controls Toolbar, LocationBar and CustomTabBar visibility.
+   // If we don't set all three, tab navigation from the app menu breaks
+@@ -347,6 +350,11 @@ class ToolbarView : public views::Access
  
    void OnShowMediaButtonChanged();
  
@@ -37,7 +47,7 @@
    void OnTouchUiChanged();
  
    void InitGlicContainer();
-@@ -468,6 +473,8 @@ class ToolbarView : public views::Access
+@@ -468,6 +476,8 @@ class ToolbarView : public views::Access
  
    BooleanPrefMember show_media_button_;
  
@@ -56,7 +66,7 @@
  #include "base/i18n/number_formatting.h"
  #include "base/i18n/rtl.h"
  #include "base/metrics/histogram_functions.h"
-@@ -221,6 +222,62 @@ void SetRefreshMargins(views::View* butt
+@@ -221,6 +222,61 @@ void SetRefreshMargins(views::View* butt
                                    : kBrowserAppMenuRefreshCollapsedMargin));
  }
  
@@ -98,17 +108,16 @@
 +  ~CenteredLocationBarLayout() override = default;
 +
 + protected:
-+  views::ProposedLayout CalculateProposedLayout(
-+      const views::SizeBounds& size_bounds) const override {
++  void LayoutImpl() override {
 +    views::ProposedLayout layout =
-+        views::FlexLayout::CalculateProposedLayout(size_bounds);
++        GetProposedLayout(host_view()->size());
 +    views::ChildLayout* const location_bar_layout =
 +        layout.GetLayoutFor(location_bar_);
 +    if (location_bar_layout && location_bar_layout->visible) {
 +      location_bar_layout->bounds =
 +          callback_.Run(location_bar_layout->bounds, layout.host_size.width());
 +    }
-+    return layout;
++    ApplyLayout(layout);
 +  }
 +
 + private:
@@ -119,7 +128,7 @@
  }  // namespace
  
  ////////////////////////////////////////////////////////////////////////////////
-@@ -678,6 +735,11 @@ void ToolbarView::Init() {
+@@ -678,6 +734,11 @@ void ToolbarView::Init() {
      OnShowMediaButtonChanged();
    }
  
@@ -131,7 +140,7 @@
    InitLayout();
  
    for (auto* button : std::array<views::Button*, 5>{back_, forward_, reload_,
-@@ -1603,7 +1665,11 @@ void ToolbarView::InitLayout() {
+@@ -1603,7 +1664,11 @@ void ToolbarView::InitLayout() {
                                 views::MaximumFlexSizeRule::kUnbounded)
            .WithOrder(location_bar_flex_order);
  
@@ -144,12 +153,28 @@
  
    layout_manager_->SetOrientation(views::LayoutOrientation::kHorizontal)
        .SetCrossAxisAlignment(views::LayoutAlignment::kCenter)
-@@ -2041,6 +2107,46 @@ void ToolbarView::OnShowMediaButtonChang
+@@ -2041,6 +2106,62 @@ void ToolbarView::OnShowMediaButtonChang
    InvalidateLayout();
  }
  
 +void ToolbarView::OnLocationBarCenteredChanged() {
 +  InvalidateLayout();
++}
++
++void ToolbarView::UpdateLocationBarCentering() {
++  if (display_mode_ != DisplayMode::kNormal || !layout_manager_ ||
++      !location_bar_is_centered_.GetValue()) {
++    return;
++  }
++
++  // Use the original FlexLayout slot to avoid shrinking on repeated updates.
++  const auto layout = layout_manager_->GetProposedLayout(size());
++  const auto* location_bar_layout = layout.GetLayoutFor(location_bar_view_);
++  if (location_bar_layout && location_bar_layout->visible) {
++    // Recenter using the parent's final bounds without relaying out the toolbar.
++    location_bar_view_->SetBoundsRect(GetCenteredLocationBarBounds(
++        location_bar_layout->bounds, layout.host_size.width()));
++  }
 +}
 +
 +gfx::Rect ToolbarView::GetCenteredLocationBarBounds(gfx::Rect bounds,
@@ -251,16 +276,29 @@
      </div>
      <div class="hr" ?hidden="${!this.showHr_(
          this.pageVisibility_.setTheme, this.pageVisibility_.homeButton)}">
---- a/chrome/browser/ui/views/frame/browser_view.cc
-+++ b/chrome/browser/ui/views/frame/browser_view.cc
-@@ -3042,6 +3042,10 @@ void BrowserView::NotifyWidgetSizeConstr
- }
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_impl.cc
+@@ -11,8 +11,10 @@
+ #include "chrome/browser/ui/views/frame/custom_corners_background.h"
+ #include "chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "ui/base/ui_base_features.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_utils.h"
  
- void BrowserView::OnWidgetShowStateChanged(views::Widget* widget) {
-+  if (toolbar_) {
-+    toolbar_->InvalidateLayout();
+ #if BUILDFLAG(IS_MAC)
+ #include "chrome/browser/ui/views/frame/glass_frame_service.h"
+@@ -267,6 +269,12 @@ void BrowserViewLayoutImpl::Layout(views
+     SetViewVisibility(view, visible);
+   });
+ 
++  // Child layouts run before parent bounds are applied. Recenter now that the
++  // toolbar and its parent have their final bounds.
++  if (auto* toolbar = views::AsViewClass<ToolbarView>(views().toolbar.get())) {
++    toolbar->UpdateLocationBarCentering();
 +  }
 +
-   // `display-state` @media feature value in renderer needs to be updated.
-   SynchronizeRenderWidgetHostVisualPropertiesForMainFrame();
- }
+   // The normal clipping created by `View::Paint()` may not cover the bottom of
+   // the TopContainerView at certain scale factor because both of the position
+   // and the height might be rounded down. This function sets the clip path that
