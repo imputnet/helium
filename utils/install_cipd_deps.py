@@ -35,7 +35,8 @@ def dependency_paths(host_os, host_cpu, remote_exec=False):
     go_os = {"linux": "linux", "darwin": "mac", "win32": "windows"}[host_os]
     paths = [
         gn_dep, "src/third_party/siso/cipd", typescript,
-        f"src/third_party/dawn/tools/golang/{go_os}-{arch}"
+        f"src/third_party/dawn/tools/golang/{go_os}-{arch}",
+        "src/third_party/devtools-frontend/src/third_party/esbuild"
     ]
     if remote_exec:
         linux_typescript = "src/third_party/typescript/linux-amd64/src"
@@ -51,9 +52,10 @@ def selected_packages(src_dir, names):
 
     deps_file = src_dir / "DEPS"
     deps = gclient_eval.Parse(deps_file.read_text(), str(deps_file))["deps"]
-    dawn_deps_file = src_dir / "third_party/dawn/DEPS"
-    dawn_deps = gclient_eval.Parse(dawn_deps_file.read_text(), str(dawn_deps_file))["deps"]
-    deps.update({f"src/third_party/dawn/{name}": dep for name, dep in dawn_deps.items()})
+    for directory in ("third_party/dawn", "third_party/devtools-frontend/src"):
+        deps_file = src_dir / directory / "DEPS"
+        nested_deps = gclient_eval.Parse(deps_file.read_text(), str(deps_file))["deps"]
+        deps.update({f"src/{directory}/{name}": dep for name, dep in nested_deps.items()})
     for name in names:
         dep = deps[name]
         if dep.get("dep_type") != "cipd":
