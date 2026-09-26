@@ -1,0 +1,1249 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -10778,6 +10778,9 @@ Keep your key file in a safe place. You
+           Pin tab search
+         </message>
+       </if>
++      <message name="IDS_VISUAL_TAB_SWITCHER_TITLE" desc="Accessible name of the visual tab switcher.">
++        Quick tab switching
++      </message>
+       <message name="IDS_TAB_SEARCH_BUTTON_CXMENU_UNPIN" desc="Name of the tab search button context menu item for unpinning tab search.">
+         Unpin
+       </message>
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -2871,6 +2871,8 @@ static_library("ui") {
+       "views/tabs/tab_width_constraints.h",
+       "views/tabs/vertical_tab_style_views.cc",
+       "views/tabs/vertical_tab_style_views.h",
++      "views/tabs/visual_tab_switcher.cc",
++      "views/tabs/visual_tab_switcher.h",
+       "views/tabs/z_orderable_tab_container_element.cc",
+       "views/tabs/z_orderable_tab_container_element.h",
+       "views/task_manager_view.cc",
+--- a/chrome/browser/ui/thumbnails/thumbnail_image.cc
++++ b/chrome/browser/ui/thumbnails/thumbnail_image.cc
+@@ -12,6 +12,7 @@
+ #include "base/task/thread_pool.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
++#include "skia/ext/image_operations.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track_event_args.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "ui/gfx/codec/jpeg_codec.h"
+@@ -43,6 +44,10 @@ ThumbnailImage::ThumbnailImage(Delegate*
+   DCHECK(delegate_);
+   DCHECK(!delegate_->thumbnail_);
+   delegate_->thumbnail_ = this;
++  if (data_) {
++    thumbnail_id_ = base::Token::CreateRandom();
++    data_id_ = thumbnail_id_;
++  }
+ }
+ 
+ ThumbnailImage::~ThumbnailImage() {
+@@ -74,6 +79,8 @@ std::unique_ptr<ThumbnailImage::Subscrip
+ void ThumbnailImage::AssignSkBitmap(SkBitmap bitmap,
+                                     std::optional<uint64_t> frame_id) {
+   thumbnail_id_ = base::Token::CreateRandom();
++  gfx::ImageSkia image = gfx::ImageSkia::CreateFrom1xBitmap(bitmap);
++  CachePreview(image);
+ 
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE,
+@@ -84,6 +91,10 @@ void ThumbnailImage::AssignSkBitmap(SkBi
+       base::BindOnce(&ThumbnailImage::AssignJPEGData,
+                      weak_ptr_factory_.GetWeakPtr(), thumbnail_id_,
+                      base::TimeTicks::Now(), frame_id));
++
++  if (preview_caching_enabled_) {
++    NotifyUncompressedDataObservers(thumbnail_id_, std::move(image));
++  }
+ }
+ 
+ void ThumbnailImage::ClearData() {
+@@ -93,12 +104,15 @@ void ThumbnailImage::ClearData() {
+     return;
+   }
+ 
+-  // If there was stored data we should notify observers that it was
+-  // cleared. Otherwise, a bitmap was assigned but never compressed so
+-  // the observers still think the thumbnail is blank.
+-  const bool should_notify = !!data_;
++  // Notify observers when either stored image has been cleared.
++  const bool should_notify = data_ || preview_was_available_;
+ 
+   data_.reset();
++  data_id_ = base::Token();
++  cached_preview_ = gfx::ImageSkia();
++  cached_preview_original_size_ = gfx::Size();
++  preview_was_available_ = false;
++  preview_request_id_.reset();
+   thumbnail_id_ = base::Token();
+ 
+   // Notify observers of the new, blank thumbnail.
+@@ -113,6 +127,71 @@ void ThumbnailImage::RequestThumbnailIma
+   ConvertJPEGDataToImageSkiaAndNotifyObservers();
+ }
+ 
++void ThumbnailImage::SetPreviewCachingEnabled(bool enabled) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (preview_caching_enabled_ == enabled) {
++    return;
++  }
++  preview_caching_enabled_ = enabled;
++  if (enabled) {
++    RequestThumbnailImage();
++  } else {
++    cached_preview_ = gfx::ImageSkia();
++    preview_request_id_.reset();
++  }
++}
++
++gfx::ImageSkia ThumbnailImage::GetCachedPreview(
++    const gfx::Size& minimum_size) const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return cached_preview_.isNull()
++             ? gfx::ImageSkia()
++             : CropPreviewImage(cached_preview_, minimum_size,
++                                cached_preview_original_size_);
++}
++
++void ThumbnailImage::CachePreview(const gfx::ImageSkia& image) {
++  if (!preview_caching_enabled_ || image.isNull() ||
++      preview_request_id_ == thumbnail_id_) {
++    return;
++  }
++  preview_request_id_ = thumbnail_id_;
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ThumbnailImage::ResizePreview, *image.bitmap()),
++      base::BindOnce(&ThumbnailImage::StoreCachedPreview,
++                     weak_ptr_factory_.GetWeakPtr(), thumbnail_id_,
++                     image.size()));
++}
++
++// static
++gfx::ImageSkia ThumbnailImage::ResizePreview(SkBitmap bitmap) {
++  // Limit each decoded preview to at most one MiB of pixels.
++  constexpr int kMaxPreviewDimension = 512;
++  const float scale =
++      std::min(1.0f, static_cast<float>(kMaxPreviewDimension) /
++                         std::max(bitmap.width(), bitmap.height()));
++  gfx::Size size = gfx::ScaleToFlooredSize(
++      gfx::Size(bitmap.width(), bitmap.height()), scale);
++  size.SetToMax(gfx::Size(1, 1));
++  gfx::ImageSkia preview = gfx::ImageSkia::CreateFrom1xBitmap(
++      skia::ImageOperations::Resize(bitmap, skia::ImageOperations::RESIZE_GOOD,
++                                    size.width(), size.height()));
++  preview.MakeThreadSafe();
++  return preview;
++}
++
++void ThumbnailImage::StoreCachedPreview(base::Token thumbnail_id,
++                                        gfx::Size original_size,
++                                        gfx::ImageSkia image) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (preview_caching_enabled_ && thumbnail_id == thumbnail_id_) {
++    cached_preview_ = std::move(image);
++    cached_preview_original_size_ = original_size;
++    preview_was_available_ = !cached_preview_.isNull();
++  }
++}
++
+ void ThumbnailImage::RequestCompressedThumbnailData() {
+   if (data_) {
+     NotifyCompressedDataObservers(data_);
+@@ -141,6 +220,7 @@ void ThumbnailImage::AssignJPEGData(base
+ 
+   data_ = base::MakeRefCounted<base::RefCountedData<std::vector<uint8_t>>>(
+       std::move(data));
++  data_id_ = thumbnail_id;
+ 
+   // We select a TRACE_EVENT_* macro based on |frame_id|'s presence.
+   // Since these are scoped traces, the macro invocation must be in the
+@@ -148,7 +228,13 @@ void ThumbnailImage::AssignJPEGData(base
+   // function.
+   auto notify = [&]() {
+     NotifyCompressedDataObservers(data_);
+-    ConvertJPEGDataToImageSkiaAndNotifyObservers();
++    if (!preview_caching_enabled_ || preview_request_id_ != thumbnail_id_ ||
++        std::ranges::any_of(subscribers_, [this](Subscription* subscription) {
++          return subscription->uncompressed_image_callback_ &&
++                 subscription->uncompressed_thumbnail_id_ != thumbnail_id_;
++        })) {
++      ConvertJPEGDataToImageSkiaAndNotifyObservers();
++    }
+   };
+ 
+   if (frame_id_for_trace) {
+@@ -176,7 +262,7 @@ bool ThumbnailImage::ConvertJPEGDataToIm
+        base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
+       base::BindOnce(&ThumbnailImage::UncompressImage, data_),
+       base::BindOnce(&ThumbnailImage::NotifyUncompressedDataObservers,
+-                     weak_ptr_factory_.GetWeakPtr(), thumbnail_id_));
++                     weak_ptr_factory_.GetWeakPtr(), data_id_));
+ }
+ 
+ void ThumbnailImage::NotifyUncompressedDataObservers(base::Token thumbnail_id,
+@@ -192,12 +278,20 @@ void ThumbnailImage::NotifyUncompressedD
+     return;
+   }
+ 
++  CachePreview(image);
++
++  if (!image.isNull()) {
++    preview_was_available_ = true;
++  }
++
+   for (Subscription* subscription : subscribers_) {
+     auto size_hint = subscription->size_hint_;
+     if (subscription->uncompressed_image_callback_) {
+       auto cropped_image = size_hint && !image.isNull()
+                                ? CropPreviewImage(image, *size_hint)
+                                : image;
++      subscription->uncompressed_thumbnail_id_ =
++          image.isNull() ? base::Token() : thumbnail_id;
+       subscription->uncompressed_image_callback_.Run(cropped_image);
+     }
+   }
+@@ -248,7 +342,8 @@ gfx::ImageSkia ThumbnailImage::Uncompres
+ // static
+ gfx::ImageSkia ThumbnailImage::CropPreviewImage(
+     const gfx::ImageSkia& source_image,
+-    const gfx::Size& minimum_size) {
++    const gfx::Size& minimum_size,
++    std::optional<gfx::Size> original_size) {
+   DCHECK(!source_image.isNull());
+   DCHECK(!source_image.size().IsEmpty());
+   DCHECK(!minimum_size.IsEmpty());
+@@ -257,9 +352,10 @@ gfx::ImageSkia ThumbnailImage::CropPrevi
+   const float source_aspect =
+       static_cast<float>(source_image.width()) / source_image.height();
+ 
++  const gfx::Size available_size = original_size.value_or(source_image.size());
+   if (source_aspect == desired_aspect ||
+-      source_image.width() < minimum_size.width() ||
+-      source_image.height() < minimum_size.height()) {
++      available_size.width() < minimum_size.width() ||
++      available_size.height() < minimum_size.height()) {
+     return source_image;
+   }
+ 
+--- a/chrome/browser/ui/thumbnails/thumbnail_image.h
++++ b/chrome/browser/ui/thumbnails/thumbnail_image.h
+@@ -95,6 +95,7 @@ class ThumbnailImage : public base::RefC
+ 
+     scoped_refptr<ThumbnailImage> thumbnail_;
+     std::optional<gfx::Size> size_hint_;
++    base::Token uncompressed_thumbnail_id_;
+ 
+     UncompressedImageCallback uncompressed_image_callback_;
+     CompressedImageCallback compressed_image_callback_;
+@@ -153,6 +154,9 @@ class ThumbnailImage : public base::RefC
+   // long it will take, though in most cases it should happen very quickly.
+   void RequestThumbnailImage();
+ 
++  void SetPreviewCachingEnabled(bool enabled);
++  gfx::ImageSkia GetCachedPreview(const gfx::Size& minimum_size) const;
++
+   // Similar to RequestThumbnailImage() but requests only the compressed JPEG
+   // data. Users should listen for a call to
+   // Observer::OnCompressedThumbnailDataAvailable().
+@@ -193,11 +197,19 @@ class ThumbnailImage : public base::RefC
+ 
+   // Crops and returns a preview from a thumbnail of an entire web page. Uses
+   // logic appropriate for fixed-aspect previews (e.g. hover cards).
+-  static gfx::ImageSkia CropPreviewImage(const gfx::ImageSkia& source_image,
+-                                         const gfx::Size& minimum_size);
++  static gfx::ImageSkia CropPreviewImage(
++      const gfx::ImageSkia& source_image,
++      const gfx::Size& minimum_size,
++      std::optional<gfx::Size> original_size = std::nullopt);
+ 
+   void HandleSubscriptionDestroyed(Subscription* subscription);
+ 
++  void CachePreview(const gfx::ImageSkia& image);
++  static gfx::ImageSkia ResizePreview(SkBitmap bitmap);
++  void StoreCachedPreview(base::Token thumbnail_id,
++                          gfx::Size original_size,
++                          gfx::ImageSkia image);
++
+   raw_ptr<Delegate> delegate_;
+ 
+   // This is a scoped_refptr to immutable data. Once set, the wrapped
+@@ -205,6 +217,13 @@ class ThumbnailImage : public base::RefC
+   // |data_| itself can be changed as this does not affect references to
+   // the old data.
+   CompressedThumbnailData data_;
++  base::Token data_id_;
++
++  bool preview_caching_enabled_ = false;
++  gfx::ImageSkia cached_preview_;
++  gfx::Size cached_preview_original_size_;
++  bool preview_was_available_ = false;
++  std::optional<base::Token> preview_request_id_;
+ 
+   // A randomly generated ID associated with each image assigned by
+   // AssignSkBitmap().
+--- a/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
++++ b/chrome/browser/ui/thumbnails/thumbnail_tab_helper.cc
+@@ -15,6 +15,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+ #include "chrome/browser/ui/thumbnails/background_thumbnail_video_capturer.h"
+@@ -22,6 +23,8 @@
+ #include "chrome/browser/ui/thumbnails/thumbnail_readiness_tracker.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_scheduler.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_scheduler_impl.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/navigation_controller.h"
+@@ -222,6 +225,9 @@ class ThumbnailTabHelper::TabStateTracke
+     }
+     page_readiness_ = readiness;
+     capture_driver_.UpdatePageReadiness(readiness);
++    if (readiness == CaptureReadiness::kReadyForFinalCapture) {
++      thumbnail_tab_helper_->CaptureThumbnailForPreview();
++    }
+   }
+ 
+   const raw_ptr<ThumbnailTabHelper> thumbnail_tab_helper_;
+@@ -240,6 +246,18 @@ class ThumbnailTabHelper::TabStateTracke
+ // ThumbnailTabHelper ----------------------------------------------------
+ 
+ void ThumbnailTabHelper::CaptureThumbnailOnTabBackgrounded() {
++  CaptureThumbnail();
++}
++
++void ThumbnailTabHelper::CaptureThumbnailForPreview() {
++  if (pref_change_registrar_.prefs()->GetBoolean(prefs::kVisualTabSwitcher) &&
++      web_contents()->GetVisibility() == content::Visibility::VISIBLE &&
++      !web_contents()->WasDiscarded()) {
++    CaptureThumbnail();
++  }
++}
++
++void ThumbnailTabHelper::CaptureThumbnail() {
+   if (!state_->is_ready()) {
+     return;
+   }
+@@ -287,6 +305,13 @@ ThumbnailTabHelper::ThumbnailTabHelper(c
+           state_.get(),
+           DiscardedTabThumbnailData::TakeThumbnailDataIfAvailable(contents))) {
+   is_tab_discarded_ = contents->WasDiscarded();
++  pref_change_registrar_.Init(
++      Profile::FromBrowserContext(contents->GetBrowserContext())->GetPrefs());
++  pref_change_registrar_.Add(
++      prefs::kVisualTabSwitcher,
++      base::BindRepeating(&ThumbnailTabHelper::UpdatePreviewCaching,
++                          base::Unretained(this)));
++  UpdatePreviewCaching();
+ }
+ 
+ ThumbnailTabHelper::~ThumbnailTabHelper() {
+@@ -342,9 +367,16 @@ void ThumbnailTabHelper::StoreThumbnail(
+ }
+ 
+ void ThumbnailTabHelper::ClearData() {
++  weak_factory_for_thumbnail_on_tab_hidden_.InvalidateWeakPtrs();
+   thumbnail_->ClearData();
+ }
+ 
++void ThumbnailTabHelper::UpdatePreviewCaching() {
++  thumbnail_->SetPreviewCachingEnabled(
++      pref_change_registrar_.prefs()->GetBoolean(prefs::kVisualTabSwitcher));
++  CaptureThumbnailForPreview();
++}
++
+ void ThumbnailTabHelper::StartVideoCapture() {
+   content::RenderWidgetHostView* const source_view = state_->GetView();
+   if (!source_view) {
+@@ -447,4 +479,14 @@ void ThumbnailTabHelper::DidStartNavigat
+   is_tab_discarded_ = false;
+ }
+ 
++void ThumbnailTabHelper::DidFirstVisuallyNonEmptyPaint() {
++  CaptureThumbnailForPreview();
++}
++
++void ThumbnailTabHelper::OnVisibilityChanged(content::Visibility visibility) {
++  if (visibility == content::Visibility::VISIBLE) {
++    CaptureThumbnailForPreview();
++  }
++}
++
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(ThumbnailTabHelper);
+--- a/chrome/browser/ui/thumbnails/thumbnail_tab_helper.h
++++ b/chrome/browser/ui/thumbnails/thumbnail_tab_helper.h
+@@ -12,6 +12,7 @@
+ #include "base/time/time.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_capture_info.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/web_contents_observer.h"
+@@ -38,6 +39,8 @@ class ThumbnailTabHelper
+   // active tab.
+   void CaptureThumbnailOnTabBackgrounded();
+ 
++  void CaptureThumbnailForPreview();
++
+  private:
+   class TabStateTracker;
+   friend class content::WebContentsUserData<ThumbnailTabHelper>;
+@@ -68,6 +71,8 @@ class ThumbnailTabHelper
+   // Clears the data associated to the currently set thumbnail. For when the
+   // thumbnail is no longer valid.
+   void ClearData();
++  void UpdatePreviewCaching();
++  void CaptureThumbnail();
+ 
+   // viz::mojom::FrameSinkVideoConsumer:
+ 
+@@ -86,6 +91,8 @@ class ThumbnailTabHelper
+ 
+   void DidStartNavigation(
+       content::NavigationHandle* navigation_handle) override;
++  void DidFirstVisuallyNonEmptyPaint() override;
++  void OnVisibilityChanged(content::Visibility visibility) override;
+ 
+   // Copy info from the most recent frame we have captured.
+   ThumbnailCaptureInfo last_frame_capture_info_;
+@@ -103,6 +110,7 @@ class ThumbnailTabHelper
+ 
+   // The thumbnail maintained by this instance.
+   scoped_refptr<ThumbnailImage> thumbnail_;
++  PrefChangeRegistrar pref_change_registrar_;
+ 
+   bool is_tab_discarded_ = false;
+ 
+--- a/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
+@@ -62,10 +62,12 @@
+ #include "components/web_modal/web_contents_modal_dialog_host.h"
+ #include "ui/accessibility/platform/ax_platform_node.h"
+ #include "ui/actions/actions.h"
++#include "ui/base/accelerators/accelerator.h"
+ #include "ui/base/accelerators/global_accelerator_listener/global_accelerator_listener.h"
+ #import "ui/base/cocoa/window_size_constants.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/mojom/window_show_state.mojom.h"
++#include "ui/events/keycodes/keyboard_code_conversion_mac.h"
+ #import "ui/views/cocoa/native_widget_mac_ns_window_host.h"
+ #include "ui/views/interaction/element_tracker_views.h"
+ 
+@@ -534,6 +536,15 @@ bool BrowserNativeWidgetMac::ExecuteComm
+ 
+   BrowserWindowInterface* browser = browser_view_->browser();
+ 
++  NSEvent* event = NSApp.currentEvent;
++  if (event.type == NSEventTypeKeyDown &&
++      (event.modifierFlags & NSEventModifierFlagControl) &&
++      ui::KeyboardCodeFromNSEvent(event) == ui::VKEY_TAB &&
++      browser_view_->MaybeShowVisualTabSwitcher(
++          command, ui::Accelerator(ui::VKEY_TAB, ui::EF_CONTROL_DOWN))) {
++    return true;
++  }
++
+   if (command == IDC_TOGGLE_VERTICAL_TABS) {
+     if (auto* controller =
+             tabs::VerticalTabStripStateController::From(browser)) {
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -221,6 +221,7 @@
+ #include "chrome/browser/ui/views/tabs/tab/tab_accessibility.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_top_container.h"
++#include "chrome/browser/ui/views/tabs/visual_tab_switcher.h"
+ #include "chrome/browser/ui/views/theme_copying_widget.h"
+ #include "chrome/browser/ui/views/toolbar/app_menu_control.h"
+ #include "chrome/browser/ui/views/toolbar/avatar_toolbar_button_interface.h"
+@@ -1191,6 +1192,7 @@ BrowserView::BrowserView(Browser* browse
+ }
+ 
+ BrowserView::~BrowserView() {
++  visual_tab_switcher_.reset();
+   if (browser_shortcut_service_) {
+     browser_shortcut_service_->RemoveObserver(this);
+     browser_shortcut_service_ = nullptr;
+@@ -5919,6 +5921,26 @@ const views::View* BrowserView::GetViewB
+ ///////////////////////////////////////////////////////////////////////////////
+ // BrowserView, ui::AcceleratorTarget overrides:
+ 
++bool BrowserView::MaybeShowVisualTabSwitcher(
++    int command_id,
++    const ui::Accelerator& accelerator) {
++  if ((command_id == IDC_CYCLE_TO_NEXT_TAB ||
++       command_id == IDC_CYCLE_TO_PREV_TAB ||
++       command_id == IDC_SELECT_NEXT_TAB ||
++       command_id == IDC_SELECT_PREVIOUS_TAB) &&
++      accelerator.key_code() == ui::VKEY_TAB && accelerator.IsCtrlDown() &&
++      GetProfile()->GetPrefs()->GetBoolean(prefs::kVisualTabSwitcher) &&
++      chrome::IsCommandEnabled(browser_.get(), command_id)) {
++    if (!visual_tab_switcher_) {
++      visual_tab_switcher_ = std::make_unique<VisualTabSwitcher>(this);
++    }
++    return visual_tab_switcher_->Cycle(command_id == IDC_CYCLE_TO_PREV_TAB ||
++                                       command_id == IDC_SELECT_PREVIOUS_TAB);
++  }
++
++  return false;
++}
++
+ bool BrowserView::AcceleratorPressed(const ui::Accelerator& accelerator) {
+   NativeWebKeyboardEvent native_event(accelerator.ToKeyEvent());
+   if (browser_->GetFeatures().exclusive_access_manager()->HandleUserKeyEvent(
+@@ -5933,6 +5955,10 @@ bool BrowserView::AcceleratorPressed(con
+     return false;
+   }
+ 
++  if (MaybeShowVisualTabSwitcher(command_id, accelerator)) {
++    return true;
++  }
++
+   UpdateAcceleratorMetrics(accelerator, command_id);
+ 
+   if (command_id == IDC_CLEAR_BROWSING_DATA) {
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -104,6 +104,7 @@ class TopContainerView;
+ class TopControlsSlideController;
+ class TopControlsSlideControllerTest;
+ class VerticalTabStripRegionView;
++class VisualTabSwitcher;
+ class WebAppFrameToolbarView;
+ 
+ namespace gfx {
+@@ -589,6 +590,8 @@ class BrowserView : public BrowserWindow
+   void ShowChromeLabs() override;
+   BrowserView* AsBrowserView() override;
+   void ShowUpdateChromeDialog() override;
++  bool MaybeShowVisualTabSwitcher(int command_id,
++                                  const ui::Accelerator& accelerator);
+   void StartTabCycling();
+   void StopTabCycling();
+   void ShowIntentPickerBubble(
+@@ -1466,6 +1469,7 @@ class BrowserView : public BrowserWindow
+       tab_strip_web_apps_reparented_state_;
+ 
+   std::unique_ptr<TabCyclingEventHandler> tab_cycling_event_handler_;
++  std::unique_ptr<VisualTabSwitcher> visual_tab_switcher_;
+ 
+   // Zen mode state.
+   std::unique_ptr<views::EventMonitor> zen_mode_event_monitor_;
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/visual_tab_switcher.cc
+@@ -0,0 +1,566 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/visual_tab_switcher.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/i18n/rtl.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/task/single_thread_task_runner.h"
++#include "build/build_config.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/thumbnails/thumbnail_tab_helper.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/common/pref_names.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_service.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/accelerators/accelerator.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_id.h"
++#include "ui/events/event.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/event_monitor.h"
++#include "ui/views/layout/box_layout.h"
++
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/global_keyboard_shortcuts_mac.h"
++#endif
++
++namespace {
++
++constexpr int kWindowInset = 24;
++constexpr int kListMaxWidth = 1000;
++constexpr int kStripMaxWidth = 1400;
++constexpr int kPopupCornerRadius = 8;
++constexpr int kContentPadding = 16;
++constexpr int kContentSpacing = 12;
++constexpr int kPreviewSpacing = 16;
++constexpr int kItemSpacing = 6;
++constexpr int kListRowHeight = 36;
++constexpr int kTilePadding = 6;
++constexpr int kThumbnailWidth = 184;
++constexpr int kThumbnailHeight = 124;
++constexpr int kTileLabelHeight = 28;
++constexpr int kListPreviewHeight = 280;
++constexpr int kStripHeight = 230;
++constexpr int kSelectionCornerRadius = 4;
++constexpr base::TimeDelta kRevealDelay = base::Milliseconds(250);
++constexpr int kDefaultMaxTabs = 5;
++
++class SwitcherContents : public views::View {
++  METADATA_HEADER(SwitcherContents, views::View)
++
++ public:
++  explicit SwitcherContents(base::WeakPtr<VisualTabSwitcher> switcher)
++      : switcher_(std::move(switcher)) {
++    SetFocusBehavior(FocusBehavior::ALWAYS);
++    GetViewAccessibility().SetRole(ax::mojom::Role::kListBox);
++    GetViewAccessibility().SetName(
++        l10n_util::GetStringUTF16(IDS_VISUAL_TAB_SWITCHER_TITLE));
++  }
++
++  bool SkipDefaultKeyEventProcessing(const ui::KeyEvent& event) override {
++    return true;
++  }
++
++  bool OnKeyPressed(const ui::KeyEvent& event) override {
++    return switcher_ && switcher_->HandleKeyEvent(event);
++  }
++
++  bool OnKeyReleased(const ui::KeyEvent& event) override {
++    return switcher_ && switcher_->HandleKeyEvent(event);
++  }
++
++ private:
++  base::WeakPtr<VisualTabSwitcher> switcher_;
++};
++
++BEGIN_METADATA(SwitcherContents)
++END_METADATA
++
++class SwitcherButton : public views::Button {
++  METADATA_HEADER(SwitcherButton, views::Button)
++
++ public:
++  explicit SwitcherButton(PressedCallback callback)
++      : views::Button(std::move(callback)) {}
++};
++
++BEGIN_METADATA(SwitcherButton)
++END_METADATA
++
++std::u16string GetTabTitle(content::WebContents* contents) {
++  return TabUIHelper::From(tabs::TabInterface::GetFromContents(contents))
++      ->GetTitle();
++}
++
++std::unique_ptr<views::ImageView> MakePreview(const gfx::Size& size) {
++  auto image = std::make_unique<views::ImageView>();
++  image->SetImageSize(size);
++  image->SetPreferredSize(size);
++  image->GetViewAccessibility().SetIsIgnored(true);
++  return image;
++}
++
++}  // namespace
++
++VisualTabSwitcher::VisualTabSwitcher(BrowserView* browser_view)
++    : browser_view_(browser_view) {}
++
++VisualTabSwitcher::~VisualTabSwitcher() {
++  Close(false);
++}
++
++bool VisualTabSwitcher::Cycle(bool reverse) {
++  const bool starting = tabs_.empty();
++  if (starting) {
++    auto* model = browser_view_->browser()->tab_strip_model();
++    const bool mru = browser_view_->GetProfile()->GetPrefs()->GetBoolean(
++        prefs::kTabCyclingMRU);
++    list_mode_ = browser_view_->GetProfile()->GetPrefs()->GetBoolean(
++        prefs::kVisualTabSwitcherList);
++    int max_tabs = kDefaultMaxTabs;
++    int configured_max_tabs;
++    if (base::StringToInt(
++            base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++                "visual-tab-switcher-max-tabs"),
++            &configured_max_tabs) &&
++        (configured_max_tabs > 0 || configured_max_tabs == -1)) {
++      max_tabs = configured_max_tabs;
++    }
++    if (list_mode_) {
++      max_tabs = -1;
++    }
++    for (int i = 0; i < model->count(); ++i) {
++      if (mru || model->IsTabEligibleForSequentialCycling(i)) {
++        tabs_.push_back(model->GetWebContentsAt(i));
++      }
++    }
++    if (tabs_.size() < 2) {
++      tabs_.clear();
++      return false;
++    }
++    auto* active = model->GetActiveWebContents();
++    const bool limit_tabs =
++        max_tabs > 0 && tabs_.size() > static_cast<size_t>(max_tabs);
++    if (mru || limit_tabs) {
++      std::stable_sort(
++          tabs_.begin(), tabs_.end(), [active](const auto& a, const auto& b) {
++            if (a == active || b == active) {
++              return a == active && b != active;
++            }
++            return a->GetLastActiveTimeTicks() > b->GetLastActiveTimeTicks();
++          });
++    }
++    if (limit_tabs) {
++      tabs_.resize(max_tabs);
++      if (!mru) {
++        std::ranges::sort(tabs_, {}, [model](const auto& tab) {
++          return model->GetIndexOfWebContents(tab);
++        });
++      }
++    }
++    const auto active_tab = std::find(tabs_.begin(), tabs_.end(), active);
++    if (active_tab == tabs_.end()) {
++      tabs_.clear();
++      return false;
++    }
++    selected_ = active_tab - tabs_.begin();
++    observed_model_ = model;
++    model->AddObserver(this);
++    auto* browser_widget = browser_view_->GetWidget();
++    widget_observation_.Observe(browser_widget);
++    event_monitor_ = views::EventMonitor::CreateWindowMonitor(
++        this, browser_widget->GetNativeWindow(),
++        {ui::EventType::kKeyReleased, ui::EventType::kKeyPressed,
++         ui::EventType::kMousePressed});
++  }
++  selected_ = reverse ? (selected_ + tabs_.size() - 1) % tabs_.size()
++                      : (selected_ + 1) % tabs_.size();
++  if (starting) {
++    reveal_timer_.Start(
++        FROM_HERE, kRevealDelay,
++        base::BindOnce(&VisualTabSwitcher::Show, weak_factory_.GetWeakPtr()));
++  } else if (!widget_) {
++    reveal_timer_.Stop();
++    Show();
++  } else {
++    UpdateSelection();
++  }
++  return true;
++}
++
++void VisualTabSwitcher::Show() {
++  gfx::Rect bounds = browser_view_->GetWidget()->GetWindowBoundsInScreen();
++  bounds.Inset(kWindowInset);
++  const int width = std::max(
++      1, std::min(bounds.width(), list_mode_ ? kListMaxWidth : kStripMaxWidth));
++
++  views::Widget::InitParams params(
++      views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++      views::Widget::InitParams::TYPE_POPUP);
++  params.SetParent(browser_view_->GetWidget());
++  params.activatable = views::Widget::InitParams::Activatable::kYes;
++  params.name = "HeliumVisualTabSwitcher";
++  params.bounds = bounds;
++  params.rounded_corners = gfx::RoundedCornersF(kPopupCornerRadius);
++  widget_ = std::make_unique<views::Widget>();
++  widget_->Init(std::move(params));
++
++  auto contents =
++      std::make_unique<SwitcherContents>(weak_factory_.GetWeakPtr());
++  contents_ = contents.get();
++  contents->SetBackground(views::CreateRoundedRectBackground(
++      ui::kColorSysSurface, kPopupCornerRadius));
++  auto* layout = contents->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical, gfx::Insets(kContentPadding),
++      kContentSpacing));
++  auto* body = contents->AddChildView(std::make_unique<views::View>());
++  auto* body_layout = body->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
++      kPreviewSpacing));
++  layout->SetFlexForView(body, 1);
++  if (list_mode_) {
++    preview_ = body->AddChildView(
++        MakePreview(gfx::Size(width / 3, kListPreviewHeight)));
++    preview_->SetVerticalAlignment(views::ImageView::Alignment::kLeading);
++  }
++  auto scroll = std::make_unique<views::ScrollView>(
++      views::ScrollView::ScrollWithLayers::kEnabled);
++  scroll->SetUseContentsPreferredSize(!list_mode_);
++  if (list_mode_) {
++    scroll->ClipHeightTo(0, std::max(1, bounds.height()));
++  }
++  scroll->SetHorizontalScrollBarMode(
++      list_mode_ ? views::ScrollView::ScrollBarMode::kDisabled
++                 : views::ScrollView::ScrollBarMode::kHiddenButEnabled);
++  scroll->SetVerticalScrollBarMode(
++      list_mode_ ? views::ScrollView::ScrollBarMode::kEnabled
++                 : views::ScrollView::ScrollBarMode::kDisabled);
++  auto items = std::make_unique<views::View>();
++  items->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      list_mode_ ? views::BoxLayout::Orientation::kVertical
++                 : views::BoxLayout::Orientation::kHorizontal,
++      gfx::Insets(), kItemSpacing));
++  for (size_t i = 0; i < tabs_.size(); ++i) {
++    const auto callback = base::BindRepeating(&VisualTabSwitcher::AcceptTab,
++                                              weak_factory_.GetWeakPtr(), i);
++    auto favicon =
++        TabUIHelper::From(tabs::TabInterface::GetFromContents(tabs_[i]))
++            ->GetFavicon();
++    views::Button* button;
++    if (list_mode_) {
++      auto row =
++          std::make_unique<views::LabelButton>(callback, GetTabTitle(tabs_[i]));
++      row->SetImageModel(views::Button::STATE_NORMAL, favicon);
++      row->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++      row->SetMinSize(gfx::Size(0, kListRowHeight));
++      button = items->AddChildView(std::move(row));
++    } else {
++      auto tile = std::make_unique<SwitcherButton>(callback);
++      tile->SetLayoutManager(std::make_unique<views::BoxLayout>(
++          views::BoxLayout::Orientation::kVertical, gfx::Insets(kTilePadding),
++          kItemSpacing));
++      auto* image = tile->AddChildView(
++          MakePreview(gfx::Size(kThumbnailWidth, kThumbnailHeight)));
++      images_.push_back(image);
++      auto* label = tile->AddChildView(std::make_unique<views::LabelButton>(
++          views::Button::PressedCallback(), GetTabTitle(tabs_[i])));
++      label->SetImageModel(views::Button::STATE_NORMAL, favicon);
++      label->SetMaxSize(gfx::Size(kThumbnailWidth, kTileLabelHeight));
++      label->SetCanProcessEventsWithinSubtree(false);
++      label->SetFocusBehavior(views::View::FocusBehavior::NEVER);
++      label->GetViewAccessibility().SetIsIgnored(true);
++      button = items->AddChildView(std::move(tile));
++    }
++    button->SetFocusBehavior(views::View::FocusBehavior::ACCESSIBLE_ONLY);
++    button->GetViewAccessibility().SetRole(ax::mojom::Role::kListBoxOption);
++    button->GetViewAccessibility().SetName(GetTabTitle(tabs_[i]));
++    buttons_.push_back(button);
++  }
++  if (!list_mode_) {
++    subscriptions_.resize(tabs_.size());
++  }
++  scroll->SetContents(std::move(items));
++  auto* scroll_view = body->AddChildView(std::move(scroll));
++  body_layout->SetFlexForView(scroll_view, 1);
++  scroll_subscription_ = scroll_view->AddContentsScrolledCallback(
++      base::BindRepeating(&VisualTabSwitcher::UpdateVisibleThumbnails,
++                          weak_factory_.GetWeakPtr()));
++  scroll_view->RegisterPostLayoutCallback(base::BindRepeating(
++      [](base::WeakPtr<VisualTabSwitcher> switcher, views::ScrollView*) {
++        if (switcher) {
++          switcher->UpdateVisibleThumbnails();
++        }
++      },
++      weak_factory_.GetWeakPtr()));
++  title_ = contents->AddChildView(
++      std::make_unique<views::Label>(GetTabTitle(tabs_[selected_])));
++  if (list_mode_) {
++    const int available_preview_height =
++        std::max(1, bounds.height() - layout->inside_border_insets().height() -
++                        layout->between_child_spacing() -
++                        title_->GetPreferredSize({}).height());
++    const gfx::Size preview_size(
++        width / 3, std::min(kListPreviewHeight, available_preview_height));
++    preview_->SetImageSize(preview_size);
++    preview_->SetPreferredSize(preview_size);
++  }
++  const int height =
++      std::max(1, std::min(bounds.height(),
++                           list_mode_ ? contents->GetPreferredSize({}).height()
++                                      : kStripHeight));
++  const int popup_width =
++      list_mode_ ? width
++                 : std::min(width, body->GetPreferredSize({}).width() +
++                                       layout->inside_border_insets().width());
++  bounds.ClampToCenteredSize(gfx::Size(popup_width, height));
++  widget_->SetContentsView(std::move(contents));
++  widget_->SetBounds(bounds);
++  widget_observation_.Reset();
++  widget_observation_.Observe(widget_.get());
++  event_monitor_.reset();
++  event_monitor_ = views::EventMonitor::CreateWindowMonitor(
++      this, widget_->GetNativeWindow(), {ui::EventType::kKeyReleased});
++  widget_->Show();
++  contents_->RequestFocus();
++  UpdateSelection();
++}
++
++void VisualTabSwitcher::UpdateSelection() {
++  for (size_t i = 0; i < buttons_.size(); ++i) {
++    buttons_[i]->SetBackground(
++        i == selected_
++            ? views::CreateRoundedRectBackground(ui::kColorSysPrimaryContainer,
++                                                 kSelectionCornerRadius)
++            : nullptr);
++    buttons_[i]->GetViewAccessibility().SetIsSelected(i == selected_);
++  }
++  contents_->GetViewAccessibility().SetActiveDescendant(*buttons_[selected_]);
++  title_->SetText(GetTabTitle(tabs_[selected_]));
++  buttons_[selected_]->ScrollViewToVisible();
++  if (preview_) {
++    subscriptions_.clear();
++    preview_->SetImage(ui::ImageModel());
++    subscriptions_.push_back(Subscribe(preview_, tabs_[selected_]));
++  } else {
++    UpdateVisibleThumbnails();
++  }
++}
++
++void VisualTabSwitcher::UpdateVisibleThumbnails() {
++  if (list_mode_ || !widget_) {
++    return;
++  }
++  for (size_t i = 0; i < images_.size(); ++i) {
++    if (!images_[i]->GetVisibleBounds().IsEmpty()) {
++      if (!subscriptions_[i]) {
++        subscriptions_[i] = Subscribe(images_[i], tabs_[i]);
++      }
++    } else if (subscriptions_[i]) {
++      subscriptions_[i].reset();
++      images_[i]->SetImage(ui::ImageModel());
++    }
++  }
++}
++
++std::unique_ptr<ThumbnailImage::Subscription> VisualTabSwitcher::Subscribe(
++    views::ImageView* image,
++    content::WebContents* contents) {
++  auto* helper = ThumbnailTabHelper::FromWebContents(contents);
++  if (!helper) {
++    return nullptr;
++  }
++  auto thumbnail = helper->thumbnail();
++  auto subscription = thumbnail->Subscribe();
++  subscription->SetSizeHint(image->GetPreferredSize({}));
++  subscription->SetUncompressedImageCallback(base::BindRepeating(
++      &VisualTabSwitcher::OnThumbnail, weak_factory_.GetWeakPtr(), image));
++  OnThumbnail(image, thumbnail->GetCachedPreview(image->GetPreferredSize({})));
++  helper->CaptureThumbnailForPreview();
++  thumbnail->RequestThumbnailImage();
++  return subscription;
++}
++
++void VisualTabSwitcher::OnThumbnail(views::ImageView* view,
++                                    gfx::ImageSkia image) {
++  if (!image.isNull()) {
++    const gfx::Size bounds = view->GetPreferredSize({});
++    const float scale =
++        std::min(static_cast<float>(bounds.width()) / image.width(),
++                 static_cast<float>(bounds.height()) / image.height());
++    gfx::Size size = gfx::ScaleToRoundedSize(image.size(), scale);
++    size.SetToMax(gfx::Size(1, 1));
++    if (view->GetImageBounds().size() != size) {
++      view->SetImageSize(size);
++    }
++  }
++  view->SetImage(ui::ImageModel::FromImageSkia(image));
++}
++
++bool VisualTabSwitcher::HandleKeyEvent(const ui::KeyEvent& event) {
++  if (tabs_.empty()) {
++    return false;
++  }
++  if (event.type() == ui::EventType::kKeyReleased) {
++    if (event.key_code() == ui::VKEY_CONTROL) {
++      Close(true);
++    }
++    return true;
++  }
++  switch (event.key_code()) {
++    case ui::VKEY_TAB: {
++      const ui::Accelerator accelerator(event);
++#if BUILDFLAG(IS_MAC)
++      const auto command = CommandForKeyEvent(event.native_event());
++      if (command.from_main_menu ||
++          !browser_view_->AcceleratorPressed(accelerator)) {
++        browser_view_->MaybeShowVisualTabSwitcher(command.chrome_command,
++                                                  accelerator);
++      }
++#else
++      browser_view_->AcceleratorPressed(accelerator);
++#endif
++      break;
++    }
++    case ui::VKEY_LEFT:
++      Cycle(!base::i18n::IsRTL());
++      break;
++    case ui::VKEY_UP:
++      Cycle(true);
++      break;
++    case ui::VKEY_RIGHT:
++      Cycle(base::i18n::IsRTL());
++      break;
++    case ui::VKEY_DOWN:
++      Cycle(false);
++      break;
++    case ui::VKEY_RETURN:
++      Close(true);
++      break;
++    case ui::VKEY_ESCAPE:
++      Close(false);
++      break;
++    default:
++      break;
++  }
++  return true;
++}
++
++void VisualTabSwitcher::AcceptTab(size_t index) {
++  selected_ = index;
++  Close(true);
++}
++
++void VisualTabSwitcher::Close(bool accept) {
++  if (tabs_.empty()) {
++    return;
++  }
++  auto* model = observed_model_.get();
++  const int index = accept && model
++                        ? model->GetIndexOfWebContents(tabs_[selected_])
++                        : TabStripModel::kNoTab;
++  weak_factory_.InvalidateWeakPtrs();
++  reveal_timer_.Stop();
++  event_monitor_.reset();
++  scroll_subscription_ = {};
++  TabStripModelObserver::StopObservingAll(this);
++  observed_model_ = nullptr;
++  widget_observation_.Reset();
++  subscriptions_.clear();
++  tabs_.clear();
++  buttons_.clear();
++  images_.clear();
++  contents_ = nullptr;
++  preview_ = nullptr;
++  title_ = nullptr;
++  auto widget = std::move(widget_);
++  if (widget) {
++    widget->Hide();
++    // Event callbacks can still refer to the contents view until they return.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->DeleteSoon(
++        FROM_HERE, std::move(widget));
++  }
++  if (index != TabStripModel::kNoTab) {
++    model->ActivateTabAt(index,
++                         TabStripUserGestureDetails(
++                             TabStripUserGestureDetails::GestureType::kOther));
++  }
++}
++
++void VisualTabSwitcher::OnTabStripModelChanged(
++    TabStripModel* model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  // Cancel before a tab change can invalidate the selection snapshot.
++  if (change.type() != TabStripModelChange::kSelectionOnly ||
++      selection.active_tab_changed()) {
++    Close(false);
++  }
++}
++
++void VisualTabSwitcher::TabGroupedStateChanged(
++    TabStripModel* model,
++    std::optional<tab_groups::TabGroupId> old_group,
++    std::optional<tab_groups::TabGroupId> new_group,
++    tabs::TabInterface* tab,
++    int index) {
++  Close(false);
++}
++
++void VisualTabSwitcher::OnTabGroupChanged(const TabGroupChange& change) {
++  Close(false);
++}
++
++void VisualTabSwitcher::OnTabGroupFocusChanged(
++    std::optional<tab_groups::TabGroupId> new_focused_group_id,
++    std::optional<tab_groups::TabGroupId> old_focused_group_id) {
++  Close(false);
++}
++
++void VisualTabSwitcher::OnTabStripModelDestroyed(TabStripModel* model) {
++  Close(false);
++}
++
++void VisualTabSwitcher::OnWidgetActivationChanged(views::Widget* widget,
++                                                  bool active) {
++  if (!active) {
++    Close(false);
++  }
++}
++
++void VisualTabSwitcher::OnWidgetClosing(views::Widget* widget) {
++  Close(false);
++}
++
++void VisualTabSwitcher::OnEvent(const ui::Event& event) {
++  if (event.type() == ui::EventType::kKeyReleased) {
++    HandleKeyEvent(*event.AsKeyEvent());
++  } else if (!widget_ &&
++             (event.type() == ui::EventType::kMousePressed ||
++              (event.type() == ui::EventType::kKeyPressed &&
++               event.AsKeyEvent()->key_code() == ui::VKEY_ESCAPE))) {
++    Close(false);
++  }
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/visual_tab_switcher.h
+@@ -0,0 +1,102 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VISUAL_TAB_SWITCHER_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VISUAL_TAB_SWITCHER_H_
++
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "chrome/browser/ui/thumbnails/thumbnail_image.h"
++#include "ui/events/event_observer.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
++
++class BrowserView;
++namespace content {
++class WebContents;
++}
++namespace ui {
++class KeyEvent;
++}
++namespace views {
++class Button;
++class EventMonitor;
++class ImageView;
++class Label;
++class View;
++}  // namespace views
++
++class VisualTabSwitcher : public TabStripModelObserver,
++                          public views::WidgetObserver,
++                          public ui::EventObserver {
++ public:
++  explicit VisualTabSwitcher(BrowserView* browser_view);
++  ~VisualTabSwitcher() override;
++
++  VisualTabSwitcher(const VisualTabSwitcher&) = delete;
++  VisualTabSwitcher& operator=(const VisualTabSwitcher&) = delete;
++
++  bool Cycle(bool reverse);
++  bool HandleKeyEvent(const ui::KeyEvent& event);
++  void Close(bool accept);
++
++ private:
++  void Show();
++  void UpdateSelection();
++  void UpdateVisibleThumbnails();
++  void AcceptTab(size_t index);
++  std::unique_ptr<ThumbnailImage::Subscription> Subscribe(
++      views::ImageView* image,
++      content::WebContents* contents);
++  void OnThumbnail(views::ImageView* view, gfx::ImageSkia image);
++
++  void OnTabStripModelChanged(
++      TabStripModel* model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void TabGroupedStateChanged(TabStripModel* model,
++                              std::optional<tab_groups::TabGroupId> old_group,
++                              std::optional<tab_groups::TabGroupId> new_group,
++                              tabs::TabInterface* tab,
++                              int index) override;
++  void OnTabGroupChanged(const TabGroupChange& change) override;
++  void OnTabGroupFocusChanged(
++      std::optional<tab_groups::TabGroupId> new_focused_group_id,
++      std::optional<tab_groups::TabGroupId> old_focused_group_id) override;
++  void OnTabStripModelDestroyed(TabStripModel* model) override;
++  void OnWidgetActivationChanged(views::Widget* widget, bool active) override;
++  void OnWidgetClosing(views::Widget* widget) override;
++  void OnEvent(const ui::Event& event) override;
++
++  const raw_ptr<BrowserView> browser_view_;
++  std::unique_ptr<views::Widget> widget_;
++  std::unique_ptr<views::EventMonitor> event_monitor_;
++  base::OneShotTimer reveal_timer_;
++  base::CallbackListSubscription scroll_subscription_;
++  raw_ptr<TabStripModel> observed_model_ = nullptr;
++  base::ScopedObservation<views::Widget, views::WidgetObserver>
++      widget_observation_{this};
++  std::vector<raw_ptr<content::WebContents>> tabs_;
++  std::vector<raw_ptr<views::Button>> buttons_;
++  std::vector<raw_ptr<views::ImageView>> images_;
++  std::vector<std::unique_ptr<ThumbnailImage::Subscription>> subscriptions_;
++  raw_ptr<views::View> contents_ = nullptr;
++  raw_ptr<views::ImageView> preview_ = nullptr;
++  raw_ptr<views::Label> title_ = nullptr;
++  size_t selected_ = 0;
++  bool list_mode_ = false;
++
++  base::WeakPtrFactory<VisualTabSwitcher> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VISUAL_TAB_SWITCHER_H_
+--- a/chrome/browser/global_keyboard_shortcuts_mac.h
++++ b/chrome/browser/global_keyboard_shortcuts_mac.h
+@@ -9,6 +9,7 @@
+ 
+ #include <vector>
+ 
++#include "base/apple/owned_objc.h"
+ #include "ui/base/accelerators/accelerator.h"
+ 
+ #if defined(__OBJC__)
+@@ -43,6 +44,9 @@ struct CommandForKeyEventResult {
+   bool from_main_menu;
+ };
+ 
++CommandForKeyEventResult CommandForKeyEvent(
++    const base::apple::OwnedNSEvent& event);
++
+ #if defined(__OBJC__)
+ 
+ // macOS applications are supposed to put all keyEquivalents [hotkeys] in the
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -223,6 +223,11 @@ const std::vector<NSMenuItem*>& GetMenuI
+   return *menu_items;
+ }
+ 
++CommandForKeyEventResult CommandForKeyEvent(
++    const base::apple::OwnedNSEvent& event) {
++  return event ? CommandForKeyEvent(event.Get()) : NoCommand();
++}
++
+ CommandForKeyEventResult CommandForKeyEvent(NSEvent* event) {
+   DCHECK(event);
+   if ([event type] != NSEventTypeKeyDown)
