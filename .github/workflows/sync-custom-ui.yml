@@ -1,0 +1,212 @@
+name: Sync custom-ui with upstream
+
+# Keeps `main` a pure fast-forward mirror of imputnet/helium, then attempts to
+# rebase `custom-ui` (this fork's own UI/branding patches) on top of the
+# updated `main` in a disposable `custom-ui-staging` branch. Nothing here ever
+# force-pushes `custom-ui` itself - a human always reviews/accepts the rebase
+# via the PR this workflow opens.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1,4" # Monday and Thursday, 09:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: sync-custom-ui
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  UPSTREAM_URL: https://github.com/imputnet/helium.git
+  CONFLICT_LABEL: custom-ui-conflict
+  VALIDATION_LABEL: custom-ui-validation-failed
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fast-forward main from upstream
+        id: ff
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main
+
+          git checkout main
+          before=$(git rev-parse main)
+          after=$(git rev-parse upstream/main)
+
+          if [ "$before" = "$after" ]; then
+            echo "main is already up to date with upstream"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git merge --ff-only upstream/main
+          git push origin main
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "range=${before}..${after}" >> "$GITHUB_OUTPUT"
+
+      - name: Attempt rebase of custom-ui onto main
+        id: rebase
+        if: steps.ff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git checkout -B custom-ui-staging origin/custom-ui
+
+          if git rebase main; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U | sort -u > /tmp/conflict-files.txt || true
+            git rebase --abort
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report rebase conflict
+        if: steps.ff.outputs.changed == 'true' && steps.rebase.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create "$CONFLICT_LABEL" --color B60205 \
+            --description "custom-ui failed to rebase onto main" 2>/dev/null || true
+
+          if gh issue list --label "$CONFLICT_LABEL" --state open --json number \
+              --jq '.[0].number' | grep -q '^[0-9]'; then
+            echo "an open conflict issue already exists, skipping duplicate"
+            exit 1
+          fi
+
+          {
+            echo "Rebasing \`custom-ui\` onto the updated \`main\` failed."
+            echo
+            echo "Upstream commits pulled in this run: \`${{ steps.ff.outputs.range }}\`"
+            echo
+            echo "### Conflicting files"
+            echo '```'
+            cat /tmp/conflict-files.txt
+            echo '```'
+            echo
+            echo "### To reproduce and resolve locally"
+            echo '```sh'
+            echo "git fetch upstream main && git fetch origin custom-ui"
+            echo "git checkout -B custom-ui-staging origin/custom-ui"
+            echo "git rebase main"
+            echo "# resolve conflicts, git add, git rebase --continue"
+            echo "git branch -f custom-ui custom-ui-staging"
+            echo "git push origin custom-ui"
+            echo '```'
+          } > /tmp/issue-body.md
+
+          gh issue create \
+            --title "Rebase de custom-ui sobre main falló ($(date -u +%Y-%m-%d))" \
+            --label "$CONFLICT_LABEL" \
+            --body-file /tmp/issue-body.md
+
+          exit 1
+
+      - name: Set up CI environment
+        if: steps.ff.outputs.changed == 'true' && steps.rebase.outputs.ok == 'true'
+        uses: ./.github/actions/ci-setup
+
+      - name: Restore Chromium download cache
+        if: steps.ff.outputs.changed == 'true' && steps.rebase.outputs.ok == 'true'
+        uses: actions/cache@v5
+        with:
+          path: chromium_download_cache
+          key: ${{ runner.os }}-chromium-download-cache-${{ hashFiles('chromium_version.txt', 'downloads.ini', 'deps.ini') }}
+
+      - name: Retrieve Chromium source archive
+        if: steps.ff.outputs.changed == 'true' && steps.rebase.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf chromium_src
+          mkdir -p chromium_download_cache
+
+          ./utils/downloads.py retrieve -i deps.ini -c chromium_download_cache &
+          DEPS_PID=$!
+
+          if ! ./utils/downloads.py retrieve -i downloads.ini -c chromium_download_cache; then
+            ./utils/clone.py -o chromium_src
+          fi
+
+          wait "$DEPS_PID"
+
+      - name: Unpack Chromium source archive
+        if: steps.ff.outputs.changed == 'true' && steps.rebase.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -d chromium_src ]; then
+            ./utils/downloads.py unpack -i downloads.ini -c chromium_download_cache chromium_src
+          fi
+          ./utils/downloads.py unpack -i deps.ini -c chromium_download_cache chromium_src
+
+      - name: Validate rebased patch series
+        if: steps.ff.outputs.changed == 'true' && steps.rebase.outputs.ok == 'true'
+        id: validate
+        run: |
+          set -euo pipefail
+          ./devutils/validate_patches.py -l chromium_src -v 2>&1 | tee /tmp/validate.log
+          ./devutils/check_patch_files.py 2>&1 | tee -a /tmp/validate.log
+
+      - name: Report validation failure
+        if: >-
+          steps.ff.outputs.changed == 'true' && steps.rebase.outputs.ok == 'true' &&
+          failure() && steps.validate.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create "$VALIDATION_LABEL" --color B60205 \
+            --description "custom-ui rebased but the patch series no longer validates" 2>/dev/null || true
+
+          {
+            echo "\`custom-ui\` rebased onto the updated \`main\` without a git conflict,"
+            echo "but \`devutils/validate_patches.py\` / \`check_patch_files.py\` failed."
+            echo
+            echo '```'
+            tail -c 60000 /tmp/validate.log
+            echo '```'
+          } > /tmp/issue-body.md
+
+          gh issue create \
+            --title "Validación de custom-ui falló tras rebase ($(date -u +%Y-%m-%d))" \
+            --label "$VALIDATION_LABEL" \
+            --body-file /tmp/issue-body.md
+
+      - name: Push staging branch and open PR
+        if: steps.ff.outputs.changed == 'true' && steps.rebase.outputs.ok == 'true' && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin custom-ui-staging
+
+          existing=$(gh pr list --head custom-ui-staging --state open --json number --jq '.[0].number' || true)
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already open for custom-ui-staging, updated by the force-push above"
+            exit 0
+          fi
+
+          gh pr create \
+            --draft \
+            --base custom-ui \
+            --head custom-ui-staging \
+            --title "sync: rebase custom-ui onto main ($(date -u +%Y-%m-%d))" \
+            --body "Automated rebase of \`custom-ui\` onto the latest \`main\` (upstream range \`${{ steps.ff.outputs.range }}\`). Patch series validated clean via \`devutils/validate_patches.py\`. Review the diff, then merge (fast-forward) into \`custom-ui\`."
