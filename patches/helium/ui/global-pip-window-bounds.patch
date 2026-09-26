@@ -1,0 +1,186 @@
+--- a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.h
++++ b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.h
+@@ -177,6 +177,11 @@
+   // Clears the picture-in-picture window cached bounds.
+   void ClearCachedBounds();
+ 
++#if !BUILDFLAG(IS_ANDROID)
++  std::optional<gfx::Rect> GetCachedVideoWindowBounds() const;
++  void UpdateCachedVideoWindowBounds(const gfx::Rect& bounds);
++#endif  // !BUILDFLAG(IS_ANDROID)
++
+   // Used for Document picture-in-picture windows only.
+   // Note that this is meant to represent the inner window bounds. When the pip
+   // window is drawn, outer bounds may be greater than kMinWindowSize to
+@@ -404,6 +409,8 @@
+   // Pointer to the currently shown picture-in-picture window, if any.
+   raw_ptr<PictureInPictureWindow> picture_in_picture_window_ = nullptr;
+ 
++  std::optional<gfx::Rect> cached_video_window_bounds_;
++
+   std::unique_ptr<PictureInPictureWindowManagerUmaHelper> uma_helper_;
+ #endif  //! BUILDFLAG(IS_ANDROID)
+ 
+--- a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
++++ b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
+@@ -550,6 +550,20 @@
+   PictureInPictureBoundsCache::ClearCachedBounds(web_contents);
+ }
+ 
++#if !BUILDFLAG(IS_ANDROID)
++std::optional<gfx::Rect>
++PictureInPictureWindowManager::GetCachedVideoWindowBounds() const {
++  return cached_video_window_bounds_;
++}
++
++void PictureInPictureWindowManager::UpdateCachedVideoWindowBounds(
++    const gfx::Rect& bounds) {
++  if (!bounds.IsEmpty()) {
++    cached_video_window_bounds_ = bounds;
++  }
++}
++#endif  // !BUILDFLAG(IS_ANDROID)
++
+ // static
+ gfx::Size PictureInPictureWindowManager::GetMinimumInnerWindowSize() {
+   return kMinWindowSize;
+--- a/chrome/browser/ui/views/overlay/video_overlay_window_views.h
++++ b/chrome/browser/ui/views/overlay/video_overlay_window_views.h
+@@ -290,5 +290,6 @@
+   // playing a new video (i.e. different aspect ratio).
+   gfx::Rect CalculateAndUpdateWindowBounds();
++  void UpdateCachedVideoWindowBounds();
+ 
+   // Set up the views::Views that will be shown on the window.
+   void SetUpViews();
+--- a/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
++++ b/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/overlay/video_overlay_window_views.h"
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ 
+ #include "base/check.h"
+@@ -502,10 +503,18 @@
+   UpdateMaxSize(work_area);
+ 
+   const gfx::Rect bounds = GetBounds();
++  const std::optional<gfx::Rect> cached_bounds =
++      !has_been_shown_
++          ? PictureInPictureWindowManager::GetInstance()
++                ->GetCachedVideoWindowBounds()
++          : std::nullopt;
+ 
+   gfx::Size window_size = bounds.size();
+   if (!has_been_shown_) {
+-    window_size = gfx::Size(work_area.width() / 5, work_area.height() / 5);
++    window_size = cached_bounds && !cached_bounds->IsEmpty()
++                      ? cached_bounds->size()
++                      : gfx::Size(work_area.width() / 5,
++                                  work_area.height() / 5);
+   }
+ 
+   // Even though we define the minimum and maximum sizes for our views::Widget,
+@@ -519,6 +528,13 @@
+   // keeping to |natural_size_|'s aspect ratio.
+   if (!natural_size_.IsEmpty()) {
+     float aspect_ratio = (float)natural_size_.width() / natural_size_.height();
++    if (!has_been_shown_ && cached_bounds && !cached_bounds->IsEmpty()) {
++      window_size = gfx::Size(
++          static_cast<int>(cached_bounds->height() * aspect_ratio),
++          cached_bounds->height());
++      window_size.SetToMin(max_size_);
++      window_size.SetToMax(GetMinimumSize());
++    }
+ 
+     WindowQuadrant quadrant = GetCurrentWindowQuadrant(bounds, GetController());
+     gfx::ResizeEdge resize_edge;
+@@ -555,13 +571,38 @@
+   if (has_been_shown_) {
+     // Make sure window is displayed entirely in the work area.
+     origin.SetToMin(default_origin);
++  } else if (cached_bounds && !cached_bounds->IsEmpty()) {
++    origin = cached_bounds->origin();
++    const gfx::Point cached_center = cached_bounds->CenterPoint();
++    if (cached_center.x() >= work_area.x() + work_area.width() / 2) {
++      origin.set_x(cached_bounds->right() - window_size.width());
++    }
++    if (cached_center.y() >= work_area.y() + work_area.height() / 2) {
++      origin.set_y(cached_bounds->bottom() - window_size.height());
++    }
++    origin.SetToMin(default_origin);
++    origin.SetToMax(work_area.origin());
+   } else {
+     origin = default_origin;
+   }
+ 
+   return gfx::Rect(origin, window_size);
+ }
+ 
++void VideoOverlayWindowViews::UpdateCachedVideoWindowBounds() {
++  if (!native_widget() || !has_been_shown_ || !IsVisible()) {
++    return;
++  }
++
++  const gfx::Rect bounds = GetBounds();
++  if (bounds.IsEmpty()) {
++    return;
++  }
++
++  PictureInPictureWindowManager::GetInstance()->UpdateCachedVideoWindowBounds(
++      bounds);
++}
++
+ void VideoOverlayWindowViews::OnNativeFocus() {
+   UpdateControlsVisibility(true);
+   views::Widget::OnNativeFocus();
+@@ -617,6 +648,7 @@
+ #endif
+ 
+   views::Widget::OnNativeWidgetMove();
++  UpdateCachedVideoWindowBounds();
+ }
+ 
+ void VideoOverlayWindowViews::OnNativeWidgetSizeChanged(
+@@ -630,6 +662,7 @@
+   UpdateLayerBoundsWithLetterboxing(new_size);
+ 
+   views::Widget::OnNativeWidgetSizeChanged(new_size);
++  UpdateCachedVideoWindowBounds();
+ }
+ 
+ void VideoOverlayWindowViews::OnKeyEvent(ui::KeyEvent* event) {
+@@ -1742,6 +1775,7 @@
+ }
+ 
+ void VideoOverlayWindowViews::Close() {
++  UpdateCachedVideoWindowBounds();
+   views::Widget::Close();
+   MaybeUnregisterFrameSinkHierarchy();
+   if (fade_animator_) {
+@@ -1835,6 +1869,7 @@
+ void VideoOverlayWindowViews::Hide() {
+   // If there is an existing overlay view, remove it now.
+   RemoveOverlayViewIfExists();
++  UpdateCachedVideoWindowBounds();
+   views::Widget::Hide();
+   if (fade_animator_) {
+     fade_animator_->CancelAndReset();
+@@ -1863,6 +1898,7 @@
+   // Update the views::Widget bounds to adhere to sizing spec. This will also
+   // update the layout of the controls.
+   SetBounds(CalculateAndUpdateWindowBounds());
++  UpdateCachedVideoWindowBounds();
+   if (is_tucking_forced_) {
+     tucker_->Tuck();
+   }
+@@ -2035,6 +2071,7 @@
+ }
+ 
+ void VideoOverlayWindowViews::OnNativeWidgetDestroying() {
++  UpdateCachedVideoWindowBounds();
+   views::Widget::OnNativeWidgetDestroying();
+   MaybeUnregisterFrameSinkHierarchy();
+ }
