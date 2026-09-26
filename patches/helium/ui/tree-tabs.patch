@@ -1,0 +1,3041 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -62,6 +62,12 @@
+     "enterprise_startup_dialog.h",
+     "helium/helium_layout_state_controller.cc",
+     "helium/helium_layout_state_controller.h",
++    "helium/helium_tab_tree_controller.cc",
++    "helium/helium_tab_tree_controller.h",
++    "helium/helium_tab_tree_restore_data.cc",
++    "helium/helium_tab_tree_restore_data.h",
++    "helium/helium_tab_tree_restore_helper.cc",
++    "helium/helium_tab_tree_restore_helper.h",
+     "idle_bubble.h",
+     "incognito_allowed_url.cc",
+     "incognito_allowed_url.h",
+
+--- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+@@ -63,6 +63,7 @@
+ #include "chrome/browser/ui/find_bar/find_bar.h"
+ #include "chrome/browser/ui/find_bar/find_bar_controller.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_controller.h"
+ #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
+ #include "chrome/browser/ui/omnibox/ai_mode_page_action_controller.h"
+ #include "chrome/browser/ui/performance_controls/memory_saver_bubble_controller.h"
+@@ -227,6 +228,65 @@
+
+ }  // namespace
+
++int BrowserWindowFeatures::GetHeliumTabTreeDepth(
++    const tabs::TabInterface* tab) const {
++  return helium_tab_tree_controller_
++             ? helium_tab_tree_controller_->GetDepthForTab(tab)
++             : 0;
++}
++
++int BrowserWindowFeatures::GetHeliumTabTreeMaxVisibleDepth() const {
++  return helium_tab_tree_controller_
++             ? helium_tab_tree_controller_->GetMaxVisibleDepth()
++             : 0;
++}
++
++bool BrowserWindowFeatures::IsHeliumTabTreeVisible(
++    const tabs::TabInterface* tab) const {
++  return helium_tab_tree_controller_
++             ? helium_tab_tree_controller_->IsTabVisible(tab)
++             : true;
++}
++
++bool BrowserWindowFeatures::HeliumTabTreeHasChildren(
++    const tabs::TabInterface* tab) const {
++  return helium_tab_tree_controller_ &&
++         helium_tab_tree_controller_->HasChildren(tab);
++}
++
++bool BrowserWindowFeatures::HeliumTabTreeHasParent(
++    const tabs::TabInterface* tab) const {
++  return helium_tab_tree_controller_ &&
++         helium_tab_tree_controller_->HasParent(tab);
++}
++
++bool BrowserWindowFeatures::IsHeliumTabTreeCollapsed(
++    const tabs::TabInterface* tab) const {
++  return helium_tab_tree_controller_ &&
++         helium_tab_tree_controller_->IsSubtreeCollapsed(tab);
++}
++
++void BrowserWindowFeatures::ToggleHeliumTabTreeCollapsed(
++    const tabs::TabInterface* tab) {
++  if (helium_tab_tree_controller_) {
++    helium_tab_tree_controller_->ToggleSubtreeCollapsed(tab);
++  }
++}
++
++base::CallbackListSubscription
++BrowserWindowFeatures::RegisterOnHeliumTabTreeChanged(
++    base::RepeatingClosure callback) {
++  if (!helium_tab_tree_controller_) {
++    return {};
++  }
++
++  return helium_tab_tree_controller_->RegisterOnTreeChanged(base::BindRepeating(
++      [](base::RepeatingClosure callback, HeliumTabTreeController*) {
++        callback.Run();
++      },
++      std::move(callback)));
++}
++
+ BrowserWindowFeatures::BrowserWindowFeatures() = default;
+ BrowserWindowFeatures::~BrowserWindowFeatures() = default;
+
+@@ -310,6 +384,9 @@
+     helium_layout_state_controller_ =
+         GetUserDataFactory().CreateInstance<HeliumLayoutStateController>(
+             *browser, browser, profile->GetPrefs());
++    helium_tab_tree_controller_ =
++        GetUserDataFactory().CreateInstance<HeliumTabTreeController>(
++            *browser, browser, browser->GetTabStripModel());
+
+     if (tabs::IsVerticalTabsFeatureEnabled()) {
+       const std::optional<bool>& restored_state_collapsed =
+
+--- a/chrome/browser/ui/browser_window/public/browser_window_features.h
++++ b/chrome/browser/ui/browser_window/public/browser_window_features.h
+@@ -61,6 +61,7 @@
+ class FindBarOwner;
+ class FullscreenControlHost;
+ class HeliumLayoutStateController;
++class HeliumTabTreeController;
+ class HistoryClustersSidePanelCoordinator;
+ class HistorySidePanelCoordinator;
+ class IncognitoClearBrowsingDataDialogCoordinator;
+@@ -492,6 +493,16 @@
+     return upgrade_notification_controller_.get();
+   }
+
++  int GetHeliumTabTreeDepth(const tabs::TabInterface* tab) const;
++  int GetHeliumTabTreeMaxVisibleDepth() const;
++  bool IsHeliumTabTreeVisible(const tabs::TabInterface* tab) const;
++  bool HeliumTabTreeHasChildren(const tabs::TabInterface* tab) const;
++  bool HeliumTabTreeHasParent(const tabs::TabInterface* tab) const;
++  bool IsHeliumTabTreeCollapsed(const tabs::TabInterface* tab) const;
++  void ToggleHeliumTabTreeCollapsed(const tabs::TabInterface* tab);
++  base::CallbackListSubscription RegisterOnHeliumTabTreeChanged(
++      base::RepeatingClosure callback);
++
+   BrowserContentSettingBubbleModelDelegate*
+   content_setting_bubble_model_delegate() {
+     return content_setting_bubble_model_delegate_.get();
+@@ -573,6 +586,7 @@
+       mv2_disabled_dialog_controller_;
+
+   std::unique_ptr<HeliumLayoutStateController> helium_layout_state_controller_;
++  std::unique_ptr<HeliumTabTreeController> helium_tab_tree_controller_;
+
+   std::unique_ptr<tabs::VerticalTabStripStateController>
+       vertical_tab_strip_state_controller_;
+
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_tab_tree_controller.cc
+@@ -0,0 +1,988 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_tab_tree_controller.h"
++
++#include <algorithm>
++#include <optional>
++#include <vector>
++
++#include "base/auto_reset.h"
++#include "base/uuid.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_restore_data.h"
++#include "chrome/browser/ui/tabs/tab_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/models/list_selection_model.h"
++#include "ui/base/page_transition_types.h"
++
++DEFINE_USER_DATA(HeliumTabTreeController);
++
++HeliumTabTreeController::HeliumTabTreeController(
++    BrowserWindowInterface* browser_window,
++    TabStripModel* tab_strip_model)
++    : tab_strip_model_(tab_strip_model),
++      scoped_unowned_user_data_(browser_window->GetUnownedUserDataHost(),
++                                *this) {
++  tab_strip_model_observation_.Observe(tab_strip_model_);
++  RebuildTreeData();
++}
++
++HeliumTabTreeController::~HeliumTabTreeController() = default;
++
++// static
++HeliumTabTreeController* HeliumTabTreeController::From(
++    BrowserWindowInterface* browser_window) {
++  return Get(browser_window->GetUnownedUserDataHost());
++}
++
++// static
++const HeliumTabTreeController* HeliumTabTreeController::From(
++    const BrowserWindowInterface* browser_window) {
++  return Get(browser_window->GetUnownedUserDataHost());
++}
++
++int HeliumTabTreeController::GetDepthForTab(
++    const tabs::TabInterface* tab) const {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return 0;
++  }
++
++  auto it = depth_by_handle_.find(tab->GetHandle());
++  return it == depth_by_handle_.end() ? 0 : it->second;
++}
++
++int HeliumTabTreeController::GetMaxVisibleDepth() const {
++  return max_visible_depth_;
++}
++
++bool HeliumTabTreeController::IsTabVisible(
++    const tabs::TabInterface* tab) const {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return true;
++  }
++
++  return visible_tabs_.contains(tab->GetHandle());
++}
++
++bool HeliumTabTreeController::HasChildren(const tabs::TabInterface* tab) const {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return false;
++  }
++
++  auto it = children_by_parent_.find(tab->GetHandle());
++  return it != children_by_parent_.end() && !it->second.empty();
++}
++
++bool HeliumTabTreeController::HasParent(const tabs::TabInterface* tab) const {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return false;
++  }
++
++  auto it = tab_tree_state_.find(tab->GetHandle());
++  return it != tab_tree_state_.end() &&
++         it->second.parent != tabs::TabHandle::Null();
++}
++
++bool HeliumTabTreeController::IsSubtreeCollapsed(
++    const tabs::TabInterface* tab) const {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return false;
++  }
++
++  auto it = tab_tree_state_.find(tab->GetHandle());
++  return it != tab_tree_state_.end() && it->second.collapsed;
++}
++
++std::string HeliumTabTreeController::GetNodeIdForTab(
++    const tabs::TabInterface* tab) const {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return std::string();
++  }
++
++  auto it = tab_tree_state_.find(tab->GetHandle());
++  return it == tab_tree_state_.end() ? std::string() : it->second.node_id;
++}
++
++std::string HeliumTabTreeController::GetParentNodeIdForTab(
++    const tabs::TabInterface* tab) const {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return std::string();
++  }
++
++  auto it = tab_tree_state_.find(tab->GetHandle());
++  if (it == tab_tree_state_.end() ||
++      it->second.parent == tabs::TabHandle::Null()) {
++    return std::string();
++  }
++
++  auto parent_it = tab_tree_state_.find(it->second.parent);
++  return parent_it == tab_tree_state_.end() ? std::string()
++                                            : parent_it->second.node_id;
++}
++
++void HeliumTabTreeController::ToggleSubtreeCollapsed(
++    const tabs::TabInterface* tab) {
++  if (!tab || !CanParticipateInTree(tab) || !HasChildren(tab)) {
++    return;
++  }
++
++  auto state_it = tab_tree_state_.find(tab->GetHandle());
++  if (state_it == tab_tree_state_.end()) {
++    return;
++  }
++
++  state_it->second.collapsed = !state_it->second.collapsed;
++  const bool is_now_collapsed = state_it->second.collapsed;
++  RebuildTreeData();
++
++  if (is_now_collapsed) {
++    const tabs::TabInterface* active_tab =
++        tab_strip_model_ ? tab_strip_model_->GetActiveTab() : nullptr;
++    if (active_tab && active_tab != tab && !IsTabVisible(active_tab) &&
++        IsDescendantOf(active_tab, tab) && tab_strip_model_) {
++      const int index = tab_strip_model_->GetIndexOfTab(tab);
++      if (index != TabStripModel::kNoTab) {
++        tab_strip_model_->ActivateTabAt(
++            index, TabStripUserGestureDetails(
++                       TabStripUserGestureDetails::GestureType::kOther));
++      }
++    }
++  }
++
++  NotifyTreeChanged();
++}
++
++bool HeliumTabTreeController::MoveSubtreeForDrop(
++    const tabs::TabInterface* tab,
++    const tabs::TabInterface* target_tab,
++    DropPosition position) {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return false;
++  }
++
++  const tabs::TabHandle source_handle = tab->GetHandle();
++  const std::vector<tabs::TabHandle> moving_handles =
++      GetSubtreeHandlesInTreeOrder(source_handle);
++  if (moving_handles.empty()) {
++    return false;
++  }
++
++  tabs::TabHandle new_parent = tabs::TabHandle::Null();
++  tabs::TabHandle target_handle = tabs::TabHandle::Null();
++  auto source_it = tab_tree_state_.find(source_handle);
++  if (source_it == tab_tree_state_.end()) {
++    return false;
++  }
++
++  auto target_collapsed_it = tab_tree_state_.end();
++  if (position != DropPosition::kRootEnd) {
++    if (!target_tab || !CanParticipateInTree(target_tab)) {
++      return false;
++    }
++
++    target_handle = target_tab->GetHandle();
++    if (target_handle == source_handle ||
++        IsDescendantOf(target_handle, source_handle)) {
++      return false;
++    }
++
++    switch (position) {
++      case DropPosition::kBefore:
++      case DropPosition::kAfter: {
++        auto target_it = tab_tree_state_.find(target_handle);
++        new_parent = target_it == tab_tree_state_.end()
++                         ? tabs::TabHandle::Null()
++                         : target_it->second.parent;
++        break;
++      }
++      case DropPosition::kInto:
++        new_parent = target_handle;
++        target_collapsed_it = tab_tree_state_.find(target_handle);
++        break;
++      case DropPosition::kRootEnd:
++        break;
++    }
++  }
++
++  const int destination_index =
++      GetInsertionIndexAfterRemoving(moving_handles, target_handle, position);
++  if (destination_index < 0) {
++    return false;
++  }
++
++  const tabs::TabHandle old_parent = source_it->second.parent;
++  const bool old_target_collapsed =
++      target_collapsed_it == tab_tree_state_.end()
++          ? false
++          : target_collapsed_it->second.collapsed;
++
++  source_it->second.parent = new_parent;
++  source_it->second.pending_parent_node_id.clear();
++  if (target_collapsed_it != tab_tree_state_.end()) {
++    target_collapsed_it->second.collapsed = false;
++  }
++
++  if (!MoveSubtreeToIndex(tab, destination_index)) {
++    source_it->second.parent = old_parent;
++    source_it->second.pending_parent_node_id.clear();
++    if (target_collapsed_it != tab_tree_state_.end()) {
++      target_collapsed_it->second.collapsed = old_target_collapsed;
++    }
++    return false;
++  }
++
++  return true;
++}
++
++HeliumTabTreeController::DropPosition
++HeliumTabTreeController::ResolveDropPositionForTab(
++    const tabs::TabInterface* tab,
++    const tabs::TabInterface* target_tab,
++    bool has_position_hint,
++    DropPosition hinted_position) const {
++  if (has_position_hint || !tab || !target_tab ||
++      hinted_position != DropPosition::kInto) {
++    return hinted_position;
++  }
++
++  const tabs::TabHandle source_handle = tab->GetHandle();
++  const tabs::TabHandle target_handle = target_tab->GetHandle();
++  if (!HaveSameTreeParent(source_handle, target_handle)) {
++    return DropPosition::kInto;
++  }
++
++  const int source_index = GetIndexOfHandle(source_handle);
++  const int target_index = GetIndexOfHandle(target_handle);
++  if (source_index == TabStripModel::kNoTab ||
++      target_index == TabStripModel::kNoTab) {
++    return DropPosition::kInto;
++  }
++
++  return source_index < target_index ? DropPosition::kAfter
++                                     : DropPosition::kBefore;
++}
++
++bool HeliumTabTreeController::MoveSubtreeToIndex(const tabs::TabInterface* tab,
++                                                 int index) {
++  if (!tab || !CanParticipateInTree(tab) || !tab_strip_model_) {
++    return false;
++  }
++
++  const std::vector<tabs::TabHandle> moving_handles =
++      GetSubtreeHandlesInTreeOrder(tab->GetHandle());
++  if (moving_handles.empty()) {
++    return false;
++  }
++
++  std::vector<std::pair<int, tabs::TabHandle>> detach_order;
++  detach_order.reserve(moving_handles.size());
++  for (tabs::TabHandle handle : moving_handles) {
++    const int current_index = GetIndexOfHandle(handle);
++    if (current_index == TabStripModel::kNoTab) {
++      return false;
++    }
++    detach_order.emplace_back(current_index, handle);
++  }
++
++  const SavedSelectionState selection_state = CaptureSelectionState();
++
++  {
++    base::AutoReset<bool> move_refresh_suppressed(&move_refresh_suppressed_,
++                                                  true);
++    std::sort(detach_order.begin(), detach_order.end(),
++              [](const auto& lhs, const auto& rhs) {
++                return lhs.first > rhs.first;
++              });
++
++    std::map<tabs::TabHandle, std::unique_ptr<tabs::TabModel>> detached_tabs;
++    for (const auto& [current_index, handle] : detach_order) {
++      detached_tabs.emplace(handle,
++                            tab_strip_model_->DetachTabAtForInsertion(
++                                current_index));
++    }
++
++    int insertion_index = std::clamp(index, 0, tab_strip_model_->count());
++    for (tabs::TabHandle handle : moving_handles) {
++      auto detached_tab_it = detached_tabs.find(handle);
++      CHECK(detached_tab_it != detached_tabs.end());
++      CHECK(detached_tab_it->second);
++
++      insertion_index = tab_strip_model_->InsertDetachedTabAt(
++          insertion_index, std::move(detached_tab_it->second), 0,
++          std::nullopt);
++      ++insertion_index;
++    }
++
++    RestoreSelectionState(selection_state);
++  }
++
++  if (!drag_refresh_suppressed_) {
++    RefreshTreeAndNotify();
++  }
++  return true;
++}
++
++void HeliumTabTreeController::SetDragRefreshSuppressed(bool suppressed) {
++  if (drag_refresh_suppressed_ == suppressed) {
++    return;
++  }
++
++  drag_refresh_suppressed_ = suppressed;
++  if (!IsRefreshSuppressed()) {
++    RefreshTreeAndNotify();
++  }
++}
++
++base::CallbackListSubscription HeliumTabTreeController::RegisterOnTreeChanged(
++    TreeChangedCallback callback) {
++  return on_tree_changed_callback_list_.Add(std::move(callback));
++}
++
++void HeliumTabTreeController::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  (void)tab_strip_model;
++  if (!tab_strip_model_) {
++    return;
++  }
++
++  if (IsRefreshSuppressed()) {
++    return;
++  }
++
++  switch (change.type()) {
++    case TabStripModelChange::kInserted: {
++      if (const auto* insert = change.GetInsert()) {
++        for (const auto& content : insert->contents) {
++          HandleInsertedTab(content.tab);
++        }
++      }
++      break;
++    }
++    case TabStripModelChange::kRemoved: {
++      if (const auto* remove = change.GetRemove()) {
++        for (const auto& content : remove->contents) {
++          if (content.tab) {
++            PromoteChildrenAndErase(content.tab->GetHandle());
++          }
++        }
++      }
++      break;
++    }
++    default:
++      break;
++  }
++
++  // The tab strip is already updating active selection during active-tab change
++  // notifications. Activating another tab here trips TabStripModel reentrancy
++  // checks, so only do hidden-active correction on non-active refreshes.
++  RefreshTreeAndNotify(!selection.active_tab_changed());
++}
++
++void HeliumTabTreeController::OnTabPinnedStateChanged(tabs::TabInterface* tab,
++                                                      int index) {
++  (void)tab;
++  (void)index;
++  if (IsRefreshSuppressed()) {
++    return;
++  }
++  RefreshTreeAndNotify();
++}
++
++void HeliumTabTreeController::TabGroupedStateChanged(
++    TabStripModel* tab_strip_model,
++    std::optional<tab_groups::TabGroupId> old_group,
++    std::optional<tab_groups::TabGroupId> new_group,
++    tabs::TabInterface* tab,
++    int index) {
++  (void)tab_strip_model;
++  (void)old_group;
++  (void)new_group;
++  (void)tab;
++  (void)index;
++  if (IsRefreshSuppressed()) {
++    return;
++  }
++  RefreshTreeAndNotify();
++}
++
++void HeliumTabTreeController::OnSplitTabChanged(const SplitTabChange& change) {
++  (void)change;
++  if (IsRefreshSuppressed()) {
++    return;
++  }
++  RefreshTreeAndNotify();
++}
++
++void HeliumTabTreeController::OnTabStripModelDestroyed(
++    TabStripModel* tab_strip_model) {
++  (void)tab_strip_model;
++  tab_strip_model_observation_.Reset();
++  tab_strip_model_ = nullptr;
++  tab_tree_state_.clear();
++  depth_by_handle_.clear();
++  visible_tabs_.clear();
++  children_by_parent_.clear();
++  max_visible_depth_ = 0;
++}
++
++bool HeliumTabTreeController::CanParticipateInTree(
++    const tabs::TabInterface* tab) const {
++  return tab && tab->IsInNormalWindow() && !tab->IsPinned() &&
++         !tab->GetGroup().has_value() && !tab->IsSplit();
++}
++
++bool HeliumTabTreeController::IsRefreshSuppressed() const {
++  return drag_refresh_suppressed_ || move_refresh_suppressed_;
++}
++
++bool HeliumTabTreeController::ExpandAncestorsInternal(
++    const tabs::TabInterface* tab) {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return false;
++  }
++
++  bool changed = false;
++  tabs::TabHandle current = tab->GetHandle();
++  while (true) {
++    auto it = tab_tree_state_.find(current);
++    if (it == tab_tree_state_.end() ||
++        it->second.parent == tabs::TabHandle::Null()) {
++      break;
++    }
++
++    current = it->second.parent;
++    auto parent_it = tab_tree_state_.find(current);
++    if (parent_it == tab_tree_state_.end()) {
++      break;
++    }
++
++    if (parent_it->second.collapsed) {
++      parent_it->second.collapsed = false;
++      changed = true;
++    }
++  }
++
++  return changed;
++}
++
++bool HeliumTabTreeController::IsDescendantOf(tabs::TabHandle descendant,
++                                             tabs::TabHandle ancestor) const {
++  if (descendant == tabs::TabHandle::Null() ||
++      ancestor == tabs::TabHandle::Null() || descendant == ancestor) {
++    return false;
++  }
++
++  tabs::TabHandle current = descendant;
++  while (true) {
++    auto it = tab_tree_state_.find(current);
++    if (it == tab_tree_state_.end() ||
++        it->second.parent == tabs::TabHandle::Null()) {
++      return false;
++    }
++
++    current = it->second.parent;
++    if (current == ancestor) {
++      return true;
++    }
++  }
++}
++
++tabs::TabHandle HeliumTabTreeController::FindHandleByNodeId(
++    const std::string& node_id,
++    tabs::TabHandle exclude) const {
++  if (node_id.empty()) {
++    return tabs::TabHandle::Null();
++  }
++
++  for (const auto& [handle, state] : tab_tree_state_) {
++    if (handle != exclude && state.node_id == node_id) {
++      return handle;
++    }
++  }
++  return tabs::TabHandle::Null();
++}
++
++std::string HeliumTabTreeController::GenerateNodeId() const {
++  return base::Uuid::GenerateRandomV4().AsLowercaseString();
++}
++
++int HeliumTabTreeController::GetIndexOfHandle(tabs::TabHandle handle) const {
++  if (!tab_strip_model_ || handle == tabs::TabHandle::Null()) {
++    return TabStripModel::kNoTab;
++  }
++
++  for (int index = 0; index < tab_strip_model_->count(); ++index) {
++    tabs::TabInterface* tab = tab_strip_model_->GetTabAtIndex(index);
++    if (tab && tab->GetHandle() == handle) {
++      return index;
++    }
++  }
++
++  return TabStripModel::kNoTab;
++}
++
++tabs::TabInterface* HeliumTabTreeController::GetTabForHandle(
++    tabs::TabHandle handle) const {
++  if (!tab_strip_model_ || handle == tabs::TabHandle::Null()) {
++    return nullptr;
++  }
++
++  for (int index = 0; index < tab_strip_model_->count(); ++index) {
++    tabs::TabInterface* tab = tab_strip_model_->GetTabAtIndex(index);
++    if (tab && tab->GetHandle() == handle) {
++      return tab;
++    }
++  }
++  return nullptr;
++}
++
++tabs::TabInterface* HeliumTabTreeController::GetVisibleAncestor(
++    const tabs::TabInterface* tab) const {
++  if (!tab || !CanParticipateInTree(tab)) {
++    return nullptr;
++  }
++
++  tabs::TabHandle current = tab->GetHandle();
++  while (true) {
++    auto it = tab_tree_state_.find(current);
++    if (it == tab_tree_state_.end() ||
++        it->second.parent == tabs::TabHandle::Null()) {
++      return nullptr;
++    }
++
++    current = it->second.parent;
++    if (visible_tabs_.contains(current)) {
++      return GetTabForHandle(current);
++    }
++  }
++}
++
++bool HeliumTabTreeController::ShouldParentInsertedTabToOpener(
++    const tabs::TabInterface* tab) const {
++  if (!tab || !tab->GetContents()) {
++    return false;
++  }
++
++  content::NavigationEntry* entry =
++      tab->GetContents()->GetController().GetPendingEntry();
++  if (!entry) {
++    entry = tab->GetContents()->GetController().GetVisibleEntry();
++  }
++  if (!entry) {
++    entry = tab->GetContents()->GetController().GetLastCommittedEntry();
++  }
++
++  // Chrome intentionally gives Cmd+T/new-tab pages a temporary opener so close
++  // order feels natural. That opener is not a tree relationship.
++  return entry && ui::PageTransitionCoreTypeIs(entry->GetTransitionType(),
++                                               ui::PAGE_TRANSITION_LINK);
++}
++
++bool HeliumTabTreeController::IsDescendantOf(
++    const tabs::TabInterface* descendant,
++    const tabs::TabInterface* ancestor) const {
++  if (!descendant || !ancestor || descendant == ancestor) {
++    return false;
++  }
++
++  return IsDescendantOf(descendant->GetHandle(), ancestor->GetHandle());
++}
++
++void HeliumTabTreeController::CollectSubtreeHandlesInTreeOrder(
++    tabs::TabHandle handle,
++    std::vector<tabs::TabHandle>* handles) const {
++  if (!handles || handle == tabs::TabHandle::Null()) {
++    return;
++  }
++
++  handles->push_back(handle);
++  if (auto it = children_by_parent_.find(handle); it != children_by_parent_.end()) {
++    for (tabs::TabHandle child : it->second) {
++      CollectSubtreeHandlesInTreeOrder(child, handles);
++    }
++  }
++}
++
++std::vector<tabs::TabHandle> HeliumTabTreeController::GetSubtreeHandlesInTreeOrder(
++    tabs::TabHandle handle) const {
++  std::vector<tabs::TabHandle> handles;
++  if (handle == tabs::TabHandle::Null()) {
++    return handles;
++  }
++
++  CollectSubtreeHandlesInTreeOrder(handle, &handles);
++  return handles;
++}
++
++bool HeliumTabTreeController::HaveSameTreeParent(
++    tabs::TabHandle left,
++    tabs::TabHandle right) const {
++  auto left_it = tab_tree_state_.find(left);
++  auto right_it = tab_tree_state_.find(right);
++  if (left_it == tab_tree_state_.end() ||
++      right_it == tab_tree_state_.end()) {
++    return false;
++  }
++
++  return left_it->second.parent == right_it->second.parent;
++}
++
++int HeliumTabTreeController::GetInsertionIndexAfterRemoving(
++    const std::vector<tabs::TabHandle>& moving_handles,
++    tabs::TabHandle target_handle,
++    DropPosition position) const {
++  if (!tab_strip_model_) {
++    return -1;
++  }
++
++  std::set<tabs::TabHandle> moving_set(moving_handles.begin(),
++                                       moving_handles.end());
++  std::vector<tabs::TabHandle> remaining_handles;
++  remaining_handles.reserve(static_cast<size_t>(std::max(
++      0, tab_strip_model_->count() - static_cast<int>(moving_set.size()))));
++  for (int index = 0; index < tab_strip_model_->count(); ++index) {
++    const tabs::TabInterface* tab = tab_strip_model_->GetTabAtIndex(index);
++    if (!tab || moving_set.contains(tab->GetHandle())) {
++      continue;
++    }
++    remaining_handles.push_back(tab->GetHandle());
++  }
++
++  if (position == DropPosition::kRootEnd) {
++    return static_cast<int>(remaining_handles.size());
++  }
++
++  int target_index = -1;
++  int after_target_subtree = -1;
++  for (size_t index = 0; index < remaining_handles.size(); ++index) {
++    const tabs::TabHandle candidate = remaining_handles[index];
++    if (candidate == target_handle && target_index == -1) {
++      target_index = static_cast<int>(index);
++    }
++    if (candidate == target_handle || IsDescendantOf(candidate, target_handle)) {
++      after_target_subtree = static_cast<int>(index) + 1;
++    }
++  }
++
++  switch (position) {
++    case DropPosition::kBefore:
++      return target_index;
++    case DropPosition::kAfter:
++    case DropPosition::kInto:
++      return after_target_subtree;
++    case DropPosition::kRootEnd:
++      return static_cast<int>(remaining_handles.size());
++  }
++
++  return -1;
++}
++
++HeliumTabTreeController::SavedSelectionState
++HeliumTabTreeController::CaptureSelectionState() const {
++  SavedSelectionState selection_state;
++  if (!tab_strip_model_) {
++    return selection_state;
++  }
++
++  const ui::ListSelectionModel& selection_model =
++      tab_strip_model_->selection_model().GetListSelectionModel();
++  for (int index : selection_model.selected_indices()) {
++    const tabs::TabInterface* tab = tab_strip_model_->GetTabAtIndex(index);
++    if (tab) {
++      selection_state.selected_handles.push_back(tab->GetHandle());
++    }
++  }
++
++  if (selection_model.active().has_value()) {
++    const int active_index = static_cast<int>(selection_model.active().value());
++    if (tab_strip_model_->ContainsIndex(active_index)) {
++      selection_state.active_handle =
++          tab_strip_model_->GetTabAtIndex(active_index)->GetHandle();
++    }
++  }
++
++  if (selection_model.anchor().has_value()) {
++    const int anchor_index = static_cast<int>(selection_model.anchor().value());
++    if (tab_strip_model_->ContainsIndex(anchor_index)) {
++      selection_state.anchor_handle =
++          tab_strip_model_->GetTabAtIndex(anchor_index)->GetHandle();
++    }
++  }
++
++  return selection_state;
++}
++
++void HeliumTabTreeController::RestoreSelectionState(
++    const SavedSelectionState& selection_state) {
++  if (!tab_strip_model_) {
++    return;
++  }
++
++  ui::ListSelectionModel selection_model;
++  for (tabs::TabHandle handle : selection_state.selected_handles) {
++    const int index = GetIndexOfHandle(handle);
++    if (index != TabStripModel::kNoTab) {
++      selection_model.AddIndexToSelection(static_cast<size_t>(index));
++    }
++  }
++
++  if (selection_model.empty()) {
++    return;
++  }
++
++  int active_index = GetIndexOfHandle(selection_state.active_handle);
++  if (active_index == TabStripModel::kNoTab) {
++    active_index = static_cast<int>(*selection_model.selected_indices().begin());
++  }
++
++  int anchor_index = GetIndexOfHandle(selection_state.anchor_handle);
++  if (anchor_index == TabStripModel::kNoTab) {
++    anchor_index = active_index;
++  }
++
++  selection_model.set_active(static_cast<size_t>(active_index));
++  selection_model.set_anchor(static_cast<size_t>(anchor_index));
++  tab_strip_model_->SetSelectionFromModel(selection_model);
++}
++
++void HeliumTabTreeController::HandleInsertedTab(const tabs::TabInterface* tab) {
++  if (!tab) {
++    return;
++  }
++
++  const tabs::TabHandle handle = tab->GetHandle();
++  if (!CanParticipateInTree(tab)) {
++    PromoteChildrenAndErase(handle);
++    return;
++  }
++
++  auto& state = tab_tree_state_[handle];
++  state.parent = tabs::TabHandle::Null();
++  if (state.node_id.empty()) {
++    state.node_id = GenerateNodeId();
++  }
++
++  if (const auto* restored_state =
++          helium::HeliumTabTreeRestoreData::FromWebContents(tab->GetContents());
++      restored_state && !restored_state->state().node_id.empty()) {
++    state.node_id = restored_state->state().node_id;
++    if (FindHandleByNodeId(state.node_id, handle) != tabs::TabHandle::Null()) {
++      state.node_id = GenerateNodeId();
++    }
++    state.collapsed = restored_state->state().collapsed;
++
++    state.pending_parent_node_id = restored_state->state().parent_node_id;
++    const tabs::TabHandle restored_parent = FindHandleByNodeId(
++        state.pending_parent_node_id, handle);
++    if (restored_parent != tabs::TabHandle::Null()) {
++      state.parent = restored_parent;
++      state.pending_parent_node_id.clear();
++    }
++    if (tab_strip_model_ && tab_strip_model_->GetActiveTab() == tab) {
++      ExpandAncestorsInternal(tab);
++    }
++    return;
++  }
++
++  if (!tab_strip_model_) {
++    return;
++  }
++
++  const int index = tab_strip_model_->GetIndexOfTab(tab);
++  if (index == TabStripModel::kNoTab) {
++    return;
++  }
++
++  const tabs::TabInterface* opener = tab_strip_model_->GetOpenerOfTabAt(index);
++  if (!CanParticipateInTree(opener) || !ShouldParentInsertedTabToOpener(tab)) {
++    return;
++  }
++
++  const int opener_index = tab_strip_model_->GetIndexOfTab(opener);
++  if (opener_index == TabStripModel::kNoTab || opener_index >= index) {
++    return;
++  }
++
++  state.parent = opener->GetHandle();
++  state.pending_parent_node_id.clear();
++  if (tab_strip_model_->GetActiveTab() == tab) {
++    ExpandAncestorsInternal(tab);
++  }
++}
++
++void HeliumTabTreeController::PromoteChildrenAndErase(tabs::TabHandle handle) {
++  auto it = tab_tree_state_.find(handle);
++  if (it == tab_tree_state_.end()) {
++    return;
++  }
++
++  const tabs::TabHandle parent = it->second.parent;
++  for (tabs::TabHandle child : GetChildrenOf(handle)) {
++    auto child_it = tab_tree_state_.find(child);
++    if (child_it != tab_tree_state_.end()) {
++      child_it->second.parent = parent;
++      child_it->second.pending_parent_node_id.clear();
++    }
++  }
++
++  tab_tree_state_.erase(it);
++}
++
++void HeliumTabTreeController::RebuildTreeData() {
++  depth_by_handle_.clear();
++  visible_tabs_.clear();
++  children_by_parent_.clear();
++  max_visible_depth_ = 0;
++
++  if (!tab_strip_model_) {
++    return;
++  }
++
++  std::set<tabs::TabHandle> eligible_handles;
++  std::map<tabs::TabHandle, int> model_index_by_handle;
++  std::set<std::string> seen_node_ids;
++  std::vector<tabs::TabHandle> ancestor_stack;
++  for (int index = 0; index < tab_strip_model_->count(); ++index) {
++    const tabs::TabInterface* tab = tab_strip_model_->GetTabAtIndex(index);
++    if (!CanParticipateInTree(tab)) {
++      continue;
++    }
++
++    const tabs::TabHandle handle = tab->GetHandle();
++    eligible_handles.insert(handle);
++    model_index_by_handle.emplace(handle, index);
++    auto& state = tab_tree_state_[handle];
++    if (state.node_id.empty() ||
++        !seen_node_ids.insert(state.node_id).second) {
++      do {
++        state.node_id = GenerateNodeId();
++      } while (!seen_node_ids.insert(state.node_id).second);
++    }
++  }
++
++  for (auto& [handle, state] : tab_tree_state_) {
++    if (state.parent != tabs::TabHandle::Null() ||
++        state.pending_parent_node_id.empty()) {
++      continue;
++    }
++
++    const tabs::TabHandle restored_parent =
++        FindHandleByNodeId(state.pending_parent_node_id, handle);
++    auto child_index_it = model_index_by_handle.find(handle);
++    auto parent_index_it = model_index_by_handle.find(restored_parent);
++    if (restored_parent != tabs::TabHandle::Null() &&
++        child_index_it != model_index_by_handle.end() &&
++        parent_index_it != model_index_by_handle.end() &&
++        parent_index_it->second < child_index_it->second) {
++      state.parent = restored_parent;
++      state.pending_parent_node_id.clear();
++    }
++  }
++
++  std::vector<tabs::TabHandle> stale_handles;
++  for (const auto& [handle, state] : tab_tree_state_) {
++    if (!eligible_handles.contains(handle)) {
++      stale_handles.push_back(handle);
++    }
++  }
++  for (tabs::TabHandle handle : stale_handles) {
++    PromoteChildrenAndErase(handle);
++  }
++
++  for (int index = 0; index < tab_strip_model_->count(); ++index) {
++    const tabs::TabInterface* tab = tab_strip_model_->GetTabAtIndex(index);
++    if (!CanParticipateInTree(tab)) {
++      continue;
++    }
++
++    const tabs::TabHandle handle = tab->GetHandle();
++    auto& state = tab_tree_state_[handle];
++
++    if (state.parent == handle) {
++      state.parent = tabs::TabHandle::Null();
++    }
++
++    if (state.parent != tabs::TabHandle::Null()) {
++      auto parent_index_it = model_index_by_handle.find(state.parent);
++      if (parent_index_it == model_index_by_handle.end() ||
++          parent_index_it->second >= index) {
++        state.parent = tabs::TabHandle::Null();
++      }
++    }
++    if (state.parent != tabs::TabHandle::Null()) {
++      auto parent_it =
++          std::ranges::find(ancestor_stack, state.parent);
++      if (parent_it == ancestor_stack.end()) {
++        state.parent = tabs::TabHandle::Null();
++      } else {
++        ancestor_stack.erase(parent_it + 1, ancestor_stack.end());
++      }
++    }
++
++    int depth = 0;
++    bool visible = true;
++    if (state.parent != tabs::TabHandle::Null()) {
++      children_by_parent_[state.parent].push_back(handle);
++
++      auto depth_it = depth_by_handle_.find(state.parent);
++      if (depth_it != depth_by_handle_.end()) {
++        depth = depth_it->second + 1;
++      }
++
++      visible = visible_tabs_.contains(state.parent) &&
++                !tab_tree_state_.at(state.parent).collapsed;
++    }
++
++    depth_by_handle_[handle] = depth;
++    if (visible) {
++      visible_tabs_.insert(handle);
++      max_visible_depth_ = std::max(max_visible_depth_, depth);
++    }
++    ancestor_stack.push_back(handle);
++  }
++}
++
++void HeliumTabTreeController::RefreshTreeAndNotify(
++    bool allow_active_tab_correction) {
++  RebuildTreeData();
++
++  const tabs::TabInterface* active_tab =
++      tab_strip_model_ ? tab_strip_model_->GetActiveTab() : nullptr;
++  if (allow_active_tab_correction && active_tab && !IsTabVisible(active_tab) &&
++      tab_strip_model_) {
++    if (tabs::TabInterface* visible_ancestor = GetVisibleAncestor(active_tab)) {
++      const int index = tab_strip_model_->GetIndexOfTab(visible_ancestor);
++      if (index != TabStripModel::kNoTab) {
++        tab_strip_model_->ActivateTabAt(
++            index, TabStripUserGestureDetails(
++                       TabStripUserGestureDetails::GestureType::kOther));
++      }
++    } else if (ExpandAncestorsInternal(active_tab)) {
++      RebuildTreeData();
++    }
++  }
++
++  NotifyTreeChanged();
++}
++
++void HeliumTabTreeController::NotifyTreeChanged() {
++  on_tree_changed_callback_list_.Notify(this);
++}
++
++std::vector<tabs::TabHandle> HeliumTabTreeController::GetChildrenOf(
++    tabs::TabHandle handle) const {
++  if (auto it = children_by_parent_.find(handle);
++      it != children_by_parent_.end()) {
++    return it->second;
++  }
++  return {};
++}
+
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_tab_tree_controller.h
+@@ -0,0 +1,151 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_CONTROLLER_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_CONTROLLER_H_
++
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++namespace tabs {
++class TabInterface;
++}
++
++class HeliumTabTreeController : public TabStripModelObserver {
++ public:
++  DECLARE_USER_DATA(HeliumTabTreeController);
++
++  enum class DropPosition {
++    kBefore,
++    kAfter,
++    kInto,
++    kRootEnd,
++  };
++
++  explicit HeliumTabTreeController(BrowserWindowInterface* browser_window,
++                                   TabStripModel* tab_strip_model);
++  HeliumTabTreeController(const HeliumTabTreeController&) = delete;
++  HeliumTabTreeController& operator=(const HeliumTabTreeController&) = delete;
++  ~HeliumTabTreeController() override;
++
++  static HeliumTabTreeController* From(BrowserWindowInterface* browser_window);
++  static const HeliumTabTreeController* From(
++      const BrowserWindowInterface* browser_window);
++
++  int GetDepthForTab(const tabs::TabInterface* tab) const;
++  int GetMaxVisibleDepth() const;
++  bool IsTabVisible(const tabs::TabInterface* tab) const;
++  bool HasChildren(const tabs::TabInterface* tab) const;
++  bool HasParent(const tabs::TabInterface* tab) const;
++  bool IsSubtreeCollapsed(const tabs::TabInterface* tab) const;
++  std::string GetNodeIdForTab(const tabs::TabInterface* tab) const;
++  std::string GetParentNodeIdForTab(const tabs::TabInterface* tab) const;
++  void ToggleSubtreeCollapsed(const tabs::TabInterface* tab);
++  bool MoveSubtreeForDrop(const tabs::TabInterface* tab,
++                          const tabs::TabInterface* target_tab,
++                          DropPosition position);
++  bool MoveSubtreeToIndex(const tabs::TabInterface* tab, int index);
++  DropPosition ResolveDropPositionForTab(const tabs::TabInterface* tab,
++                                         const tabs::TabInterface* target_tab,
++                                         bool has_position_hint,
++                                         DropPosition hinted_position) const;
++  bool IsDescendantOf(const tabs::TabInterface* descendant,
++                      const tabs::TabInterface* ancestor) const;
++  void SetDragRefreshSuppressed(bool suppressed);
++
++  using TreeChangedCallback =
++      base::RepeatingCallback<void(HeliumTabTreeController*)>;
++  base::CallbackListSubscription RegisterOnTreeChanged(
++      TreeChangedCallback callback);
++
++ private:
++  struct TabTreeState {
++    tabs::TabHandle parent = tabs::TabHandle::Null();
++    std::string node_id;
++    std::string pending_parent_node_id;
++    bool collapsed = false;
++  };
++
++  struct SavedSelectionState {
++    std::vector<tabs::TabHandle> selected_handles;
++    tabs::TabHandle active_handle = tabs::TabHandle::Null();
++    tabs::TabHandle anchor_handle = tabs::TabHandle::Null();
++  };
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void TabGroupedStateChanged(
++      TabStripModel* tab_strip_model,
++      std::optional<tab_groups::TabGroupId> old_group,
++      std::optional<tab_groups::TabGroupId> new_group,
++      tabs::TabInterface* tab,
++      int index) override;
++  void OnSplitTabChanged(const SplitTabChange& change) override;
++  void OnTabStripModelDestroyed(TabStripModel* tab_strip_model) override;
++
++  bool CanParticipateInTree(const tabs::TabInterface* tab) const;
++  bool IsRefreshSuppressed() const;
++  bool ExpandAncestorsInternal(const tabs::TabInterface* tab);
++  bool IsDescendantOf(tabs::TabHandle descendant,
++                      tabs::TabHandle ancestor) const;
++  tabs::TabHandle FindHandleByNodeId(
++      const std::string& node_id,
++      tabs::TabHandle exclude = tabs::TabHandle::Null()) const;
++  std::string GenerateNodeId() const;
++  int GetIndexOfHandle(tabs::TabHandle handle) const;
++  tabs::TabInterface* GetTabForHandle(tabs::TabHandle handle) const;
++  tabs::TabInterface* GetVisibleAncestor(const tabs::TabInterface* tab) const;
++  bool ShouldParentInsertedTabToOpener(const tabs::TabInterface* tab) const;
++  void CollectSubtreeHandlesInTreeOrder(
++      tabs::TabHandle handle,
++      std::vector<tabs::TabHandle>* handles) const;
++  std::vector<tabs::TabHandle> GetSubtreeHandlesInTreeOrder(
++      tabs::TabHandle handle) const;
++  bool HaveSameTreeParent(tabs::TabHandle left,
++                          tabs::TabHandle right) const;
++  int GetInsertionIndexAfterRemoving(
++      const std::vector<tabs::TabHandle>& moving_handles,
++      tabs::TabHandle target_handle,
++      DropPosition position) const;
++  SavedSelectionState CaptureSelectionState() const;
++  void RestoreSelectionState(const SavedSelectionState& selection_state);
++  void HandleInsertedTab(const tabs::TabInterface* tab);
++  void PromoteChildrenAndErase(tabs::TabHandle handle);
++  void RebuildTreeData();
++  void RefreshTreeAndNotify(bool allow_active_tab_correction = true);
++  void NotifyTreeChanged();
++  std::vector<tabs::TabHandle> GetChildrenOf(tabs::TabHandle handle) const;
++
++  raw_ptr<TabStripModel> tab_strip_model_ = nullptr;
++  std::map<tabs::TabHandle, TabTreeState> tab_tree_state_;
++  std::map<tabs::TabHandle, int> depth_by_handle_;
++  std::set<tabs::TabHandle> visible_tabs_;
++  std::map<tabs::TabHandle, std::vector<tabs::TabHandle>> children_by_parent_;
++  int max_visible_depth_ = 0;
++  base::RepeatingCallbackList<void(HeliumTabTreeController*)>
++      on_tree_changed_callback_list_;
++  base::ScopedObservation<TabStripModel, HeliumTabTreeController>
++      tab_strip_model_observation_{this};
++  ui::ScopedUnownedUserData<HeliumTabTreeController>
++      scoped_unowned_user_data_;
++  bool drag_refresh_suppressed_ = false;
++  bool move_refresh_suppressed_ = false;
++};
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_CONTROLLER_H_
+
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_restore_helper.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -152,6 +153,8 @@ std::map<std::string, std::string> BrowserLiveTabContext::GetExtraDataForTab(
+     int index) const {
+   std::map<std::string, std::string> extra_data;
+
++  helium::PopulateHeliumTabTreeExtraData(
++      tab_strip_model_->GetWebContentsAt(index), &extra_data);
+   glic::PopulateGlicExtraData(tab_strip_model_->GetWebContentsAt(index),
+                               &extra_data);
+
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -18,6 +18,7 @@
+ #include "chrome/browser/tab_contents/tab_util.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_restore_helper.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+@@ -84,6 +85,8 @@ std::unique_ptr<WebContents> CreateRestoredTab(
+   apps::SetAppIdForWebContents(browser->profile(), web_contents.get(),
+                                extension_app_id);
+
++  helium::RestoreHeliumTabTreeStateFromExtraData(web_contents.get(),
++                                                 extra_data);
+   glic::RestoreGlicStateFromExtraData(web_contents.get(), extra_data);
+
+   std::vector<std::unique_ptr<NavigationEntry>> entries =
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view_browsertest.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view_browsertest.cc
+@@ -4,6 +4,8 @@
+
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h"
+
++#include <map>
++
+ #include "base/functional/callback_helpers.h"
+ #include "base/run_loop.h"
+ #include "base/test/metrics/histogram_tester.h"
+@@ -14,7 +16,10 @@
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/browser_live_tab_context.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_controller.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_restore_helper.h"
+ #include "chrome/browser/ui/recently_audible_helper.h"
+ #include "chrome/browser/ui/tab_contents/core_tab_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert.h"
+@@ -30,6 +35,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/root_tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_split_tab_view.h"
++#include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
+ #include "chrome/browser/ui/views/test/vertical_tabs_browser_test_mixin.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "chrome/test/base/in_process_browser_test.h"
+@@ -429,43 +435,355 @@ IN_PROC_BROWSER_TEST_F(VerticalTabViewTe
+   const tabs::TabInterface* child_tab = tab_strip_model()->GetActiveTab();
+   ASSERT_NE(parent_tab, child_tab);
+
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(3, tab_strip_model()->count());
++
++  const tabs::TabInterface* grandchild_tab =
++      tab_strip_model()->GetActiveTab();
++  ASSERT_NE(child_tab, grandchild_tab);
++
+   auto& features = browser()->GetFeatures();
+   EXPECT_EQ(1, features.GetHeliumTabTreeDepth(child_tab));
++  EXPECT_EQ(2, features.GetHeliumTabTreeDepth(grandchild_tab));
+   EXPECT_TRUE(features.HeliumTabTreeHasChildren(parent_tab));
++  EXPECT_TRUE(features.HeliumTabTreeHasChildren(child_tab));
+   EXPECT_TRUE(features.IsHeliumTabTreeVisible(child_tab));
++  EXPECT_TRUE(features.IsHeliumTabTreeVisible(grandchild_tab));
+
+   TabCollectionNode* parent_node =
+       unpinned_collection_node()->GetNodeForHandle(parent_tab->GetHandle());
+   TabCollectionNode* child_node =
+       unpinned_collection_node()->GetNodeForHandle(child_tab->GetHandle());
++  TabCollectionNode* grandchild_node =
++      unpinned_collection_node()->GetNodeForHandle(
++          grandchild_tab->GetHandle());
+   ASSERT_TRUE(parent_node);
+   ASSERT_TRUE(child_node);
++  ASSERT_TRUE(grandchild_node);
+
+   auto* parent_view = views::AsViewClass<VerticalTabView>(parent_node->view());
+   auto* child_view = views::AsViewClass<VerticalTabView>(child_node->view());
++  auto* grandchild_view =
++      views::AsViewClass<VerticalTabView>(grandchild_node->view());
+   ASSERT_TRUE(parent_view);
+   ASSERT_TRUE(child_view);
++  ASSERT_TRUE(grandchild_view);
+
+   RunScheduledLayouts();
+   WaitForLayout(parent_view);
+   WaitForLayout(child_view);
++  WaitForLayout(grandchild_view);
+
+   auto* parent_icon = views::AsViewClass<TabIcon>(
+       parent_view->GetViewByElementId(kTabIconElementId));
+   auto* child_icon = views::AsViewClass<TabIcon>(
+       child_view->GetViewByElementId(kTabIconElementId));
++  auto* grandchild_icon = views::AsViewClass<TabIcon>(
++      grandchild_view->GetViewByElementId(kTabIconElementId));
+   ASSERT_TRUE(parent_icon);
+   ASSERT_TRUE(child_icon);
+-  EXPECT_GT(child_icon->bounds().x(), parent_icon->bounds().x());
++  ASSERT_TRUE(grandchild_icon);
++  EXPECT_GE(child_icon->bounds().x(), parent_icon->bounds().right());
++  EXPECT_GE(grandchild_icon->bounds().x(), child_icon->bounds().right());
+
+   features.ToggleHeliumTabTreeCollapsed(parent_tab);
+
+   ASSERT_TRUE(base::test::RunUntil([&]() { return !child_view->GetVisible(); }));
++  EXPECT_FALSE(grandchild_view->GetVisible());
+   EXPECT_EQ(parent_tab, tab_strip_model()->GetActiveTab());
+   EXPECT_TRUE(features.IsHeliumTabTreeCollapsed(parent_tab));
+ }
+
+ IN_PROC_BROWSER_TEST_F(VerticalTabViewTest,
++                       TreeTabsCollapseShrinksBottomButtonGap) {
++  const tabs::TabInterface* parent_tab = tab_strip_model()->GetActiveTab();
++
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(2, tab_strip_model()->count());
++
++  const tabs::TabInterface* child_tab = tab_strip_model()->GetActiveTab();
++  ASSERT_NE(parent_tab, child_tab);
++
++  TabCollectionNode* child_node =
++      unpinned_collection_node()->GetNodeForHandle(child_tab->GetHandle());
++  ASSERT_TRUE(child_node);
++  auto* child_view = views::AsViewClass<VerticalTabView>(child_node->view());
++  ASSERT_TRUE(child_view);
++
++  VerticalTabStripRegionView* const region_view =
++      browser()->GetBrowserView().vertical_tab_strip_region_view_for_testing();
++  ASSERT_TRUE(region_view);
++  auto* bottom_container = region_view->GetBottomContainer();
++  ASSERT_TRUE(bottom_container);
++
++  RunScheduledLayouts();
++  WaitForLayout(region_view);
++  const int expanded_bottom_container_y = bottom_container->y();
++
++  browser()->GetFeatures().ToggleHeliumTabTreeCollapsed(parent_tab);
++
++  ASSERT_TRUE(base::test::RunUntil([&]() { return !child_view->GetVisible(); }));
++  ASSERT_TRUE(base::test::RunUntil([&]() {
++    RunScheduledLayouts();
++    return bottom_container->y() < expanded_bottom_container_y;
++  }));
++}
++
++IN_PROC_BROWSER_TEST_F(VerticalTabViewTest,
++                       TreeTabsActiveChildOpenedFromCollapsedParentIsVisible) {
++  const tabs::TabInterface* parent_tab = tab_strip_model()->GetActiveTab();
++
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(2, tab_strip_model()->count());
++
++  const tabs::TabInterface* first_child = tab_strip_model()->GetActiveTab();
++  ASSERT_NE(parent_tab, first_child);
++
++  auto& features = browser()->GetFeatures();
++  features.ToggleHeliumTabTreeCollapsed(parent_tab);
++  EXPECT_EQ(parent_tab, tab_strip_model()->GetActiveTab());
++  EXPECT_TRUE(features.IsHeliumTabTreeCollapsed(parent_tab));
++
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(3, tab_strip_model()->count());
++
++  const tabs::TabInterface* second_child = tab_strip_model()->GetActiveTab();
++  EXPECT_EQ(1, features.GetHeliumTabTreeDepth(second_child));
++  EXPECT_FALSE(features.IsHeliumTabTreeCollapsed(parent_tab));
++  EXPECT_TRUE(features.IsHeliumTabTreeVisible(second_child));
++
++  TabCollectionNode* child_node =
++      unpinned_collection_node()->GetNodeForHandle(second_child->GetHandle());
++  ASSERT_TRUE(child_node);
++  EXPECT_TRUE(child_node->view()->GetVisible());
++}
++
++IN_PROC_BROWSER_TEST_F(VerticalTabViewTest,
++                       TreeTabsPersistAndRestoreFromExtraData) {
++  const tabs::TabInterface* original_parent = tab_strip_model()->GetActiveTab();
++
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(2, tab_strip_model()->count());
++
++  const tabs::TabInterface* original_child = tab_strip_model()->GetActiveTab();
++  auto& features = browser()->GetFeatures();
++  features.ToggleHeliumTabTreeCollapsed(original_parent);
++  ASSERT_TRUE(features.IsHeliumTabTreeCollapsed(original_parent));
++
++  BrowserLiveTabContext* live_tab_context = features.live_tab_context();
++  ASSERT_TRUE(live_tab_context);
++
++  const std::map<std::string, std::string> parent_extra_data =
++      live_tab_context->GetExtraDataForTab(
++          tab_strip_model()->GetIndexOfTab(original_parent));
++  const std::map<std::string, std::string> child_extra_data =
++      live_tab_context->GetExtraDataForTab(
++          tab_strip_model()->GetIndexOfTab(original_child));
++
++  auto parent_node_id = parent_extra_data.find("helium.tree.node_id");
++  ASSERT_NE(parent_node_id, parent_extra_data.end());
++  EXPECT_EQ("true", parent_extra_data.at("helium.tree.collapsed"));
++  EXPECT_EQ(parent_node_id->second,
++            child_extra_data.at("helium.tree.parent_node_id"));
++
++  Browser* restored_browser = CreateBrowser(browser()->profile());
++  ASSERT_TRUE(restored_browser);
++  TabStripModel* restored_model = restored_browser->tab_strip_model();
++  ASSERT_TRUE(restored_model);
++
++  auto restored_parent_contents = content::WebContents::Create(
++      content::WebContents::CreateParams(browser()->profile()));
++  helium::RestoreHeliumTabTreeStateFromExtraData(restored_parent_contents.get(),
++                                                 parent_extra_data);
++  restored_model->AddWebContents(std::move(restored_parent_contents), -1,
++                                 ui::PAGE_TRANSITION_TYPED, ADD_ACTIVE,
++                                 std::nullopt);
++
++  auto restored_child_contents = content::WebContents::Create(
++      content::WebContents::CreateParams(browser()->profile()));
++  helium::RestoreHeliumTabTreeStateFromExtraData(restored_child_contents.get(),
++                                                 child_extra_data);
++  restored_model->AddWebContents(std::move(restored_child_contents), -1,
++                                 ui::PAGE_TRANSITION_TYPED, ADD_ACTIVE,
++                                 std::nullopt);
++
++  const tabs::TabInterface* restored_parent =
++      restored_model->GetTabAtIndex(restored_model->count() - 2);
++  const tabs::TabInterface* restored_child =
++      restored_model->GetTabAtIndex(restored_model->count() - 1);
++  auto& restored_features = restored_browser->GetFeatures();
++
++  EXPECT_EQ(1, restored_features.GetHeliumTabTreeDepth(restored_child));
++  EXPECT_TRUE(restored_features.HeliumTabTreeHasChildren(restored_parent));
++  EXPECT_FALSE(restored_features.IsHeliumTabTreeCollapsed(restored_parent));
++  EXPECT_TRUE(restored_features.IsHeliumTabTreeVisible(restored_child));
++  EXPECT_EQ(restored_child, restored_model->GetActiveTab());
++}
++
++IN_PROC_BROWSER_TEST_F(VerticalTabViewTest,
++                       TreeTabsRestoreChildBeforeParentInsertion) {
++  const tabs::TabInterface* original_parent = tab_strip_model()->GetActiveTab();
++
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(2, tab_strip_model()->count());
++
++  const tabs::TabInterface* original_child = tab_strip_model()->GetActiveTab();
++
++  BrowserLiveTabContext* live_tab_context =
++      browser()->GetFeatures().live_tab_context();
++  ASSERT_TRUE(live_tab_context);
++
++  const std::map<std::string, std::string> parent_extra_data =
++      live_tab_context->GetExtraDataForTab(
++          tab_strip_model()->GetIndexOfTab(original_parent));
++  const std::map<std::string, std::string> child_extra_data =
++      live_tab_context->GetExtraDataForTab(
++          tab_strip_model()->GetIndexOfTab(original_child));
++
++  Browser* restored_browser = CreateBrowser(browser()->profile());
++  ASSERT_TRUE(restored_browser);
++  TabStripModel* restored_model = restored_browser->tab_strip_model();
++  ASSERT_TRUE(restored_model);
++
++  auto restored_child_contents = content::WebContents::Create(
++      content::WebContents::CreateParams(browser()->profile()));
++  helium::RestoreHeliumTabTreeStateFromExtraData(restored_child_contents.get(),
++                                                 child_extra_data);
++  restored_model->AddWebContents(std::move(restored_child_contents), -1,
++                                 ui::PAGE_TRANSITION_TYPED, ADD_ACTIVE,
++                                 std::nullopt);
++
++  auto restored_parent_contents = content::WebContents::Create(
++      content::WebContents::CreateParams(browser()->profile()));
++  helium::RestoreHeliumTabTreeStateFromExtraData(restored_parent_contents.get(),
++                                                 parent_extra_data);
++  restored_model->AddWebContents(std::move(restored_parent_contents),
++                                 restored_model->count() - 1,
++                                 ui::PAGE_TRANSITION_TYPED, ADD_ACTIVE,
++                                 std::nullopt);
++
++  const tabs::TabInterface* restored_parent =
++      restored_model->GetTabAtIndex(restored_model->count() - 2);
++  const tabs::TabInterface* restored_child =
++      restored_model->GetTabAtIndex(restored_model->count() - 1);
++  auto& restored_features = restored_browser->GetFeatures();
++
++  EXPECT_EQ(1, restored_features.GetHeliumTabTreeDepth(restored_child));
++  EXPECT_TRUE(restored_features.HeliumTabTreeHasChildren(restored_parent));
++}
++
++IN_PROC_BROWSER_TEST_F(VerticalTabViewTest, TreeTabsMoveSubtreeIntoNewParent) {
++  HeliumTabTreeController* controller =
++      HeliumTabTreeController::From(browser());
++  ASSERT_TRUE(controller);
++
++  const tabs::TabInterface* original_parent = tab_strip_model()->GetActiveTab();
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(2, tab_strip_model()->count());
++  const tabs::TabInterface* original_child = tab_strip_model()->GetActiveTab();
++
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_TYPED, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(3, tab_strip_model()->count());
++  const tabs::TabInterface* new_parent = tab_strip_model()->GetActiveTab();
++
++  ASSERT_TRUE(controller->MoveSubtreeForDrop(
++      original_parent, new_parent,
++      HeliumTabTreeController::DropPosition::kInto));
++
++  auto& features = browser()->GetFeatures();
++  EXPECT_EQ(new_parent, tab_strip_model()->GetTabAtIndex(0));
++  EXPECT_EQ(original_parent, tab_strip_model()->GetTabAtIndex(1));
++  EXPECT_EQ(original_child, tab_strip_model()->GetTabAtIndex(2));
++  EXPECT_TRUE(features.HeliumTabTreeHasChildren(new_parent));
++  EXPECT_TRUE(features.HeliumTabTreeHasChildren(original_parent));
++  EXPECT_EQ(1, features.GetHeliumTabTreeDepth(original_parent));
++  EXPECT_EQ(2, features.GetHeliumTabTreeDepth(original_child));
++}
++
++IN_PROC_BROWSER_TEST_F(VerticalTabViewTest, TreeTabsMoveChildAfterRootSibling) {
++  HeliumTabTreeController* controller =
++      HeliumTabTreeController::From(browser());
++  ASSERT_TRUE(controller);
++
++  const tabs::TabInterface* original_parent = tab_strip_model()->GetActiveTab();
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(2, tab_strip_model()->count());
++  const tabs::TabInterface* original_child = tab_strip_model()->GetActiveTab();
++
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_TYPED, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(3, tab_strip_model()->count());
++  const tabs::TabInterface* root_sibling = tab_strip_model()->GetActiveTab();
++
++  ASSERT_TRUE(controller->MoveSubtreeForDrop(
++      original_child, root_sibling,
++      HeliumTabTreeController::DropPosition::kAfter));
++
++  auto& features = browser()->GetFeatures();
++  EXPECT_EQ(original_parent, tab_strip_model()->GetTabAtIndex(0));
++  EXPECT_EQ(root_sibling, tab_strip_model()->GetTabAtIndex(1));
++  EXPECT_EQ(original_child, tab_strip_model()->GetTabAtIndex(2));
++  EXPECT_FALSE(features.HeliumTabTreeHasChildren(original_parent));
++  EXPECT_FALSE(features.HeliumTabTreeHasParent(original_child));
++  EXPECT_EQ(0, features.GetHeliumTabTreeDepth(original_child));
++}
++
++IN_PROC_BROWSER_TEST_F(VerticalTabViewTest,
++                       TreeTabsRejectMoveIntoDescendant) {
++  HeliumTabTreeController* controller =
++      HeliumTabTreeController::From(browser());
++  ASSERT_TRUE(controller);
++
++  const tabs::TabInterface* original_parent = tab_strip_model()->GetActiveTab();
++  tab_strip_model()->AddWebContents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(browser()->profile())),
++      -1, ui::PAGE_TRANSITION_LINK, ADD_ACTIVE, std::nullopt);
++  ASSERT_EQ(2, tab_strip_model()->count());
++  const tabs::TabInterface* original_child = tab_strip_model()->GetActiveTab();
++
++  ASSERT_FALSE(controller->MoveSubtreeForDrop(
++      original_parent, original_child,
++      HeliumTabTreeController::DropPosition::kInto));
++
++  auto& features = browser()->GetFeatures();
++  EXPECT_EQ(original_parent, tab_strip_model()->GetTabAtIndex(0));
++  EXPECT_EQ(original_child, tab_strip_model()->GetTabAtIndex(1));
++  EXPECT_TRUE(features.HeliumTabTreeHasChildren(original_parent));
++  EXPECT_TRUE(features.HeliumTabTreeHasParent(original_child));
++  EXPECT_EQ(1, features.GetHeliumTabTreeDepth(original_child));
++}
++
++IN_PROC_BROWSER_TEST_F(VerticalTabViewTest,
+                        CloseButtonVisibilityActiveCollapsed) {
+   TabCollectionNode* tab_node = unpinned_collection_node()->children()[0].get();
+   VerticalTabView* tab_view =
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -67,6 +67,7 @@
+ #include "ui/gfx/geometry/skia_conversions.h"
+ #include "ui/gfx/scoped_canvas.h"
+ #include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/animation/ink_drop.h"
+ #include "ui/views/background.h"
+ #include "ui/views/border.h"
+ #include "ui/views/controls/button/button.h"
+@@ -89,6 +90,15 @@ constexpr int kDefaultPadding = 4;
+ constexpr int kFocusRingInset = 0.0f;
+ constexpr int kTreeButtonSize = 16;
+-constexpr int kTreeIndentWidth = 16;
++constexpr int kTreeIndentWidth = 12;
++constexpr int kTreeMinIndentWidth = 2;
++constexpr int kTreeButtonSlotWidth = kTreeButtonSize + kDefaultPadding;
++constexpr int kTreeTrailingControlsReserve =
++    kTreeButtonSlotWidth + kIconDesignWidth + kDefaultPadding +
++    kIconDesignWidth + kDefaultPadding;
++constexpr int kTreeDropIndicatorHeight = 2;
++constexpr int kTreeDropIndicatorLeadingBleed =
++    kTreeButtonSlotWidth + kDefaultPadding;
++constexpr int kTreeDropIndicatorTrailingInset = 6;
+
+ class VerticalTabHighlightPathGenerator : public views::HighlightPathGenerator {
+  public:
+@@ -243,6 +249,11 @@ VerticalTabView::VerticalTabView(TabColl
+           &VerticalTabView::OnCollapsedStateChanged, base::Unretained(this)));
+   collapsed_ = state_controller->IsCollapsed();
+   tree_button_->SetFocusBehavior(FocusBehavior::NEVER);
++  tree_button_->SetInstallFocusRingOnFocus(false);
++  tree_button_->SetShowInkDropWhenHotTracked(false);
++  tree_button_->SetHasInkDropActionOnClick(false);
++  views::InkDrop::Get(tree_button_)->SetHighlightOpacity(0.0f);
++  views::InkDrop::Get(tree_button_)->SetVisibleOpacity(0.0f);
+   tree_button_->SetVisible(false);
+   if (browser_window) {
+     tree_state_changed_subscription_ =
+@@ -509,6 +520,11 @@ void VerticalTabView::OnPaint(gfx::Canva
+     return;
+   }
+
++  const bool paint_as_drag_preview = IsDragging();
++  if (paint_as_drag_preview) {
++    canvas->SaveLayerAlpha(0x94);
++  }
++
+   if (active_tab_fill_id_.has_value() || inactive_tab_fill_id_.has_value()) {
+     PaintTabBackgroundWithImages(canvas, active_tab_fill_id_,
+                                  inactive_tab_fill_id_);
+@@ -518,6 +534,11 @@ void VerticalTabView::OnPaint(gfx::Canva
+   }
+
+   views::View::OnPaint(canvas);
++  if (paint_as_drag_preview) {
++    canvas->Restore();
++  }
++
++  PaintTreeDropIndicator(canvas);
+ }
+
+ void VerticalTabView::PaintTabBackgroundWithImages(
+@@ -581,6 +602,52 @@ void VerticalTabView::PaintTabBackground
+   }
+ }
+
++void VerticalTabView::PaintTreeDropIndicator(gfx::Canvas* canvas) const {
++  const bool drop_before = IsPendingTreeDropTargetBefore();
++  const bool drop_after = IsPendingTreeDropTargetAfter();
++  const bool drop_into = IsPendingTreeReparentTarget();
++  if (!drop_before && !drop_after && !drop_into) {
++    return;
++  }
++
++  if (drop_into) {
++    const gfx::Rect indicator_bounds = GetContentsBounds();
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(SkColorSetA(title_->GetEnabledColor(), 0x24));
++    canvas->DrawRoundRect(indicator_bounds, 6.0f, flags);
++
++    cc::PaintFlags stroke_flags;
++    stroke_flags.setAntiAlias(true);
++    stroke_flags.setStyle(cc::PaintFlags::kStroke_Style);
++    stroke_flags.setStrokeWidth(2.0f);
++    stroke_flags.setColor(SkColorSetA(title_->GetEnabledColor(), 0xb3));
++    canvas->DrawRoundRect(gfx::RectF(indicator_bounds), 6.0f, stroke_flags);
++    return;
++  }
++
++  const int target_indent =
++      kHorizontalInset +
++      GetTreeDepthIndentWidth(width() - 2 * kHorizontalInset) +
++      kTreeButtonSlotWidth;
++  const int x =
++      std::clamp(target_indent - kTreeDropIndicatorLeadingBleed, 0, width());
++  const int trailing_x =
++      std::max(x, width() - kTreeDropIndicatorTrailingInset);
++  const int y = drop_before ? 0 : height() - kTreeDropIndicatorHeight;
++  const gfx::Rect indicator_bounds(x, y, trailing_x - x,
++                                   kTreeDropIndicatorHeight);
++  if (indicator_bounds.IsEmpty()) {
++    return;
++  }
++
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  flags.setColor(SkColorSetA(title_->GetEnabledColor(), 0xb3));
++  canvas->DrawRoundRect(indicator_bounds, kTreeDropIndicatorHeight / 2.0f,
++                        flags);
++}
++
+ bool VerticalTabView::ShouldPaintTabBackgroundColor(
+     TabStyle::TabSelectionState selection_state,
+     bool has_custom_background,
+@@ -1193,3 +1251,24 @@ bool VerticalTabView::IsDragging() const
+              *this);
+ }
+
++bool VerticalTabView::IsPendingTreeReparentTarget() const {
++  return collection_node_ && collection_node_->GetController() &&
++         collection_node_->GetController()
++             ->GetDragHandler()
++             .IsPendingTreeReparentTarget(*collection_node_);
++}
++
++bool VerticalTabView::IsPendingTreeDropTargetBefore() const {
++  return collection_node_ && collection_node_->GetController() &&
++         collection_node_->GetController()
++             ->GetDragHandler()
++             .IsPendingTreeDropTargetBefore(*collection_node_);
++}
++
++bool VerticalTabView::IsPendingTreeDropTargetAfter() const {
++  return collection_node_ && collection_node_->GetController() &&
++         collection_node_->GetController()
++             ->GetDragHandler()
++             .IsPendingTreeDropTargetAfter(*collection_node_);
++}
++
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -1054,5 +1054,6 @@ void VerticalTabView::UpdateTreeState()
+   if (!browser_window) {
+     tree_depth_ = 0;
++    tree_max_visible_depth_ = 0;
+     has_tree_children_ = false;
+     tree_collapsed_ = false;
+     tree_button_->SetVisible(false);
+@@ -1065,6 +1066,7 @@ void VerticalTabView::UpdateTreeState()
+   const BrowserWindowFeatures& features = browser_window->GetFeatures();
+
+   tree_depth_ = features.GetHeliumTabTreeDepth(tab);
++  tree_max_visible_depth_ = features.GetHeliumTabTreeMaxVisibleDepth();
+   has_tree_children_ = features.HeliumTabTreeHasChildren(tab);
+   tree_collapsed_ = features.IsHeliumTabTreeCollapsed(tab);
+   tree_button_->SetVisible(!pinned_ && !collapsed_ && has_tree_children_);
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -807,6 +807,7 @@
+       pinned_;
+   if (!is_centered) {
+-    bounds_remaining.Inset(gfx::Insets().set_left(GetTreeIndentWidth()));
++    bounds_remaining.Inset(
++        gfx::Insets().set_left(GetTreeIndentWidth(bounds_remaining.width())));
+   }
+
+   int placed_children = 0;
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.cc
+@@ -1271,11 +1272,32 @@
+ }
+
+-int VerticalTabView::GetTreeIndentWidth() const {
++int VerticalTabView::GetTreeDepthIndentWidth(int available_width) const {
+   if (pinned_ || collapsed_) {
+     return 0;
+   }
+
+-  return tree_depth_ * kTreeIndentWidth;
++  int indent_width = kTreeIndentWidth;
++  if (tree_max_visible_depth_ > 0) {
++    const int indent_budget =
++        std::max(0, available_width - kTreeTrailingControlsReserve -
++                        kTreeButtonSlotWidth);
++    indent_width = std::clamp(indent_budget / tree_max_visible_depth_,
++                              kTreeMinIndentWidth, kTreeIndentWidth);
++  }
++
++  const int max_total_indent =
++      std::max(0, available_width - kTreeTrailingControlsReserve);
++  return std::min(tree_depth_ * indent_width, max_total_indent);
++}
++
++int VerticalTabView::GetTreeIndentWidth(int available_width) const {
++  const int leaf_padding = tree_depth_ > 0 && !has_tree_children_
++                               ? kTreeButtonSlotWidth
++                               : 0;
++  const int max_total_indent =
++      std::max(0, available_width - kTreeTrailingControlsReserve);
++  return std::min(GetTreeDepthIndentWidth(available_width) + leaf_padding,
++                  max_total_indent);
+ }
+
+ const tabs::TabInterface* VerticalTabView::GetTabInterface() const {
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.cc
+@@ -7,10 +7,13 @@
+ #include <algorithm>
+ #include <memory>
+
++#include "base/auto_reset.h"
+ #include "base/check_deref.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/notreached.h"
+ #include "base/types/to_address.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_controller.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+@@ -114,6 +117,7 @@ VerticalTabDragHandlerImpl::~VerticalTab
+ void VerticalTabDragHandlerImpl::InitializeDrag(TabCollectionNode& node,
+                                                 const ui::MouseEvent& event) {
+   ResetDragState();
++  BeginHeliumTreeDragSuppression(node);
+   drag_controller_ = std::make_unique<TabDragController>();
+
+   DragInitData drag_init_data;
+@@ -282,12 +286,21 @@ void VerticalTabDragHandlerImpl::EndDrag
+
+ void VerticalTabDragHandlerImpl::HandleDraggedTabsOverNode(
+     const TabCollectionNode& node,
+-    std::optional<DragPositionHint> position_hint) {
++    std::optional<DragPositionHint> position_hint,
++    bool prefer_tree_reparent) {
+   CHECK(drag_controller_);
++  if (completing_helium_tree_drop_) {
++    return;
++  }
++
++  UpdatePendingHeliumTreeDrop(node, position_hint, prefer_tree_reparent);
++  if (IsHeliumTreePreviewDrag()) {
++    return;
++  }
+
+   switch (node.type()) {
+     case TabCollectionNode::Type::TAB:
+-      HandleTabDragOverTab(node);
++      HandleTabDragOverTab(node, position_hint);
+       break;
+     case TabCollectionNode::Type::SPLIT:
+       HandleTabDragOverSplit(node);
+@@ -303,6 +316,15 @@ void VerticalTabDragHandlerImpl::HandleD
+ void VerticalTabDragHandlerImpl::HandleDraggedTabsIntoNode(
+     const TabCollectionNode& node) {
+   CHECK(drag_controller_);
++  if (completing_helium_tree_drop_) {
++    return;
++  }
++
++  if (IsHeliumTreePreviewDrag()) {
++    return;
++  }
++
++  ClearPendingHeliumTreeDrop();
+   const auto& drag_session_data = drag_controller_->GetSessionData();
+
+   const TabDragData* source_drag_data =
+@@ -361,6 +383,15 @@ void VerticalTabDragHandlerImpl::HandleD
+     const TabCollectionNode& node,
+     DragPositionHint position_hint) {
+   CHECK_EQ(node.type(), TabCollectionNode::Type::GROUP);
++  if (completing_helium_tree_drop_) {
++    return;
++  }
++
++  if (IsHeliumTreePreviewDrag()) {
++    return;
++  }
++
++  ClearPendingHeliumTreeDrop();
+
+   const auto& tab_group = TabGroupDataFromNode(node);
+
+@@ -389,6 +420,16 @@ void VerticalTabDragHandlerImpl::HandleD
+ }
+
+ void VerticalTabDragHandlerImpl::HandleDraggedTabsAtEndOfTabStrip() {
++  if (completing_helium_tree_drop_) {
++    return;
++  }
++
++  pending_helium_tree_drop_.type = HeliumTreeDropType::kRootEnd;
++  pending_helium_tree_drop_.target_contents = nullptr;
++  if (IsHeliumTreePreviewDrag()) {
++    return;
++  }
++
+   // If the tabs were dragging into the tab strip in an area where they did not
+   // overlap any nodes then update the model appropriately if the tabs are not
+   // already at the end.
+@@ -398,17 +439,115 @@ void VerticalTabDragHandlerImpl::HandleD
+   }
+ }
+
++void VerticalTabDragHandlerImpl::CompleteTabDrop(
++    TabDragTarget::DragController& controller) {
++  base::ScopedClosureRunner end_tree_drag_suppression(base::BindOnce(
++      &VerticalTabDragHandlerImpl::EndHeliumTreeDragSuppression,
++      base::Unretained(this)));
++
++  if (!suppressed_helium_tab_tree_controller_) {
++    return;
++  }
++
++  const DragSessionData& session_data = controller.GetSessionData();
++  const TabDragData* source_drag_data = session_data.source_view_drag_data();
++  if (!source_drag_data || !source_drag_data->contents ||
++      !source_drag_data->source_model_index.has_value() ||
++      session_data.group_header_drag_data_.has_value()) {
++    return;
++  }
++
++  tabs::TabInterface* source_tab =
++      GetTabInterfaceForContents(source_drag_data->contents);
++  HeliumTabTreeController* tree_controller =
++      suppressed_helium_tab_tree_controller_;
++  auto* browser_window =
++      source_tab ? source_tab->GetBrowserWindowInterface() : nullptr;
++  if (!source_tab || !browser_window ||
++      HeliumTabTreeController::From(browser_window) != tree_controller) {
++    return;
++  }
++
++  const int original_index = source_drag_data->source_model_index.value();
++  const tabs::TabInterface* target_tab = GetTabForPendingDropTarget();
++  std::vector<tabs::TabInterface*> tabs_to_move;
++  for (int index : tab_strip_model_->selection_model()
++                       .GetListSelectionModel()
++                       .selected_indices()) {
++    tabs_to_move.push_back(tab_strip_model_->GetTabAtIndex(index));
++  }
++  if (!std::ranges::contains(tabs_to_move, source_tab)) {
++    tabs_to_move.push_back(source_tab);
++  }
++  std::erase_if(tabs_to_move, [&](tabs::TabInterface* tab) {
++    return std::ranges::any_of(tabs_to_move, [&](tabs::TabInterface* other) {
++      return tab != other && tree_controller->IsDescendantOf(tab, other);
++    });
++  });
++
++  bool moved = true;
++  base::AutoReset<bool> completing_drop(&completing_helium_tree_drop_, true);
++
++  for (tabs::TabInterface* tab : tabs_to_move) {
++    bool tab_moved = false;
++    switch (pending_helium_tree_drop_.type) {
++      case HeliumTreeDropType::kBefore:
++        tab_moved = tree_controller->MoveSubtreeForDrop(
++            tab, target_tab, HeliumTabTreeController::DropPosition::kBefore);
++        break;
++      case HeliumTreeDropType::kAfter:
++        tab_moved = tree_controller->MoveSubtreeForDrop(
++            tab, target_tab, HeliumTabTreeController::DropPosition::kAfter);
++        break;
++      case HeliumTreeDropType::kInto:
++        tab_moved = tree_controller->MoveSubtreeForDrop(
++            tab, target_tab, HeliumTabTreeController::DropPosition::kInto);
++        break;
++      case HeliumTreeDropType::kRootEnd:
++        tab_moved = tree_controller->MoveSubtreeForDrop(
++            tab, nullptr, HeliumTabTreeController::DropPosition::kRootEnd);
++        break;
++      case HeliumTreeDropType::kNone:
++        tab_moved = true;
++        break;
++    }
++    moved = moved && tab_moved;
++  }
++
++  if (!moved && pending_helium_tree_drop_.type != HeliumTreeDropType::kNone) {
++    tree_controller->MoveSubtreeToIndex(source_tab, original_index);
++  }
++}
++
+ void VerticalTabDragHandlerImpl::HandleTabDragOverTab(
+-    const TabCollectionNode& node) {
++    const TabCollectionNode& node,
++    std::optional<DragPositionHint> position_hint) {
+   const auto* tab = std::get<const tabs::TabInterface*>(node.GetNodeData());
+   CHECK(tab);
+-  const auto& selection_model = tab_strip_model_->selection_model();
+-  int first_selected_idx =
+-      *selection_model.GetListSelectionModel().selected_indices().cbegin();
+   int insertion_idx = tab_strip_model_->GetIndexOfTab(tab);
+-  if (first_selected_idx <= insertion_idx) {
+-    insertion_idx -= selection_model.size();
+-    ++insertion_idx;
++  const DragSessionData& session_data = drag_controller_->GetSessionData();
++  if (position_hint.has_value()) {
++    int num_dragged_tabs_before_target = 0;
++    for (const TabDragData& tab_drag_data : session_data.tab_drag_data_) {
++      if (tab_drag_data.contents &&
++          tab_strip_model_->GetIndexOfWebContents(tab_drag_data.contents) <
++              insertion_idx) {
++        ++num_dragged_tabs_before_target;
++      }
++    }
++
++    insertion_idx -= num_dragged_tabs_before_target;
++    if (position_hint == DragPositionHint::kAfter) {
++      ++insertion_idx;
++    }
++  } else {
++    const auto& selection_model = tab_strip_model_->selection_model();
++    int first_selected_idx =
++        *selection_model.GetListSelectionModel().selected_indices().cbegin();
++    if (first_selected_idx <= insertion_idx) {
++      insertion_idx -= selection_model.size();
++      ++insertion_idx;
++    }
+   }
+   insertion_idx = std::clamp(insertion_idx, 0, tab_strip_model_->count() - 1);
+   if (auto group = GetDraggingGroupHeaderId(); group.has_value()) {
+@@ -493,13 +617,43 @@ bool VerticalTabDragHandlerImpl::IsViewD
+   if (!drag_controller_) {
+     return false;
+   }
+-  for (TabSlotView* slot_view :
+-       drag_controller_->GetSessionData().attached_views()) {
+-    if (&view == ViewFromTabSlot(slot_view)) {
+-      return true;
+-    }
++  return std::ranges::contains(dragged_views_, &view);
++}
++
++bool VerticalTabDragHandlerImpl::IsPendingTreeReparentTarget(
++    const TabCollectionNode& node) const {
++  if (pending_helium_tree_drop_.type != HeliumTreeDropType::kInto ||
++      node.type() != TabCollectionNode::Type::TAB) {
++    return false;
++  }
++
++  const auto* tab = std::get<const tabs::TabInterface*>(node.GetNodeData());
++  return tab && tab->GetContents() ==
++                    pending_helium_tree_drop_.target_contents.get();
++}
++
++bool VerticalTabDragHandlerImpl::IsPendingTreeDropTargetBefore(
++    const TabCollectionNode& node) const {
++  if (pending_helium_tree_drop_.type != HeliumTreeDropType::kBefore ||
++      node.type() != TabCollectionNode::Type::TAB) {
++    return false;
++  }
++
++  const auto* tab = std::get<const tabs::TabInterface*>(node.GetNodeData());
++  return tab && tab->GetContents() ==
++                    pending_helium_tree_drop_.target_contents.get();
++}
++
++bool VerticalTabDragHandlerImpl::IsPendingTreeDropTargetAfter(
++    const TabCollectionNode& node) const {
++  if (pending_helium_tree_drop_.type != HeliumTreeDropType::kAfter ||
++      node.type() != TabCollectionNode::Type::TAB) {
++    return false;
+   }
+-  return false;
++
++  const auto* tab = std::get<const tabs::TabInterface*>(node.GetNodeData());
++  return tab && tab->GetContents() ==
++                    pending_helium_tree_drop_.target_contents.get();
+ }
+
+ bool VerticalTabDragHandlerImpl::IsDraggingPinnedTabs() const {
+@@ -537,6 +691,138 @@ VerticalTabDragHandlerImpl::GetDraggingG
+                           : std::nullopt;
+ }
+
++tabs::TabInterface* VerticalTabDragHandlerImpl::GetTabInterfaceForContents(
++    content::WebContents* contents) const {
++  return contents ? tabs::TabInterface::GetFromContents(contents) : nullptr;
++}
++
++tabs::TabInterface* VerticalTabDragHandlerImpl::GetTabForPendingDropTarget()
++    const {
++  return GetTabInterfaceForContents(pending_helium_tree_drop_.target_contents);
++}
++
++bool VerticalTabDragHandlerImpl::IsHeliumTreePreviewDrag() const {
++  if (!drag_controller_ || !suppressed_helium_tab_tree_controller_) {
++    return false;
++  }
++
++  const DragSessionData& session_data = drag_controller_->GetSessionData();
++  return !session_data.group_header_drag_data_.has_value() &&
++         session_data.source_view_drag_data();
++}
++
++void VerticalTabDragHandlerImpl::UpdatePendingHeliumTreeDrop(
++    const TabCollectionNode& node,
++    std::optional<DragPositionHint> position_hint,
++    bool prefer_tree_reparent) {
++  content::WebContents* const previous_target =
++      pending_helium_tree_drop_.target_contents.get();
++  const tabs::TabInterface* target_tab = nullptr;
++  if (node.type() == TabCollectionNode::Type::TAB) {
++    target_tab = std::get<const tabs::TabInterface*>(node.GetNodeData());
++  }
++
++  if (!target_tab) {
++    ClearPendingHeliumTreeDrop();
++    return;
++  }
++
++  const DragSessionData& session_data = drag_controller_->GetSessionData();
++  const TabDragData* source_drag_data = session_data.source_view_drag_data();
++  const tabs::TabInterface* source_tab =
++      source_drag_data ? GetTabInterfaceForContents(source_drag_data->contents)
++                       : nullptr;
++  const HeliumTabTreeController::DropPosition hinted_position =
++      !position_hint.has_value() || prefer_tree_reparent
++          ? HeliumTabTreeController::DropPosition::kInto
++          : (*position_hint == DragPositionHint::kBefore
++                 ? HeliumTabTreeController::DropPosition::kBefore
++                 : HeliumTabTreeController::DropPosition::kAfter);
++  const HeliumTabTreeController::DropPosition resolved_position =
++      suppressed_helium_tab_tree_controller_
++          ? suppressed_helium_tab_tree_controller_->ResolveDropPositionForTab(
++                source_tab, target_tab,
++                position_hint.has_value() || prefer_tree_reparent,
++                hinted_position)
++          : hinted_position;
++
++  pending_helium_tree_drop_.target_contents = target_tab->GetContents();
++  switch (resolved_position) {
++    case HeliumTabTreeController::DropPosition::kBefore:
++      pending_helium_tree_drop_.type = HeliumTreeDropType::kBefore;
++      break;
++    case HeliumTabTreeController::DropPosition::kAfter:
++      pending_helium_tree_drop_.type = HeliumTreeDropType::kAfter;
++      break;
++    case HeliumTabTreeController::DropPosition::kInto:
++      pending_helium_tree_drop_.type = HeliumTreeDropType::kInto;
++      break;
++    case HeliumTabTreeController::DropPosition::kRootEnd:
++      pending_helium_tree_drop_.type = HeliumTreeDropType::kRootEnd;
++      break;
++  }
++  if (previous_target &&
++      previous_target != pending_helium_tree_drop_.target_contents.get()) {
++    if (TabCollectionNode* previous_node = GetNodeForContents(previous_target)) {
++      previous_node->view()->SchedulePaint();
++    }
++  }
++  node.view()->SchedulePaint();
++}
++
++void VerticalTabDragHandlerImpl::ClearPendingHeliumTreeDrop() {
++  content::WebContents* const previous_target =
++      pending_helium_tree_drop_.target_contents.get();
++  pending_helium_tree_drop_.type = HeliumTreeDropType::kNone;
++  pending_helium_tree_drop_.target_contents = nullptr;
++  if (previous_target) {
++    if (TabCollectionNode* previous_node = GetNodeForContents(previous_target)) {
++      previous_node->view()->SchedulePaint();
++    }
++  }
++}
++
++void VerticalTabDragHandlerImpl::BeginHeliumTreeDragSuppression(
++    TabCollectionNode& source_node) {
++  EndHeliumTreeDragSuppression();
++
++  if (source_node.type() != TabCollectionNode::Type::TAB) {
++    return;
++  }
++
++  const tabs::TabInterface* source_tab_from_node =
++      std::get<const tabs::TabInterface*>(source_node.GetNodeData());
++  tabs::TabInterface* source_tab =
++      source_tab_from_node
++          ? GetTabInterfaceForContents(source_tab_from_node->GetContents())
++          : nullptr;
++  if (!source_tab) {
++    return;
++  }
++
++  auto* browser_window = source_tab->GetBrowserWindowInterface();
++  if (!browser_window) {
++    return;
++  }
++
++  HeliumTabTreeController* tree_controller =
++      HeliumTabTreeController::From(browser_window);
++  if (!tree_controller || tree_controller->GetNodeIdForTab(source_tab).empty()) {
++    return;
++  }
++
++  suppressed_helium_tab_tree_controller_ = tree_controller;
++  suppressed_helium_tab_tree_controller_->SetDragRefreshSuppressed(true);
++}
++
++void VerticalTabDragHandlerImpl::EndHeliumTreeDragSuppression() {
++  if (suppressed_helium_tab_tree_controller_) {
++    suppressed_helium_tab_tree_controller_->SetDragRefreshSuppressed(false);
++    suppressed_helium_tab_tree_controller_ = nullptr;
++  }
++  ClearPendingHeliumTreeDrop();
++}
++
+ views::View* VerticalTabDragHandlerImpl::ViewFromTabSlot(
+     TabSlotView* view) const {
+   CHECK(drag_controller_);
+@@ -709,16 +992,22 @@ void VerticalTabDragHandlerImpl::OwnDrag
+
+ std::unique_ptr<TabDragController>
+ VerticalTabDragHandlerImpl::ReleaseDragController() {
++  EndHeliumTreeDragSuppression();
++  dragged_views_.clear();
+   return std::move(drag_controller_);
+ }
+
+ void VerticalTabDragHandlerImpl::DestroyDragController() {
++  EndHeliumTreeDragSuppression();
++  dragged_views_.clear();
+   drag_controller_.reset();
+ }
+
+ void VerticalTabDragHandlerImpl::StartedDragging(
+     const std::vector<TabSlotView*>& views) {
+   CHECK(drag_controller_);
++  dragged_views_.clear();
++
+   auto* source_dragged_view = ViewFromTabSlot(drag_controller_->GetSessionData()
+                                                   .source_view_drag_data()
+                                                   ->attached_view);
+@@ -732,8 +1021,14 @@ void VerticalTabDragHandlerImpl::Started
+
+     views::View* dragged_view = ViewFromTabSlot(slot_view);
+     CHECK(dragged_view);
++    if (!std::ranges::contains(dragged_views_, dragged_view)) {
++      dragged_views_.push_back(dragged_view);
++    }
+     dragged_view->SetPaintToLayer();
+     dragged_view->layer()->SetFillsBoundsOpaquely(false);
++    if (IsHeliumTreePreviewDrag()) {
++      dragged_view->layer()->SetOpacity(0.48f);
++    }
+     gfx::Vector2d offset = dragged_view->GetBoundsInScreen().origin() -
+                            source_view_origin_in_screen;
+     dragged_view->SetProperty(kOffsetAtTabDragStart, offset);
+@@ -750,12 +1045,11 @@ void VerticalTabDragHandlerImpl::Started
+ void VerticalTabDragHandlerImpl::DraggedTabsDetached() {}
+
+ void VerticalTabDragHandlerImpl::StoppedDragging() {
+-  for (auto& [_, slot_view] : slot_views_) {
+-    views::View* dragged_view = ViewFromTabSlot(slot_view);
+-    CHECK(dragged_view);
++  for (views::View* dragged_view : dragged_views_) {
+     dragged_view->DestroyLayer();
+     dragged_view->ClearProperty(kOffsetAtTabDragStart);
+   }
++  dragged_views_.clear();
+
+   if (!drag_controller_) {
+     return;
+@@ -861,6 +1155,10 @@ TabSlotView& VerticalTabDragHandlerImpl:
+ }
+
+ void VerticalTabDragHandlerImpl::OnNodeWillDestroy(TabCollectionNode& node) {
++  dragged_views_.erase(
++      std::remove(dragged_views_.begin(), dragged_views_.end(), node.view()),
++      dragged_views_.end());
++
+   auto it = slot_views_.find(&node);
+   CHECK(it != slot_views_.end());
+   auto view = node.view()->RemoveChildViewT(it->second);
+@@ -868,6 +1166,8 @@ void VerticalTabDragHandlerImpl::OnNodeW
+ }
+
+ void VerticalTabDragHandlerImpl::ResetDragState() {
++  EndHeliumTreeDragSuppression();
++  dragged_views_.clear();
+   drag_controller_.reset();
+ }
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_drag_handler.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+
+ #include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+@@ -23,6 +24,7 @@
+ class TabCollectionNode;
+ class TabStripModel;
+ class VerticalTabLinkDropHandler;
++class HeliumTabTreeController;
+
+ enum class DragPositionHint {
+   kBefore,  // The drag is before the drag target.
+@@ -47,7 +49,8 @@ class VerticalTabDragHandler {
+   // Position hint is used to determine where the drag is, relative to the node.
+   virtual void HandleDraggedTabsOverNode(
+       const TabCollectionNode& node,
+-      std::optional<DragPositionHint> position_hint) = 0;
++      std::optional<DragPositionHint> position_hint,
++      bool prefer_tree_reparent = false) = 0;
+
+   // Handles tab strip model updates to reflect dragged tabs entering a node.
+   // This reparents them to become direct children of the node.
+@@ -62,16 +65,28 @@ class VerticalTabDragHandler {
+   // is a special case because there is no node there to handle the drag.
+   virtual void HandleDraggedTabsAtEndOfTabStrip() = 0;
+
++  // Finalizes any custom drop behavior once the drag is committed.
++  virtual void CompleteTabDrop(TabDragTarget::DragController& controller) = 0;
++
+   // Returns the drag context for this handler.
+   virtual TabDragContext* GetDragContext() = 0;
+
+   // Whether this is is handling a drag.
+   virtual bool IsDragging() const = 0;
++  virtual bool IsHeliumTreePreviewDrag() const = 0;
+
+   // Returns true if `view` belongs to a TabCollectionNode currently being
+   // dragged.
+   virtual bool IsViewDragging(const views::View& view) const = 0;
+
++  // Returns true if `node` is the current tree-tab reparent drop target.
++  virtual bool IsPendingTreeReparentTarget(
++      const TabCollectionNode& node) const = 0;
++  virtual bool IsPendingTreeDropTargetBefore(
++      const TabCollectionNode& node) const = 0;
++  virtual bool IsPendingTreeDropTargetAfter(
++      const TabCollectionNode& node) const = 0;
++
+   // Returns true if there is an ongoing drag that includes a pinned tab.
+   virtual bool IsDraggingPinnedTabs() const = 0;
+
+@@ -128,14 +142,22 @@ class VerticalTabDragHandlerImpl : publi
+   void EndDrag(EndDragReason reason) override;
+   void HandleDraggedTabsOverNode(
+       const TabCollectionNode& node,
+-      std::optional<DragPositionHint> position_hint) override;
++      std::optional<DragPositionHint> position_hint,
++      bool prefer_tree_reparent = false) override;
+   void HandleDraggedTabsIntoNode(const TabCollectionNode& node) override;
+   void HandleDraggedTabsOutOfGroup(const TabCollectionNode& node,
+                                    DragPositionHint position_hint) override;
+   void HandleDraggedTabsAtEndOfTabStrip() override;
++  void CompleteTabDrop(TabDragTarget::DragController& controller) override;
+   TabDragContext* GetDragContext() override;
+   bool IsDragging() const override;
++  bool IsHeliumTreePreviewDrag() const override;
+   bool IsViewDragging(const views::View& view) const override;
++  bool IsPendingTreeReparentTarget(const TabCollectionNode& node) const override;
++  bool IsPendingTreeDropTargetBefore(
++      const TabCollectionNode& node) const override;
++  bool IsPendingTreeDropTargetAfter(
++      const TabCollectionNode& node) const override;
+   bool IsDraggingPinnedTabs() const override;
+   bool IsDraggingGroups() const override;
+   bool IsDraggingAtEndOfTabStrip() const override;
+@@ -184,6 +205,13 @@ class VerticalTabDragHandlerImpl : publi
+   void OnDragExited() override;
+
+  private:
++  enum class HeliumTreeDropType { kNone, kBefore, kAfter, kInto, kRootEnd };
++
++  struct PendingHeliumTreeDrop {
++    HeliumTreeDropType type = HeliumTreeDropType::kNone;
++    raw_ptr<content::WebContents> target_contents = nullptr;
++  };
++
+   // Encapsulates data needed to initialize a drag session.
+   struct DragInitData {
+     DragInitData();
+@@ -221,9 +249,20 @@ class VerticalTabDragHandlerImpl : publi
+   void OnNodeWillDestroy(TabCollectionNode& node);
+
+   // Handlers for drag operations over various node types.
+-  void HandleTabDragOverTab(const TabCollectionNode& node);
++  void HandleTabDragOverTab(const TabCollectionNode& node,
++                            std::optional<DragPositionHint> position_hint);
+   void HandleTabDragOverSplit(const TabCollectionNode& node);
+   void HandleTabDragOverGroup(const TabCollectionNode& node);
++  tabs::TabInterface* GetTabInterfaceForContents(
++      content::WebContents* contents) const;
++  tabs::TabInterface* GetTabForPendingDropTarget() const;
++  void UpdatePendingHeliumTreeDrop(
++      const TabCollectionNode& node,
++      std::optional<DragPositionHint> position_hint,
++      bool prefer_tree_reparent);
++  void ClearPendingHeliumTreeDrop();
++  void BeginHeliumTreeDragSuppression(TabCollectionNode& source_node);
++  void EndHeliumTreeDragSuppression();
+
+   // Returns the group id of the dragged group header, or null if the drag
+   // was not initiated by a group header.
+@@ -240,7 +280,12 @@ class VerticalTabDragHandlerImpl : publi
+   // A mapping from nodes to their `TabSlotView`, used for compatibility
+   // with the core dragging system.
+   std::map<raw_ptr<const TabCollectionNode>, raw_ptr<TabSlotView>> slot_views_;
++  std::vector<raw_ptr<views::View>> dragged_views_;
+   std::vector<base::CallbackListSubscription> node_destroyed_callbacks_;
++  PendingHeliumTreeDrop pending_helium_tree_drop_;
++  raw_ptr<HeliumTabTreeController> suppressed_helium_tab_tree_controller_ =
++      nullptr;
++  bool completing_helium_tree_drop_ = false;
+ };
+
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_DRAG_HANDLER_H_
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_view.h
+@@ -121,6 +121,7 @@ class VerticalTabView : public views::Vi
+                               TabStyle::TabSelectionState selection_state,
+                               bool hovered,
+                               std::optional<int> fill_id) const;
++  void PaintTreeDropIndicator(gfx::Canvas* canvas) const;
+   bool ShouldPaintTabBackgroundColor(
+       TabStyle::TabSelectionState selection_state,
+       bool has_custom_background,
+@@ -198,5 +199,10 @@ class VerticalTabView : public views::Vi
+   TabStyle::TabSelectionState GetSelectionState() const;
+
+   bool IsDragging() const;
++  bool IsPendingTreeReparentTarget() const;
++  bool IsPendingTreeDropTargetBefore() const;
++  bool IsPendingTreeDropTargetAfter() const;
++  int GetTreeDepthIndentWidth(int available_width) const;
++  int GetTreeIndentWidth(int available_width) const;
+
+  const tabs::TabInterface* GetTabInterface() const;
+
+@@ -234,5 +239,6 @@ class VerticalTabView : public views::Vi
+   bool has_tree_children_ = false;
+   bool shift_pressed_on_mouse_down_ = false;
+   int tree_depth_ = 0;
++  int tree_max_visible_depth_ = 0;
+
+   std::unique_ptr<GlowHoverController> hover_controller_;
+
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_tab_tree_restore_data.cc
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_tab_tree_restore_data.h"
++
++#include <utility>
++
++namespace helium {
++
++HeliumTabTreeRestoredState::HeliumTabTreeRestoredState() = default;
++HeliumTabTreeRestoredState::~HeliumTabTreeRestoredState() = default;
++HeliumTabTreeRestoredState::HeliumTabTreeRestoredState(
++    HeliumTabTreeRestoredState&&) = default;
++HeliumTabTreeRestoredState& HeliumTabTreeRestoredState::operator=(
++    HeliumTabTreeRestoredState&&) = default;
++
++HeliumTabTreeRestoreData::~HeliumTabTreeRestoreData() = default;
++
++HeliumTabTreeRestoreData::HeliumTabTreeRestoreData(
++    content::WebContents* contents,
++    HeliumTabTreeRestoredState state)
++    : content::WebContentsUserData<HeliumTabTreeRestoreData>(*contents),
++      state_(std::move(state)) {}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(HeliumTabTreeRestoreData);
++
++}  // namespace helium
+
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_tab_tree_restore_data.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_RESTORE_DATA_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_RESTORE_DATA_H_
++
++#include <string>
++
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace helium {
++
++struct HeliumTabTreeRestoredState {
++  HeliumTabTreeRestoredState();
++  ~HeliumTabTreeRestoredState();
++  HeliumTabTreeRestoredState(const HeliumTabTreeRestoredState&) = delete;
++  HeliumTabTreeRestoredState& operator=(const HeliumTabTreeRestoredState&) =
++      delete;
++  HeliumTabTreeRestoredState(HeliumTabTreeRestoredState&&);
++  HeliumTabTreeRestoredState& operator=(HeliumTabTreeRestoredState&&);
++
++  std::string node_id;
++  std::string parent_node_id;
++  bool collapsed = false;
++};
++
++// Holds restored Helium tree metadata until the tab is inserted into a window
++// and consumed by HeliumTabTreeController.
++class HeliumTabTreeRestoreData
++    : public content::WebContentsUserData<HeliumTabTreeRestoreData> {
++ public:
++  ~HeliumTabTreeRestoreData() override;
++
++  const HeliumTabTreeRestoredState& state() const { return state_; }
++
++ private:
++  friend class content::WebContentsUserData<HeliumTabTreeRestoreData>;
++
++  HeliumTabTreeRestoreData(content::WebContents* contents,
++                           HeliumTabTreeRestoredState state);
++
++  HeliumTabTreeRestoredState state_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_RESTORE_DATA_H_
+
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_tab_tree_restore_helper.cc
+@@ -0,0 +1,90 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium/helium_tab_tree_restore_helper.h"
++
++#include <utility>
++
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_controller.h"
++#include "chrome/browser/ui/helium/helium_tab_tree_restore_data.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++
++namespace helium {
++namespace {
++
++constexpr char kNodeIdKey[] = "helium.tree.node_id";
++constexpr char kParentNodeIdKey[] = "helium.tree.parent_node_id";
++constexpr char kCollapsedKey[] = "helium.tree.collapsed";
++
++}  // namespace
++
++void PopulateHeliumTabTreeExtraData(
++    content::WebContents* web_contents,
++    std::map<std::string, std::string>* extra_data) {
++  if (!web_contents || !extra_data) {
++    return;
++  }
++
++  tabs::TabInterface* tab = tabs::TabInterface::GetFromContents(web_contents);
++  if (!tab) {
++    return;
++  }
++
++  BrowserWindowInterface* browser_window = tab->GetBrowserWindowInterface();
++  if (!browser_window) {
++    return;
++  }
++
++  HeliumTabTreeController* controller = HeliumTabTreeController::From(
++      browser_window);
++  if (!controller) {
++    return;
++  }
++
++  const std::string node_id = controller->GetNodeIdForTab(tab);
++  if (node_id.empty()) {
++    return;
++  }
++
++  (*extra_data)[kNodeIdKey] = node_id;
++  if (const std::string parent_node_id =
++          controller->GetParentNodeIdForTab(tab);
++      !parent_node_id.empty()) {
++    (*extra_data)[kParentNodeIdKey] = parent_node_id;
++  }
++  if (controller->IsSubtreeCollapsed(tab)) {
++    (*extra_data)[kCollapsedKey] = "true";
++  }
++}
++
++void RestoreHeliumTabTreeStateFromExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!web_contents) {
++    return;
++  }
++
++  auto node_it = extra_data.find(kNodeIdKey);
++  if (node_it == extra_data.end() || node_it->second.empty()) {
++    return;
++  }
++
++  HeliumTabTreeRestoredState state;
++  state.node_id = node_it->second;
++  if (auto parent_it = extra_data.find(kParentNodeIdKey);
++      parent_it != extra_data.end()) {
++    state.parent_node_id = parent_it->second;
++  }
++  if (auto collapsed_it = extra_data.find(kCollapsedKey);
++      collapsed_it != extra_data.end()) {
++    state.collapsed = collapsed_it->second == "true";
++  }
++
++  HeliumTabTreeRestoreData::CreateForWebContents(web_contents,
++                                                 std::move(state));
++}
++
++}  // namespace helium
+
+--- /dev/null
++++ b/chrome/browser/ui/helium/helium_tab_tree_restore_helper.h
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_RESTORE_HELPER_H_
++#define CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_RESTORE_HELPER_H_
++
++#include <map>
++#include <string>
++
++namespace content {
++class WebContents;
++}
++
++namespace helium {
++
++void PopulateHeliumTabTreeExtraData(
++    content::WebContents* web_contents,
++    std::map<std::string, std::string>* extra_data);
++
++void RestoreHeliumTabTreeStateFromExtraData(
++    content::WebContents* web_contents,
++    const std::map<std::string, std::string>& extra_data);
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_HELIUM_HELIUM_TAB_TREE_RESTORE_HELPER_H_
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.cc
+@@ -116,6 +116,6 @@
+                         dragged_bounds_in_container));
+
+-  HandleTabDragInContainer(dragged_bounds_in_container);
++  HandleTabDragInContainer(dragged_bounds_in_container, point_in_container);
+
+   UpdateDraggingViewTransforms(point_in_container);
+ }
+@@ -138,6 +138,11 @@
+   return true;
+ }
+
++void VerticalDraggedTabsContainer::HandleTabDrop(
++    TabDragTarget::DragController& controller) {
++  GetDragHandler().CompleteTabDrop(controller);
++}
++
+ void VerticalDraggedTabsContainer::HandleTabDragEnteredContainer() {
+   CHECK(collection_node_);
+   GetDragHandler().HandleDraggedTabsIntoNode(*collection_node_);
+@@ -294,6 +299,10 @@
+     if (dragging_view->parent() != base::to_address(host_view_)) {
+       continue;
+     }
++    if (GetDragHandler().IsHeliumTreePreviewDrag() &&
++        dragging_view != source_dragged_view) {
++      continue;
++    }
+     if (dragging_views_.contains(dragging_view)) {
+       // It's possible that multiple dragged tabs map to the same dragged view
+       // (e.g., split tabs). Skip the duplicates.
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_dragged_tabs_container.h
+@@ -63,6 +63,7 @@
+   void OnTabDragExited(const gfx::Point& point_in_screen) override;
+   void OnTabDragEnded() override;
+   bool CanDropTab() final;
++  void HandleTabDrop(TabDragTarget::DragController& controller) final;
+   base::CallbackListSubscription RegisterWillDestroyCallback(
+      base::OnceClosure callback) final;
+
+@@ -134,8 +135,11 @@
+   // Get the layout of the host view, skipping animations.
+   virtual const views::ProposedLayout& GetLayoutForDrag() const = 0;
+
+   // Handles a dragged tab that is parented within this target.
+-  virtual void HandleTabDragInContainer(const gfx::Rect& dragged_tab_bounds) = 0;
++  // `point_in_container` is a point relative to this target's view.
++  virtual void HandleTabDragInContainer(
++      const gfx::Rect& dragged_tab_bounds,
++      const gfx::Point& point_in_container) = 0;
+
+   // Handles dragged tabs entering this container, applying the necessary
+   // updates to reparent them into this.
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h
+@@ -62,7 +62,9 @@
+   void UpdateTargetLayoutForDrag(
+       const std::vector<const views::View*>& views_to_snap) override;
+   const views::ProposedLayout& GetLayoutForDrag() const override;
+-  void HandleTabDragInContainer(const gfx::Rect& dragged_tab_bounds) override;
++  void HandleTabDragInContainer(
++      const gfx::Rect& dragged_tab_bounds,
++      const gfx::Point& point_in_container) override;
+
+   // Returns whether a drag that is currently being handled by the given
+   // `group_view` should continue being handled by it.
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.h
+@@ -56,7 +56,9 @@
+   void UpdateTargetLayoutForDrag(
+       const std::vector<const views::View*>& views_to_snap) override;
+   const views::ProposedLayout& GetLayoutForDrag() const override;
+-  void HandleTabDragInContainer(const gfx::Rect& dragged_tab_bounds) override;
++  void HandleTabDragInContainer(
++      const gfx::Rect& dragged_tab_bounds,
++      const gfx::Point& point_in_container) override;
+
+   // While collapsed, only the y-coordinate is used to determine the drop
+   // index, similar to the unpinned container.
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.h
+@@ -87,7 +87,9 @@
+   void UpdateTargetLayoutForDrag(
+       const std::vector<const views::View*>& views_to_snap) override;
+   const views::ProposedLayout& GetLayoutForDrag() const override;
+-  void HandleTabDragInContainer(const gfx::Rect& dragged_tab_bounds) override;
++  void HandleTabDragInContainer(
++      const gfx::Rect& dragged_tab_bounds,
++      const gfx::Point& point_in_container) override;
+   void OnTabDragExited(const gfx::Point& point_in_screen) override;
+
+   void AttachChildView(std::unique_ptr<views::View> child_view,
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_unpinned_tab_container_view.h"
++
++#include <algorithm>
++#include <optional>
+
+ #include "base/containers/adapters.h"
+ #include "chrome/browser/ui/layout_constants.h"
+@@ -50,6 +52,30 @@
+ static_assert(kMinHeaderHeightPctForGroupExit <
+               kMinHeaderHeightPctForGroupEntry);
+
++std::optional<DragPositionHint> GetDragPositionHintForBounds(
++    const gfx::Rect& dragged_tab_bounds,
++    const gfx::Rect& target_bounds) {
++  constexpr double kDragOverMargins = 0.25;
++  const int center_y = dragged_tab_bounds.CenterPoint().y() - target_bounds.y();
++  if (center_y < target_bounds.height() * kDragOverMargins) {
++    return DragPositionHint::kBefore;
++  }
++  if (center_y > target_bounds.height() * (1 - kDragOverMargins)) {
++    return DragPositionHint::kAfter;
++  }
++  return std::nullopt;
++}
++
++bool ShouldPreferTreeReparentForBounds(const gfx::Rect& dragged_tab_bounds,
++                                       const gfx::Point& point_in_container,
++                                       const gfx::Rect& target_bounds) {
++  constexpr int kMinHorizontalReparentOffset = 16;
++  return !GetDragPositionHintForBounds(dragged_tab_bounds, target_bounds)
++              .has_value() &&
++         point_in_container.x() >=
++             target_bounds.x() + kMinHorizontalReparentOffset;
++}
++
+ class VerticalUnpinnedTabContainerViewTargeter
+     : public views::ViewTargeterDelegate {
+  public:
+@@ -111,6 +135,7 @@
+   int width = 0;
+   int height = 0;
+   int dragged_view_bottom = 0;
++  size_t laid_out_children = 0;
+   bool is_collapsed = IsTabStripCollapsed();
+
+   const int horizontal_padding = GetLayoutConstant(
+@@ -123,6 +148,9 @@
+   // Layout children in order. Children will have their preferred height and
+   // fill available width.
+   for (auto* child : children) {
++    auto drag_data = GetVisualDataForDraggedView(*child);
++    const bool include_in_height = child->GetVisible() || drag_data;
++
+     // The leading inset should not be applied for tab groups when the tab strip
+     // is collapsed since the group color line is drawn in that space.
+     int x = views::AsViewClass<VerticalTabGroupView>(child) && is_collapsed
+@@ -136,7 +163,9 @@
+     gfx::Rect bounds = gfx::Rect(child->GetPreferredSize(child_size_bounds));
+     bounds.set_x(x);
+
+-    auto drag_data = GetVisualDataForDraggedView(*child);
+     CHECK(!drag_data || !drag_data->should_hide);
+     bounds.set_y(drag_data ? drag_data->offset.y() : height);
++    if (!include_in_height) {
++      bounds.set_height(0);
++    }
+
+@@ -149,9 +183,13 @@
+     layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
++    if (!include_in_height) {
++      continue;
++    }
+     height += bounds.height() + kTabVerticalPadding;
+     width = std::max(width, bounds.width() + bounds.x());
++    ++laid_out_children;
+   }
+   // Remove excess padding if needed.
+-  if (!children.empty()) {
++  if (laid_out_children > 0) {
+     height -= kTabVerticalPadding;
+   }
+
+@@ -203,8 +241,12 @@
+   }
+
+   // The minimum size should be enough to show a tab and a half, if needed.
+-  const int num_children = collection_node_->GetDirectChildren().size();
++  const auto children = collection_node_->GetDirectChildren();
++  const size_t num_children =
++      std::ranges::count_if(children, [](views::View* child) {
++        return child && child->GetVisible();
++      });
+   const int min_height =
+       base::ClampCeil(GetLayoutConstant(LayoutConstant::kVerticalTabHeight) *
+                       std::min(1.5f, static_cast<float>(num_children))) +
+
+@@ -299,13 +331,22 @@
+
+ void VerticalUnpinnedTabContainerView::HandleTabDragInContainer(
+-    const gfx::Rect& dragged_tab_bounds) {
++    const gfx::Rect& dragged_tab_bounds,
++    const gfx::Point& point_in_container) {
+   const views::ProposedLayout& target_layout = layout_manager_->target_layout();
+   views::View* view_at_point =
+       GetViewForDragBounds(target_layout, dragged_tab_bounds);
+   const TabCollectionNode* node = nullptr;
++  std::optional<DragPositionHint> position_hint;
++  bool prefer_tree_reparent = false;
+   VerticalTabDragHandler& drag_handler = GetDragHandler();
+   if (auto* tab_view = views::AsViewClass<VerticalTabView>(view_at_point)) {
+     node = tab_view->collection_node();
++    position_hint =
++        GetDragPositionHintForBounds(dragged_tab_bounds, tab_view->bounds());
++    prefer_tree_reparent =
++        ShouldPreferTreeReparentForBounds(dragged_tab_bounds,
++                                          point_in_container,
++                                          tab_view->bounds());
+   } else if (auto* group_view =
+                  views::AsViewClass<VerticalTabGroupView>(view_at_point)) {
+     // Groups themselves are a drag target except when they are collapsed or
+@@ -318,9 +357,12 @@
+   } else if (auto* split_tab_view =
+                  views::AsViewClass<VerticalSplitTabView>(view_at_point)) {
+     node = split_tab_view->collection_node();
++    position_hint = GetDragPositionHintForBounds(dragged_tab_bounds,
++                                                 split_tab_view->bounds());
+   }
+   if (node) {
+-    drag_handler.HandleDraggedTabsOverNode(*node, std::nullopt);
++    drag_handler.HandleDraggedTabsOverNode(*node, position_hint,
++                                           prefer_tree_reparent);
+     // Synchronously force a layout here to update the target layout. Since all
+     // the calculations are based off on target layout, we need to ensure it is
+     // updated where there are model change.
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_pinned_tab_container_view.cc
+@@ -340,7 +340,8 @@
+ }
+
+ void VerticalPinnedTabContainerView::HandleTabDragInContainer(
+-    const gfx::Rect& dragged_tab_bounds) {
++    const gfx::Rect& dragged_tab_bounds,
++    const gfx::Point& point_in_container) {
+   const views::ProposedLayout& target_layout = layout_manager_->target_layout();
+   views::View* view_at_point =
+       GetViewForDragBounds(target_layout, dragged_tab_bounds);
+
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_group_view.cc
+@@ -393,7 +393,8 @@
+ }
+
+ void VerticalTabGroupView::HandleTabDragInContainer(
+-    const gfx::Rect& dragged_tab_bounds) {
++    const gfx::Rect& dragged_tab_bounds,
++    const gfx::Point& point_in_container) {
+   CHECK(!IsCollapsed());
+   views::View* view_at_point = GetViewForDragBounds(
+       layout_manager_->target_layout(), dragged_tab_bounds);
