@@ -1,0 +1,560 @@
+--- a/chrome/browser/ui/ui_features.h
++++ b/chrome/browser/ui/ui_features.h
+@@ -23,6 +23,9 @@ BASE_DECLARE_FEATURE(kUseActionsForBrowserCommands);
+ 
+ BASE_DECLARE_FEATURE(kUseActionsForBrowserCommands);
+ 
++BASE_DECLARE_FEATURE(kHeliumAdaptiveTabColor);
++BASE_DECLARE_FEATURE_PARAM(double, kHeliumAdaptiveTabColorMinContrast);
++
+ BASE_DECLARE_FEATURE(kAllowEyeDropperWGCScreenCapture);
+ 
+ // Enables a compositor-driven rotation animation for the tab load throbber.
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -35,6 +35,13 @@ BASE_FEATURE(kUseActionsForBrowserCommands, base::FEAT
+ // Enables the migration of browser commands to Action API.
+ BASE_FEATURE(kUseActionsForBrowserCommands, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++BASE_FEATURE(kHeliumAdaptiveTabColor, base::FEATURE_DISABLED_BY_DEFAULT);
++BASE_FEATURE_PARAM(double,
++                   kHeliumAdaptiveTabColorMinContrast,
++                   &kHeliumAdaptiveTabColor,
++                   "min-contrast",
++                   4.5);
++
+ // Enables the use of WGC for the Eye Dropper screen capture.
+ BASE_FEATURE(kAllowEyeDropperWGCScreenCapture,
+ #if BUILDFLAG(IS_WIN)
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -42,6 +42,9 @@ constexpr const char kDisableEchCommandLine[] = "disab
+ constexpr const char kHeliumSplitClientHelloCommandLine[] =
+     "helium-split-clienthello";
+ 
++constexpr const char kHeliumAdaptiveTabColorCommandLine[] =
++    "helium-adaptive-tab-color";
++
+ }  // namespace helium
+ 
+ #endif /* CHROME_BROWSER_HELIUM_FLAG_CHOICES_H_ */
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -75,5 +75,9 @@
+      "prevent access to networks that require a proxy. Helium flag.",
+      kOsAll, SINGLE_VALUE_TYPE(switches::kNoProxyServer)},
+     // ui
++    {helium::kHeliumAdaptiveTabColorCommandLine, "Adaptive tab color",
++     "Tints the browser frame and toolbar with the color of the current "
++     "page. Helium flag.",
++     kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumAdaptiveTabColor)},
+     // platform
+ #endif  // CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_
+--- a/ui/color/color_provider_key.h
++++ b/ui/color/color_provider_key.h
+@@ -142,6 +142,7 @@ struct COMPONENT_EXPORT(COLOR_PROVIDER_KEY) ColorProvi
+   FrameStyle frame_style = FrameStyle::kDefault;
+   UserColorSource user_color_source = UserColorSource::kAccent;
+   std::optional<SkColor> user_color = std::nullopt;
++  std::optional<SkColor> adaptive_color = std::nullopt;
+   std::optional<SchemeVariant> scheme_variant = std::nullopt;
+   scoped_refptr<ThemeInitializerSupplier> custom_theme = nullptr;
+   // Only dereferenced when populating the ColorMixer. After that, used to
+@@ -163,22 +164,26 @@ struct COMPONENT_EXPORT(COLOR_PROVIDER_KEY) ColorProvi
+ #if BUILDFLAG(IS_ANDROID)
+     return std::tie(color_mode, contrast_mode, forced_colors, system_theme,
+                     frame_type, frame_style, user_color_source, user_color,
++                    adaptive_color,
+                     scheme_variant, custom_theme, lhs_app_controller,
+                     system_theme_version, context_hash) ==
+            std::tie(other.color_mode, other.contrast_mode, other.forced_colors,
+                     other.system_theme, other.frame_type, other.frame_style,
+                     other.user_color_source, other.user_color,
++                    other.adaptive_color,
+                     other.scheme_variant, other.custom_theme,
+                     rhs_app_controller, other.system_theme_version,
+                     other.context_hash);
+ #else
+     return std::tie(color_mode, contrast_mode, forced_colors, system_theme,
+                     frame_type, frame_style, user_color_source, user_color,
++                    adaptive_color,
+                     scheme_variant, custom_theme, lhs_app_controller,
+                     system_theme_version) ==
+            std::tie(other.color_mode, other.contrast_mode, other.forced_colors,
+                     other.system_theme, other.frame_type, other.frame_style,
+                     other.user_color_source, other.user_color,
++                    other.adaptive_color,
+                     other.scheme_variant, other.custom_theme,
+                     rhs_app_controller, other.system_theme_version);
+ #endif
+@@ -190,22 +195,26 @@ struct COMPONENT_EXPORT(COLOR_PROVIDER_KEY) ColorProvi
+ #if BUILDFLAG(IS_ANDROID)
+     return std::tie(color_mode, contrast_mode, forced_colors, system_theme,
+                     frame_type, frame_style, user_color_source, user_color,
++                    adaptive_color,
+                     scheme_variant, custom_theme, lhs_app_controller,
+                     system_theme_version, context_hash) <
+            std::tie(other.color_mode, other.contrast_mode, other.forced_colors,
+                     other.system_theme, other.frame_type, other.frame_style,
+                     other.user_color_source, other.user_color,
++                    other.adaptive_color,
+                     other.scheme_variant, other.custom_theme,
+                     rhs_app_controller, other.system_theme_version,
+                     other.context_hash);
+ #else
+     return std::tie(color_mode, contrast_mode, forced_colors, system_theme,
+                     frame_type, frame_style, user_color_source, user_color,
++                    adaptive_color,
+                     scheme_variant, custom_theme, lhs_app_controller,
+                     system_theme_version) <
+            std::tie(other.color_mode, other.contrast_mode, other.forced_colors,
+                     other.system_theme, other.frame_type, other.frame_style,
+                     other.user_color_source, other.user_color,
++                    other.adaptive_color,
+                     other.scheme_variant, other.custom_theme,
+                     rhs_app_controller, other.system_theme_version);
+ #endif
+--- a/ui/color/color_provider_manager.cc
++++ b/ui/color/color_provider_manager.cc
+@@ -19,6 +19,7 @@
+ #include "ui/color/color_provider.h"
+ #include "ui/color/color_provider_key.h"
+ #include "ui/color/color_provider_utils.h"
++#include "ui/gfx/color_utils.h"
+ #include "ui/webui/buildflags.h"
+ 
+ namespace ui {
+@@ -105,7 +106,13 @@ ColorProvider* ColorProviderManager::GetColorProviderF
+     auto provider = std::make_unique<ColorProvider>();
+     DCHECK(initializer_list_);
+     if (!initializer_list_->empty()) {
+-      initializer_list_->Notify(provider.get(), key);
++      ColorProviderKey mixer_key = key;
++      if (key.adaptive_color) {
++        mixer_key.color_mode = color_utils::IsDark(*key.adaptive_color)
++                                   ? ColorProviderKey::ColorMode::kDark
++                                   : ColorProviderKey::ColorMode::kLight;
++      }
++      initializer_list_->Notify(provider.get(), mixer_key);
+     }
+ 
+     RecordTimeSpentInitializingColorProvider(timer.Elapsed());
+--- a/chrome/browser/ui/color/material_chrome_color_mixer.cc
++++ b/chrome/browser/ui/color/material_chrome_color_mixer.cc
+@@ -505,6 +505,11 @@ void AddMaterialChromeColorMixer(ui::ColorProvider* pr
+   // Toolbar colors.
+   mixer[kColorToolbar] = {dark_mode ? ui::kColorFrameActive
+                                     : ui::kColorSysBase};
++  if (key.adaptive_color) {
++    mixer[ui::kColorFrameActive] = {*key.adaptive_color};
++    mixer[ui::kColorFrameInactive] = {*key.adaptive_color};
++    mixer[kColorToolbar] = {*key.adaptive_color};
++  }
+   mixer[kColorToolbarButtonBackgroundHighlightedDefault] = {
+       ui::kColorSysStateHoverOnSubtle};
+   mixer[kColorToolbarButtonBorder] = {ui::kColorSysOutline};
+--- a/chrome/browser/ui/color/chrome_color_mixer.cc
++++ b/chrome/browser/ui/color/chrome_color_mixer.cc
+@@ -126,10 +126,18 @@ void ApplyGM3OmniboxBackgroundColor(ui::ColorMixer& mi
+     // Let frame materials show through the location bar and its matching tabs.
+     const SkAlpha background_alpha =
+         ShouldApplyHighContrastColors(key) ? SK_AlphaOPAQUE : 0xCC;
+-    mixer[kColorLocationBarBackground] = ui::SetAlpha(
++    ui::ColorTransform background =
+         dark_mode ? ui::ColorTransform(kColorOmniboxResultsBackground)
+-                  : ui::ColorTransform(ui::kColorSysOmniboxContainer),
+-        background_alpha);
++                  : ui::ColorTransform(ui::kColorSysOmniboxContainer);
++    if (key.adaptive_color) {
++      // Keep the location bar and its matching tabs distinct from the adaptive
++      // frame and toolbar, which are painted in the same color.
++      constexpr float kAdaptiveContrast = 1.25f;
++      background = ui::BlendForMinContrastWithSelf(*key.adaptive_color,
++                                                   kAdaptiveContrast);
++    }
++    mixer[kColorLocationBarBackground] =
++        ui::SetAlpha(std::move(background), background_alpha);
+     mixer[kColorLocationBarBackgroundHovered] =
+         ui::GetResultingPaintColor(ui::kColorSysStateHoverBrightBlendProtection,
+                                    kColorLocationBarBackground);
+--- /dev/null
++++ b/chrome/browser/ui/views/helium/adaptive_tab_color.h
+@@ -0,0 +1,58 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_ADAPTIVE_TAB_COLOR_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_ADAPTIVE_TAB_COLOR_H_
++
++#include <optional>
++
++#include "base/containers/flat_set.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "third_party/skia/include/core/SkColor.h"
++
++class BrowserWidget;
++class TabStripModel;
++
++class AdaptiveTabColor : public TabStripModelObserver,
++                         public content::WebContentsObserver {
++ public:
++  AdaptiveTabColor(BrowserWidget* widget, TabStripModel* tab_strip_model);
++  ~AdaptiveTabColor() override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++
++  // content::WebContentsObserver:
++  void PrimaryPageChanged(content::Page& page) override;
++  void DidFirstVisuallyNonEmptyPaint() override;
++  void DidStopLoading() override;
++  void DidChangeThemeColor() override;
++  void OnBackgroundColorChanged() override;
++
++ private:
++  bool CanAdapt() const;
++  void ScheduleUpdate();
++  void Update();
++  void OnPageSampled(std::optional<SkColor> rendered);
++  void SetColor(std::optional<SkColor> color);
++
++  const raw_ptr<BrowserWidget> widget_;
++  base::OneShotTimer update_timer_;
++  base::OneShotTimer settle_timer_;
++  base::flat_set<SkColor> colors_seen_;
++  // Last color rendered along the page's top edge, kept while copies fail
++  // (e.g. the window is occluded).
++  std::optional<SkColor> last_rendered_;
++  int sample_retries_ = 0;
++  base::WeakPtrFactory<AdaptiveTabColor> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_ADAPTIVE_TAB_COLOR_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/helium/adaptive_tab_color.cc
+@@ -0,0 +1,204 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium/adaptive_tab_color.h"
++
++#include <algorithm>
++#include <optional>
++
++#include "base/containers/flat_map.h"
++#include "base/functional/bind.h"
++#include "base/task/bind_post_task.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/frame/browser_widget.h"
++#include "chrome/common/webui_url_constants.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/common/url_constants.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++#include "url/gurl.h"
++
++namespace {
++
++constexpr base::TimeDelta kUpdateDelay = base::Milliseconds(100);
++// Samples again once the page settles after loading, e.g. the NTP background
++// image fades in over 700ms.
++constexpr base::TimeDelta kSettleDelay = base::Seconds(1);
++constexpr base::TimeDelta kSampleTimeout = base::Seconds(1);
++
++// Height of the strip sampled along the page's top edge, in DIPs.
++constexpr int kSampleHeight = 16;
++// Retries while there is no surface to copy yet, e.g. a tab just shown.
++constexpr int kMaxSampleRetries = 5;
++
++constexpr SkColor kTextOnDark = SkColorSetRGB(0xC6, 0xC6, 0xC6);
++constexpr SkColor kTextOnLight = SkColorSetRGB(0x47, 0x47, 0x47);
++
++constexpr size_t kMaxColorsPerTab = 64;
++
++SkColor Quantize(SkColor color) {
++  const auto level = [](unsigned c) { return (c >> 3) * 255 / 31; };
++  return SkColorSetRGB(level(SkColorGetR(color)), level(SkColorGetG(color)),
++                       level(SkColorGetB(color)));
++}
++
++// Most common color in `bitmap`, so text and logos don't skew the result.
++std::optional<SkColor> MostCommonColor(const SkBitmap& bitmap) {
++  if (bitmap.drawsNothing()) {
++    return std::nullopt;
++  }
++  base::flat_map<SkColor, int> counts;
++  for (int y = 0; y < bitmap.height(); ++y) {
++    for (int x = 0; x < bitmap.width(); ++x) {
++      ++counts[Quantize(bitmap.getColor(x, y))];
++    }
++  }
++  return std::ranges::max_element(counts, {}, [](const auto& entry) {
++           return entry.second;
++         })->first;
++}
++
++}  // namespace
++
++AdaptiveTabColor::AdaptiveTabColor(BrowserWidget* widget,
++                                   TabStripModel* tab_strip_model)
++    : widget_(widget) {
++  tab_strip_model->AddObserver(this);
++  Observe(tab_strip_model->GetActiveWebContents());
++  Update();
++}
++
++AdaptiveTabColor::~AdaptiveTabColor() = default;
++
++void AdaptiveTabColor::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  if (selection.active_tab_changed()) {
++    Observe(selection.new_contents);
++    colors_seen_.clear();
++    last_rendered_.reset();
++    sample_retries_ = 0;
++    Update();
++  }
++}
++
++void AdaptiveTabColor::PrimaryPageChanged(content::Page& page) {
++  colors_seen_.clear();
++  last_rendered_.reset();
++  sample_retries_ = 0;
++  if (!CanAdapt()) {
++    Update();
++  }
++}
++
++void AdaptiveTabColor::DidFirstVisuallyNonEmptyPaint() {
++  ScheduleUpdate();
++}
++
++void AdaptiveTabColor::DidStopLoading() {
++  ScheduleUpdate();
++  settle_timer_.Start(FROM_HERE, kSettleDelay, this, &AdaptiveTabColor::Update);
++}
++
++void AdaptiveTabColor::DidChangeThemeColor() {
++  ScheduleUpdate();
++}
++
++void AdaptiveTabColor::OnBackgroundColorChanged() {
++  ScheduleUpdate();
++}
++
++bool AdaptiveTabColor::CanAdapt() const {
++  if (!web_contents()) {
++    return false;
++  }
++  const GURL& url = web_contents()->GetLastCommittedURL();
++  return url.SchemeIsHTTPOrHTTPS() ||
++         (url.SchemeIs(content::kChromeUIScheme) &&
++          url.host_piece() == chrome::kChromeUINewTabPageHost);
++}
++
++void AdaptiveTabColor::ScheduleUpdate() {
++  update_timer_.Start(FROM_HERE, kUpdateDelay, this, &AdaptiveTabColor::Update);
++}
++
++void AdaptiveTabColor::Update() {
++  update_timer_.Stop();
++  weak_factory_.InvalidateWeakPtrs();
++
++  content::RenderWidgetHostView* view =
++      CanAdapt() ? web_contents()->GetRenderWidgetHostView() : nullptr;
++  if (!view || !view->IsSurfaceAvailableForCopy()) {
++    OnPageSampled(std::nullopt);
++    return;
++  }
++  gfx::Rect strip(view->GetViewBounds().size());
++  strip.set_height(std::min(strip.height(), kSampleHeight));
++  const gfx::Size output_size = gfx::ScaleToFlooredSize(strip.size(), 0.25f);
++  // An empty rect would copy the whole surface.
++  if (output_size.IsEmpty()) {
++    OnPageSampled(std::nullopt);
++    return;
++  }
++  view->CopyFromSurface(
++      strip, output_size, kSampleTimeout,
++      base::BindPostTaskToCurrentDefault(
++          base::BindOnce([](const content::CopyFromSurfaceResult& result) {
++            return result.has_value() ? MostCommonColor(result->bitmap)
++                                      : std::nullopt;
++          }).Then(base::BindOnce(&AdaptiveTabColor::OnPageSampled,
++                                 weak_factory_.GetWeakPtr()))));
++}
++
++void AdaptiveTabColor::OnPageSampled(std::optional<SkColor> rendered) {
++  if (!CanAdapt()) {
++    SetColor(std::nullopt);
++    return;
++  }
++  if (rendered) {
++    last_rendered_ = rendered;
++  } else if (sample_retries_++ < kMaxSampleRetries) {
++    ScheduleUpdate();
++  }
++
++  // theme-color wins unless the page renders with the opposite lightness, e.g.
++  // when restyled by Dark Reader. Pages without one use what's rendered along
++  // the top edge, which also covers the NTP background image.
++  std::optional<SkColor> color = web_contents()->GetThemeColor();
++  if (last_rendered_ &&
++      (!color ||
++       color_utils::IsDark(*color) != color_utils::IsDark(*last_rendered_))) {
++    color = last_rendered_;
++  }
++  if (!color) {
++    color = web_contents()->GetBackgroundColor();
++  }
++  SetColor(color);
++}
++
++void AdaptiveTabColor::SetColor(std::optional<SkColor> color) {
++  if (color) {
++    color = Quantize(SkColorSetA(*color, SK_AlphaOPAQUE));
++    color = color_utils::BlendForMinContrast(
++                *color, color_utils::IsDark(*color) ? kTextOnDark : kTextOnLight,
++                std::nullopt,
++                static_cast<float>(
++                    features::kHeliumAdaptiveTabColorMinContrast.Get()))
++                .color;
++    if (!colors_seen_.contains(*color)) {
++      if (colors_seen_.size() >= kMaxColorsPerTab) {
++        return;
++      }
++      colors_seen_.insert(*color);
++    }
++  }
++  widget_->SetAdaptiveColor(color);
++}
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -2605,6 +2605,8 @@ static_library("ui") {
+       "views/frame/vertical_tab_strip_background_blur_backdrop.h",
+       "views/frame/vertical_tab_strip_region_view.cc",
+       "views/frame/vertical_tab_strip_region_view.h",
++      "views/helium/adaptive_tab_color.cc",
++      "views/helium/adaptive_tab_color.h",
+       "views/helium/frame_corner_radius.cc",
+       "views/helium/frame_corner_radius.h",
+       "views/idle_bubble.cc",
+--- a/chrome/browser/ui/views/frame/browser_widget.h
++++ b/chrome/browser/ui/views/frame/browser_widget.h
+@@ -18,6 +18,7 @@
+ #include <optional>
+ #endif
+ 
++class AdaptiveTabColor;
+ class BrowserFrameView;
+ class BrowserRootView;
+ enum class BrowserThemeChangeType;
+@@ -129,6 +130,8 @@ class BrowserWidget : public views::Widget,
+     return browser_native_widget_;
+   }
+ 
++  void SetAdaptiveColor(std::optional<SkColor> color);
++
+   void SetTabDragKind(TabDragKind tab_drag_kind);
+   TabDragKind tab_drag_kind() const { return tab_drag_kind_; }
+ 
+@@ -201,6 +204,9 @@ class BrowserWidget : public views::Widget,
+ #if BUILDFLAG(IS_LINUX)
+   bool tiled_ = false;
+ #endif
++
++  std::optional<SkColor> adaptive_color_;
++  std::unique_ptr<AdaptiveTabColor> adaptive_tab_color_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_BROWSER_WIDGET_H_
+--- a/chrome/browser/ui/views/frame/browser_widget.cc
++++ b/chrome/browser/ui/views/frame/browser_widget.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/views/frame/glass_frame_service.h"
+ #include "chrome/browser/ui/views/frame/system_menu_model_builder.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
++#include "chrome/browser/ui/views/helium/adaptive_tab_color.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/common/chrome_switches.h"
+ #include "ui/base/hit_test.h"
+@@ -235,6 +236,13 @@ void BrowserWidget::InitBrowserWidget() {
+     DCHECK(non_client_view());
+     non_client_view()->set_context_menu_controller(this);
+   }
++
++  if (browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL &&
++      !IsIncognitoBrowser() &&
++      base::FeatureList::IsEnabled(features::kHeliumAdaptiveTabColor)) {
++    adaptive_tab_color_ = std::make_unique<AdaptiveTabColor>(
++        this, browser->GetTabStripModel());
++  }
+ }
+ 
+ BrowserFrameView* BrowserWidget::GetFrameView() const {
+@@ -267,6 +275,13 @@ bool BrowserWidget::HandleKeyboardEvent(
+          browser_native_widget_->HandleKeyboardEvent(event);
+ }
+ 
++void BrowserWidget::SetAdaptiveColor(std::optional<SkColor> color) {
++  if (color != adaptive_color_) {
++    adaptive_color_ = color;
++    ScheduleThemeChanged();
++  }
++}
++
+ void BrowserWidget::UserChangedTheme(BrowserThemeChangeType theme_change_type) {
+   if (base::FeatureList::IsEnabled(features::kThemeChangeOptimization)) {
+     ResetLastColorProviderKey();
+@@ -524,6 +539,12 @@ ui::ColorProviderKey BrowserWidget::GetColorProviderKe
+   }
+ #endif
+ 
++  if (!key.custom_theme && !key.app_controller &&
++      key.contrast_mode == ui::ColorProviderKey::ContrastMode::kNormal &&
++      key.forced_colors == ui::ColorProviderKey::ForcedColors::kNone) {
++    key.adaptive_color = adaptive_color_;
++  }
++
+   if (auto* const glass_frame_service = GlassFrameService::GetInstance()) {
+     if (glass_frame_service->IsBrowserWindowEligible(
+             browser_view_->browser())) {
+--- a/ui/views/widget/widget.cc
++++ b/ui/views/widget/widget.cc
+@@ -2750,6 +2750,7 @@ ui::RendererColorMap Widget::GetRendererColorMap(
+   auto key = GetColorProviderKey();
+   key.color_mode = color_mode;
+   key.forced_colors = forced_colors;
++  key.adaptive_color.reset();
+   ui::ColorProvider* color_provider =
+       ui::ColorProviderManager::Get().GetColorProviderFor(key);
+   CHECK(color_provider);
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -4015,6 +4015,9 @@ GetPreferredColorScheme(const WebPreferences& web_pref
+           web_contents->GetColorProvider().GetColor(kColorToolbar))
+           ? blink::mojom::PreferredColorScheme::kDark
+           : blink::mojom::PreferredColorScheme::kLight;
++  if (base::FeatureList::IsEnabled(features::kHeliumAdaptiveTabColor)) {
++    preferred_root_scrollbar_color_scheme = preferred_color_scheme;
++  }
+ #endif
+ 
+ #if BUILDFLAG(ENABLE_GUEST_VIEW)
