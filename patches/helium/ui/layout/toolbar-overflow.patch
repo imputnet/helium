@@ -1,0 +1,367 @@
+--- a/chrome/browser/ui/views/toolbar/overflow_menu.cc
++++ b/chrome/browser/ui/views/toolbar/overflow_menu.cc
+@@ -171,6 +171,13 @@ OverflowMenu::GetDefaultResponsiveElemen
+   elements.insert(
+       elements.end(),
+       {ResponsiveElementInfo(
++           ElementIdInfo(kToolbarExtensionsContainerElementId,
++                         IDS_OVERFLOW_MENU_ITEM_TEXT_EXTENSIONS,
++                         &vector_icons::kChromeExtensionIcon,
++                         kExtensionsMenuButtonElementId,
++                         kExtensionsMenuMainPageElementId),
++           /*is_section_end=*/true),
++       ResponsiveElementInfo(
+            ElementIdInfo(kToolbarBatterySaverButtonElementId,
+                          IDS_OVERFLOW_MENU_ITEM_TEXT_ENERGY_SAVER,
+                          &kBatterySaverRefreshCustomIcon,
+@@ -356,14 +363,9 @@ OverflowMenu::GetResponsiveElementsWithO
+ std::unique_ptr<ui::SimpleMenuModel> OverflowMenu::CreateMenuModel() {
+   auto menu_model = std::make_unique<ui::SimpleMenuModel>(this);
+ 
+-  // True if the separator belonging to previous section has not been added yet.
+-  bool pre_separator_pending = false;
+   for (size_t i = 0; i < responsive_elements_.size(); ++i) {
+     const auto& element = responsive_elements_[i];
+     if (delegate_->IsCurrentlyOverflowed(element.overflow_id)) {
+-      if (pre_separator_pending && menu_model->GetItemCount() > 0) {
+-        menu_model->AddSeparator(ui::NORMAL_SEPARATOR);
+-      }
+       const auto image_model = GetMenuIcon(element);
+       if (image_model.has_value()) {
+         menu_model->AddItemWithIcon(i, GetMenuText(element),
+@@ -371,10 +373,6 @@ std::unique_ptr<ui::SimpleMenuModel> Ove
+       } else {
+         menu_model->AddItem(i, GetMenuText(element));
+       }
+-      pre_separator_pending = false;
+-    }
+-    if (element.is_section_end) {
+-      pre_separator_pending = true;
+     }
+   }
+   return menu_model;
+--- a/chrome/browser/ui/views/toolbar/toolbar_controller.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_controller.cc
+@@ -152,9 +152,14 @@ ToolbarController::ToolbarController(
+                 toolbar_element->SetProperty(views::kFlexBehaviorKey,
+                                              flex_spec);
+               }
+-              flex_spec =
+-                  toolbar_element->GetProperty(views::kFlexBehaviorKey)
+-                      ->WithOrder(id_to_order_map.at(id.overflow_identifier));
++              flex_spec = *toolbar_element->GetProperty(views::kFlexBehaviorKey);
++              // The extensions container keeps the priority set by ToolbarView
++              // relative to the location bar and pinned actions.
++              if (id.overflow_identifier !=
++                  kToolbarExtensionsContainerElementId) {
++                flex_spec = flex_spec.WithOrder(
++                    id_to_order_map.at(id.overflow_identifier));
++              }
+               toolbar_element->SetProperty(views::kFlexBehaviorKey, flex_spec);
+ 
+               // Create pop out state and pop out handlers to support pop out.
+@@ -189,14 +194,14 @@ std::vector<ui::ElementIdentifier>
+ ToolbarController::GetDefaultOverflowOrder() {
+   std::vector<ui::ElementIdentifier> order = {
+       kToolbarMediaButtonElementId, kToolbarBatterySaverButtonElementId,
+-      kToolbarHomeButtonElementId,
++      kToolbarHomeButtonElementId, kToolbarSplitTabsToolbarButtonElementId,
+       // `kWebUIToolbarElementIdentifier` is a placeholder element representing
+       // the order it uses for both the home and forward buttons, if it's
+       // displaying them. Using a value in the middle of the two means that it
+       // uses the correct relative order, even when only one of the two buttons
+       // is being handled by the WebUI toolbar.
+       kWebUIToolbarElementIdentifier, kToolbarForwardButtonElementId,
+-      kToolbarAvatarButtonElementId, kToolbarSplitTabsToolbarButtonElementId,
++      kToolbarAvatarButtonElementId,
+       kPinnedToolbarActionShowSidePanelContextualTasksElementId};
+   if (base::FeatureList::IsEnabled(features::kToolbarGlicButtonResizing)) {
+     const auto it =
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/auto_reset.h"
+ #include "base/command_line.h"
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/feature_list.h"
+@@ -254,25 +255,84 @@ int CenteredLocationBarWidthReduction(in
+   return 0;
+ }
+ 
+-class CenteredLocationBarLayout : public views::FlexLayout {
++class ResponsiveToolbarLayout : public views::FlexLayout {
++ public:
++  explicit ResponsiveToolbarLayout(base::RepeatingCallback<bool()> is_compact)
++      : is_compact_(std::move(is_compact)) {}
++
++  ~ResponsiveToolbarLayout() override = default;
++
++  views::FlexSpecification ProtectedCompactFlex(
++      const views::FlexSpecification& responsive,
++      views::MaximumFlexSizeRule maximum =
++          views::MaximumFlexSizeRule::kPreferred) const {
++    const views::FlexSpecification protected_spec(
++        views::MinimumFlexSizeRule::kPreferred, maximum);
++    const views::FlexRule mode_rule = base::BindRepeating(
++        &ResponsiveToolbarLayout::GetSizeForMode, base::Unretained(this),
++        responsive.rule(), protected_spec.rule());
++    return views::FlexSpecification(mode_rule)
++        .WithOrder(responsive.order())
++        .WithWeight(responsive.weight())
++        .WithAlignment(responsive.alignment());
++  }
++
++ protected:
++  views::ProposedLayout CalculateProposedLayout(
++      const views::SizeBounds& bounds) const override {
++    base::AutoReset reset_mode(&flex_mode_, FlexMode::kResponsive);
++    if (is_compact_.Run() && bounds.width().is_bounded()) {
++      // Measure the controls with compact protection and no space for tabs.
++      flex_mode_ = FlexMode::kProtectControls;
++      const auto minimum = FlexLayout::CalculateProposedLayout(
++          views::SizeBounds(0, bounds.height()));
++      flex_mode_ = bounds.width().value() < minimum.host_size.width()
++                       ? FlexMode::kResponsive
++                       : FlexMode::kProtectControls;
++    }
++    return FlexLayout::CalculateProposedLayout(bounds);
++  }
++
++ private:
++  enum class FlexMode {
++    // Use each control's normal shrinking and overflow behavior.
++    kResponsive,
++    // Keep controls from shrinking or overflowing while there is room.
++    kProtectControls,
++  };
++
++  gfx::Size GetSizeForMode(const views::FlexRule& responsive_rule,
++                           const views::FlexRule& protected_rule,
++                           const views::View* view,
++                           const views::SizeBounds& bounds) const {
++    if (flex_mode_ == FlexMode::kResponsive) {
++      return responsive_rule.Run(view, bounds);
++    }
++    return protected_rule.Run(view, bounds);
++  }
++
++  base::RepeatingCallback<bool()> is_compact_;
++  mutable FlexMode flex_mode_ = FlexMode::kResponsive;
++};
++
++// Optionally centers the location bar after the toolbar's flex layout.
++class CenteredLocationBarLayout : public ResponsiveToolbarLayout {
+  public:
+   using GetCenteredBoundsCallback =
+       base::RepeatingCallback<gfx::Rect(gfx::Rect, int)>;
+ 
+   CenteredLocationBarLayout(views::View* location_bar,
+-                            GetCenteredBoundsCallback callback)
+-      : location_bar_(location_bar), callback_(std::move(callback)) {}
+-
+-  CenteredLocationBarLayout(const CenteredLocationBarLayout&) = delete;
+-  CenteredLocationBarLayout& operator=(const CenteredLocationBarLayout&) =
+-      delete;
++                            GetCenteredBoundsCallback callback,
++                            base::RepeatingCallback<bool()> is_compact)
++      : ResponsiveToolbarLayout(std::move(is_compact)),
++        location_bar_(location_bar),
++        callback_(std::move(callback)) {}
+ 
+   ~CenteredLocationBarLayout() override = default;
+ 
+  protected:
+   void LayoutImpl() override {
+-    views::ProposedLayout layout =
+-        GetProposedLayout(host_view()->size());
++    views::ProposedLayout layout = GetProposedLayout(host_view()->size());
+     views::ChildLayout* const location_bar_layout =
+         layout.GetLayoutFor(location_bar_);
+     if (location_bar_layout && location_bar_layout->visible) {
+@@ -1696,6 +1756,8 @@ void ToolbarView::InitLayout() {
+       SetLayoutManager(std::make_unique<CenteredLocationBarLayout>(
+           location_bar_view_,
+           base::BindRepeating(&ToolbarView::GetCenteredLocationBarBounds,
++                              base::Unretained(this)),
++          base::BindRepeating(&ToolbarView::IsCompactLayout,
+                               base::Unretained(this))));
+ 
+   layout_manager_->SetOrientation(views::LayoutOrientation::kHorizontal)
+@@ -1705,26 +1767,6 @@ void ToolbarView::InitLayout() {
+ 
+   UpdateToolbarLayout();
+ 
+-  if (extensions_container_) {
+-    const views::FlexSpecification extensions_flex_rule =
+-        views::FlexSpecification(
+-            extensions_container_->GetAnimatingLayoutManager()
+-                ->GetDefaultFlexRule())
+-            .WithOrder(kExtensionsFlexOrder);
+-
+-    extensions_container_->SetProperty(views::kFlexBehaviorKey,
+-                                       extensions_flex_rule);
+-  }
+-
+-  if (pinned_toolbar_actions_container_) {
+-    pinned_toolbar_actions_container_->SetProperty(
+-        views::kFlexBehaviorKey,
+-        views::FlexSpecification(
+-            pinned_toolbar_actions_container_->GetAnimatingLayoutManager()
+-                ->GetDefaultFlexRule())
+-            .WithOrder(kToolbarActionsFlexOrder));
+-  }
+-
+   if (glic_button_ &&
+       base::FeatureList::IsEnabled(features::kToolbarGlicButtonResizing)) {
+     glic_button_->SetProperty(
+@@ -1759,6 +1801,52 @@ void ToolbarView::InitLayout() {
+     toolbar_webview_->SetProperty(views::kMarginsKey, gfx::Insets());
+   }
+ 
++  // Preserve Chromium's responsive rules, but protect compact controls until
++  // the controls themselves no longer fit, independently of the tab strip.
++  auto* responsive_layout =
++      static_cast<ResponsiveToolbarLayout*>(layout_manager_.get());
++  if (pinned_toolbar_actions_container_) {
++    pinned_toolbar_actions_container_->SetProperty(
++        views::kFlexBehaviorKey,
++        responsive_layout->ProtectedCompactFlex(
++            views::FlexSpecification(
++                pinned_toolbar_actions_container_->GetAnimatingLayoutManager()
++                    ->GetDefaultFlexRule())
++                .WithOrder(kToolbarActionsFlexOrder)));
++  }
++
++  if (extensions_container_) {
++    extensions_container_->SetProperty(
++        views::kFlexBehaviorKey,
++        responsive_layout->ProtectedCompactFlex(
++            views::FlexSpecification(
++                views::MinimumFlexSizeRule::kScaleToMinimumSnapToZero,
++                views::MaximumFlexSizeRule::kPreferred)
++                .WithOrder(kExtensionsFlexOrder)));
++  }
++
++  const auto overflow_order = ToolbarController::GetDefaultOverflowOrder();
++  for (views::View* child : children()) {
++    if (child == toolbar_webview_ ||
++        !std::ranges::contains(
++            overflow_order, child->GetProperty(views::kElementIdentifierKey))) {
++      continue;
++    }
++    auto responsive = views::FlexSpecification(
++        views::MinimumFlexSizeRule::kPreferredSnapToZero,
++        views::MaximumFlexSizeRule::kPreferred);
++    if (const auto* flex = child->GetProperty(views::kFlexBehaviorKey)) {
++      responsive = *flex;
++    }
++    child->SetProperty(views::kFlexBehaviorKey,
++                       responsive_layout->ProtectedCompactFlex(responsive));
++  }
++  if (overflow_button_) {
++    overflow_button_->SetProperty(
++        views::kFlexBehaviorKey,
++        responsive_layout->ProtectedCompactFlex(views::FlexSpecification()));
++  }
++
+   // If there are any non-WebUI controls, needs to set up the ToolbarController
+   // to handle overflow. Otherwise, the toolbar controller is not needed.
+   if (!features::IsWebUIToolbarFullyEnabled()) {
+@@ -1768,9 +1856,9 @@ void ToolbarView::InitLayout() {
+ 
+     // TODO(crbug.com/40929989): Ignore containers till issue addressed.
+     toolbar_controller_ = std::make_unique<ToolbarController>(
+-        OverflowMenu::GetDefaultResponsiveElements(browser_),
+-        ToolbarController::GetDefaultOverflowOrder(), kToolbarFlexOrderStart,
+-        this, toolbar_webview_.get(), overflow_button_, pinned_toolbar_actions_,
++        OverflowMenu::GetDefaultResponsiveElements(browser_), overflow_order,
++        kToolbarFlexOrderStart, this, toolbar_webview_.get(), overflow_button_,
++        pinned_toolbar_actions_,
+         PinnedToolbarActionsModel::Get(browser_view_->GetProfile()));
+     overflow_button_->set_toolbar_controller(toolbar_controller_.get());
+   }
+@@ -1930,6 +2018,19 @@ void ToolbarView::UpdateToolbarLayout()
+       location_bar_view_->SetProperty(views::kMarginsKey,
+                                       gfx::Insets::VH(0, location_bar_margin));
+     }
++    if (display_mode_ == DisplayMode::kNormal) {
++      const auto maximum = is_compact_layout
++                               ? views::MaximumFlexSizeRule::kPreferred
++                               : views::MaximumFlexSizeRule::kUnbounded;
++      location_bar_view_->SetProperty(
++          views::kFlexBehaviorKey,
++          static_cast<ResponsiveToolbarLayout*>(layout_manager_.get())
++              ->ProtectedCompactFlex(
++                  views::FlexSpecification(
++                      views::MinimumFlexSizeRule::kScaleToMinimum, maximum)
++                      .WithOrder(kLocationBarFlexOrder),
++                  maximum));
++    }
+   }
+ 
+   InvalidateLayout();
+@@ -1978,6 +2079,9 @@ views::BubbleAnchor ToolbarView::GetDefa
+   if (extensions_container && extensions_container->IsVisible()) {
+     return extensions_container->GetExtensionsButtonAnchor();
+   }
++  if (overflow_button_ && overflow_button_->IsDrawn()) {
++    return views::BubbleAnchor(overflow_button_);
++  }
+   auto* control = GetAppMenuControl();
+   return control ? control->GetAnchor() : views::BubbleAnchor();
+ }
+--- a/chrome/browser/ui/views/extensions/extensions_toolbar_button.cc
++++ b/chrome/browser/ui/views/extensions/extensions_toolbar_button.cc
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/views/extensions/extensions_menu_view.h"
+ #include "chrome/browser/ui/views/extensions/extensions_request_access_button.h"
+ #include "chrome/browser/ui/views/extensions/extensions_toolbar_desktop.h"
++#include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "extensions/common/extension_features.h"
+@@ -157,6 +158,11 @@ void ExtensionsToolbarButton::ToggleExte
+     return;
+   }
+ 
++  views::BubbleAnchor anchor(this);
++  if (!IsDrawn()) {
++    anchor = ToolbarButtonProvider::From(browser_)
++                 ->GetDefaultExtensionDialogAnchor();
++  }
+   pressed_lock_ = menu_button_controller_->TakeLock();
+   extensions_toolbar_->OnMenuOpening();
+   base::RecordAction(base::UserMetricsAction("Extensions.Toolbar.MenuOpened"));
+@@ -167,16 +173,15 @@ void ExtensionsToolbarButton::ToggleExte
+       base::RecordAction(base::UserMetricsAction(
+           "Extensions.Toolbar.MenuOpenedWhenExtensionsAreRequestingAccess"));
+     }
+-    extensions_menu_coordinator_->Show(views::BubbleAnchor(this),
+-                                       extensions_toolbar_);
++    extensions_menu_coordinator_->Show(anchor, extensions_toolbar_);
+     menu = extensions_menu_coordinator_->GetExtensionsMenuWidget();
+   } else {
+     // Desktop Android will use the
+     // extensions_features::kExtensionsMenuAccessControl menu, therefore we can
+     // use Browser for the other menu until the feature is rolled out.
+     menu = ExtensionsMenuView::ShowBubble(
+-        views::BubbleAnchor(this), browser_,
+-        extensions_toolbar_->GetToolbarViewModel(), extensions_toolbar_);
++        anchor, browser_, extensions_toolbar_->GetToolbarViewModel(),
++        extensions_toolbar_);
+   }
+   extensions_menu_widget_ = menu->GetWeakPtr();
+   extension_menu_observation_.Observe(menu);
+--- a/chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.cc
++++ b/chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.cc
+@@ -119,6 +119,7 @@ PinnedToolbarActionsContainer::PinnedToo
+       button_provider_(button_provider),
+       model_(PinnedToolbarActionsModel::Get(browser_view->GetProfile())) {
+   SetPaintToLayer();
++  SetClipLayerToVisibleBounds(true);
+   SetProperty(views::kElementIdentifierKey,
+               kPinnedToolbarActionsContainerElementId);
+   // So we only get enter/exit messages when the mouse enters/exits the whole
