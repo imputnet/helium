@@ -88,7 +88,7 @@
  namespace signin {
  class IdentityManager;
  }
-@@ -26,10 +33,20 @@ class TrustedVaultClient;
+@@ -26,10 +33,19 @@ class TrustedVaultClient;
  
  namespace syncer {
  
@@ -102,14 +102,13 @@
 +  kEnabled,
 +  kFeatureDisabled,
 +  kProviderUnavailable,
-+  kDisabledByPolicy,
 +  kReconciliationBlocked,
 +};
 +
  // Interface for clients of the Sync API to plumb through necessary dependent
  // components. This interface is purely for abstracting dependencies, and
  // should not contain any non-trivial functional logic.
-@@ -55,6 +72,13 @@ class SyncClient {
+@@ -55,6 +71,13 @@ class SyncClient {
    // It is only used when sync is running against a local backend.
    virtual base::FilePath GetLocalSyncBackendFolder() = 0;
  
@@ -125,13 +124,12 @@
    virtual scoped_refptr<ExtensionsActivity> GetExtensionsActivity() = 0;
 --- a/components/sync/service/sync_service.cc
 +++ b/components/sync/service/sync_service.cc
-@@ -20,6 +20,15 @@ SyncSetupInProgressHandle::~SyncSetupInP
+@@ -20,6 +20,14 @@ SyncSetupInProgressHandle::~SyncSetupInP
    std::move(on_destroy_).Run();
  }
  
 +SyncBackendType SyncService::GetSyncBackendType() const {
-+  return IsLocalSyncEnabled() ? SyncBackendType::kLocal
-+                              : SyncBackendType::kDisabled;
++  return SyncBackendType::kDisabled;
 +}
 +
 +bool SyncService::ReconfigureBackend() {
@@ -172,20 +170,24 @@
    };
  
    using DisableReasonSet =
-@@ -330,6 +343,12 @@ class SyncService : public KeyedService
-   // etc. is considered not granted.
-   virtual bool IsLocalSyncEnabled() const = 0;
+@@ -324,11 +337,11 @@ class SyncService : public KeyedService
+   // Usually these errors are displayed to the user in the UI.
+   virtual UserActionableError GetUserActionableError() const = 0;
  
+-  // Returns true if the local sync backend server has been enabled through a
+-  // command line flag or policy. In this case sync is considered active but any
+-  // implied consent for further related services e.g. Suggestions, Web History
+-  // etc. is considered not granted.
+-  virtual bool IsLocalSyncEnabled() const = 0;
 +  // Returns the currently selected backend.
 +  virtual SyncBackendType GetSyncBackendType() const;
 +
 +  // Read the embedder's configuration and perform a live engine restart.
 +  virtual bool ReconfigureBackend();
-+
+ 
    // Information about the primary account. Note that this account doesn't
    // necessarily have Sync consent (in that case, only Sync-the-transport may be
-   // running).
-@@ -556,7 +575,8 @@ class SyncService : public KeyedService
+@@ -556,7 +569,8 @@ class SyncService : public KeyedService
      kLocalSync = 4,
      kSyncInternals = 5,
      kForeignSessionHelper = 6,
@@ -223,7 +225,7 @@
 -      identity_manager_(sync_prefs_.IsLocalSyncEnabled()
 -                            ? nullptr
 -                            : sync_client_->GetIdentityManager()),
-+      backend_type_(sync_prefs_.IsLocalSyncEnabled()
++      backend_type_(sync_prefs_.IsLocalSyncBackendEnabled()
 +                        ? SyncBackendType::kLocal
 +                        : (sync_client_->IsCustomSyncBackendConfigured()
 +                               ? SyncBackendType::kCustom
@@ -422,15 +424,15 @@
    // Now that everything is shut down, try to start up again.
    switch (shutdown_reason) {
      case ShutdownReason::STOP_SYNC_AND_KEEP_DATA:
-@@ -826,16 +813,35 @@ SyncService::DisableReasonSet SyncServic
+@@ -826,16 +813,32 @@ SyncService::DisableReasonSet SyncServic
    DCHECK(IsSyncAllowedByFlag());
    DisableReasonSet result;
  
 -  // If local sync is enabled, most disable reasons don't apply.
 -  if (!IsLocalSyncEnabled()) {
-+  // Local roaming sync intentionally ignores account Sync policy.
-+  // Custom sync does not.
-+  if (backend_type_ != SyncBackendType::kLocal) {
++  // Non-account backends intentionally ignore account Sync policy.
++  if (backend_type_ != SyncBackendType::kLocal &&
++      backend_type_ != SyncBackendType::kCustom) {
      if (user_settings_->IsSyncClientDisabledByPolicy() ||
          sync_disabled_by_admin_) {
        result.Put(DISABLE_REASON_ENTERPRISE_POLICY);
@@ -448,9 +450,6 @@
 +      case CustomSyncBackendStatus::kProviderUnavailable:
 +        result.Put(DISABLE_REASON_CUSTOM_BACKEND_PROVIDER_UNAVAILABLE);
 +        break;
-+      case CustomSyncBackendStatus::kDisabledByPolicy:
-+        result.Put(DISABLE_REASON_ENTERPRISE_POLICY);
-+        break;
 +      case CustomSyncBackendStatus::kReconciliationBlocked:
 +        result.Put(DISABLE_REASON_CUSTOM_BACKEND_BLOCKED);
 +        break;
@@ -462,7 +461,7 @@
  
    if (unrecoverable_error_reason_) {
      result.Put(DISABLE_REASON_UNRECOVERABLE_ERROR);
-@@ -852,10 +858,6 @@ SyncService::TransportState SyncServiceI
+@@ -852,10 +855,6 @@ SyncService::TransportState SyncServiceI
      return TransportState::DISABLED;
    }
  
@@ -473,7 +472,7 @@
    CHECK(IsEngineAllowedToRun());
  
    if (!engine_) {
-@@ -880,14 +882,6 @@ SyncService::TransportState SyncServiceI
+@@ -880,14 +879,6 @@ SyncService::TransportState SyncServiceI
      return TransportState::INITIALIZING;
    }
  
@@ -488,7 +487,7 @@
    // At this point we should usually be able to configure our data types (so the
    // DataTypeManager should not be STOPPED anymore), unless setup is in
    // progress. But it can also happen if this gets called from DataTypeManager
-@@ -1106,11 +1100,8 @@ void SyncServiceImpl::OnSyncCycleComplet
+@@ -1106,11 +1097,8 @@ void SyncServiceImpl::OnSyncCycleComplet
    NotifySyncCycleCompleted();
  }
  
@@ -501,7 +500,7 @@
    DVLOG(2) << "Notify observers OnConnectionStatusChange";
    NotifyObservers();
  }
-@@ -1172,47 +1163,6 @@ void SyncServiceImpl::OnActionableProtoc
+@@ -1172,47 +1160,6 @@ void SyncServiceImpl::OnActionableProtoc
        // immediately because IsEngineAllowedToRun() is almost certainly true at
        // this point and StopAndClear() leads to TryStart().
        user_settings_->SetSyncFeatureDisabledViaDashboard();
@@ -549,7 +548,7 @@
  #endif  // BUILDFLAG(IS_CHROMEOS)
        break;
      case STOP_SYNC_FOR_DISABLED_ACCOUNT:
-@@ -1310,93 +1260,12 @@ void SyncServiceImpl::OnConfigureStart()
+@@ -1310,93 +1257,12 @@ void SyncServiceImpl::OnConfigureStart()
  
  void SyncServiceImpl::SyncAuthAccountStateChanged() {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -645,7 +644,7 @@
  }
  
  void SyncServiceImpl::CryptoStateChanged() {
-@@ -1493,21 +1362,54 @@ bool SyncServiceImpl::IsCustomPassphrase
+@@ -1493,21 +1359,54 @@ bool SyncServiceImpl::IsCustomPassphrase
    return sync_client_->IsCustomPassphraseAllowed();
  }
  
@@ -658,7 +657,7 @@
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +
 +  const SyncBackendType desired_backend =
-+      sync_prefs_.IsLocalSyncEnabled()
++      sync_prefs_.IsLocalSyncBackendEnabled()
 +          ? SyncBackendType::kLocal
 +          : (sync_client_->IsCustomSyncBackendConfigured()
 +                 ? SyncBackendType::kCustom
@@ -710,7 +709,7 @@
  }
  
  CoreAccountInfo SyncServiceImpl::GetSyncAccountInfoForPrefs() const {
-@@ -1552,12 +1454,12 @@ bool SyncServiceImpl::QueryDetailedSyncS
+@@ -1552,12 +1451,12 @@ bool SyncServiceImpl::QueryDetailedSyncS
  
  GoogleServiceAuthError SyncServiceImpl::GetAuthError() const {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -725,14 +724,13 @@
  }
  
  bool SyncServiceImpl::HasCachedPersistentAuthErrorForMetrics() const {
-@@ -1583,7 +1485,28 @@ SyncServiceImpl::GetSetupInProgressHandl
+@@ -1581,9 +1480,25 @@ SyncServiceImpl::GetSetupInProgressHandl
+                           weak_factory_.GetWeakPtr()));
+ }
  
- bool SyncServiceImpl::IsLocalSyncEnabled() const {
-   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-bool SyncServiceImpl::IsLocalSyncEnabled() const {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 -  return sync_prefs_.IsLocalSyncEnabled();
-+  return backend_type_ == SyncBackendType::kLocal;
-+}
-+
 +bool SyncServiceImpl::HasActiveSyncBackend() const {
 +  return backend_type_ != SyncBackendType::kDisabled;
 +}
@@ -755,7 +753,7 @@
  }
  
  void SyncServiceImpl::TriggerRefresh(TriggerRefreshSource source,
-@@ -1595,11 +1518,6 @@ void SyncServiceImpl::TriggerRefresh(Tri
+@@ -1595,11 +1510,6 @@ void SyncServiceImpl::TriggerRefresh(Tri
    }
  }
  
@@ -767,7 +765,7 @@
  base::Time SyncServiceImpl::GetLastSyncedTimeForDebugging() const {
    if (!engine_ || !engine_->IsInitialized()) {
      return base::Time();
-@@ -1704,7 +1622,7 @@ DataTypeSet SyncServiceImpl::GetTypesWit
+@@ -1704,7 +1614,7 @@ DataTypeSet SyncServiceImpl::GetTypesWit
  
    if (GetTransportState() == TransportState::INITIALIZING &&
        !sync_client_->GetSyncEngineFactory()->HasTransportDataIncludingFirstSync(
@@ -776,7 +774,7 @@
      // The engine is initializing for the very first sync (usually after
      // sign-in). In this case all types are reported as pending download,
      // optimistically assuming datatype preconditions will be met.
-@@ -1730,14 +1648,6 @@ void SyncServiceImpl::ConfigureDataTypeM
+@@ -1730,14 +1640,6 @@ void SyncServiceImpl::ConfigureDataTypeM
      return;
    }
  
@@ -791,7 +789,7 @@
    DCHECK(!engine_->GetCacheGuid().empty());
    DVLOG(1) << "Started DataTypeManager configuration, reason: "
             << static_cast<int>(reason);
-@@ -1745,9 +1655,8 @@ void SyncServiceImpl::ConfigureDataTypeM
+@@ -1745,9 +1647,8 @@ void SyncServiceImpl::ConfigureDataTypeM
    const bool use_transport_only_mode = UseTransportOnlyMode();
  
    ConfigureContext configure_context;
@@ -802,7 +800,7 @@
    configure_context.cache_guid = engine_->GetCacheGuid();
    configure_context.sync_mode =
        use_transport_only_mode ? SyncMode::kTransportOnly : SyncMode::kFull;
-@@ -1772,8 +1681,7 @@ void SyncServiceImpl::ConfigureDataTypeM
+@@ -1772,8 +1673,7 @@ void SyncServiceImpl::ConfigureDataTypeM
      }
    }
  
@@ -812,7 +810,7 @@
    DCHECK(!configure_context.cache_guid.empty());
    DCHECK_NE(configure_context.reason, ConfigureReason::kUnknown);
  
-@@ -1842,7 +1750,7 @@ void SyncServiceImpl::ConfigureDataTypeM
+@@ -1842,7 +1742,7 @@ void SyncServiceImpl::ConfigureDataTypeM
  bool SyncServiceImpl::UseTransportOnlyMode() const {
    // Note: When local Sync is enabled, then we want full-sync mode (not just
    // transport), even though Sync-the-feature is not considered enabled.
@@ -821,7 +819,21 @@
  }
  
  void SyncServiceImpl::UpdateDataTypesForInvalidations() {
-@@ -2103,22 +2011,6 @@ SyncService::DataTypeDownloadStatus Sync
+@@ -1923,9 +1823,10 @@ void SyncServiceImpl::GetEntityCountsFor
+ void SyncServiceImpl::OnSyncClientDisabledByPolicyChanged() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+-  // Local sync is not controlled by the "sync managed" policy, so these pref
+-  // changes make no difference to the service state.
+-  if (IsLocalSyncEnabled()) {
++  // Non-account backends are not controlled by the "sync managed" policy, so
++  // these pref changes make no difference to the service state.
++  if (backend_type_ == SyncBackendType::kLocal ||
++      backend_type_ == SyncBackendType::kCustom) {
+     return;
+   }
+ 
+@@ -2103,22 +2004,6 @@ SyncService::DataTypeDownloadStatus Sync
    // Download status doesn't make sense for non-real data types.
    CHECK(IsRealDataType(type));
  
@@ -844,7 +856,7 @@
    // TODO(crbug.com/40260679): check whether this works when local sync is
    // enabled.
    if (!GetDisableReasons().empty() || !GetPreferredDataTypes().Has(type)) {
-@@ -2184,24 +2076,12 @@ void SyncServiceImpl::CacheTrustedVaultD
+@@ -2184,24 +2069,12 @@ void SyncServiceImpl::CacheTrustedVaultD
  
  CoreAccountInfo SyncServiceImpl::GetAccountInfo() const {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -871,7 +883,7 @@
  }
  
  void SyncServiceImpl::SetInvalidationsForSessionsEnabled(bool enabled) {
-@@ -2433,7 +2313,7 @@ void SyncServiceImpl::GetTypesWithUnsync
+@@ -2433,7 +2306,7 @@ void SyncServiceImpl::GetTypesWithUnsync
  
    // Syncing users do not use separate local and account storages. Thus, there's
    // no local-only data. The same is true for local sync users.
@@ -880,7 +892,7 @@
      std::move(callback).Run({});
      return;
    }
-@@ -2464,7 +2344,7 @@ void SyncServiceImpl::GetLocalDataDescri
+@@ -2464,7 +2337,7 @@ void SyncServiceImpl::GetLocalDataDescri
          callback) {
    // Syncing users do not use separate local and account storages. Thus, there's
    // no local-only data. The same is true for local sync users.
@@ -889,7 +901,7 @@
      std::move(callback).Run({});
      return;
    }
-@@ -2473,6 +2353,8 @@ void SyncServiceImpl::GetLocalDataDescri
+@@ -2473,6 +2346,8 @@ void SyncServiceImpl::GetLocalDataDescri
  }
  
  void SyncServiceImpl::TriggerLocalDataMigration(DataTypeSet types) {
@@ -898,7 +910,16 @@
    for (DataType type : types) {
      base::UmaHistogramEnumeration("Sync.BatchUpload.Requests3",
                                    syncer::DataTypeHistogramValue(type));
-@@ -2489,6 +2371,8 @@ void SyncServiceImpl::TriggerLocalDataMi
+@@ -2480,7 +2355,7 @@ void SyncServiceImpl::TriggerLocalDataMi
+ 
+   // Syncing users do not use separate local and account storages. Thus, there's
+   // no local-only data to migrate. The same is true for local sync users.
+-  if (HasSyncConsent() || IsLocalSyncEnabled()) {
++  if (HasSyncConsent() || backend_type_ == SyncBackendType::kLocal) {
+     return;
+   }
+ 
+@@ -2489,6 +2364,8 @@ void SyncServiceImpl::TriggerLocalDataMi
  
  void SyncServiceImpl::TriggerLocalDataMigrationForItems(
      std::map<DataType, std::vector<LocalDataItemModel::DataId>> items) {
@@ -907,7 +928,16 @@
    for (const auto& [type, _] : items) {
      base::UmaHistogramEnumeration("Sync.BatchUpload.Requests3",
                                    syncer::DataTypeHistogramValue(type));
-@@ -2507,7 +2391,7 @@ void SyncServiceImpl::TriggerLocalDataMi
+@@ -2496,7 +2373,7 @@ void SyncServiceImpl::TriggerLocalDataMi
+ 
+   // Syncing users do not use separate local and account storages. Thus, there's
+   // no local-only data to migrate. The same is true for local sync users.
+-  if (HasSyncConsent() || IsLocalSyncEnabled()) {
++  if (HasSyncConsent() || backend_type_ == SyncBackendType::kLocal) {
+     return;
+   }
+ 
+@@ -2507,7 +2384,7 @@ void SyncServiceImpl::TriggerLocalDataMi
  void SyncServiceImpl::SelectTypeAndMigrateLocalDataItemsWhenActive(
      DataType data_type,
      std::vector<LocalDataItemModel::DataId> items) {
@@ -916,7 +946,7 @@
      // This function should not have been called for local sync (i.e. enterprise
      // roaming profiles). However, as additional safeguard, the call is ignored
      // to avoid any unexpected side-effects.
-@@ -2515,7 +2399,6 @@ void SyncServiceImpl::SelectTypeAndMigra
+@@ -2515,7 +2392,6 @@ void SyncServiceImpl::SelectTypeAndMigra
    }
  
    CHECK(local_data_migration_item_queue_);
@@ -942,16 +972,17 @@
  #include "components/sync/service/sync_client.h"
  #include "components/sync/service/sync_prefs.h"
  #include "components/sync/service/sync_service.h"
-@@ -128,6 +130,8 @@ class SyncServiceImpl : public SyncServi
+@@ -127,7 +129,8 @@ class SyncServiceImpl : public SyncServi
+   DisableReasonSet GetDisableReasons() const override;
    TransportState GetTransportState() const override;
    UserActionableError GetUserActionableError() const override;
-   bool IsLocalSyncEnabled() const override;
+-  bool IsLocalSyncEnabled() const override;
 +  SyncBackendType GetSyncBackendType() const override;
 +  bool ReconfigureBackend() override;
    CoreAccountInfo GetAccountInfo() const override;
    bool HasSyncConsent() const override;
    GoogleServiceAuthError GetAuthError() const override;
-@@ -340,6 +344,9 @@ class SyncServiceImpl : public SyncServi
+@@ -340,6 +343,9 @@ class SyncServiceImpl : public SyncServi
  
    bool IsEngineAllowedToRun() const;
  
@@ -961,7 +992,7 @@
    // Configures the data type manager with the latest enabled types.
    // Note: Does not initialize the engine if it is not already initialized.
    // If a Sync setup is currently in progress (i.e. a settings UI is open), then
-@@ -356,7 +363,8 @@ class SyncServiceImpl : public SyncServi
+@@ -356,7 +362,8 @@ class SyncServiceImpl : public SyncServi
    // the shutdown, and dictates if sync metadata should be kept or not.
    // If the engine is still allowed to run (per IsEngineAllowedToRun()), it will
    // soon start up again (possibly in transport-only mode).
@@ -971,7 +1002,7 @@
  
    // Helper for OnUnrecoverableError.
    void OnUnrecoverableErrorImpl(const base::Location& from_here,
-@@ -386,9 +394,6 @@ class SyncServiceImpl : public SyncServi
+@@ -386,9 +393,6 @@ class SyncServiceImpl : public SyncServi
        base::TimeTicks try_start_time,
        std::vector<scoped_refptr<os_crypt_async::Encryptor>> encryptors);
  
@@ -981,7 +1012,7 @@
    // Tell the sync server that this client has disabled sync.
    void RemoveClientFromServer() const;
  
-@@ -445,6 +450,9 @@ class SyncServiceImpl : public SyncServi
+@@ -445,6 +449,9 @@ class SyncServiceImpl : public SyncServi
    // The class that handles getting, setting, and persisting sync preferences.
    SyncPrefs sync_prefs_;
  
@@ -1014,3 +1045,116 @@
  </enum>
  
  <!-- LINT.ThenChange(/components/sync/service/sync_service.h:TriggerRefreshSource) -->
+--- a/chrome/browser/signin/signin_promo_util.cc
++++ b/chrome/browser/signin/signin_promo_util.cc
+@@ -574,7 +574,7 @@ bool CanShowPromoForSyncableDataType(Sig
+   syncer::SyncPrefs prefs(profile.GetPrefs());
+   // Don't show if sync is not allowed to start or is running in local mode.
+   if (!SyncServiceFactory::IsSyncAllowed(&profile) ||
+-      prefs.IsLocalSyncEnabled()) {
++      prefs.IsLocalSyncBackendEnabled()) {
+     return false;
+   }
+ 
+--- a/chrome/browser/sync/device_info_sync_client_impl.cc
++++ b/chrome/browser/sync/device_info_sync_client_impl.cc
+@@ -43,7 +43,7 @@ std::string DeviceInfoSyncClientImpl::Ge
+ // Linux don't even check the pref on other os-es.
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX)
+   syncer::SyncPrefs prefs(profile_->GetPrefs());
+-  if (prefs.IsLocalSyncEnabled()) {
++  if (prefs.IsLocalSyncBackendEnabled()) {
+     return "local_device";
+   }
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX)
+--- a/chrome/browser/sync/sync_ui_util.cc
++++ b/chrome/browser/sync/sync_ui_util.cc
+@@ -318,7 +318,8 @@ bool ShouldRequestSyncConfirmation(const
+   // aborted without actually disabling Sync again. That generally shouldn't
+   // happen, but it might if Chrome crashed while the setup was ongoing, or due
+   // to past bugs in the setup flow.
+-  return !service->IsLocalSyncEnabled() && service->HasSyncConsent() &&
++  return service->GetSyncBackendType() != syncer::SyncBackendType::kLocal &&
++         service->HasSyncConsent() &&
+          !service->IsSetupInProgress() &&
+          !service->GetUserSettings()->IsInitialSyncFeatureSetupComplete();
+ }
+--- a/chrome/browser/ui/webui/settings/people_handler.cc
++++ b/chrome/browser/ui/webui/settings/people_handler.cc
+@@ -1345,7 +1345,8 @@ void PeopleHandler::PushSyncPrefs() {
+              base::TimeFormatShortDate(passphrase_time));
+   }
+ 
+-  args.Set("localSyncEnabled", service->IsLocalSyncEnabled());
++  args.Set("localSyncEnabled",
++           service->GetSyncBackendType() == syncer::SyncBackendType::kLocal);
+ 
+   FireWebUIListener("sync-prefs-changed", args);
+ }
+--- a/components/sync/service/sync_internals_util.cc
++++ b/components/sync/service/sync_internals_util.cc
+@@ -524,7 +524,8 @@ base::DictValue ConstructAboutInformatio
+       service->GetLastCycleSnapshotForDebugging();
+   const SyncTokenStatus& token_status =
+       service->GetSyncTokenStatusForDebugging();
+-  bool is_local_sync_enabled_state = service->IsLocalSyncEnabled();
++  bool is_local_sync_enabled_state =
++      service->GetSyncBackendType() == SyncBackendType::kLocal;
+ 
+   // Version Info.
+   // `client_version` was already set above.
+--- a/components/sync/service/sync_prefs.cc
++++ b/components/sync/service/sync_prefs.cc
+@@ -771,7 +771,7 @@ void SyncPrefs::RegisterTypeSelectedPref
+   registry->RegisterBooleanPref(pref_name, false);
+ }
+ 
+-bool SyncPrefs::IsLocalSyncEnabled() const {
++bool SyncPrefs::IsLocalSyncBackendEnabled() const {
+   return local_sync_enabled_;
+ }
+ 
+@@ -805,7 +805,7 @@ bool SyncPrefs::MaybeMigratePrefsForSync
+     return false;
+   }
+ 
+-  if (IsLocalSyncEnabled()) {
++  if (IsLocalSyncBackendEnabled()) {
+     // Special case for local sync: There isn't necessarily a signed-in user
+     // (even if the SyncAccountState is kSyncing), so just mark the migration as
+     // done.
+@@ -900,7 +900,7 @@ bool SyncPrefs::MaybeMigratePrefsForSync
+ 
+   // The actual migration: For explicit-passphrase users, addresses sync gets
+   // disabled by default.
+-  if (is_using_explicit_passphrase && !IsLocalSyncEnabled()) {
++  if (is_using_explicit_passphrase && !IsLocalSyncBackendEnabled()) {
+     CHECK(!gaia_id.empty());
+     SetAccountKeyedPrefDictEntry(
+         pref_service_, prefs::internal::kSelectedTypesPerAccount,
+--- a/components/sync/service/sync_prefs.h
++++ b/components/sync/service/sync_prefs.h
+@@ -191,8 +191,10 @@ class SyncPrefs {
+   static void SetTypeDisabledByCustodian(PrefValueMap* supervised_user_prefs,
+                                          UserSelectableType type);
+ 
+-  // Gets the local sync backend enabled state.
+-  bool IsLocalSyncEnabled() const;
++  // Reads the cached kEnableLocalSyncBackend pref. Use this when choosing a
++  // backend or before SyncService exists. For an existing service, use
++  // SyncService::GetSyncBackendType() to inspect its selected backend.
++  bool IsLocalSyncBackendEnabled() const;
+ 
+   // The user's passphrase type, determined the first time the engine is
+   // successfully initialized.
+--- a/chrome/browser/sync/sync_service_factory.cc
++++ b/chrome/browser/sync/sync_service_factory.cc
+@@ -433,7 +433,7 @@ std::unique_ptr<KeyedService> BuildSyncS
+   // Windows, Mac and Linux.
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX)
+   syncer::SyncPrefs prefs(profile->GetPrefs());
+-  local_sync_backend_enabled = prefs.IsLocalSyncEnabled();
++  local_sync_backend_enabled = prefs.IsLocalSyncBackendEnabled();
+   base::UmaHistogramBoolean("Sync.Local.Enabled2", local_sync_backend_enabled);
+ 
+   if (local_sync_backend_enabled) {
