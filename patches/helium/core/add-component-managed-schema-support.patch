@@ -1,42 +1,28 @@
 --- a/chrome/browser/extensions/api/storage/managed_value_store_cache.cc
 +++ b/chrome/browser/extensions/api/storage/managed_value_store_cache.cc
-@@ -99,9 +99,11 @@ class ManagedValueStoreCache::ExtensionT
- 
-   // Loads the schemas of the |extensions| and passes a ComponentMap to
+@@ -101,7 +101,7 @@ class ManagedValueStoreCache::ExtensionT
    // Register().
-+  void LoadSchemasOnUIThread(ExtensionSet extensions);
    static void LoadSchemasOnFileTaskRunner(ExtensionSet extensions,
                                            base::WeakPtr<ExtensionTracker> self);
 -  void Register(const policy::ComponentMap* components);
-+  void Register(const policy::ComponentMap* components,
-+                ExtensionSet extensions);
++  void Register(policy::ComponentMap* components, ExtensionSet extensions);
  
    raw_ptr<Profile> profile_;
    policy::PolicyDomain policy_domain_;
-@@ -184,6 +186,22 @@ bool ManagedValueStoreCache::ExtensionTr
-   return extension->manifest()->FindPath(manifest_keys::kStorageManagedSchema);
- }
+@@ -191,6 +191,12 @@ void ManagedValueStoreCache::ExtensionTr
+   auto components = std::make_unique<policy::ComponentMap>();
  
-+void ManagedValueStoreCache::ExtensionTracker::LoadSchemasOnUIThread(ExtensionSet extensions) {
-+  auto components = std::make_unique<policy::ComponentMap>();
-+
-+  for (const auto& extension : extensions) {
-+    if (!Manifest::IsComponentLocation(extension->location())) {
+   for (const auto& extension : extensions) {
++    // Component schemas live in the resource bundle and must be read on the
++    // UI thread. Do not register a failed filesystem lookup as an empty schema.
++    if (Manifest::IsComponentLocation(extension->location())) {
 +      continue;
 +    }
 +
-+    (*components)[extension->id()] =
-+        StorageSchemaManifestHandler::GetComponentSchema(extension.get())
-+            .value_or(policy::Schema());
-+  }
-+
-+  schema_registry_->RegisterComponents(policy_domain_, *components);
-+}
-+
- // static
- void ManagedValueStoreCache::ExtensionTracker::LoadSchemasOnFileTaskRunner(
-     ExtensionSet extensions,
-@@ -213,14 +231,21 @@ void ManagedValueStoreCache::ExtensionTr
+     if (!extension->manifest()->FindStringPath(
+             manifest_keys::kStorageManagedSchema)) {
+       // TODO(joaodasilva): Remove this. http://crbug.com/41078198
+@@ -213,12 +219,27 @@ void ManagedValueStoreCache::ExtensionTr
  
    content::GetUIThreadTaskRunner({})->PostTask(
        FROM_HERE, base::BindOnce(&ExtensionTracker::Register, self,
@@ -47,19 +33,25 @@
  
  void ManagedValueStoreCache::ExtensionTracker::Register(
 -    const policy::ComponentMap* components) {
-+    const policy::ComponentMap* components,
++    policy::ComponentMap* components,
 +    ExtensionSet extensions) {
    DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  for (const auto& extension : extensions) {
++    if (!Manifest::IsComponentLocation(extension->location())) {
++      continue;
++    }
++    auto schema =
++        StorageSchemaManifestHandler::GetComponentSchema(extension.get());
++    if (!schema.has_value()) {
++      LOG(ERROR) << "Failed to parse schema for extension " << extension->id()
++                 << " with error: " << schema.error();
++      schema = policy::Schema();
++    }
++    (*components)[extension->id()] = std::move(schema.value());
++  }
    schema_registry_->RegisterComponents(policy_domain_, *components);
  
-+  // Our uBlock Origin component has a policy schema, but is
-+  // not anywhere on the actual filesystem - so we need to pull
-+  // it out on the UI thread from resources.
-+  LoadSchemasOnUIThread(std::move(extensions));
-+
    // The first SetExtensionsDomainsReady() call is performed after the
-   // ExtensionSystem is ready, even if there are no managed extensions. It will
-   // trigger a loading of the initial policy for any managed extensions, and
 --- a/chrome/common/extensions/api/storage/storage_schema_manifest_handler.cc
 +++ b/chrome/common/extensions/api/storage/storage_schema_manifest_handler.cc
 @@ -15,6 +15,8 @@
