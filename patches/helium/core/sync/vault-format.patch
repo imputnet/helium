@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/components/sync/engine/sync_vault/BUILD.gn
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,23 @@
 +# Copyright 2026 The Helium Authors
 +# You can use, redistribute, and/or modify this source code under
 +# the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -8,6 +8,7 @@
 +import("//third_party/protobuf/proto_library.gni")
 +
 +proto_library("sync_vault_proto") {
++  proto_in_dir = "//"
 +  sources = [ "sync_vault.proto" ]
 +  extra_configs = [ "//build/config/compiler:wexit_time_destructors" ]
 +}
@@ -25,7 +26,7 @@
 +}
 --- /dev/null
 +++ b/components/sync/engine/sync_vault/sync_vault.proto
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,39 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -36,58 +37,47 @@
 +
 +package sync_pb;
 +
-+// Encrypted vault metadata. Cryptographic authentication is provided
-+// by the enclosing AEAD.
-+message SyncVaultDescriptor {
-+  optional uint32 format_version = 1;
-+  optional string vault_uuid = 2;
-+  optional int64 creation_time_millis = 3;
-+}
-+
 +message SyncVaultHead {
 +  optional uint32 format_version = 1;
-+  optional uint64 generation = 2;
-+  optional string record_id = 3;
-+  optional uint32 epoch = 4;
-+  optional uint64 epoch_start_generation = 5;
-+  optional uint32 minimum_retained_epoch = 6;
-+  optional uint64 minimum_retained_generation = 7;
-+  optional uint64 epoch_uploaded_bytes = 8;
++  // Absent only for an initialized vault with no commits.
++  optional bytes commit_digest = 2;
 +}
 +
-+message SyncVaultObjectReference {
-+  optional string object_id = 1;
-+  optional uint32 plaintext_size = 2;
-+}
-+
-+message SyncVaultJournalRecord {
++message SyncVaultCommit {
 +  optional uint32 format_version = 1;
 +  optional uint64 generation = 2;
-+  optional int64 creation_time_millis = 3;
-+  optional uint32 mutation_count = 4;
-+  optional string parent_record_id = 5;
-+  repeated SyncVaultObjectReference state_chunks = 6;
-+  optional uint32 epoch = 7;
++  // Absent only for generation one.
++  optional bytes parent_commit_digest = 3;
++  optional uint32 epoch = 4;
++  optional uint64 epoch_start_generation = 5;
++  optional uint64 minimum_retained_generation = 6;
++  // Cumulative plaintext payload bytes committed in this epoch.
++  optional uint64 epoch_payload_bytes = 7;
++  // Exactly one payload representation is present. Small payloads remain in
++  // this authenticated object; large payloads use encrypted external chunks.
++  optional bytes inline_payload = 8;
++  repeated bytes payload_chunk_digests = 9;
++  optional uint32 external_payload_size = 10;
 +}
 +
 +message SyncVaultCheckpoint {
 +  optional uint32 format_version = 1;
 +  optional string vault_uuid = 2;
 +  optional uint64 generation = 3;
-+  optional string record_id = 4;
-+  optional uint32 epoch = 5;
++  optional bytes commit_digest = 4;
 +}
 --- /dev/null
 +++ b/components/sync/engine/sync_vault/sync_vault_format.cc
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,398 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "components/sync/engine/sync_vault/sync_vault_format.h"
 +
-+#include <algorithm>
 +#include <cstdint>
++#include <limits>
++#include <optional>
 +#include <set>
 +#include <string>
 +#include <utility>
@@ -96,6 +86,8 @@
 +#include "base/containers/span.h"
 +#include "base/numerics/checked_math.h"
 +#include "base/numerics/safe_conversions.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_view_util.h"
 +#include "base/uuid.h"
 +#include "components/sync/engine/sync_vault/sync_vault.pb.h"
 +
@@ -107,84 +99,76 @@
 +  return base::Uuid::ParseLowercase(vault_uuid).is_valid();
 +}
 +
-+bool IsValidObjectId(const std::string& object_id) {
-+  return !object_id.empty() &&
-+         object_id.size() <= kSyncVaultMaximumIdentifierBytes;
-+}
-+
-+bool IsValidHeadIdentity(uint64_t generation, const std::string& record_id) {
-+  if (generation == 0) {
-+    return record_id.empty();
++std::optional<SyncVaultObjectDigest> ParseObjectDigest(
++    std::string_view serialized) {
++  if (serialized.size() != kSyncVaultObjectDigestBytes) {
++    return std::nullopt;
 +  }
-+  return IsValidObjectId(record_id);
-+}
-+
-+bool IsValidDescriptor(const SyncVaultDescriptor& descriptor) {
-+  return IsValidVaultUuid(descriptor.vault_uuid) &&
-+         descriptor.creation_time_millis >= 0;
-+}
-+
-+bool IsValidHead(const SyncVaultHead& head) {
-+  if (!IsValidHeadIdentity(head.generation, head.record_id) ||
-+      head.minimum_retained_epoch > head.epoch ||
-+      head.minimum_retained_generation > head.epoch_start_generation) {
-+    return false;
-+  }
-+  if (head.generation == 0) {
-+    return head.epoch == 0 && head.epoch_start_generation == 0 &&
-+           head.minimum_retained_epoch == 0 &&
-+           head.minimum_retained_generation == 0 &&
-+           head.epoch_uploaded_bytes == 0;
-+  }
-+  if (head.epoch_start_generation == 0 ||
-+      head.epoch_start_generation > head.generation ||
-+      head.epoch >= head.generation) {
-+    return false;
-+  }
-+  const uint32_t expected_retained_epoch = head.epoch == 0 ? 0 : head.epoch - 1;
-+  return head.minimum_retained_epoch == expected_retained_epoch &&
-+         (head.epoch <= 1 ? head.minimum_retained_generation == 0
-+                          : head.minimum_retained_generation > 0 &&
-+                                head.minimum_retained_generation <
-+                                    head.epoch_start_generation);
++  SyncVaultObjectDigest digest;
++  base::span(digest.bytes).copy_from(base::as_byte_span(serialized));
++  return digest;
 +}
 +
 +bool IsValidCheckpoint(const SyncVaultCheckpoint& checkpoint) {
 +  return IsValidVaultUuid(checkpoint.vault_uuid) &&
-+         IsValidHeadIdentity(checkpoint.generation, checkpoint.record_id) &&
-+         (checkpoint.generation == 0
-+              ? checkpoint.epoch == 0
-+              : checkpoint.epoch < checkpoint.generation);
++         ((checkpoint.generation == 0 && !checkpoint.commit_digest) ||
++          (checkpoint.generation > 0 && checkpoint.commit_digest));
 +}
 +
-+bool IsValidJournalRecord(const SyncVaultJournalRecord& record) {
-+  if (record.generation == 0 || record.creation_time_millis < 0 ||
-+      record.mutation_count == 0 || record.state_chunks.empty() ||
-+      record.state_chunks.size() > kSyncVaultMaximumStateChunks ||
-+      record.epoch >= record.generation) {
++uint64_t PayloadPlaintextSize(const SyncVaultCommit& commit) {
++  if (!commit.inline_payload.empty()) {
++    return commit.inline_payload.size();
++  }
++  return commit.external_payload_size;
++}
++
++bool IsValidCommit(const SyncVaultCommit& commit) {
++  const SyncVaultCommitHeader& header = commit.header;
++  if (header.generation == 0 || header.epoch_start_generation == 0 ||
++      header.epoch_start_generation > header.generation ||
++      header.epoch >= header.epoch_start_generation ||
++      header.minimum_retained_generation > header.epoch_start_generation ||
++      header.epoch_payload_bytes == 0 ||
++      (commit.inline_payload.empty() == commit.payload_chunk_digests.empty())) {
 +    return false;
 +  }
-+  if (record.generation == 1) {
-+    if (!record.parent_record_id.empty()) {
-+      return false;
-+    }
-+  } else if (!IsValidObjectId(record.parent_record_id)) {
++  if ((header.generation == 1 &&
++       (commit.parent_commit_digest || header.epoch != 0 ||
++        header.epoch_start_generation != 1)) ||
++      (header.generation > 1 && !commit.parent_commit_digest)) {
 +    return false;
++  }
++  if ((header.epoch <= 1 && header.minimum_retained_generation != 0) ||
++      (header.epoch > 1 &&
++       (header.minimum_retained_generation == 0 ||
++        header.minimum_retained_generation >= header.epoch_start_generation))) {
++    return false;
++  }
++  if (!commit.inline_payload.empty()) {
++    return commit.external_payload_size == 0 &&
++           commit.inline_payload.size() <=
++               kSyncVaultMaximumCommitPlaintextBytes &&
++           header.epoch_payload_bytes >= commit.inline_payload.size() &&
++           (header.generation != header.epoch_start_generation ||
++            header.epoch_payload_bytes == commit.inline_payload.size());
 +  }
 +
-+  base::CheckedNumeric<size_t> reconstructed_bytes = 0;
-+  std::set<std::string> object_ids;
-+  for (const SyncVaultObjectReference& chunk : record.state_chunks) {
-+    if (!IsValidObjectId(chunk.object_id) || chunk.plaintext_size == 0 ||
-+        chunk.plaintext_size > kSyncVaultMaximumEntityPlaintextBytes ||
-+        !object_ids.insert(chunk.object_id).second) {
++  if (commit.external_payload_size == 0 ||
++      commit.payload_chunk_digests.size() !=
++          1 + (commit.external_payload_size - 1) /
++                  kSyncVaultMaximumPayloadPlaintextBytes) {
++    return false;
++  }
++  std::set<SyncVaultObjectDigest> object_digests;
++  for (const SyncVaultObjectDigest& digest : commit.payload_chunk_digests) {
++    if (!object_digests.insert(digest).second) {
 +      return false;
 +    }
-+    reconstructed_bytes += chunk.plaintext_size;
 +  }
-+  return reconstructed_bytes.IsValid() &&
-+         reconstructed_bytes.ValueOrDie() <=
-+             kSyncVaultMaximumReconstructedBytes;
++  const uint64_t payload_bytes = commit.external_payload_size;
++  return header.epoch_payload_bytes >= payload_bytes &&
++         (header.generation != header.epoch_start_generation ||
++          header.epoch_payload_bytes == payload_bytes);
 +}
 +
 +template <typename Message>
@@ -225,55 +209,17 @@
 +
 +}  // namespace
 +
-+SyncVaultSerializeResult SerializeSyncVaultDescriptor(
-+    const SyncVaultDescriptor& descriptor) {
-+  if (!IsValidDescriptor(descriptor)) {
-+    return base::unexpected(SyncVaultFormatError::kInvalidValue);
-+  }
-+  sync_pb::SyncVaultDescriptor proto;
-+  proto.set_format_version(kSyncVaultFormatVersion);
-+  proto.set_vault_uuid(descriptor.vault_uuid);
-+  proto.set_creation_time_millis(descriptor.creation_time_millis);
-+  return SerializeProto(proto, kSyncVaultMaximumMetadataPlaintextBytes);
-+}
-+
-+SyncVaultParseResult<SyncVaultDescriptor> ParseSyncVaultDescriptor(
-+    base::span<const uint8_t> serialized) {
-+  sync_pb::SyncVaultDescriptor proto;
-+  auto parsed =
-+      ParseProto(serialized, kSyncVaultMaximumMetadataPlaintextBytes, &proto);
-+  if (!parsed.has_value()) {
-+    return base::unexpected(parsed.error());
-+  }
-+  if (!proto.has_format_version() || !proto.has_vault_uuid() ||
-+      !proto.has_creation_time_millis()) {
-+    return base::unexpected(SyncVaultFormatError::kMalformed);
-+  }
-+  if (proto.format_version() != kSyncVaultFormatVersion) {
-+    return base::unexpected(SyncVaultFormatError::kUnsupportedVersion);
-+  }
-+  SyncVaultDescriptor descriptor;
-+  descriptor.vault_uuid = proto.vault_uuid();
-+  descriptor.creation_time_millis = proto.creation_time_millis();
-+  if (!IsValidDescriptor(descriptor)) {
-+    return base::unexpected(SyncVaultFormatError::kInvalidValue);
-+  }
-+  return descriptor;
++std::string GetSyncVaultImmutableObjectId(const SyncVaultObjectDigest& digest) {
++  return base::HexEncode(digest.bytes);
 +}
 +
 +SyncVaultSerializeResult SerializeSyncVaultHead(const SyncVaultHead& head) {
-+  if (!IsValidHead(head)) {
-+    return base::unexpected(SyncVaultFormatError::kInvalidValue);
-+  }
 +  sync_pb::SyncVaultHead proto;
 +  proto.set_format_version(kSyncVaultFormatVersion);
-+  proto.set_generation(head.generation);
-+  proto.set_record_id(head.record_id);
-+  proto.set_epoch(head.epoch);
-+  proto.set_epoch_start_generation(head.epoch_start_generation);
-+  proto.set_minimum_retained_epoch(head.minimum_retained_epoch);
-+  proto.set_minimum_retained_generation(head.minimum_retained_generation);
-+  proto.set_epoch_uploaded_bytes(head.epoch_uploaded_bytes);
++  if (head.commit_digest) {
++    proto.set_commit_digest(head.commit_digest->bytes.data(),
++                            head.commit_digest->bytes.size());
++  }
 +  return SerializeProto(proto, kSyncVaultMaximumMetadataPlaintextBytes);
 +}
 +
@@ -285,93 +231,140 @@
 +  if (!parsed.has_value()) {
 +    return base::unexpected(parsed.error());
 +  }
-+  if (!proto.has_format_version() || !proto.has_generation() ||
-+      !proto.has_record_id() || !proto.has_epoch() ||
-+      !proto.has_epoch_start_generation() ||
-+      !proto.has_minimum_retained_epoch() ||
-+      !proto.has_minimum_retained_generation() ||
-+      !proto.has_epoch_uploaded_bytes()) {
++  if (!proto.has_format_version()) {
 +    return base::unexpected(SyncVaultFormatError::kMalformed);
 +  }
 +  if (proto.format_version() != kSyncVaultFormatVersion) {
 +    return base::unexpected(VersionError(proto.format_version()));
 +  }
-+  SyncVaultHead head;
-+  head.generation = proto.generation();
-+  head.record_id = proto.record_id();
-+  head.epoch = proto.epoch();
-+  head.epoch_start_generation = proto.epoch_start_generation();
-+  head.minimum_retained_epoch = proto.minimum_retained_epoch();
-+  head.minimum_retained_generation = proto.minimum_retained_generation();
-+  head.epoch_uploaded_bytes = proto.epoch_uploaded_bytes();
-+  if (!IsValidHead(head)) {
-+    return base::unexpected(SyncVaultFormatError::kInvalidValue);
++  std::optional<SyncVaultObjectDigest> commit_digest;
++  if (proto.has_commit_digest()) {
++    commit_digest = ParseObjectDigest(proto.commit_digest());
++    if (!commit_digest) {
++      return base::unexpected(SyncVaultFormatError::kInvalidValue);
++    }
 +  }
-+  return head;
++  return SyncVaultHead{std::move(commit_digest)};
 +}
 +
-+SyncVaultSerializeResult SerializeSyncVaultJournalRecord(
-+    const SyncVaultJournalRecord& record) {
-+  if (!IsValidJournalRecord(record)) {
++SyncVaultSerializeResult SerializeSyncVaultCommit(
++    const SyncVaultCommit& commit) {
++  if (!IsValidCommit(commit)) {
 +    return base::unexpected(SyncVaultFormatError::kInvalidValue);
 +  }
-+  sync_pb::SyncVaultJournalRecord proto;
++  sync_pb::SyncVaultCommit proto;
 +  proto.set_format_version(kSyncVaultFormatVersion);
-+  proto.set_generation(record.generation);
-+  proto.set_creation_time_millis(record.creation_time_millis);
-+  proto.set_mutation_count(record.mutation_count);
-+  proto.set_parent_record_id(record.parent_record_id);
-+  proto.set_epoch(record.epoch);
-+  for (const SyncVaultObjectReference& chunk : record.state_chunks) {
-+    sync_pb::SyncVaultObjectReference* chunk_proto = proto.add_state_chunks();
-+    chunk_proto->set_object_id(chunk.object_id);
-+    chunk_proto->set_plaintext_size(chunk.plaintext_size);
++  proto.set_generation(commit.header.generation);
++  if (commit.parent_commit_digest) {
++    proto.set_parent_commit_digest(commit.parent_commit_digest->bytes.data(),
++                                   commit.parent_commit_digest->bytes.size());
 +  }
-+  return SerializeProto(proto, kSyncVaultMaximumJournalPlaintextBytes);
++  proto.set_epoch(commit.header.epoch);
++  proto.set_epoch_start_generation(commit.header.epoch_start_generation);
++  proto.set_minimum_retained_generation(
++      commit.header.minimum_retained_generation);
++  proto.set_epoch_payload_bytes(commit.header.epoch_payload_bytes);
++  if (!commit.inline_payload.empty()) {
++    proto.set_inline_payload(commit.inline_payload.data(),
++                             commit.inline_payload.size());
++  }
++  for (const SyncVaultObjectDigest& digest : commit.payload_chunk_digests) {
++    proto.add_payload_chunk_digests(digest.bytes.data(), digest.bytes.size());
++  }
++  if (!commit.payload_chunk_digests.empty()) {
++    proto.set_external_payload_size(commit.external_payload_size);
++  }
++  return SerializeProto(proto, kSyncVaultMaximumCommitPlaintextBytes);
 +}
 +
-+SyncVaultParseResult<SyncVaultJournalRecord> ParseSyncVaultJournalRecord(
++SyncVaultParseResult<SyncVaultCommit> ParseSyncVaultCommit(
 +    base::span<const uint8_t> serialized) {
-+  sync_pb::SyncVaultJournalRecord proto;
++  sync_pb::SyncVaultCommit proto;
 +  auto parsed =
-+      ParseProto(serialized, kSyncVaultMaximumJournalPlaintextBytes, &proto);
++      ParseProto(serialized, kSyncVaultMaximumCommitPlaintextBytes, &proto);
 +  if (!parsed.has_value()) {
 +    return base::unexpected(parsed.error());
 +  }
 +  if (!proto.has_format_version() || !proto.has_generation() ||
-+      !proto.has_creation_time_millis() || !proto.has_mutation_count() ||
-+      !proto.has_parent_record_id() || !proto.has_epoch()) {
++      !proto.has_epoch() || !proto.has_epoch_start_generation() ||
++      !proto.has_minimum_retained_generation() ||
++      !proto.has_epoch_payload_bytes()) {
 +    return base::unexpected(SyncVaultFormatError::kMalformed);
 +  }
 +  if (proto.format_version() != kSyncVaultFormatVersion) {
 +    return base::unexpected(VersionError(proto.format_version()));
 +  }
-+  if (proto.state_chunks_size() <= 0 ||
-+      base::checked_cast<size_t>(proto.state_chunks_size()) >
-+          kSyncVaultMaximumStateChunks) {
-+    return base::unexpected(SyncVaultFormatError::kInvalidValue);
++  const bool has_external_payload = proto.payload_chunk_digests_size() > 0;
++  if (proto.has_inline_payload() == has_external_payload ||
++      proto.has_external_payload_size() != has_external_payload) {
++    return base::unexpected(SyncVaultFormatError::kMalformed);
 +  }
-+  SyncVaultJournalRecord record;
-+  record.generation = proto.generation();
-+  record.creation_time_millis = proto.creation_time_millis();
-+  record.mutation_count = proto.mutation_count();
-+  record.parent_record_id = proto.parent_record_id();
-+  record.epoch = proto.epoch();
-+  record.state_chunks.reserve(proto.state_chunks_size());
-+  for (const sync_pb::SyncVaultObjectReference& chunk_proto :
-+       proto.state_chunks()) {
-+    if (!chunk_proto.has_object_id() || !chunk_proto.has_plaintext_size()) {
-+      return base::unexpected(SyncVaultFormatError::kMalformed);
++  SyncVaultCommit commit;
++  commit.header.generation = proto.generation();
++  if (proto.has_parent_commit_digest()) {
++    commit.parent_commit_digest =
++        ParseObjectDigest(proto.parent_commit_digest());
++    if (!commit.parent_commit_digest) {
++      return base::unexpected(SyncVaultFormatError::kInvalidValue);
 +    }
-+    SyncVaultObjectReference chunk;
-+    chunk.object_id = chunk_proto.object_id();
-+    chunk.plaintext_size = chunk_proto.plaintext_size();
-+    record.state_chunks.push_back(std::move(chunk));
 +  }
-+  if (!IsValidJournalRecord(record)) {
++  commit.header.epoch = proto.epoch();
++  commit.header.epoch_start_generation = proto.epoch_start_generation();
++  commit.header.minimum_retained_generation =
++      proto.minimum_retained_generation();
++  commit.header.epoch_payload_bytes = proto.epoch_payload_bytes();
++  if (proto.has_inline_payload()) {
++    commit.inline_payload.assign(proto.inline_payload().begin(),
++                                 proto.inline_payload().end());
++  }
++  if (proto.has_external_payload_size()) {
++    commit.external_payload_size = proto.external_payload_size();
++  }
++  commit.payload_chunk_digests.reserve(proto.payload_chunk_digests_size());
++  for (const std::string& serialized_digest : proto.payload_chunk_digests()) {
++    std::optional<SyncVaultObjectDigest> object_digest =
++        ParseObjectDigest(serialized_digest);
++    if (!object_digest) {
++      return base::unexpected(SyncVaultFormatError::kInvalidValue);
++    }
++    commit.payload_chunk_digests.push_back(std::move(*object_digest));
++  }
++  if (!IsValidCommit(commit)) {
 +    return base::unexpected(SyncVaultFormatError::kInvalidValue);
 +  }
-+  return record;
++  return commit;
++}
++
++bool IsValidSyncVaultCommitTransition(
++    const SyncVaultObjectDigest& parent_digest,
++    const SyncVaultCommitHeader& parent,
++    const SyncVaultCommit& child) {
++  if (parent.generation == std::numeric_limits<uint64_t>::max() ||
++      child.header.generation != parent.generation + 1 ||
++      child.parent_commit_digest != parent_digest) {
++    return false;
++  }
++
++  if (child.header.epoch == parent.epoch) {
++    const uint64_t child_payload_bytes = PayloadPlaintextSize(child);
++    base::CheckedNumeric<uint64_t> expected_epoch_payload_bytes =
++        parent.epoch_payload_bytes;
++    expected_epoch_payload_bytes += child_payload_bytes;
++    return expected_epoch_payload_bytes.IsValid() &&
++           child.header.generation > child.header.epoch_start_generation &&
++           child.header.epoch_start_generation ==
++               parent.epoch_start_generation &&
++           child.header.minimum_retained_generation ==
++               parent.minimum_retained_generation &&
++           child.header.epoch_payload_bytes ==
++               expected_epoch_payload_bytes.ValueOrDie();
++  }
++
++  return parent.epoch != std::numeric_limits<uint32_t>::max() &&
++         child.header.epoch == parent.epoch + 1 &&
++         child.header.epoch_start_generation == child.header.generation &&
++         child.header.minimum_retained_generation ==
++             (child.header.epoch <= 1 ? 0 : parent.epoch_start_generation);
 +}
 +
 +SyncVaultSerializeResult SerializeSyncVaultCheckpoint(
@@ -383,8 +376,10 @@
 +  proto.set_format_version(kSyncVaultFormatVersion);
 +  proto.set_vault_uuid(checkpoint.vault_uuid);
 +  proto.set_generation(checkpoint.generation);
-+  proto.set_record_id(checkpoint.record_id);
-+  proto.set_epoch(checkpoint.epoch);
++  if (checkpoint.commit_digest) {
++    proto.set_commit_digest(checkpoint.commit_digest->bytes.data(),
++                            checkpoint.commit_digest->bytes.size());
++  }
 +  return SerializeProto(proto, kSyncVaultMaximumMetadataPlaintextBytes);
 +}
 +
@@ -397,17 +392,21 @@
 +    return base::unexpected(parsed.error());
 +  }
 +  if (!proto.has_format_version() || !proto.has_vault_uuid() ||
-+      !proto.has_generation() || !proto.has_record_id() || !proto.has_epoch()) {
++      !proto.has_generation()) {
 +    return base::unexpected(SyncVaultFormatError::kMalformed);
 +  }
 +  if (proto.format_version() != kSyncVaultFormatVersion) {
 +    return base::unexpected(VersionError(proto.format_version()));
 +  }
-+  SyncVaultCheckpoint checkpoint;
-+  checkpoint.vault_uuid = proto.vault_uuid();
-+  checkpoint.generation = proto.generation();
-+  checkpoint.record_id = proto.record_id();
-+  checkpoint.epoch = proto.epoch();
++  std::optional<SyncVaultObjectDigest> commit_digest;
++  if (proto.has_commit_digest()) {
++    commit_digest = ParseObjectDigest(proto.commit_digest());
++    if (!commit_digest) {
++      return base::unexpected(SyncVaultFormatError::kInvalidValue);
++    }
++  }
++  SyncVaultCheckpoint checkpoint{proto.vault_uuid(), proto.generation(),
++                                 std::move(commit_digest)};
 +  if (!IsValidCheckpoint(checkpoint)) {
 +    return base::unexpected(SyncVaultFormatError::kInvalidValue);
 +  }
@@ -416,57 +415,53 @@
 +
 +SyncVaultHistoryValidationResult ValidateSyncVaultHistory(
 +    const SyncVaultCheckpoint& checkpoint,
-+    const SyncVaultHead& candidate_head,
-+    base::span<const AuthenticatedSyncVaultJournalRecord>
-+        newest_first_ancestry) {
-+  if (!IsValidCheckpoint(checkpoint) || !IsValidHead(candidate_head) ||
-+      newest_first_ancestry.size() > kSyncVaultMaximumJournalAncestryRecords) {
++    const SyncVaultCommit& candidate_commit,
++    const SyncVaultObjectDigest& candidate_commit_digest,
++    base::span<const AuthenticatedSyncVaultCommit> newest_first_ancestry) {
++  if (!IsValidCheckpoint(checkpoint) || !IsValidCommit(candidate_commit) ||
++      newest_first_ancestry.size() > kSyncVaultMaximumCommitAncestry) {
 +    return SyncVaultHistoryValidationResult::kInvalidHistory;
 +  }
-+  if (candidate_head.generation < checkpoint.generation) {
++  if (candidate_commit.header.generation < checkpoint.generation) {
 +    return SyncVaultHistoryValidationResult::kRollback;
 +  }
-+  if (candidate_head.generation == checkpoint.generation) {
++  if (candidate_commit.header.generation == checkpoint.generation) {
 +    if (!newest_first_ancestry.empty()) {
 +      return SyncVaultHistoryValidationResult::kInvalidHistory;
 +    }
-+    return candidate_head.record_id == checkpoint.record_id
++    return checkpoint.commit_digest == candidate_commit_digest
 +               ? SyncVaultHistoryValidationResult::kAcceptCurrent
 +               : SyncVaultHistoryValidationResult::kFork;
 +  }
-+
-+  if (checkpoint.generation < candidate_head.minimum_retained_generation) {
++  if (checkpoint.generation == 0 ||
++      checkpoint.generation <
++          candidate_commit.header.minimum_retained_generation) {
 +    return newest_first_ancestry.empty()
-+               ? SyncVaultHistoryValidationResult::kAcceptCompacted
++               ? SyncVaultHistoryValidationResult::kAcceptBaseline
 +               : SyncVaultHistoryValidationResult::kInvalidHistory;
 +  }
 +
-+  uint64_t expected_generation = candidate_head.generation;
-+  std::string expected_record_id = candidate_head.record_id;
++  uint64_t expected_generation = candidate_commit.header.generation;
++  SyncVaultObjectDigest expected_commit_digest = candidate_commit_digest;
 +  for (size_t index = 0; index < newest_first_ancestry.size(); ++index) {
-+    const AuthenticatedSyncVaultJournalRecord& authenticated_record =
-+        newest_first_ancestry[index];
-+    if (authenticated_record.generation != expected_generation ||
-+        authenticated_record.record_id != expected_record_id) {
++    const AuthenticatedSyncVaultCommit& commit = newest_first_ancestry[index];
++    if (commit.generation != expected_generation ||
++        commit.commit_digest != expected_commit_digest) {
 +      return SyncVaultHistoryValidationResult::kInvalidHistory;
 +    }
-+
-+    if (checkpoint.generation == 0) {
-+      return index + 1 == newest_first_ancestry.size()
-+                 ? SyncVaultHistoryValidationResult::kAcceptDescendant
-+                 : SyncVaultHistoryValidationResult::kInvalidHistory;
-+    }
-+
 +    if (expected_generation == checkpoint.generation + 1) {
 +      if (index + 1 != newest_first_ancestry.size()) {
 +        return SyncVaultHistoryValidationResult::kInvalidHistory;
 +      }
-+      return authenticated_record.parent_record_id == checkpoint.record_id
++      return commit.parent_commit_digest == checkpoint.commit_digest
 +                 ? SyncVaultHistoryValidationResult::kAcceptDescendant
 +                 : SyncVaultHistoryValidationResult::kFork;
 +    }
++    if (!commit.parent_commit_digest) {
++      return SyncVaultHistoryValidationResult::kInvalidHistory;
++    }
 +    expected_generation--;
-+    expected_record_id = authenticated_record.parent_record_id;
++    expected_commit_digest = *commit.parent_commit_digest;
 +  }
 +  return SyncVaultHistoryValidationResult::kIncompleteHistory;
 +}
@@ -474,7 +469,7 @@
 +}  // namespace syncer
 --- /dev/null
 +++ b/components/sync/engine/sync_vault/sync_vault_format.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,152 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -482,8 +477,10 @@
 +#ifndef COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_FORMAT_H_
 +#define COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_FORMAT_H_
 +
++#include <array>
 +#include <cstddef>
 +#include <cstdint>
++#include <optional>
 +#include <string>
 +#include <vector>
 +
@@ -494,8 +491,16 @@
 +namespace syncer {
 +
 +inline constexpr uint32_t kSyncVaultFormatVersion = 1;
-+inline constexpr size_t kSyncVaultMaximumStateChunks = 100000;
-+inline constexpr size_t kSyncVaultMaximumJournalAncestryRecords = 100000;
++inline constexpr size_t kSyncVaultObjectDigestBytes = 32;
++inline constexpr uint64_t kSyncVaultEpochCommitTarget = 64;
++inline constexpr size_t kSyncVaultMaximumCommitAncestry =
++    2 * kSyncVaultEpochCommitTarget;
++
++struct SyncVaultObjectDigest {
++  std::array<uint8_t, kSyncVaultObjectDigestBytes> bytes{};
++
++  auto operator<=>(const SyncVaultObjectDigest&) const = default;
++};
 +
 +enum class SyncVaultFormatError {
 +  kMalformed,
@@ -504,45 +509,37 @@
 +  kInvalidValue,
 +};
 +
-+struct SyncVaultDescriptor {
-+  std::string vault_uuid;
-+  int64_t creation_time_millis = 0;
-+
-+  bool operator==(const SyncVaultDescriptor&) const = default;
-+};
-+
-+// Generation zero is the only valid empty head. Every later head
-+// identifies and authenticates one journal record.
++// The fixed mutable head publishes one complete immutable commit. A missing
++// digest represents an initialized vault with no commits.
 +struct SyncVaultHead {
-+  uint64_t generation = 0;
-+  std::string record_id;
-+  uint32_t epoch = 0;
-+  uint64_t epoch_start_generation = 0;
-+  uint32_t minimum_retained_epoch = 0;
-+  uint64_t minimum_retained_generation = 0;
-+  uint64_t epoch_uploaded_bytes = 0;
++  std::optional<SyncVaultObjectDigest> commit_digest;
 +
 +  bool operator==(const SyncVaultHead&) const = default;
 +};
 +
-+// A journal record references the immutable encrypted chunks that
-+// reconstruct the complete LoopbackServer state for that generation.
-+struct SyncVaultObjectReference {
-+  std::string object_id;
-+  uint32_t plaintext_size = 0;
++// Fields needed to construct and validate the next commit. Loaded state keeps
++// this header without retaining the commit's transient payload references.
++struct SyncVaultCommitHeader {
++  uint64_t generation = 0;
++  uint32_t epoch = 0;
++  uint64_t epoch_start_generation = 0;
++  uint64_t minimum_retained_generation = 0;
++  uint64_t epoch_payload_bytes = 0;
 +
-+  bool operator==(const SyncVaultObjectReference&) const = default;
++  bool operator==(const SyncVaultCommitHeader&) const = default;
 +};
 +
-+struct SyncVaultJournalRecord {
-+  uint64_t generation = 0;
-+  int64_t creation_time_millis = 0;
-+  uint32_t mutation_count = 0;
-+  std::string parent_record_id;
-+  std::vector<SyncVaultObjectReference> state_chunks;
-+  uint32_t epoch = 0;
++// One immutable journal commit. The first commit in each epoch contains a
++// complete state snapshot; later commits contain semantic deltas. The payload
++// is inline unless it is too large for the commit object.
++struct SyncVaultCommit {
++  SyncVaultCommitHeader header;
++  std::optional<SyncVaultObjectDigest> parent_commit_digest;
++  std::vector<uint8_t> inline_payload;
++  uint32_t external_payload_size = 0;
++  std::vector<SyncVaultObjectDigest> payload_chunk_digests;
 +
-+  bool operator==(const SyncVaultJournalRecord&) const = default;
++  bool operator==(const SyncVaultCommit&) const = default;
 +};
 +
 +// This is stored only in OS-protected local state. It is updated after
@@ -550,8 +547,7 @@
 +struct SyncVaultCheckpoint {
 +  std::string vault_uuid;
 +  uint64_t generation = 0;
-+  std::string record_id;
-+  uint32_t epoch = 0;
++  std::optional<SyncVaultObjectDigest> commit_digest;
 +
 +  bool operator==(const SyncVaultCheckpoint&) const = default;
 +};
@@ -561,29 +557,36 @@
 +template <typename T>
 +using SyncVaultParseResult = base::expected<T, SyncVaultFormatError>;
 +
-+SyncVaultSerializeResult SerializeSyncVaultDescriptor(
-+    const SyncVaultDescriptor& descriptor);
-+SyncVaultParseResult<SyncVaultDescriptor> ParseSyncVaultDescriptor(
-+    base::span<const uint8_t> serialized);
-+
 +SyncVaultSerializeResult SerializeSyncVaultHead(const SyncVaultHead& head);
 +SyncVaultParseResult<SyncVaultHead> ParseSyncVaultHead(
 +    base::span<const uint8_t> serialized);
 +
-+SyncVaultSerializeResult SerializeSyncVaultJournalRecord(
-+    const SyncVaultJournalRecord& record);
-+SyncVaultParseResult<SyncVaultJournalRecord> ParseSyncVaultJournalRecord(
++SyncVaultSerializeResult SerializeSyncVaultCommit(
++    const SyncVaultCommit& commit);
++SyncVaultParseResult<SyncVaultCommit> ParseSyncVaultCommit(
 +    base::span<const uint8_t> serialized);
++
++// Returns whether `child` can immediately follow `parent`. Both commits must
++// already have passed their individual format validation, and `parent_digest`
++// is the authenticated digest from which `parent` was loaded.
++bool IsValidSyncVaultCommitTransition(
++    const SyncVaultObjectDigest& parent_digest,
++    const SyncVaultCommitHeader& parent,
++    const SyncVaultCommit& child);
 +
 +SyncVaultSerializeResult SerializeSyncVaultCheckpoint(
 +    const SyncVaultCheckpoint& checkpoint);
 +SyncVaultParseResult<SyncVaultCheckpoint> ParseSyncVaultCheckpoint(
 +    base::span<const uint8_t> serialized);
 +
-+struct AuthenticatedSyncVaultJournalRecord {
-+  std::string record_id;
++// Provider object identifiers are canonical encodings of internal ciphertext
++// digests. The provider scopes them by the separately supplied vault UUID.
++std::string GetSyncVaultImmutableObjectId(const SyncVaultObjectDigest& digest);
++
++struct AuthenticatedSyncVaultCommit {
++  SyncVaultObjectDigest commit_digest;
 +  uint64_t generation = 0;
-+  std::string parent_record_id;
++  std::optional<SyncVaultObjectDigest> parent_commit_digest;
 +};
 +
 +enum class SyncVaultHistoryValidationResult {
@@ -593,9 +596,9 @@
 +  // The ancestry links the newer candidate to the checkpoint.
 +  // Accept it and advance the checkpoint after loading its state.
 +  kAcceptDescendant,
-+  // The checkpoint predates retained history. Accept the candidate as
-+  // the new baseline and advance the checkpoint.
-+  kAcceptCompacted,
++  // There is no retained checkpoint commit against which to compare the
++  // candidate. Accept it as the new baseline and advance the checkpoint.
++  kAcceptBaseline,
 +  // The candidate generation is older than the checkpoint. Reject and
 +  // report a rollback.
 +  kRollback,
@@ -612,16 +615,16 @@
 +
 +SyncVaultHistoryValidationResult ValidateSyncVaultHistory(
 +    const SyncVaultCheckpoint& checkpoint,
-+    const SyncVaultHead& candidate_head,
-+    base::span<const AuthenticatedSyncVaultJournalRecord>
-+        newest_first_ancestry);
++    const SyncVaultCommit& candidate_commit,
++    const SyncVaultObjectDigest& candidate_commit_digest,
++    base::span<const AuthenticatedSyncVaultCommit> newest_first_ancestry);
 +
 +}  // namespace syncer
 +
 +#endif  // COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_FORMAT_H_
 --- /dev/null
 +++ b/components/sync/engine/sync_vault/sync_vault_limits.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,38 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -638,21 +641,23 @@
 +inline constexpr size_t kSyncVaultContainerOverheadBytes = 28;
 +inline constexpr size_t kSyncVaultMaximumEncryptedObjectBytes =
 +    16 * 1024 * 1024;
-+inline constexpr size_t kSyncVaultMaximumIdentifierBytes = 4096;
++// Object identifiers are browser-owned fixed names or hexadecimal SHA-256
++// digests.
++inline constexpr size_t kSyncVaultMaximumObjectIdBytes = 64;
++inline constexpr size_t kSyncVaultMaximumRevisionBytes = 4096;
 +inline constexpr size_t kSyncVaultMaximumMetadataPlaintextBytes =
 +    64 * 1024 - kSyncVaultContainerOverheadBytes;
-+inline constexpr size_t kSyncVaultMaximumJournalPlaintextBytes =
++inline constexpr size_t kSyncVaultMaximumCommitPlaintextBytes =
 +    4 * 1024 * 1024 - kSyncVaultContainerOverheadBytes;
-+inline constexpr size_t kSyncVaultMaximumEntityPlaintextBytes =
++inline constexpr size_t kSyncVaultMaximumPayloadPlaintextBytes =
 +    kSyncVaultMaximumEncryptedObjectBytes - kSyncVaultContainerOverheadBytes;
-+inline constexpr size_t kSyncVaultMaximumReconstructedBytes = 256 * 1024 * 1024;
 +
 +inline constexpr bool IsValidSyncVaultObjectId(std::string_view value) {
-+  return !value.empty() && value.size() <= kSyncVaultMaximumIdentifierBytes;
++  return !value.empty() && value.size() <= kSyncVaultMaximumObjectIdBytes;
 +}
 +
 +inline constexpr bool IsValidSyncVaultRevision(std::string_view value) {
-+  return !value.empty() && value.size() <= kSyncVaultMaximumIdentifierBytes;
++  return !value.empty() && value.size() <= kSyncVaultMaximumRevisionBytes;
 +}
 +
 +}  // namespace syncer
