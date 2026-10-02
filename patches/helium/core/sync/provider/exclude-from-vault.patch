@@ -486,20 +486,18 @@
  #include "extensions/browser/blocklist_extension_prefs.h"
  #include "extensions/browser/disable_reason.h"
  #include "extensions/browser/extension_registrar.h"
-@@ -181,6 +186,12 @@ ExtensionSyncService::ExtensionSyncServi
+@@ -181,6 +186,10 @@ ExtensionSyncService::ExtensionSyncServi
    prefs_observation_.Observe(ExtensionPrefs::Get(profile_));
    extension_management_observation_.Observe(
        ExtensionManagementFactory::GetForBrowserContext(profile_));
-+  pref_change_registrar_.Init(profile_->GetPrefs());
-+  pref_change_registrar_.Add(
-+      browser_sync::private_sync_prefs::kConfiguration,
-+      base::BindRepeating(
-+          &ExtensionSyncService::OnPrivateSyncConfigurationChanged,
-+          base::Unretained(this)));
++  if (auto* repository =
++          browser_sync::private_sync::Repository::Get(profile_)) {
++    repository_observation_.Observe(repository);
++  }
  }
  
  ExtensionSyncService::~ExtensionSyncService() = default;
-@@ -193,7 +204,14 @@ ExtensionSyncService* ExtensionSyncServi
+@@ -193,7 +202,14 @@ ExtensionSyncService* ExtensionSyncServi
  
  void ExtensionSyncService::SyncExtensionChangeIfNeeded(
      const Extension& extension) {
@@ -515,7 +513,7 @@
      return;
    }
  
-@@ -226,6 +244,12 @@ ExtensionSyncService::MergeDataAndStartS
+@@ -226,6 +242,12 @@ ExtensionSyncService::MergeDataAndStartS
    LOG_IF(FATAL, type != syncer::EXTENSIONS && type != syncer::APPS)
        << "Got " << type << " DataType";
  
@@ -528,7 +526,7 @@
    SyncBundle* bundle = GetSyncBundle(type);
    bundle->StartSyncing(std::move(sync_processor));
  
-@@ -257,6 +281,9 @@ ExtensionSyncService::MergeDataAndStartS
+@@ -257,6 +279,9 @@ ExtensionSyncService::MergeDataAndStartS
  
  void ExtensionSyncService::StopSyncing(syncer::DataType type) {
    GetSyncBundle(type)->Reset();
@@ -538,7 +536,7 @@
  }
  
  syncer::SyncDataList ExtensionSyncService::GetAllSyncDataForTesting(
-@@ -390,6 +417,12 @@ void ExtensionSyncService::ApplySyncData
+@@ -390,6 +415,12 @@ void ExtensionSyncService::ApplySyncData
    // Apply the sync data, filtering out any items where we have more
    // recent local changes.
    for (const ExtensionSyncData& extension_sync_data : sync_data_list) {
@@ -551,7 +549,7 @@
      // If the extension has local state that needs to be synced, ignore this
      // change (we assume the local state is more recent).
      if (!ExtensionPrefs::Get(profile_)->NeedsSync(extension_sync_data.id())) {
-@@ -409,6 +442,19 @@ void ExtensionSyncService::ApplySyncData
+@@ -409,6 +440,19 @@ void ExtensionSyncService::ApplySyncData
      const ExtensionSyncData& extension_sync_data) {
    const std::string& id = extension_sync_data.id();
  
@@ -571,7 +569,7 @@
    // Remove all deprecated bookmark apps immediately, as they aren't loaded into
    // the extensions system at all (and thus cannot be looked up).
    if (extension_sync_data.is_deprecated_bookmark_app()) {
-@@ -435,10 +481,6 @@ void ExtensionSyncService::ApplySyncData
+@@ -435,10 +479,6 @@ void ExtensionSyncService::ApplySyncData
    // sync data, so that we don't end up notifying ourselves.
    base::AutoReset<bool> ignore_updates(&ignore_updates_, true);
  
@@ -582,7 +580,7 @@
    if (extension && !IsCorrectSyncType(*extension, type)) {
      // The installed item isn't the same type as the sync data item, so we need
      // to remove the sync data item; otherwise it will be a zombie that will
-@@ -884,10 +926,70 @@ bool ExtensionSyncService::ShouldReceive
+@@ -884,10 +924,70 @@ bool ExtensionSyncService::ShouldReceive
      return false;
    }
  
@@ -613,7 +611,7 @@
 +  ExtensionPrefs::Get(profile_)->SetNeedsSync(extension.id(), false);
 +}
 +
-+void ExtensionSyncService::OnPrivateSyncConfigurationChanged() {
++void ExtensionSyncService::OnVaultConfigurationChanged() {
 +  const std::optional<extensions::ExtensionId> provider_id =
 +      browser_sync::private_sync_prefs::GetActiveExtensionProviderId(
 +          *profile_->GetPrefs());
@@ -659,11 +657,21 @@
  #include "base/version.h"
  #include "chrome/browser/extensions/extension_management.h"
  #include "chrome/browser/extensions/sync/sync_bundle.h"
-+#include "components/prefs/pref_change_registrar.h"
++#include "chrome/browser/sync/private_sync/private_sync_repository.h"
  #include "components/keyed_service/core/keyed_service.h"
  #include "components/sync/model/model_error.h"
  #include "components/sync/model/syncable_service.h"
-@@ -157,6 +158,13 @@ class ExtensionSyncService : public sync
+@@ -45,7 +46,8 @@ class ExtensionSyncService : public sync
+                              public KeyedService,
+                              public extensions::ExtensionRegistryObserver,
+                              public extensions::ExtensionPrefsObserver,
+-                             public extensions::ExtensionManagement::Observer {
++                             public extensions::ExtensionManagement::Observer,
++                             public browser_sync::private_sync::Repository::Observer {
+  public:
+   explicit ExtensionSyncService(Profile* profile);
+ 
+@@ -157,6 +159,13 @@ class ExtensionSyncService : public sync
    // uploaded to sync (ShouldSync returns false).
    bool ShouldReceiveSyncData(const extensions::Extension& extension) const;
  
@@ -672,23 +680,25 @@
 +  bool IsPrivateSyncProvider(const extensions::ExtensionId& extension_id) const;
 +  void RemovePrivateSyncProviderData(
 +      const extensions::Extension& extension);
-+  void OnPrivateSyncConfigurationChanged();
++  void OnVaultConfigurationChanged() override;
 +
    // Returns if the given `extension` should be synced by this class (i.e. it
    // can be uploaded to the sync server).
    bool ShouldSync(const extensions::Extension& extension) const;
-@@ -180,6 +188,8 @@ class ExtensionSyncService : public sync
+@@ -180,6 +189,10 @@ class ExtensionSyncService : public sync
    base::ScopedObservation<extensions::ExtensionManagement,
                            extensions::ExtensionManagement::Observer>
        extension_management_observation_{this};
-+  PrefChangeRegistrar pref_change_registrar_;
++  base::ScopedObservation<browser_sync::private_sync::Repository,
++                          browser_sync::private_sync::Repository::Observer>
++      repository_observation_{this};
 +  std::optional<extensions::ExtensionId> active_private_sync_provider_id_;
  
    // When this is set to true, any incoming updates (from the observers as well
    // as from explicit SyncExtensionChangeIfNeeded calls) are ignored. This is
 --- a/chrome/browser/sync/BUILD.gn
 +++ b/chrome/browser/sync/BUILD.gn
-@@ -75,6 +75,7 @@ source_set("sync") {
+@@ -78,6 +78,7 @@ source_set("sync") {
      "//components/keyed_service/core",
      "//components/prefs",
      "//components/sessions:session_id",
@@ -764,3 +774,21 @@
    // Creates with a specific `storage_factory`.
    static std::unique_ptr<StorageFrontend> CreateForTesting(
        scoped_refptr<value_store::ValueStoreFactory> storage_factory,
+--- a/chrome/browser/extensions/sync/extension_sync_service_factory.cc
++++ b/chrome/browser/extensions/sync/extension_sync_service_factory.cc
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/extensions/sync/account_extension_tracker.h"
+ #include "chrome/browser/extensions/sync/extension_sync_service.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sync/private_sync/private_sync_repository.h"
+ #include "components/prefs/pref_service.h"
+ #include "extensions/browser/extension_prefs_factory.h"
+ #include "extensions/browser/extension_registry_factory.h"
+@@ -43,6 +44,7 @@ ExtensionSyncServiceFactory::ExtensionSy
+               .WithAshInternals(ProfileSelection::kRedirectedToOriginal)
+               .Build()) {
+   DependsOn(extensions::AccountExtensionTracker::GetFactory());
++  DependsOn(browser_sync::private_sync::Repository::GetFactory());
+   DependsOn(extensions::ExtensionPrefsFactory::GetInstance());
+   DependsOn(extensions::ExtensionRegistryFactory::GetInstance());
+   DependsOn(extensions::ChromeExtensionSystemFactory::GetInstance());
