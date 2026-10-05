@@ -1,0 +1,114 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -12289,6 +12289,12 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_UNPIN_TAB" desc="The label of the tab context menu item for unpinning one or more tabs.">
+           Unpin
+         </message>
++        <message name="IDS_TAB_CXMENU_SOUND_MUTE_TAB" desc="The label of the tab context menu item for muting one or more tabs. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
++          {NUM_TABS, plural, =1 {Mute tab} other {Mute tabs}}
++        </message>
++        <message name="IDS_TAB_CXMENU_SOUND_UNMUTE_TAB" desc="The label of the tab context menu item for unmuting one or more tabs. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
++          {NUM_TABS, plural, =1 {Unmute tab} other {Unmute tabs}}
++        </message>
+         <message name="IDS_TAB_CXMENU_SOUND_MUTE_SITE" desc="The label of the tab context menu item for muting one or more sites. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
+           {NUM_TABS, plural, =1 {Mute site} other {Mute sites}}
+         </message>
+@@ -12420,6 +12426,12 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_UNPIN_TAB" desc="In Title Case: The label of the tab context menu item for unpinning one or more tabs.">
+           Unpin
+         </message>
++        <message name="IDS_TAB_CXMENU_SOUND_MUTE_TAB" desc="In Title Case: The label of the tab context menu item for muting one or more tabs. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
++          {NUM_TABS, plural, =1 {Mute Tab} other {Mute Tabs}}
++        </message>
++        <message name="IDS_TAB_CXMENU_SOUND_UNMUTE_TAB" desc="In Title Case: The label of the tab context menu item for unmuting one or more tabs. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
++          {NUM_TABS, plural, =1 {Unmute Tab} other {Unmute Tabs}}
++        </message>
+         <message name="IDS_TAB_CXMENU_SOUND_MUTE_SITE" desc="In Title Case: The label of the tab context menu item for muting one or more sites. NOTE: If having no explicit # makes the phrasing awkward, feel free to add a # as necessary. [ICU Syntax]">
+           {NUM_TABS, plural, =1 {Mute Site} other {Mute Sites}}
+         </message>
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -506,6 +506,13 @@ void TabMenuModel::Build(int index) {
+             ui::kColorMenuIcon, ui::SimpleMenuModel::kDefaultIconSize));
+   }
+ 
++  const bool will_mute_tab = tab_strip_->WillContextMenuMuteTabs(index);
++  AddItem(TabStripModel::CommandToggleTabMuted,
++          l10n_util::GetPluralStringFUTF16(
++              will_mute_tab ? IDS_TAB_CXMENU_SOUND_MUTE_TAB
++                            : IDS_TAB_CXMENU_SOUND_UNMUTE_TAB,
++              num_tabs));
++
+   const bool will_mute = !AreAllSitesMuted(*tab_strip_, indices);
+   AddItem(TabStripModel::CommandToggleSiteMuted,
+           will_mute ? l10n_util::GetPluralStringFUTF16(
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2758,6 +2758,7 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandGlicUnshare:
+       return true;
+ 
++    case CommandToggleTabMuted:
+     case CommandCopyURL:
+       return GetWebContentsAt(context_index) != nullptr;
+ 
+@@ -2989,6 +2990,19 @@ void TabStripModel::ExecuteContextMenuCo
+       break;
+     }
+ 
++    case CommandToggleTabMuted: {
++      const bool mute = WillContextMenuMuteTabs(context_index);
++      for (int index : GetIndicesForCommand(context_index)) {
++        WebContents* const contents = GetWebContentsAt(index);
++        if (contents) {
++          base::UmaHistogramBoolean("Media.Audio.TabAudioMuted", mute);
++          SetTabAudioMuted(contents, mute, TabMutedReason::kAudioIndicator,
++                           std::string());
++        }
++      }
++      break;
++    }
++
+     case CommandToggleSiteMuted: {
+       base::UmaHistogramCounts1000(
+           "Tab.ContextMenu.ToggleSiteMuted.SelectedTabsCount",
+@@ -3471,6 +3485,16 @@ void TabStripModel::ExecuteCloseTabsComm
+   }
+ }
+ 
++bool TabStripModel::WillContextMenuMuteTabs(int index) {
++  for (int tab_index : GetIndicesForCommand(index)) {
++    WebContents* const contents = GetWebContentsAt(tab_index);
++    if (contents && !contents->IsAudioMuted()) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ bool TabStripModel::WillContextMenuMuteSites(int index) {
+   return !AreAllSitesMuted(*this, GetIndicesForCommand(index));
+ }
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -827,6 +827,10 @@ class TabStripModel {
+   void ExecuteAddToNewSplitCommand(int context_index,
+                                    split_tabs::SplitTabLayout layout);
+ 
++  // Returns true if 'CommandToggleTabMuted' will mute. `index` is the
++  // index supplied to `ExecuteContextMenuCommand`.
++  bool WillContextMenuMuteTabs(int index);
++
+   // Returns true if 'CommandToggleSiteMuted' will mute. `index` is the
+   // index supplied to `ExecuteContextMenuCommand`.
+   bool WillContextMenuMuteSites(int index);
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -40,6 +40,7 @@ enum TabContextMenuCommand {
+   CommandGlicSwitchToRecentConversation,
+   CommandGlicUnshare,
+   CommandDiscard,
++  CommandToggleTabMuted,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
