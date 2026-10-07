@@ -3,6 +3,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path, PurePosixPath
 import platform
 import subprocess
@@ -139,6 +140,8 @@ def main():
     args = parser.parse_args()
 
     src_dir = args.src_dir.resolve()
+    os.environ["PATH"] = (str(src_dir / "third_party/depot_tools") + os.pathsep +
+                          os.environ.get("PATH", ""))
     gclient_eval, gclient = load_chromium_modules(src_dir)
     deps = load_deps(src_dir, gclient_eval)
     cipd = src_dir / "third_party/depot_tools" / ("cipd.bat" if sys.platform == "win32" else "cipd")
