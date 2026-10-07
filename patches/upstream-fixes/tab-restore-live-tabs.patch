@@ -1,0 +1,636 @@
+From 54db51dbd55d1cab1a3dc053222f4f20a0f38477 Mon Sep 17 00:00:00 2001
+From: Joe Mason <joenotcharles@google.com>
+Date: Mon, 14 Sep 2026 22:09:24 -0700
+Subject: [PATCH] Reland "Return only live tabs from TabRestoreService restore operations"
+
+This reverts commit a467c37711d44556022a49dbbbce6b1d4bda8964.
+
+Reason for revert: Fixed MSAN errors
+
+Original change's description:
+> Revert "Return only live tabs from TabRestoreService restore operations"
+>
+> This reverts commit b10218380b91df1c63d4eb1a8d4ad50adfa22ea7.
+>
+> Reason for revert: Newly added tests are failing
+>
+> Failure Link:
+> https://ci.chromium.org/ui/p/chromium/builders/ci/Linux%20ChromiumOS%20MSan%20Tests/61349/overview
+>
+> https://ci.chromium.org/ui/p/chromium/builders/ci/Linux%20MSan%20Tests/64914/overview
+>
+>
+> Original change's description:
+> > Return only live tabs from TabRestoreService restore operations
+> >
+> > TabRestoreService restore methods previously collected raw LiveTab
+> > pointers before showing and activating the target browser window.
+> > If showing the window triggers nested event processing that closes
+> > restored tabs or the window before the operation completes, the
+> > returned collection could include pointers to destroyed tabs.
+> >
+> > Track restored tabs using WeakPtr throughout the restore pipeline and
+> > filter out any tabs that are no longer valid upon completion. In
+> > addition, update SessionsRestoreFunction to handle empty restore results
+> > gracefully by returning an error instead of assuming a tab is always
+> > present.
+> >
+> > Fixed: 553132214
+> > Change-Id: I007a5f97eecdd692080f23d866ee6cdf80c2a248
+> > Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/8383396
+> > Reviewed-by: Darryl James <dljames@chromium.org>
+> > Commit-Queue: Joe Mason <joenotcharles@google.com>
+> > Auto-Submit: Joe Mason <joenotcharles@google.com>
+> > Owners-Override: Gabriel Charette <gab@chromium.org>
+> > Cr-Commit-Position: refs/heads/main@{#1696548}
+>
+> Bug: 553132214
+> Change-Id: I9fc29f5113c263f1f3cb0c3c3ef5c951ffd6de63
+> Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/8405065
+> Commit-Queue: Lingqi Chi <lingqi@chromium.org>
+> Bot-Commit: rubber-stamper@appspot.gserviceaccount.com <rubber-stamper@appspot.gserviceaccount.com>
+> Commit-Queue: rubber-stamper@appspot.gserviceaccount.com <rubber-stamper@appspot.gserviceaccount.com>
+> Auto-Submit: Lingqi Chi <lingqi@chromium.org>
+> Owners-Override: Lingqi Chi <lingqi@chromium.org>
+> Cr-Commit-Position: refs/heads/main@{#1697070}
+
+Bug: 553132214
+Fixed: 553132214
+Change-Id: If281660e94ad3fbf5174416e83581adabebc7aea
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/8405169
+Reviewed-by: Darryl James <dljames@chromium.org>
+Owners-Override: Gabriel Charette <gab@chromium.org>
+Commit-Queue: Joe Mason <joenotcharles@google.com>
+Cr-Commit-Position: refs/heads/main@{#1697819}
+---
+
+--- a/chrome/browser/android/recently_closed_tabs_bridge.cc
++++ b/chrome/browser/android/recently_closed_tabs_bridge.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "chrome/browser/android/recently_closed_tabs_bridge.h"
+ 
++#include <optional>
++#include <vector>
++
+ #include "base/android/jni_array.h"
+ #include "base/android/jni_string.h"
+ #include "base/android/token_android.h"
+@@ -333,11 +336,11 @@ bool RecentlyClosedTabsBridge::OpenRecen
+   }
+ 
+   AndroidLiveTabContextRestoreWrapper restore_context(model);
+-  std::vector<sessions::LiveTab*> restored_tabs =
++  std::optional<std::vector<sessions::LiveTab*>> restored_tabs =
+       tab_restore_service_->RestoreEntryById(
+           &restore_context, entry_id,
+           static_cast<WindowOpenDisposition>(j_disposition));
+-  return !restored_tabs.empty();
++  return !restored_tabs.value_or({}).empty();
+ }
+ 
+ bool RecentlyClosedTabsBridge::OpenRecentlyClosedEntry(
+@@ -355,12 +358,12 @@ bool RecentlyClosedTabsBridge::OpenRecen
+   }
+ 
+   AndroidLiveTabContextRestoreWrapper restore_context(model);
+-  std::vector<sessions::LiveTab*> restored_tabs =
++  std::optional<std::vector<sessions::LiveTab*>> restored_tabs =
+       tab_restore_service_->RestoreEntryById(
+           &restore_context, SessionID::FromSerializedValue(entry_session_id),
+           WindowOpenDisposition::NEW_BACKGROUND_TAB);
+   RestoreAndroidTabGroups(env, model, restore_context.GetTabGroups());
+-  return !restored_tabs.empty();
++  return !restored_tabs.value_or({}).empty();
+ }
+ 
+ bool RecentlyClosedTabsBridge::OpenMostRecentlyClosedEntry(JNIEnv* env,
+@@ -381,12 +384,12 @@ bool RecentlyClosedTabsBridge::OpenMostR
+   // AndroidLiveTabContext. `restore_context` is required to rebuild groups
+   // information. To avoid this just use the first entry in entries when
+   // restoring.
+-  std::vector<sessions::LiveTab*> restored_tabs =
++  std::optional<std::vector<sessions::LiveTab*>> restored_tabs =
+       tab_restore_service_->RestoreEntryById(
+           &restore_context, tab_restore_service_->entries().front()->id,
+           WindowOpenDisposition::NEW_BACKGROUND_TAB);
+   RestoreAndroidTabGroups(env, model, restore_context.GetTabGroups());
+-  return !restored_tabs.empty();
++  return !restored_tabs.value_or({}).empty();
+ }
+ 
+ void RecentlyClosedTabsBridge::ClearRecentlyClosedEntries(JNIEnv* env) {
+--- a/chrome/browser/extensions/api/sessions/sessions_api.cc
++++ b/chrome/browser/extensions/api/sessions/sessions_api.cc
+@@ -749,7 +749,9 @@ SessionsRestoreFunction::RestoreMostRece
+   }
+   std::vector<sessions::LiveTab*> restored_tabs =
+       tab_restore_service->RestoreMostRecentEntry(context);
+-  DCHECK(restored_tabs.size());
++  if (restored_tabs.empty()) {
++    return RespondNow(Error(kNoActiveTabError));
++  }
+ 
+   sessions::ContentLiveTab* first_tab =
+       static_cast<sessions::ContentLiveTab*>(restored_tabs[0]);
+@@ -926,17 +928,19 @@ ExtensionFunction::ResponseAction Sessio
+   if (!context) {
+     return RespondNow(Error(kNoLiveTabContextError));
+   }
+-  std::vector<sessions::LiveTab*> restored_tabs =
++  std::optional<std::vector<sessions::LiveTab*>> restored_tabs =
+       tab_restore_service->RestoreEntryById(
+           context, SessionID::FromSerializedValue(session_id.id()),
+           WindowOpenDisposition::UNKNOWN);
+-  // If the ID is invalid, restored_tabs will be empty.
+-  if (restored_tabs.empty()) {
++  if (!restored_tabs.has_value()) {
+     return RespondNow(Error(kInvalidSessionIdError, session_id.ToString()));
+   }
++  if (restored_tabs->empty()) {
++    return RespondNow(Error(kNoActiveTabError));
++  }
+ 
+   sessions::ContentLiveTab* first_tab =
+-      static_cast<sessions::ContentLiveTab*>(restored_tabs[0]);
++      static_cast<sessions::ContentLiveTab*>((*restored_tabs)[0]);
+ 
+   // Retrieve the window through any of the tabs in restored_tabs.
+   if (is_window) {
+--- a/components/sessions/content/content_live_tab.cc
++++ b/components/sessions/content/content_live_tab.cc
+@@ -69,6 +69,10 @@ SerializedUserAgentOverride ContentLiveT
+   return serialized_ua_override;
+ }
+ 
++base::WeakPtr<LiveTab> ContentLiveTab::GetWeakPtr() {
++  return weak_ptr_factory_.GetWeakPtr();
++}
++
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(ContentLiveTab);
+ 
+ }  // namespace sessions
+--- a/components/sessions/content/content_live_tab.h
++++ b/components/sessions/content/content_live_tab.h
+@@ -6,6 +6,7 @@
+ #define COMPONENTS_SESSIONS_CONTENT_CONTENT_LIVE_TAB_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/supports_user_data.h"
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/sessions/core/live_tab.h"
+@@ -43,6 +44,7 @@ class SESSIONS_EXPORT ContentLiveTab
+   std::unique_ptr<tab_restore::PlatformSpecificTabData>
+   GetPlatformSpecificTabData() override;
+   SerializedUserAgentOverride GetUserAgentOverride() override;
++  base::WeakPtr<LiveTab> GetWeakPtr() override;
+ 
+  private:
+   friend class content::WebContentsUserData<ContentLiveTab>;
+@@ -55,6 +57,8 @@ class SESSIONS_EXPORT ContentLiveTab
+   content::NavigationController& navigation_controller() {
+     return GetWebContents().GetController();
+   }
++
++  base::WeakPtrFactory<ContentLiveTab> weak_ptr_factory_{this};
+ };
+ 
+ }  // namespace sessions
+--- a/components/sessions/core/live_tab.h
++++ b/components/sessions/core/live_tab.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPONENTS_SESSIONS_CORE_LIVE_TAB_H_
+ #define COMPONENTS_SESSIONS_CORE_LIVE_TAB_H_
+ 
++#include "base/memory/weak_ptr.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/sessions/core/session_id.h"
+@@ -40,6 +41,9 @@ class SESSIONS_EXPORT LiveTab {
+ 
+   // Returns the user agent override, if any.
+   virtual SerializedUserAgentOverride GetUserAgentOverride() = 0;
++
++  // Returns a WeakPtr that is invalidated when the tab is destroyed.
++  virtual base::WeakPtr<LiveTab> GetWeakPtr() = 0;
+ };
+ 
+ }  // namespace sessions
+--- a/components/sessions/core/tab_restore_service.h
++++ b/components/sessions/core/tab_restore_service.h
+@@ -113,7 +113,8 @@ class SESSIONS_EXPORT TabRestoreService
+ 
+   // Restores the most recently closed entry. Does nothing if there are no
+   // entries to restore. If the most recently restored entry is a tab, it is
+-  // added to |context|. Returns the LiveTab instances of the restored tab(s).
++  // added to |context|. Returns the LiveTab instances of the restored tab(s)
++  // that are still open when the restore completes.
+   virtual std::vector<LiveTab*> RestoreMostRecentEntry(
+       LiveTabContext* context) = 0;
+ 
+@@ -124,12 +125,15 @@ class SESSIONS_EXPORT TabRestoreService
+   virtual void RemoveLeastRecentlyUsedEntries(int num_to_remove) = 0;
+ 
+   // Restores an entry by id. If there is no entry with an id matching |id|,
+-  // this does nothing. If |context| is NULL, this creates a new window for the
+-  // entry. |disposition| is respected, but the attributes (tabstrip index,
+-  // browser window) of the tab when it was closed will be respected if
+-  // disposition is UNKNOWN. Returns the LiveTab instances of the restored
+-  // tab(s).
+-  virtual std::vector<LiveTab*> RestoreEntryById(
++  // this does nothing and returns nullopt. Otherwise, returns the LiveTab
++  // instances of the restored tab(s) that are still open when the restore
++  // completes.
++  //
++  // If |context| is NULL, this creates a new window for the entry.
++  // |disposition| is respected, but the attributes (tabstrip index, browser
++  // window) of the tab when it was closed will be respected if disposition is
++  // UNKNOWN.
++  virtual std::optional<std::vector<LiveTab*>> RestoreEntryById(
+       LiveTabContext* context,
+       SessionID id,
+       WindowOpenDisposition disposition) = 0;
+--- a/components/sessions/core/tab_restore_service_helper.cc
++++ b/components/sessions/core/tab_restore_service_helper.cc
+@@ -661,7 +661,8 @@ std::vector<LiveTab*> TabRestoreServiceH
+     return std::vector<LiveTab*>();
+   }
+   return RestoreEntryById(context, entries_.front()->id,
+-                          WindowOpenDisposition::UNKNOWN);
++                          WindowOpenDisposition::UNKNOWN)
++      .value();
+ }
+ 
+ void TabRestoreServiceHelper::RemoveEntryById(SessionID id) {
+@@ -692,7 +693,7 @@ LiveTabContext* TabRestoreServiceHelper:
+     SessionID id,
+     LiveTabContext* context,
+     WindowOpenDisposition disposition,
+-    std::vector<LiveTab*>* live_tabs) {
++    std::vector<base::WeakPtr<LiveTab>>* live_tabs) {
+   // 1. Determine if `id` corresponds to a tab. If so, restore the tab.
+   bool found_tab_to_delete = false;
+   SessionID::id_type restored_tab_browser_id;
+@@ -709,7 +710,9 @@ LiveTabContext* TabRestoreServiceHelper:
+     context = RestoreTab(tab, context, disposition,
+                          sessions::tab_restore::WINDOW, &restored_tab,
+                          /*is_restoring_group_or_window=*/false);
+-    live_tabs->push_back(restored_tab);
++    if (restored_tab) {
++      live_tabs->push_back(restored_tab->GetWeakPtr());
++    }
+ 
+     // Cleanup.
+     std::optional<tab_groups::TabGroupId> group_id = tab.group;
+@@ -781,7 +784,9 @@ LiveTabContext* TabRestoreServiceHelper:
+           DCHECK_EQ(new_context, context);
+         }
+         context = new_context;
+-        live_tabs->push_back(restored_tab);
++        if (restored_tab) {
++          live_tabs->push_back(restored_tab->GetWeakPtr());
++        }
+ 
+         window.tabs.erase(window.tabs.begin() + tab_i);
+       }
+@@ -833,7 +838,7 @@ LiveTabContext* TabRestoreServiceHelper:
+             RestoreTab(tab, context, disposition, sessions::tab_restore::WINDOW,
+                        &restored_tab, /*is_restoring_group_or_window=*/false);
+         if (restored_tab) {
+-          live_tabs->push_back(restored_tab);
++          live_tabs->push_back(restored_tab->GetWeakPtr());
+           restored_tab_map[tab.id] = restored_tab;
+         }
+ 
+@@ -898,14 +903,13 @@ TabRestoreServiceHelper::CreateLocalSave
+   return group_mapping;
+ }
+ 
+-std::vector<LiveTab*> TabRestoreServiceHelper::RestoreEntryById(
++std::optional<std::vector<LiveTab*>> TabRestoreServiceHelper::RestoreEntryById(
+     LiveTabContext* context,
+     SessionID id,
+     WindowOpenDisposition disposition) {
+   auto entry_iterator = GetEntryIteratorById(id);
+   if (entry_iterator == entries_.end()) {
+-    // Don't hoark here, we allow an invalid id.
+-    return std::vector<LiveTab*>();
++    return std::nullopt;
+   }
+ 
+   if (observer_) {
+@@ -923,7 +927,12 @@ std::vector<LiveTab*> TabRestoreServiceH
+   // |context| will be NULL in cases where one isn't already available (eg,
+   // when invoked on Mac OS X with no windows open). In this case, create a
+   // new browser into which we restore the tabs.
+-  std::vector<LiveTab*> live_tabs;
++  //
++  // The restored tabs are tracked with WeakPtrs because restoring involves
++  // deletion-capable calls (e.g. showing and activating browser windows) that
++  // can synchronously close restored tabs, or even the window they were
++  // restored into, before this method returns.
++  std::vector<base::WeakPtr<LiveTab>> live_tabs;
+   switch (entry.type) {
+     case tab_restore::Type::TAB: {
+       auto& tab = static_cast<const Tab&>(entry);
+@@ -937,7 +946,9 @@ std::vector<LiveTab*> TabRestoreServiceH
+       LiveTab* restored_tab = nullptr;
+       context = RestoreTab(tab, context, disposition, entry.type, &restored_tab,
+                            /*is_restoring_group_or_window=*/false);
+-      live_tabs.push_back(restored_tab);
++      if (restored_tab) {
++        live_tabs.push_back(restored_tab->GetWeakPtr());
++      }
+       context->ShowBrowserWindow();
+       break;
+     }
+@@ -1000,7 +1011,7 @@ std::vector<LiveTab*> TabRestoreServiceH
+             client_->OnTabRestored(
+                 tab->navigations.at(tab->current_navigation_index)
+                     .virtual_url());
+-            live_tabs.push_back(restored_tab);
++            live_tabs.push_back(restored_tab->GetWeakPtr());
+             restored_tab_map[tab->id] = restored_tab;
+           }
+ 
+@@ -1096,7 +1107,7 @@ std::vector<LiveTab*> TabRestoreServiceH
+               *tab.get(), context->GetTabCount(), group.tabs[0]->id == tab->id,
+               /*restored_from_group_or_window_context=*/true, entry.type);
+           if (restored_tab) {
+-            live_tabs.push_back(restored_tab);
++            live_tabs.push_back(restored_tab->GetWeakPtr());
+             restored_tab_map[tab->id] = restored_tab;
+           }
+           if (tab->split_id.has_value()) {
+@@ -1135,7 +1146,9 @@ std::vector<LiveTab*> TabRestoreServiceH
+           context =
+               RestoreTab(**it, context, disposition, entry.type, &restored_tab,
+                          /*is_restoring_group_or_window=*/false);
+-          live_tabs.push_back(restored_tab);
++          if (restored_tab) {
++            live_tabs.push_back(restored_tab->GetWeakPtr());
++          }
+           CHECK(ValidateGroup(group));
+           group.tabs.erase(it);
+         } else {
+@@ -1168,7 +1181,7 @@ std::vector<LiveTab*> TabRestoreServiceH
+         context = RestoreTab(*split.tabs[0], context, disposition, entry.type,
+                              &restored_leading_tab, false);
+         if (restored_leading_tab) {
+-          live_tabs.push_back(restored_leading_tab);
++          live_tabs.push_back(restored_leading_tab->GetWeakPtr());
+         }
+ 
+         // Directly restore the trailing tab into the same context as the
+@@ -1182,7 +1195,7 @@ std::vector<LiveTab*> TabRestoreServiceH
+               static_cast<int>(split.tabs[1]->navigations.size() - 1));
+           client_->OnTabRestored(
+               split.tabs[1]->navigations.at(nav_index).virtual_url());
+-          live_tabs.push_back(restored_trailing_tab);
++          live_tabs.push_back(restored_trailing_tab->GetWeakPtr());
+         }
+ 
+         if (restored_leading_tab && restored_trailing_tab &&
+@@ -1214,7 +1227,15 @@ std::vector<LiveTab*> TabRestoreServiceH
+ 
+   restoring_ = false;
+   NotifyEntriesChanged();
+-  return live_tabs;
++
++  std::vector<LiveTab*> result;
++  result.reserve(live_tabs.size());
++  for (const base::WeakPtr<LiveTab>& weak_tab : live_tabs) {
++    if (weak_tab) {
++      result.push_back(weak_tab.get());
++    }
++  }
++  return result;
+ }
+ 
+ bool TabRestoreServiceHelper::IsRestoring() const {
+@@ -1567,7 +1588,7 @@ TabRestoreServiceHelper::RestoreOneTabFr
+     LiveTabContext** context,
+     WindowOpenDisposition disposition,
+     tab_restore::Type session_restore_type,
+-    std::vector<LiveTab*>& live_tabs) {
++    std::vector<base::WeakPtr<LiveTab>>& live_tabs) {
+   for (size_t i = 0; i < split.tabs.size(); i++) {
+     const Tab& tab = *split.tabs[i];
+     if (tab.id == id) {
+@@ -1576,7 +1597,7 @@ TabRestoreServiceHelper::RestoreOneTabFr
+           RestoreTab(tab, *context, disposition, session_restore_type,
+                      &restored_tab, /*is_restoring_group_or_window=*/false);
+       if (restored_tab) {
+-        live_tabs.push_back(restored_tab);
++        live_tabs.push_back(restored_tab->GetWeakPtr());
+       }
+ 
+       // Extract the remaining tab, remove split association, and return it.
+@@ -1594,7 +1615,7 @@ bool TabRestoreServiceHelper::RestoreSpl
+     SessionID id,
+     LiveTabContext** context,
+     WindowOpenDisposition disposition,
+-    std::vector<LiveTab*>& live_tabs) {
++    std::vector<base::WeakPtr<LiveTab>>& live_tabs) {
+   for (auto& split_pair : group.split_tabs) {
+     auto& split = split_pair.second;
+     if (split->id != id && split->original_id != id) {
+@@ -1616,7 +1637,7 @@ bool TabRestoreServiceHelper::RestoreSpl
+                               tab_restore::Type::GROUP, &restored_tab,
+                               /*is_restoring_group_or_window=*/false);
+         if (restored_tab) {
+-          live_tabs.push_back(restored_tab);
++          live_tabs.push_back(restored_tab->GetWeakPtr());
+           restored_tab_map[tab.id] = restored_tab;
+         }
+         reconstruct_split_tabs[split_id].push_back(tab_i.get());
+--- a/components/sessions/core/tab_restore_service_helper.h
++++ b/components/sessions/core/tab_restore_service_helper.h
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/observer_list.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/memory_dump_provider.h"
+@@ -116,9 +117,10 @@ class SESSIONS_EXPORT TabRestoreServiceH
+   std::vector<LiveTab*> RestoreMostRecentEntry(LiveTabContext* context);
+   void RemoveEntryById(SessionID id);
+   void RemoveLeastRecentlyUsedEntries(int num_to_remove);
+-  std::vector<LiveTab*> RestoreEntryById(LiveTabContext* context,
+-                                         SessionID id,
+-                                         WindowOpenDisposition disposition);
++  std::optional<std::vector<LiveTab*>> RestoreEntryById(
++      LiveTabContext* context,
++      SessionID id,
++      WindowOpenDisposition disposition);
+   bool IsRestoring() const;
+ 
+   // Notifies observers the entries have changed.
+@@ -181,11 +183,12 @@ class SESSIONS_EXPORT TabRestoreServiceH
+   // This is a helper function for RestoreEntryById(). Restores a single entry
+   // from the `window`. The entry to restore is denoted by `id` and can either
+   // be a single tab or an entire group.
+-  LiveTabContext* RestoreTabOrGroupFromWindow(Window& window,
+-                                              SessionID id,
+-                                              LiveTabContext* context,
+-                                              WindowOpenDisposition disposition,
+-                                              std::vector<LiveTab*>* live_tabs);
++  LiveTabContext* RestoreTabOrGroupFromWindow(
++      Window& window,
++      SessionID id,
++      LiveTabContext* context,
++      WindowOpenDisposition disposition,
++      std::vector<base::WeakPtr<LiveTab>>* live_tabs);
+ 
+   // Helper function for RestoreEntryById(). Restores a single tab from the
+   // `split` and returns the remaining tab.
+@@ -195,7 +198,7 @@ class SESSIONS_EXPORT TabRestoreServiceH
+       LiveTabContext** context,
+       WindowOpenDisposition disposition,
+       sessions::tab_restore::Type session_restore_type,
+-      std::vector<LiveTab*>& live_tabs);
++      std::vector<base::WeakPtr<LiveTab>>& live_tabs);
+ 
+   // Helper function for RestoreEntryById(). Restores a single split view from
+   // the `group`. Returns true if a split was found and restored.
+@@ -203,7 +206,7 @@ class SESSIONS_EXPORT TabRestoreServiceH
+                              SessionID id,
+                              LiveTabContext** context,
+                              WindowOpenDisposition disposition,
+-                             std::vector<LiveTab*>& live_tabs);
++                             std::vector<base::WeakPtr<LiveTab>>& live_tabs);
+ 
+   // Helper function for CreateHistoricalGroup. Returns a Group populated with
+   // metadata for the tab group `id`.
+--- a/components/sessions/core/tab_restore_service_impl.cc
++++ b/components/sessions/core/tab_restore_service_impl.cc
+@@ -1903,7 +1903,7 @@ void TabRestoreServiceImpl::RemoveLeastR
+   helper_.RemoveLeastRecentlyUsedEntries(num_to_remove);
+ }
+ 
+-std::vector<LiveTab*> TabRestoreServiceImpl::RestoreEntryById(
++std::optional<std::vector<LiveTab*>> TabRestoreServiceImpl::RestoreEntryById(
+     LiveTabContext* context,
+     SessionID id,
+     WindowOpenDisposition disposition) {
+--- a/components/sessions/core/tab_restore_service_impl.h
++++ b/components/sessions/core/tab_restore_service_impl.h
+@@ -62,7 +62,7 @@ class SESSIONS_EXPORT TabRestoreServiceI
+       LiveTabContext* context) override;
+   void RemoveEntryById(SessionID id) override;
+   void RemoveLeastRecentlyUsedEntries(int num_to_remove) override;
+-  std::vector<LiveTab*> RestoreEntryById(
++  std::optional<std::vector<LiveTab*>> RestoreEntryById(
+       LiveTabContext* context,
+       SessionID id,
+       WindowOpenDisposition disposition) override;
+--- a/components/sessions/core/tab_restore_types.cc
++++ b/components/sessions/core/tab_restore_types.cc
+@@ -5,6 +5,7 @@
+ #include "components/sessions/core/tab_restore_types.h"
+ 
+ #include "base/trace_event/memory_usage_estimator.h"
++#include "ui/base/mojom/window_show_state.mojom.h"
+ 
+ namespace sessions::tab_restore {
+ 
+@@ -49,7 +50,8 @@ std::unique_ptr<Split> Split::FromTab(co
+   return split;
+ }
+ 
+-Window::Window() : Entry(WINDOW) {}
++Window::Window()
++    : Entry(WINDOW), show_state(ui::mojom::WindowShowState::kDefault) {}
+ Window::~Window() = default;
+ 
+ size_t Window::EstimateMemoryUsage() const {
+--- a/components/sessions/core/tab_restore_types.h
++++ b/components/sessions/core/tab_restore_types.h
+@@ -212,7 +212,8 @@ struct SESSIONS_EXPORT Window : public E
+   size_t EstimateMemoryUsage() const override;
+ 
+   // Type of window.
+-  sessions::SessionWindow::WindowType window_type;
++  sessions::SessionWindow::WindowType window_type =
++      sessions::SessionWindow::TYPE_NORMAL;
+ 
+   // The tabs that comprised the window, in order.
+   std::vector<std::unique_ptr<Tab>> tabs;
+--- a/components/sessions/ios/ios_restore_live_tab.h
++++ b/components/sessions/ios/ios_restore_live_tab.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPONENTS_SESSIONS_IOS_IOS_RESTORE_LIVE_TAB_H_
+ #define COMPONENTS_SESSIONS_IOS_IOS_RESTORE_LIVE_TAB_H_
+ 
++#include "base/memory/weak_ptr.h"
+ #include "components/sessions/ios/ios_live_tab.h"
+ #include "ios/web/public/session/proto/navigation.pb.h"
+ 
+@@ -32,10 +33,12 @@ class SESSIONS_EXPORT RestoreIOSLiveTab
+   sessions::SerializedNavigationEntry GetPendingEntry() override;
+   int GetEntryCount() override;
+   sessions::SerializedUserAgentOverride GetUserAgentOverride() override;
++  base::WeakPtr<LiveTab> GetWeakPtr() override;
+   const web::WebState* GetWebState() const override;
+ 
+  private:
+   const web::proto::NavigationStorage storage_;
++  base::WeakPtrFactory<RestoreIOSLiveTab> weak_ptr_factory_{this};
+ };
+ 
+ }  // namespace sessions
+--- a/components/sessions/ios/ios_restore_live_tab.mm
++++ b/components/sessions/ios/ios_restore_live_tab.mm
+@@ -53,6 +53,10 @@ RestoreIOSLiveTab::GetUserAgentOverride(
+   return sessions::SerializedUserAgentOverride();
+ }
+ 
++base::WeakPtr<LiveTab> RestoreIOSLiveTab::GetWeakPtr() {
++  return weak_ptr_factory_.GetWeakPtr();
++}
++
+ const web::WebState* RestoreIOSLiveTab::GetWebState() const {
+   return nullptr;
+ }
+--- a/components/sessions/ios/ios_webstate_live_tab.h
++++ b/components/sessions/ios/ios_webstate_live_tab.h
+@@ -6,6 +6,7 @@
+ #define COMPONENTS_SESSIONS_IOS_IOS_WEBSTATE_LIVE_TAB_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/supports_user_data.h"
+ #include "components/sessions/ios/ios_live_tab.h"
+ #include "components/sessions/ios/ios_serialized_navigation_builder.h"
+@@ -40,6 +41,7 @@ class SESSIONS_EXPORT IOSWebStateLiveTab
+   sessions::SerializedNavigationEntry GetPendingEntry() override;
+   int GetEntryCount() override;
+   sessions::SerializedUserAgentOverride GetUserAgentOverride() override;
++  base::WeakPtr<LiveTab> GetWeakPtr() override;
+ 
+   const web::WebState* GetWebState() const override;
+ 
+@@ -53,6 +55,7 @@ class SESSIONS_EXPORT IOSWebStateLiveTab
+   }
+ 
+   raw_ptr<web::WebState> web_state_;
++  base::WeakPtrFactory<IOSWebStateLiveTab> weak_ptr_factory_{this};
+ };
+ 
+ }  // namespace sessions
+--- a/components/sessions/ios/ios_webstate_live_tab.mm
++++ b/components/sessions/ios/ios_webstate_live_tab.mm
+@@ -68,6 +68,10 @@ IOSWebStateLiveTab::GetUserAgentOverride
+   return sessions::SerializedUserAgentOverride();
+ }
+ 
++base::WeakPtr<LiveTab> IOSWebStateLiveTab::GetWeakPtr() {
++  return weak_ptr_factory_.GetWeakPtr();
++}
++
+ const web::WebState* IOSWebStateLiveTab::GetWebState() const {
+   return web_state_;
+ }

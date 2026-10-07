@@ -180,7 +180,7 @@
    // failures.
 --- a/third_party/blink/renderer/core/frame/local_frame.cc
 +++ b/third_party/blink/renderer/core/frame/local_frame.cc
-@@ -3605,10 +3605,9 @@ void LocalFrame::UpdateFaviconURL(mojom:
+@@ -3602,10 +3602,9 @@ void LocalFrame::UpdateFaviconURL(mojom:
        1 << static_cast<int>(
            mojom::blink::FaviconIconType::kTouchPrecomposedIcon);
    Vector<IconURL> icon_urls = GetDocument()->IconURLs(icon_types_mask);
@@ -302,11 +302,12 @@
    void DidUpdateFaviconURL(
 --- a/chrome/browser/ui/tab_ui_helper.cc
 +++ b/chrome/browser/ui/tab_ui_helper.cc
-@@ -28,11 +28,13 @@
+@@ -29,12 +29,14 @@
  #include "chrome/browser/ui/web_applications/web_app_browser_controller.h"
  #include "chrome/common/webui_url_constants.h"
  #include "chrome/grit/generated_resources.h"
 +#include "components/favicon/content/content_favicon_driver.h"
+ #include "components/favicon/content/content_favicon_util.h"
  #include "components/security_interstitials/content/security_interstitial_tab_helper.h"
  #include "components/tabs/public/tab_interface.h"
  #include "components/tabs/public/tab_network_state.h"
@@ -316,7 +317,7 @@
  #include "content/public/browser/web_contents.h"
  #include "content/public/common/url_constants.h"
  #include "ui/base/l10n/l10n_util.h"
-@@ -181,6 +183,7 @@ ui::ImageModel TabUIHelper::GetFavicon()
+@@ -202,6 +204,7 @@ ui::ImageModel TabUIHelper::GetFavicon()
    if (wc_listener) {
      if (const std::optional<tab_groups::DeferredTabState>& deferred_tab_state =
              wc_listener->deferred_tab_state()) {
@@ -324,7 +325,7 @@
        return deferred_tab_state.value().favicon();
      }
    }
-@@ -191,18 +194,57 @@ ui::ImageModel TabUIHelper::GetFavicon()
+@@ -212,11 +215,13 @@ ui::ImageModel TabUIHelper::GetFavicon()
      const gfx::ImageSkia home_tab_icon =
          web_app_browser_controller->GetHomeTabIcon();
      if (!home_tab_icon.isNull()) {
@@ -338,12 +339,31 @@
          return ui::ImageModel::FromImageSkia(fallback_home_icon);
        }
      }
-   }
- 
--  return ui::ImageModel::FromImage(
--      favicon::TabFaviconFromWebContents(web_contents()));
+@@ -228,9 +233,11 @@ ui::ImageModel TabUIHelper::GetFavicon()
+   // the window's active state -- rather than the global color scheme, which can
+   // disagree and render the globe low-contrast ("dim") on some Linux themes
+   // (e.g. the built-in PDF viewer). crbug.com/544891511
+-  const favicon::FaviconDriver* const favicon_driver =
+-      favicon::ContentFaviconDriver::FromWebContents(web_contents());
+-  if (!favicon_driver || !favicon_driver->FaviconIsValid()) {
 +  content::WebContents* const contents = web_contents();
-+  gfx::Image favicon = favicon::TabFaviconFromWebContents(contents);
++  const auto* driver = favicon::ContentFaviconDriver::FromWebContents(contents);
++  gfx::Image favicon = favicon::GetTabFaviconMaybeDesaturatedOnError(contents);
++  ui::ImageModel favicon_model;
++  if (!driver || !driver->FaviconIsValid()) {
+     // Cache the model so repeated calls return an equal ImageModel; TabData
+     // compares favicons by value, and a fresh BindRepeating each call would
+     // never compare equal. The bound resolver still re-runs at raster time, so
+@@ -240,11 +247,46 @@ ui::ImageModel TabUIHelper::GetFavicon()
+           favicon::GetDefaultFaviconModel(base::BindRepeating(
+               &GetDefaultFaviconBackgroundColorId, tab().GetWeakPtr()));
+     }
+-    return default_favicon_model_;
++    favicon_model = default_favicon_model_;
++  } else {
++    favicon_model = ui::ImageModel::FromImage(favicon);
++  }
++
 +  auto* const rfh = contents->GetPrimaryMainFrame();
 +  const auto* entry = contents->GetController().GetLastCommittedEntry();
 +  // Discard preserves the navigation entry but replaces the live document.
@@ -355,12 +375,10 @@
 +  const url::Origin page_origin =
 +      use_saved_entry ? url::Origin::Create(page_url)
 +                      : rfh->GetLastCommittedOrigin();
-+  const auto* driver =
-+      favicon::ContentFaviconDriver::FromWebContents(contents);
 +  if (!driver || !page_url.SchemeIsHTTPOrHTTPS() || rfh->IsErrorDocument() ||
 +      (use_saved_entry && entry->GetPageType() == content::PAGE_TYPE_ERROR)) {
 +    retained_favicon_ = gfx::Image();
-+    return ui::ImageModel::FromImage(favicon);
++    return favicon_model;
 +  }
 +
 +  if (driver->FaviconIsValid()) {
@@ -371,31 +389,33 @@
 +    retained_favicon_ = retained_favicon_origin_.IsSameOriginWith(page_origin)
 +                            ? favicon
 +                            : gfx::Image();
-+    return ui::ImageModel::FromImage(favicon);
-+  }
-+
++    return favicon_model;
+   }
+ 
+-  return ui::ImageModel::FromImage(
+-      favicon::GetTabFaviconMaybeDesaturatedOnError(web_contents()));
 +  if (!retained_favicon_origin_.IsSameOriginWith(page_origin) ||
 +      (!use_saved_entry && !driver->ShouldWaitForFavicon())) {
 +    retained_favicon_ = gfx::Image();
 +  }
-+  return ui::ImageModel::FromImage(retained_favicon_.IsEmpty()
-+                                      ? favicon
-+                                      : retained_favicon_);
++  return retained_favicon_.IsEmpty()
++             ? favicon_model
++             : ui::ImageModel::FromImage(retained_favicon_);
  }
  
  bool TabUIHelper::ShouldHideThrobber() const {
 --- a/chrome/browser/ui/tab_ui_helper.h
 +++ b/chrome/browser/ui/tab_ui_helper.h
-@@ -17,6 +17,8 @@
- #include "components/tabs/public/tab_network_state.h"
+@@ -18,6 +18,8 @@
  #include "content/public/browser/web_contents_observer.h"
+ #include "ui/base/models/image_model.h"
  #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
 +#include "ui/gfx/image/image.h"
 +#include "url/origin.h"
  
  class BrowserUiController;
  
-@@ -63,6 +65,7 @@ class TabUIHelper : public tabs::Content
+@@ -60,6 +62,7 @@ class TabUIHelper : public tabs::Content
  
    // Get the favicon of the tab. It will return a favicon from history service
    // if it needs to, otherwise, it will return the favicon of the WebContents.
@@ -403,9 +423,9 @@
    ui::ImageModel GetFavicon();
  
    // Return true if the throbber should be hidden during a page load.
-@@ -123,6 +126,10 @@ class TabUIHelper : public tabs::Content
-   bool needs_attention_ = false;
-   base::CallbackListSubscription pin_tab_subscription_;
+@@ -127,6 +130,10 @@ class TabUIHelper : public tabs::Content
+   // at raster time. crbug.com/544891511
+   ui::ImageModel default_favicon_model_;
  
 +  // Keep retention with the tab so it survives view recreation and discards.
 +  gfx::Image retained_favicon_;
