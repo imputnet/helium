@@ -120,16 +120,15 @@ def _extract_tar_with_7z(binary, archive_path, output_dir, relative_to):
 def _extract_tar_with_tar(binary, archive_path, output_dir, relative_to):
     get_logger().debug('Using BSD or GNU tar extractor')
     output_dir.mkdir(exist_ok=True)
-    cmd = (binary, '-xf', str(archive_path), '-C', str(output_dir))
+    cmd = [binary, '-xf', str(archive_path), '-C', str(output_dir)]
+    if relative_to is not None:
+        cmd.extend(('--strip-components', str(len(relative_to.parts))))
+        cmd.append(relative_to.as_posix() + '/')
     get_logger().debug('tar command line: %s', ' '.join(cmd))
     result = subprocess.run(cmd, check=False)
     if result.returncode != 0:
         get_logger().error('tar command returned %s', result.returncode)
         raise ChildProcessError()
-
-    # for gnu tar, the --transform option could be used. but to keep compatibility with
-    # bsdtar on macos, we just do this ourselves
-    _process_relative_to(output_dir, relative_to)
 
 
 def _extract_tar_with_winrar(binary, archive_path, output_dir, relative_to):
@@ -242,6 +241,8 @@ def extract_tar_file(archive_path, output_dir, relative_to, extractors=None):
         # This is not a normal code path, so make it clear.
         raise NotImplementedError(current_platform)
     # Fallback to Python-based extractor on all platforms
+    if archive_path.suffix == '.zst':
+        raise FileNotFoundError('zstandard archives require a compatible tar, 7z or winrar')
     _extract_tar_with_python(archive_path, output_dir, relative_to)
 
 
