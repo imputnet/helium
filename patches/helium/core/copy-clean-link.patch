@@ -1,0 +1,721 @@
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -184,6 +184,7 @@
+ #define IDC_COPY                        36001
+ #define IDC_PASTE                       36003
+ #define IDC_FORCE_PASTE                 36005
++#define IDC_COPY_CLEAN_LINK             36006
+ 
+ // Find-in-page
+ #define IDC_FIND                        37000
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -1573,6 +1573,9 @@ are declared in tools/grit/grit_args.gni
+           <message name="IDS_FORCE_PASTE" desc="The label for a command that pastes text without invoking page paste handlers">
+             Force paste
+           </message>
++          <message name="IDS_COPY_CLEAN_LINK" desc="The label for copying a link without known tracking parameters">
++            Copy clean link
++          </message>
+           <message name="IDS_DELETE" desc="The text label of the Delete menu item (which deletes selected text without copying to clipboard)">
+             &amp;Delete
+           </message>
+@@ -1682,6 +1685,9 @@ are declared in tools/grit/grit_args.gni
+           <message name="IDS_FORCE_PASTE" desc="In Title Case: The label for a command that pastes text without invoking page paste handlers">
+             Force Paste
+           </message>
++          <message name="IDS_COPY_CLEAN_LINK" desc="In Title Case: The label for copying a link without known tracking parameters">
++            Copy Clean Link
++          </message>
+           <message name="IDS_DELETE" desc="In Title Case: The text label of the Delete menu item (which deletes selected text without copying to clipboard)">
+             &amp;Delete
+           </message>
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -215,11 +215,12 @@
+ #include "components/strings/grit/components_strings.h"
+ #include "components/supervised_user/core/browser/supervised_user_preferences.h"
+ #include "components/supervised_user/core/browser/supervised_user_url_filtering_service.h"
+-#include "components/translate/core/common/translate_switches.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
+ #include "components/translate/core/browser/translate_manager.h"
+ #include "components/translate/core/browser/translate_prefs.h"
++#include "components/translate/core/common/translate_switches.h"
+ #include "components/translate/core/common/translate_util.h"
++#include "components/url_formatter/url_cleaner.h"
+ #include "components/url_formatter/url_formatter.h"
+ #include "components/user_prefs/user_prefs.h"
+ #include "components/vector_icons/vector_icons.h"
+@@ -658,13 +659,14 @@ int UmaEnumForCommand(int key, UmaEnumId
+        {IDC_CONTENT_CONTEXT_SAVE_TO_MEMORY_BANKS, 168},
+        {IDC_CONTENT_CONTEXT_OPENLINK_ISOLATED, 169},
+        {IDC_CONTENT_CONTEXT_FORCE_PASTE, 170},
++       {IDC_COPY_CLEAN_LINK, 171},
+        // To add new items:
+        //   - Add one more line above this comment block, using the UMA value
+        //     from the line below this comment block.
+        //   - Increment the UMA value in that latter line.
+        //   - Add the new item to the RenderViewContextMenuItem enum in
+        //     tools/metrics/histograms/metadata/ui/enums.xml.
+-       {kUmaMaxValueKey, 171}});
++       {kUmaMaxValueKey, 172}});
+   // LINT.ThenChange(//tools/metrics/histograms/metadata/ui/enums.xml:RenderViewContextMenuItem)
+ 
+   // LINT.IfChange(ContextMenuOptionDesktop)
+@@ -1196,7 +1198,8 @@ void RenderViewContextMenu::WriteURLToCl
+   scw.WriteText(FormatURLForClipboard(url));
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+-  if (id == IDC_CONTENT_CONTEXT_COPYLINKLOCATION &&
++  if ((id == IDC_CONTENT_CONTEXT_COPYLINKLOCATION ||
++       id == IDC_COPY_CLEAN_LINK) &&
+       toast_features::IsEnabled(toast_features::kLinkCopiedToast)) {
+     auto* const toast_controller = GetToastController();
+     if (toast_controller) {
+@@ -2159,6 +2162,10 @@ void RenderViewContextMenu::AppendCopyLi
+                                   params_.link_url.SchemeIs(url::kMailToScheme)
+                                       ? IDS_CONTENT_CONTEXT_COPYEMAILADDRESS
+                                       : IDS_CONTENT_CONTEXT_COPYLINKLOCATION);
++  if (params_.unfiltered_link_url.is_valid() &&
++      params_.unfiltered_link_url.SchemeIsHTTPOrHTTPS()) {
++    menu_model_.AddItemWithStringId(IDC_COPY_CLEAN_LINK, IDS_COPY_CLEAN_LINK);
++  }
+   if (features::IsMenuSimplificationEnabled() && !params_.has_image_contents) {
+     menu_model_.AddItemWithStringIdAndIcon(
+         IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST,
+@@ -3407,6 +3414,10 @@ bool RenderViewContextMenu::IsCommandIdE
+     case IDC_CONTENT_CONTEXT_COPYLINKLOCATION:
+       return params_.unfiltered_link_url.is_valid();
+ 
++    case IDC_COPY_CLEAN_LINK:
++      return params_.unfiltered_link_url.is_valid() &&
++             params_.unfiltered_link_url.SchemeIsHTTPOrHTTPS();
++
+     case IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST:
+       return params_.link_url.is_valid();
+ 
+@@ -3795,6 +3806,14 @@ void RenderViewContextMenu::ExecuteComma
+       WriteURLToClipboard(params_.unfiltered_link_url, id);
+       break;
+ 
++    case IDC_COPY_CLEAN_LINK:
++      if (IsCommandIdEnabled(id)) {
++        WriteURLToClipboard(
++            url_formatter::StripTrackingParameters(params_.unfiltered_link_url),
++            id);
++      }
++      break;
++
+     case IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST: {
+       ReadingListModel* model =
+           ReadingListModelFactory::GetForBrowserContext(browser_context_);
+--- a/chrome/browser/ui/actions/chrome_action_id.h
++++ b/chrome/browser/ui/actions/chrome_action_id.h
+@@ -23,6 +23,7 @@
+   E(kActionCopy, IDC_COPY, actions) \
+   E(kActionPaste, IDC_PASTE, actions) \
+   E(kActionBack, IDC_BACK, kChromeActionsStart, ChromeActionIds) \
++  E(kActionCopyCleanLink, IDC_COPY_CLEAN_LINK) \
+   E(kActionReload, IDC_RELOAD) \
+   E(kActionOpenCurrentUrl, IDC_OPEN_CURRENT_URL) \
+   E(kActionStop, IDC_STOP) \
+--- a/chrome/browser/ui/views/omnibox/omnibox_context_menu_mixin.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_context_menu_mixin.cc
+@@ -9,6 +9,7 @@
+ #include "base/check.h"
+ #include "base/feature_list.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
+@@ -33,10 +34,14 @@
+ #include "components/search_engines/ai_mode_button_service.h"
+ #include "components/search_engines/search_engines_switches.h"
+ #include "components/url_formatter/elide_url.h"
++#include "components/url_formatter/url_cleaner.h"
+ #include "content/public/browser/context_menu_params.h"
+ #include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/web_contents.h"
+ #include "third_party/blink/public/common/context_menu_data/edit_flags.h"
+ #include "ui/base/clipboard/clipboard.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
++#include "ui/base/data_transfer_policy/data_transfer_endpoint.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/ui_base_features.h"
+ #include "ui/gfx/text_elider.h"
+@@ -196,6 +201,13 @@ bool OmniboxContextMenuMixinBase::Handle
+     return text_services_context_menu_->IsCommandIdEnabled(command_id);
+   }
+ 
++  if (command_id == IDC_COPY_CLEAN_LINK) {
++    auto* contents = location_bar_ ? location_bar_->GetWebContents() : nullptr;
++    return controller_ && contents && contents->GetVisibleURL().is_valid() &&
++           contents->GetVisibleURL().SchemeIsHTTPOrHTTPS() &&
++           !controller_->edit_model()->user_input_in_progress();
++  }
++
+   if (command_id ==
+       std::to_underlying(ui::TouchEditable::MenuCommands::kPaste)) {
+     return !IsContextMenuForReadOnlyOmnibox() &&
+@@ -265,6 +277,27 @@ bool OmniboxContextMenuMixinBase::Handle
+   switch (command_id) {
+     // These commands DO NOT invoke the popup via
+     // OnBefore/AfterPossibleChange().
++    case IDC_COPY_CLEAN_LINK: {
++      if (!HandleIsCommandIdEnabled(command_id)) {
++        return true;
++      }
++      const GURL& url = location_bar_->GetWebContents()->GetVisibleURL();
++      const bool off_the_record = location_bar_->GetProfile()->IsOffTheRecord();
++      ui::ScopedClipboardWriter writer(
++          ui::ClipboardBuffer::kCopyPaste,
++          std::make_unique<ui::DataTransferEndpoint>(
++              url, ui::DataTransferEndpointOptions{
++                       .notify_if_restricted = true,
++                       .off_the_record = off_the_record}));
++      writer.SetDataSourceURL(url, url);
++      if (off_the_record) {
++        writer.MarkAsOffTheRecord();
++      }
++      writer.WriteText(base::UTF8ToUTF16(
++          url_formatter::StripTrackingParameters(url).spec()));
++      return true;
++    }
++
+     case IDC_PASTE_AND_GO:
+       GetClipboardText(
+           /*notify_if_restricted=*/true,
+@@ -406,6 +439,13 @@ void OmniboxContextMenuMixinBase::AddOmn
+     ui::SimpleMenuModel* menu_contents) {
+   MaybeAddSendTabToSelfItem(menu_contents);
+ 
++  if (const auto copy_position = menu_contents->GetIndexOfCommandId(
++          std::to_underlying(ui::TouchEditable::MenuCommands::kCopy));
++      copy_position && HandleIsCommandIdEnabled(IDC_COPY_CLEAN_LINK)) {
++    menu_contents->InsertItemWithStringIdAt(
++        *copy_position + 1, IDC_COPY_CLEAN_LINK, IDS_COPY_CLEAN_LINK);
++  }
++
+   const std::optional<size_t> paste_position =
+       menu_contents->GetIndexOfCommandId(
+           std::to_underlying(ui::TouchEditable::MenuCommands::kPaste));
+--- a/components/url_formatter/BUILD.gn
++++ b/components/url_formatter/BUILD.gn
+@@ -26,6 +26,8 @@ static_library("url_formatter") {
+     "spoof_checks/idn_spoof_checker.cc",
+     "spoof_checks/idn_spoof_checker.h",
+     "spoof_checks/idn_spoof_checker_types.h",
++    "url_cleaner.cc",
++    "url_cleaner.h",
+     "url_fixer.cc",
+     "url_fixer.h",
+     "url_formatter.cc",
+@@ -72,6 +74,7 @@ source_set("unit_tests") {
+   sources = [
+     "elide_url_unittest.cc",
+     "spoof_checks/idn_spoof_checker_unittest.cc",
++    "url_cleaner_unittest.cc",
+     "url_fixer_unittest.cc",
+     "url_formatter_unittest.cc",
+   ]
+--- /dev/null
++++ b/components/url_formatter/url_cleaner.cc
+@@ -0,0 +1,77 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/url_formatter/url_cleaner.h"
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/fixed_flat_set.h"
++#include "base/strings/escape.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "url/gurl.h"
++
++namespace url_formatter {
++
++GURL StripTrackingParameters(const GURL& url) {
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || !url.has_query()) {
++    return url;
++  }
++
++  static constexpr auto kTrackingParameters =
++      base::MakeFixedFlatSet<std::string_view>({
++          "dclid",
++          "fbclid",
++          "gbraid",
++          "gclid",
++          "igshid",
++          "li_fat_id",
++          "mc_cid",
++          "mc_eid",
++          "msclkid",
++          "srsltid",
++          "ttclid",
++          "twclid",
++          "utm_campaign",
++          "utm_content",
++          "utm_creative_format",
++          "utm_id",
++          "utm_marketing_tactic",
++          "utm_medium",
++          "utm_source",
++          "utm_source_platform",
++          "utm_term",
++          "wbraid",
++      });
++
++  auto parameters = base::SplitStringPiece(
++      url.query(), "&", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++  const auto removed = std::erase_if(parameters, [&url](std::string_view part) {
++    const std::string key = base::ToLowerASCII(base::UnescapeURLComponent(
++        part.substr(0, part.find('=')), base::UnescapeRule::NORMAL));
++    if (kTrackingParameters.contains(key)) {
++      return true;
++    }
++    // "si" also has functional uses, so only remove known share identifiers.
++    return key == "si" &&
++           (url.DomainIs("youtube.com") || url.DomainIs("youtu.be") ||
++            url.DomainIs("open.spotify.com"));
++  });
++  if (!removed) {
++    return url;
++  }
++
++  const std::string query = base::JoinString(parameters, "&");
++  GURL::Replacements replacements;
++  if (parameters.empty()) {
++    replacements.ClearQuery();
++  } else {
++    replacements.SetQueryStr(query);
++  }
++  return url.ReplaceComponents(replacements);
++}
++
++}  // namespace url_formatter
+--- /dev/null
++++ b/components/url_formatter/url_cleaner.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_URL_FORMATTER_URL_CLEANER_H_
++#define COMPONENTS_URL_FORMATTER_URL_CLEANER_H_
++
++class GURL;
++
++namespace url_formatter {
++
++// Removes known tracking query parameters from HTTP(S) URLs. Other URL
++// components and the encoding and order of retained parameters are preserved.
++GURL StripTrackingParameters(const GURL& url);
++
++}  // namespace url_formatter
++
++#endif  // COMPONENTS_URL_FORMATTER_URL_CLEANER_H_
+--- /dev/null
++++ b/components/url_formatter/url_cleaner_unittest.cc
+@@ -0,0 +1,152 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/url_formatter/url_cleaner.h"
++
++#include <string>
++
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace url_formatter {
++namespace {
++
++TEST(UrlCleanerTest, RemovesKnownTrackingParameters) {
++  for (const char* key : {"dclid",
++                          "fbclid",
++                          "gbraid",
++                          "gclid",
++                          "igshid",
++                          "li_fat_id",
++                          "mc_cid",
++                          "mc_eid",
++                          "msclkid",
++                          "srsltid",
++                          "ttclid",
++                          "twclid",
++                          "utm_campaign",
++                          "utm_content",
++                          "utm_creative_format",
++                          "utm_id",
++                          "utm_marketing_tactic",
++                          "utm_medium",
++                          "utm_source",
++                          "utm_source_platform",
++                          "utm_term",
++                          "wbraid"}) {
++    SCOPED_TRACE(key);
++    const GURL input(std::string("https://example.com/path?") + key + "=track");
++    EXPECT_EQ("https://example.com/path",
++              StripTrackingParameters(input).spec());
++  }
++}
++
++TEST(UrlCleanerTest, PreservesFunctionalUrlComponents) {
++  const struct {
++    const char* input;
++    const char* expected;
++  } cases[] = {
++      {"https://example.com/?utm_source=a&q=hello&utm_medium=b#section",
++       "https://example.com/?q=hello#section"},
++      {"https://example.com/?q=a&utm_source=x&q=b&fbclid=y",
++       "https://example.com/?q=a&q=b"},
++      {"https://example.com/?utm_source=x&utm_source=y&UTM_SOURCE=z",
++       "https://example.com/"},
++      {"https://example.com/?utm_source&fbclid=&q=", "https://example.com/?q="},
++      {"https://example.com/?%75tm_source=x&FBCLID=y&q=%26%3D%2f+%20",
++       "https://example.com/?q=%26%3D%2f+%20"},
++      {"https://example.com/?q=%75tm_source%3Dx%26fbclid%3Dy&gclid=z",
++       "https://example.com/?q=%75tm_source%3Dx%26fbclid%3Dy"},
++      {"https://example.com/?utm_source=x&flag&=value&q=a=b",
++       "https://example.com/?flag&=value&q=a=b"},
++      {"https://example.com/?&utm_source=x&&q=1&",
++       "https://example.com/?&&q=1&"},
++      {"https://example.com/?utm_source=x&", "https://example.com/?"},
++      {"https://example.com/?utm_source=x#", "https://example.com/#"},
++      {"https://example.com/?utm_source=x#/route?q=1&fbclid=fragment",
++       "https://example.com/#/route?q=1&fbclid=fragment"},
++      {"https://example.com/?utm_source=x#:~:text=hello",
++       "https://example.com/#:~:text=hello"},
++      {"http://example.com:8080/a%2Fb?utm_source=x&q=%FF%00#%E2%82%AC",
++       "http://example.com:8080/a%2Fb?q=%FF%00#%E2%82%AC"},
++      {"https://person:password@example.com/?utm_source=x&q=1",
++       "https://person:password@example.com/?q=1"},
++      {"https://[2001:db8::1]:8443/path?utm_source=x&id=42",
++       "https://[2001:db8::1]:8443/path?id=42"},
++      {"https://xn--bcher-kva.example/?utm_source=x&q=%C3%A9",
++       "https://xn--bcher-kva.example/?q=%C3%A9"},
++  };
++  for (const auto& test : cases) {
++    SCOPED_TRACE(test.input);
++    const GURL cleaned = StripTrackingParameters(GURL(test.input));
++    EXPECT_EQ(test.expected, cleaned.spec());
++    EXPECT_EQ(cleaned, StripTrackingParameters(cleaned));
++  }
++}
++
++TEST(UrlCleanerTest, LeavesUnrecognizedParametersAndSchemesUnchanged) {
++  for (const char* input :
++       {"",
++        "not a url",
++        "https://",
++        "https://example.com/",
++        "https://example.com/?",
++        "https://example.com/?&&",
++        "https://example.com/?ref=1&source=2&id=3&si=4&feature=5",
++        "https://example.com/?utm_custom=1&utm_source_extra=2",
++        "https://example.com/?utm%ZZ_source=x&%00utm_source=x",
++        "https://example.com/?utm%255fsource=x",
++        "https://example.com/?q=first;utm_source=second",
++        "https://example.com/utm_source=x#utm_source=y",
++        "https://example.com/"
++        "?redirect=https%3A%2F%2Fexample.org%2F%3Ffbclid%3Dx",
++        "file:///tmp/file?utm_source=x",
++        "ftp://example.com/?utm_source=x",
++        "mailto:person@example.com?utm_source=x",
++        "javascript:alert('utm_source=x')",
++        "data:text/plain,?utm_source=x",
++        "chrome://settings/?utm_source=x",
++        "blob:https://example.com/id?utm_source=x"}) {
++    SCOPED_TRACE(input);
++    const GURL url(input);
++    EXPECT_EQ(url, StripTrackingParameters(url));
++  }
++}
++
++TEST(UrlCleanerTest, RemovesShareIdsOnlyOnKnownHosts) {
++  for (const char* host :
++       {"youtube.com", "www.youtube.com", "music.youtube.com", "youtu.be",
++        "open.spotify.com"}) {
++    SCOPED_TRACE(host);
++    const std::string prefix = std::string("https://") + host + "/watch";
++    EXPECT_EQ(prefix + "?v=video&t=30&list=playlist",
++              StripTrackingParameters(
++                  GURL(prefix + "?v=video&si=one&t=30&SI=two&list=playlist"))
++                  .spec());
++  }
++  for (const char* host : {"example.com", "notyoutube.com",
++                           "youtube.com.example.com", "youtu.be.example.com",
++                           "open.spotify.com.example.com", "spotify.com"}) {
++    SCOPED_TRACE(host);
++    const GURL url(std::string("https://") + host + "/?si=functional");
++    EXPECT_EQ(url, StripTrackingParameters(url));
++  }
++}
++
++TEST(UrlCleanerTest, HandlesManyRepeatedParameters) {
++  std::string input = "https://example.com/?";
++  std::string expected = input;
++  for (int i = 0; i < 10000; ++i) {
++    if (i) {
++      input += '&';
++      expected += '&';
++    }
++    input += "utm_source=x&item=" + std::to_string(i);
++    expected += "item=" + std::to_string(i);
++  }
++  EXPECT_EQ(expected, StripTrackingParameters(GURL(input)).spec());
++}
++
++}  // namespace
++}  // namespace url_formatter
+--- a/tools/metrics/histograms/metadata/ui/enums.xml
++++ b/tools/metrics/histograms/metadata/ui/enums.xml
+@@ -415,6 +415,7 @@ chromium-metrics-reviews@google.com.
+   <int value="168" label="IDC_CONTENT_CONTEXT_SAVE_TO_MEMORY_BANKS"/>
+   <int value="169" label="IDC_CONTENT_CONTEXT_OPENLINK_ISOLATED"/>
+   <int value="170" label="IDC_CONTENT_CONTEXT_FORCE_PASTE"/>
++  <int value="171" label="IDC_COPY_CLEAN_LINK"/>
+ </enum>
+ 
+ <!-- LINT.ThenChange(//chrome/browser/renderer_context_menu/render_view_context_menu.cc:RenderViewContextMenuItem) -->
+--- a/chrome/browser/ui/views/renderer_context_menu/BUILD.gn
++++ b/chrome/browser/ui/views/renderer_context_menu/BUILD.gn
+@@ -55,12 +55,19 @@ source_set("browser_tests") {
+     "//base",
+     "//chrome/app:command_ids",
+     "//chrome/browser/renderer_context_menu",
++    "//chrome/browser/ui",
++    "//chrome/browser/ui/location_bar",
+     "//chrome/browser/ui/tabs:tab_strip",
++    "//chrome/browser/ui/views/omnibox",
+     "//chrome/test:test_support",
+     "//content/public/browser",
+     "//content/test:test_support",
++    "//net:test_support",
+     "//testing/gtest",
+     "//third_party/blink/public/common:headers",
++    "//ui/base/clipboard:clipboard_test_support",
++    "//ui/touch_selection",
++    "//ui/views:test_support",
+     "//url",
+   ]
+ }
+--- a/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views_browsertest.cc
++++ b/chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views_browsertest.cc
+@@ -4,21 +4,35 @@
+ 
+ #include "chrome/browser/ui/views/renderer_context_menu/render_view_context_menu_views.h"
+ 
++#include <utility>
++
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/test/base/in_process_browser_test.h"
++#include "chrome/test/base/ui_test_utils.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/context_menu_params.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/test/browser_test.h"
++#include "net/test/embedded_test_server/embedded_test_server.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "third_party/blink/public/common/context_menu_data/context_menu_data.h"
+ #include "third_party/blink/public/mojom/context_menu/context_menu.mojom.h"
+ #include "ui/base/accelerators/accelerator.h"
++#include "ui/base/clipboard/clipboard.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
++#include "ui/base/clipboard/test/clipboard_test_util.h"
++#include "ui/base/models/menu_model.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/range/range.h"
++#include "ui/touch_selection/touch_editing_controller.h"
++#include "ui/views/controls/textfield/textfield_test_api.h"
+ #include "url/gurl.h"
+ 
+ namespace {
+@@ -144,4 +158,173 @@ IN_PROC_BROWSER_TEST_F(RenderViewContext
+       menu.GetAcceleratorForCommandId(IDC_CONTENT_CONTEXT_DICTATION, &accel));
+ }
+ 
++IN_PROC_BROWSER_TEST_F(RenderViewContextMenuViewsBrowserTest,
++                       CopyCleanLinkKeepsOrdinaryCopyIntact) {
++  content::ContextMenuParams params;
++  params.page_url = GURL("https://example.com/");
++  params.link_url =
++      GURL("https://example.org/path?utm_source=track&id=42#part");
++  params.unfiltered_link_url = params.link_url;
++  auto* clipboard = ui::Clipboard::GetForCurrentThread();
++
++  TestRenderViewContextMenuViews menu(GetPrimaryMainFrame(), params);
++  menu.Init();
++  const auto copy = menu.menu_model().GetIndexOfCommandId(
++      IDC_CONTENT_CONTEXT_COPYLINKLOCATION);
++  const auto clean = menu.menu_model().GetIndexOfCommandId(IDC_COPY_CLEAN_LINK);
++  ASSERT_TRUE(copy.has_value());
++  ASSERT_TRUE(clean.has_value());
++  EXPECT_EQ(*copy + 1, *clean);
++  ASSERT_TRUE(menu.IsCommandIdEnabled(IDC_COPY_CLEAN_LINK));
++  menu.ExecuteCommand(IDC_COPY_CLEAN_LINK, 0);
++  EXPECT_EQ("https://example.org/path?id=42#part",
++            ui::clipboard_test_util::ReadAsciiText(
++                clipboard, ui::ClipboardBuffer::kCopyPaste, nullptr));
++
++  TestRenderViewContextMenuViews original_menu(GetPrimaryMainFrame(), params);
++  original_menu.Init();
++  original_menu.ExecuteCommand(IDC_CONTENT_CONTEXT_COPYLINKLOCATION, 0);
++  EXPECT_EQ(params.link_url.spec(),
++            ui::clipboard_test_util::ReadAsciiText(
++                clipboard, ui::ClipboardBuffer::kCopyPaste, nullptr));
++}
++
++IN_PROC_BROWSER_TEST_F(RenderViewContextMenuViewsBrowserTest,
++                       CopyCleanLinkUnavailableForUnsupportedSchemes) {
++  for (const char* input :
++       {"mailto:person@example.com", "javascript:alert(1)", "file:///tmp/file",
++        "chrome://settings/", "https://"}) {
++    SCOPED_TRACE(input);
++    content::ContextMenuParams params;
++    params.page_url = GURL("https://example.com/");
++    params.link_url = GURL(input);
++    params.unfiltered_link_url = params.link_url;
++    TestRenderViewContextMenuViews menu(GetPrimaryMainFrame(), params);
++    menu.Init();
++    EXPECT_FALSE(menu.menu_model().GetIndexOfCommandId(IDC_COPY_CLEAN_LINK));
++    EXPECT_FALSE(menu.IsCommandIdEnabled(IDC_COPY_CLEAN_LINK));
++  }
++}
++
++IN_PROC_BROWSER_TEST_F(RenderViewContextMenuViewsBrowserTest,
++                       CopyCleanLinkUsesUnfilteredLinkForLinkedImages) {
++  content::ContextMenuParams params;
++  params.page_url = GURL("https://example.com/");
++  params.link_url = GURL("about:blank#blocked");
++  params.unfiltered_link_url = GURL("https://example.org/?fbclid=track&id=42");
++  params.src_url = GURL("https://example.com/image.png?utm_source=image");
++  params.media_type = blink::mojom::ContextMenuDataMediaType::kImage;
++  params.has_image_contents = true;
++  TestRenderViewContextMenuViews menu(GetPrimaryMainFrame(), params);
++  menu.Init();
++  ASSERT_TRUE(menu.IsCommandIdEnabled(IDC_COPY_CLEAN_LINK));
++  menu.ExecuteCommand(IDC_COPY_CLEAN_LINK, 0);
++  EXPECT_EQ("https://example.org/?id=42",
++            ui::clipboard_test_util::ReadAsciiText(
++                ui::Clipboard::GetForCurrentThread(),
++                ui::ClipboardBuffer::kCopyPaste, nullptr));
++}
++
++IN_PROC_BROWSER_TEST_F(RenderViewContextMenuViewsBrowserTest,
++                       CopyCleanLinkOmniboxPreservesPageAndSelection) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  const GURL url = embedded_test_server()->GetURL(
++      "/title1.html?utm_source=track&id=42#part");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), url));
++  auto* view =
++      static_cast<OmniboxViewViews*>(BrowserWindow::FromBrowser(browser())
++                                         ->GetLocationBar()
++                                         ->GetOmniboxView());
++  view->SetSelectedRange(gfx::Range(2, 5));
++  const auto text = view->GetText();
++  const auto selection = view->GetSelectedRange();
++  ASSERT_TRUE(view->IsCommandIdEnabled(IDC_COPY_CLEAN_LINK));
++  view->ExecuteCommand(IDC_COPY_CLEAN_LINK, 0);
++  EXPECT_EQ(embedded_test_server()->GetURL("/title1.html?id=42#part").spec(),
++            ui::clipboard_test_util::ReadAsciiText(
++                ui::Clipboard::GetForCurrentThread(),
++                ui::ClipboardBuffer::kCopyPaste, nullptr));
++  EXPECT_EQ(
++      url,
++      browser()->GetTabStripModel()->GetActiveWebContents()->GetVisibleURL());
++  EXPECT_EQ(text, view->GetText());
++  EXPECT_EQ(selection, view->GetSelectedRange());
++
++  view->SelectAll(false);
++  view->ExecuteCommand(
++      std::to_underlying(ui::TouchEditable::MenuCommands::kCopy), 0);
++  EXPECT_EQ(url.spec(), ui::clipboard_test_util::ReadAsciiText(
++                            ui::Clipboard::GetForCurrentThread(),
++                            ui::ClipboardBuffer::kCopyPaste, nullptr));
++}
++
++IN_PROC_BROWSER_TEST_F(RenderViewContextMenuViewsBrowserTest,
++                       CopyCleanLinkOmniboxDoesNotCopyStalePageWhileEditing) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(
++      browser(),
++      embedded_test_server()->GetURL("/title1.html?utm_source=track")));
++  auto* view =
++      static_cast<OmniboxViewViews*>(BrowserWindow::FromBrowser(browser())
++                                         ->GetLocationBar()
++                                         ->GetOmniboxView());
++  ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste).WriteText(u"keep");
++  view->SetUserText(u"a search query");
++  EXPECT_FALSE(view->IsCommandIdEnabled(IDC_COPY_CLEAN_LINK));
++  view->ExecuteCommand(IDC_COPY_CLEAN_LINK, 0);
++  EXPECT_EQ("keep", ui::clipboard_test_util::ReadAsciiText(
++                        ui::Clipboard::GetForCurrentThread(),
++                        ui::ClipboardBuffer::kCopyPaste, nullptr));
++  EXPECT_EQ(u"a search query", view->GetText());
++}
++
++IN_PROC_BROWSER_TEST_F(
++    RenderViewContextMenuViewsBrowserTest,
++    CopyCleanLinkOmniboxSupportsIncognitoButNotInternalPages) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  BrowserWindowInterface* incognito = CreateIncognitoBrowser();
++  const GURL url =
++      embedded_test_server()->GetURL("/title1.html?utm_source=track");
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(incognito, url));
++  auto* view =
++      static_cast<OmniboxViewViews*>(BrowserWindow::FromBrowser(incognito)
++                                         ->GetLocationBar()
++                                         ->GetOmniboxView());
++  ASSERT_TRUE(view->IsCommandIdEnabled(IDC_COPY_CLEAN_LINK));
++  view->ExecuteCommand(IDC_COPY_CLEAN_LINK, 0);
++  EXPECT_EQ(embedded_test_server()->GetURL("/title1.html").spec(),
++            ui::clipboard_test_util::ReadAsciiText(
++                ui::Clipboard::GetForCurrentThread(),
++                ui::ClipboardBuffer::kCopyPaste, nullptr));
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(incognito, GURL("about:blank")));
++  EXPECT_FALSE(view->IsCommandIdEnabled(IDC_COPY_CLEAN_LINK));
++}
++
++IN_PROC_BROWSER_TEST_F(RenderViewContextMenuViewsBrowserTest,
++                       CopyCleanLinkOmniboxMenuOnlyShowsEligiblePages) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(
++      browser(),
++      embedded_test_server()->GetURL("/title1.html?utm_source=track")));
++  auto* view =
++      static_cast<OmniboxViewViews*>(BrowserWindow::FromBrowser(browser())
++                                         ->GetLocationBar()
++                                         ->GetOmniboxView());
++  views::TextfieldTestApi test_api(view);
++  auto has_clean_link = [&] {
++    test_api.UpdateContextMenu();
++    ui::MenuModel* menu = test_api.context_menu_contents();
++    size_t index = 0;
++    return ui::MenuModel::GetModelAndIndexForCommandId(IDC_COPY_CLEAN_LINK,
++                                                       &menu, &index);
++  };
++  EXPECT_TRUE(has_clean_link());
++  view->SetUserText(u"a search query");
++  EXPECT_FALSE(has_clean_link());
++  view->RevertAll();
++  EXPECT_TRUE(has_clean_link());
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), GURL("about:blank")));
++  EXPECT_FALSE(has_clean_link());
++}
++
+ }  // namespace
