@@ -1,0 +1,1376 @@
+--- /dev/null
++++ b/components/helium_adblock/core/source/BUILD.gn
+@@ -0,0 +1,32 @@
++# Copyright 2026 The Helium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//components/helium_adblock/features.gni")
++
++assert(enable_native_adblock)
++
++source_set("source") {
++  sources = [
++    "adblock_bundled_assets.cc",
++    "adblock_bundled_assets.h",
++    "adblock_filter_list_preprocessor.cc",
++    "adblock_filter_list_preprocessor.h",
++    "adblock_refresh_schedule.cc",
++    "adblock_refresh_schedule.h",
++    "adblock_source_cache.cc",
++    "adblock_source_cache.h",
++    "adblock_source_catalog.cc",
++    "adblock_source_catalog.h",
++    "adblock_source_downloader.cc",
++    "adblock_source_downloader.h",
++  ]
++
++  deps = [
++    "//base",
++    "//crypto",
++    "//net",
++    "//services/network/public/cpp",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_bundled_assets.cc
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/source/adblock_bundled_assets.h"
++
++namespace helium_adblock {
++
++base::FilePath GetBundledCatalogPath(const base::FilePath& assets_root) {
++  return assets_root.AppendASCII(kBundledCatalogResourcePath);
++}
++
++base::FilePath GetBundledResourcesPath(const base::FilePath& assets_root) {
++  return assets_root.AppendASCII(kBundledResourcesResourcePath);
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_bundled_assets.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_BUNDLED_ASSETS_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_BUNDLED_ASSETS_H_
++
++#include "base/files/file_path.h"
++
++namespace helium_adblock {
++
++inline constexpr char kBundledCatalogResourcePath[] = "assets/assets.json";
++inline constexpr char kBundledResourcesResourcePath[] = "resources.json";
++
++// `assets_root` is the embedder-provided directory that contains the bundled
++// filter catalog and engine resources. Filter lists are available through
++// HeliumAdBlockClient::GetBundledListReader() on every platform.
++base::FilePath GetBundledCatalogPath(const base::FilePath& assets_root);
++base::FilePath GetBundledResourcesPath(const base::FilePath& assets_root);
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_BUNDLED_ASSETS_H_
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_filter_list_preprocessor.cc
+@@ -0,0 +1,248 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/source/adblock_filter_list_preprocessor.h"
++
++#include <optional>
++#include <string_view>
++#include <vector>
++
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++
++namespace helium_adblock {
++namespace {
++
++constexpr size_t kMaximumFilterListSize = 20 * 1024 * 1024;
++
++class ConditionParser {
++ public:
++  ConditionParser(std::string_view input,
++                  const FilterListPreprocessorEnvironment& environment)
++      : input_(input), environment_(environment) {}
++
++  std::optional<bool> Parse() {
++    std::optional<bool> result = ParseOr();
++    SkipWhitespace();
++    if (!result.has_value() || position_ != input_.size()) {
++      return std::nullopt;
++    }
++    return result;
++  }
++
++ private:
++  std::optional<bool> ParseOr() {
++    std::optional<bool> result = ParseAnd();
++    if (!result.has_value()) {
++      return std::nullopt;
++    }
++    while (Consume("||")) {
++      const std::optional<bool> right = ParseAnd();
++      if (!right.has_value()) {
++        return std::nullopt;
++      }
++      *result = *result || *right;
++    }
++    return result;
++  }
++
++  std::optional<bool> ParseAnd() {
++    std::optional<bool> result = ParseUnary();
++    if (!result.has_value()) {
++      return std::nullopt;
++    }
++    while (Consume("&&")) {
++      const std::optional<bool> right = ParseUnary();
++      if (!right.has_value()) {
++        return std::nullopt;
++      }
++      *result = *result && *right;
++    }
++    return result;
++  }
++
++  std::optional<bool> ParseUnary() {
++    if (Consume("!")) {
++      const std::optional<bool> value = ParseUnary();
++      if (!value.has_value()) {
++        return std::nullopt;
++      }
++      return !*value;
++    }
++    if (Consume("(")) {
++      const std::optional<bool> value = ParseOr();
++      if (!value.has_value() || !Consume(")")) {
++        return std::nullopt;
++      }
++      return value;
++    }
++    return ParseCapability();
++  }
++
++  std::optional<bool> ParseCapability() {
++    SkipWhitespace();
++    const size_t start = position_;
++    while (position_ < input_.size()) {
++      const char c = input_[position_];
++      if (!base::IsAsciiAlphaNumeric(c) && c != '_') {
++        break;
++      }
++      ++position_;
++    }
++    if (start == position_) {
++      return std::nullopt;
++    }
++    const std::string_view capability =
++        input_.substr(start, position_ - start);
++    if (capability == "env_chromium") {
++      return environment_.chromium;
++    }
++    if (capability == "env_mobile") {
++      return environment_.mobile;
++    }
++    if (capability == "ext_ublock") {
++      return environment_.ublock;
++    }
++    return false;
++  }
++
++  bool Consume(std::string_view token) {
++    SkipWhitespace();
++    if (!input_.substr(position_).starts_with(token)) {
++      return false;
++    }
++    position_ += token.size();
++    return true;
++  }
++
++  void SkipWhitespace() {
++    while (position_ < input_.size() &&
++           base::IsAsciiWhitespace(input_[position_])) {
++      ++position_;
++    }
++  }
++
++  std::string_view input_;
++  const FilterListPreprocessorEnvironment& environment_;
++  size_t position_ = 0;
++};
++
++bool HasUnsupportedNetworkModifier(std::string_view line) {
++  const size_t options = line.rfind('$');
++  if (options == std::string_view::npos) {
++    return false;
++  }
++  for (std::string_view option : base::SplitStringPiece(
++           line.substr(options + 1), ",", base::TRIM_WHITESPACE,
++           base::SPLIT_WANT_NONEMPTY)) {
++    if (option.starts_with("~")) {
++      option.remove_prefix(1);
++    }
++    option = option.substr(0, option.find('='));
++    if (option == "csp" || option == "header" || option == "ipaddress") {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool IsUnsupportedRule(std::string_view line) {
++  return !line.starts_with("!") &&
++         (line.find("##^") != std::string_view::npos ||
++          HasUnsupportedNetworkModifier(line));
++}
++
++struct ConditionalFrame {
++  bool parent_enabled;
++  bool condition;
++  bool saw_else = false;
++};
++
++base::expected<PreprocessedFilterList, FilterListPreprocessError>
++ProcessContents(std::string_view contents,
++                const FilterListPreprocessorEnvironment& environment) {
++  PreprocessedFilterList output;
++  bool enabled = true;
++  std::vector<ConditionalFrame> conditionals;
++  for (std::string_view line : base::SplitStringPiece(
++           contents, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    const std::string_view trimmed =
++        base::TrimWhitespaceASCII(line, base::TRIM_ALL);
++    if (base::StartsWith(trimmed, "!#if")) {
++      if (!base::StartsWith(trimmed, "!#if ")) {
++        return base::unexpected(FilterListPreprocessError::kMalformedDirective);
++      }
++      const std::optional<bool> condition =
++          ConditionParser(trimmed.substr(5), environment).Parse();
++      if (!condition.has_value()) {
++        return base::unexpected(FilterListPreprocessError::kMalformedDirective);
++      }
++      conditionals.push_back({enabled, *condition});
++      enabled = enabled && *condition;
++      continue;
++    }
++    if (base::StartsWith(trimmed, "!#else")) {
++      if (trimmed != "!#else") {
++        return base::unexpected(FilterListPreprocessError::kMalformedDirective);
++      }
++      if (conditionals.empty() || conditionals.back().saw_else) {
++        return base::unexpected(FilterListPreprocessError::kMalformedDirective);
++      }
++      conditionals.back().saw_else = true;
++      enabled = conditionals.back().parent_enabled &&
++                !conditionals.back().condition;
++      continue;
++    }
++    if (base::StartsWith(trimmed, "!#endif")) {
++      if (trimmed != "!#endif") {
++        return base::unexpected(FilterListPreprocessError::kMalformedDirective);
++      }
++      if (conditionals.empty()) {
++        return base::unexpected(FilterListPreprocessError::kMalformedDirective);
++      }
++      enabled = conditionals.back().parent_enabled;
++      conditionals.pop_back();
++      continue;
++    }
++    if (!enabled) {
++      continue;
++    }
++    if (base::StartsWith(trimmed, "!#include")) {
++      ++output.ignored_include_count;
++      continue;
++    }
++    if (IsUnsupportedRule(trimmed)) {
++      ++output.unsupported_rule_count;
++      continue;
++    }
++    if (output.contents.size() + line.size() + 1 > kMaximumFilterListSize) {
++      return base::unexpected(FilterListPreprocessError::kInputTooLarge);
++    }
++    output.contents.append(line);
++    output.contents.push_back('\n');
++  }
++
++  if (!conditionals.empty()) {
++    return base::unexpected(FilterListPreprocessError::kMalformedDirective);
++  }
++  return output;
++}
++
++}  // namespace
++
++base::expected<PreprocessedFilterList, FilterListPreprocessError>
++PreprocessFilterList(
++    std::string_view contents,
++    const GURL& source_url,
++    const FilterListPreprocessorEnvironment& environment) {
++  if (!source_url.is_valid() || !source_url.SchemeIs("https")) {
++    return base::unexpected(FilterListPreprocessError::kInvalidSourceUrl);
++  }
++  if (contents.size() > kMaximumFilterListSize) {
++    return base::unexpected(FilterListPreprocessError::kInputTooLarge);
++  }
++  return ProcessContents(contents, environment);
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_filter_list_preprocessor.h
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_FILTER_LIST_PREPROCESSOR_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_FILTER_LIST_PREPROCESSOR_H_
++
++#include <cstddef>
++#include <string>
++#include <string_view>
++
++#include "base/types/expected.h"
++#include "url/gurl.h"
++
++namespace helium_adblock {
++
++struct FilterListPreprocessorEnvironment {
++  bool chromium = true;
++  bool mobile = false;
++  bool ublock = true;
++};
++
++enum class FilterListPreprocessError {
++  kInvalidSourceUrl,
++  kInputTooLarge,
++  kMalformedDirective,
++};
++
++struct PreprocessedFilterList {
++  std::string contents;
++  size_t ignored_include_count = 0;
++  size_t unsupported_rule_count = 0;
++};
++
++// Evaluates uBlock Origin conditional directives and strips rules unsupported
++// by the native engine. Include markers are ignored because the browser only
++// consumes subscriptions materialized by helium_filters and does not resolve
++// additional filter files.
++base::expected<PreprocessedFilterList, FilterListPreprocessError>
++PreprocessFilterList(
++    std::string_view contents,
++    const GURL& source_url,
++    const FilterListPreprocessorEnvironment& environment);
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_FILTER_LIST_PREPROCESSOR_H_
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_refresh_schedule.cc
+@@ -0,0 +1,34 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/source/adblock_refresh_schedule.h"
++
++#include <algorithm>
++
++#include "base/rand_util.h"
++
++namespace helium_adblock {
++namespace {
++
++constexpr base::TimeDelta kMinimumRefreshInterval = base::Hours(4);
++constexpr base::TimeDelta kDefaultRefreshInterval = base::Days(7);
++constexpr base::TimeDelta kMaximumRefreshInterval = base::Days(30);
++
++}  // namespace
++
++base::TimeDelta ClampRefreshInterval(base::TimeDelta value) {
++  if (!value.is_positive()) {
++    value = kDefaultRefreshInterval;
++  }
++  return std::clamp(value, kMinimumRefreshInterval, kMaximumRefreshInterval);
++}
++
++base::Time GetJitteredRefreshTime(base::Time now,
++                                  base::TimeDelta refresh_interval) {
++  const base::TimeDelta interval = ClampRefreshInterval(refresh_interval);
++  const double multiplier = 0.9 + base::RandDouble() * 0.2;
++  return now + interval * multiplier;
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_refresh_schedule.h
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_REFRESH_SCHEDULE_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_REFRESH_SCHEDULE_H_
++
++#include "base/time/time.h"
++
++namespace helium_adblock {
++
++base::TimeDelta ClampRefreshInterval(base::TimeDelta refresh_interval);
++
++// Returns a randomized refresh deadline `refresh_interval` (clamped to a
++// sane range) from `now`, with ±10% jitter so refreshes spread out.
++base::Time GetJitteredRefreshTime(base::Time now,
++                                  base::TimeDelta refresh_interval);
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_REFRESH_SCHEDULE_H_
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_source_cache.cc
+@@ -0,0 +1,277 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/source/adblock_source_cache.h"
++
++#include <algorithm>
++#include <string>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/files/important_file_writer.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/json/values_util.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "crypto/sha2.h"
++
++namespace helium_adblock {
++namespace {
++
++constexpr size_t kMaximumSourceSize = 20 * 1024 * 1024;
++constexpr char kMetadataFilename[] = "sources.json";
++
++const char* ResultName(SourceResult result) {
++  switch (result) {
++    case SourceResult::kNever:
++      return "never";
++    case SourceResult::kSuccess:
++      return "success";
++    case SourceResult::kNotModified:
++      return "not_modified";
++    case SourceResult::kNetworkError:
++      return "network";
++    case SourceResult::kInvalidData:
++      return "invalid_data";
++    case SourceResult::kUnsupported:
++      return "unsupported";
++  }
++}
++
++SourceResult ParseResult(std::string_view value) {
++  if (value == "success") {
++    return SourceResult::kSuccess;
++  }
++  if (value == "not_modified") {
++    return SourceResult::kNotModified;
++  }
++  if (value == "network") {
++    return SourceResult::kNetworkError;
++  }
++  if (value == "invalid_data") {
++    return SourceResult::kInvalidData;
++  }
++  if (value == "unsupported") {
++    return SourceResult::kUnsupported;
++  }
++  return SourceResult::kNever;
++}
++
++void Upsert(SourceCacheMetadata metadata,
++            std::vector<SourceCacheMetadata>* all_metadata) {
++  auto existing =
++      std::ranges::find(*all_metadata, metadata.id, &SourceCacheMetadata::id);
++  if (existing == all_metadata->end()) {
++    all_metadata->push_back(std::move(metadata));
++  } else {
++    *existing = std::move(metadata);
++  }
++}
++
++std::string Digest(std::string_view contents) {
++  return base::HexEncodeLower(crypto::SHA256HashString(contents));
++}
++
++bool IsValidDigest(std::string_view digest) {
++  return digest.size() == crypto::kSHA256Length * 2 &&
++         std::ranges::all_of(digest, base::IsHexDigit<char>);
++}
++
++}  // namespace
++
++SourceCache::SourceCache(base::FilePath directory)
++    : directory_(std::move(directory)) {}
++
++SourceCache::~SourceCache() = default;
++
++std::vector<SourceCacheMetadata> SourceCache::LoadMetadata() const {
++  std::string json;
++  if (!base::ReadFileToStringWithMaxSize(
++          directory_.AppendASCII(kMetadataFilename), &json, 1024 * 1024)) {
++    return {};
++  }
++  std::optional<base::Value> root =
++      base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  if (!root || !root->is_list()) {
++    DLOG(ERROR) << "helium-adblock: invalid source cache metadata";
++    return {};
++  }
++
++  std::vector<SourceCacheMetadata> result;
++  for (const base::Value& value : root->GetList()) {
++    const base::DictValue* item = value.GetIfDict();
++    const std::string* id = item ? item->FindString("id") : nullptr;
++    if (!id || !IsValidSourceId(*id)) {
++      continue;
++    }
++    SourceCacheMetadata metadata;
++    metadata.id = *id;
++    if (const std::string* digest = item->FindString("content_digest")) {
++      if (!IsValidDigest(*digest)) {
++        continue;
++      }
++      metadata.content_digest = *digest;
++    }
++    if (const std::string* etag = item->FindString("etag")) {
++      metadata.validators.etag = *etag;
++    }
++    if (const std::string* modified = item->FindString("last_modified")) {
++      metadata.validators.last_modified = *modified;
++    }
++    metadata.expiry =
++        base::ValueToTime(item->Find("expiry")).value_or(base::Time());
++    metadata.last_success =
++        base::ValueToTime(item->Find("last_success")).value_or(base::Time());
++    if (const std::string* last_result = item->FindString("last_result")) {
++      metadata.last_result = ParseResult(*last_result);
++    }
++    result.push_back(std::move(metadata));
++  }
++  return result;
++}
++
++std::optional<std::string> SourceCache::LoadContents(
++    const SourceCacheMetadata& metadata) const {
++  if (!IsValidSourceId(metadata.id)) {
++    return std::nullopt;
++  }
++  std::string contents;
++  if (!base::ReadFileToStringWithMaxSize(ContentPath(metadata), &contents,
++                                         kMaximumSourceSize) ||
++      !base::IsStringUTF8(contents) ||
++      (!metadata.content_digest.empty() &&
++       Digest(contents) != metadata.content_digest)) {
++    return std::nullopt;
++  }
++  return contents;
++}
++
++bool SourceCache::Commit(SourceCacheMetadata metadata,
++                         std::string_view validated_contents,
++                         std::vector<SourceCacheMetadata>* all_metadata) const {
++  if (!IsValidSourceId(metadata.id) ||
++      validated_contents.size() > kMaximumSourceSize ||
++      !base::IsStringUTF8(validated_contents) ||
++      !base::CreateDirectory(directory_)) {
++    return false;
++  }
++  const auto previous =
++      std::ranges::find(*all_metadata, metadata.id, &SourceCacheMetadata::id);
++  const base::FilePath previous_path =
++      previous == all_metadata->end() ? base::FilePath()
++                                      : ContentPath(*previous);
++
++  metadata.content_digest = Digest(validated_contents);
++  const base::FilePath content_path = ContentPath(metadata);
++  if (!base::ImportantFileWriter::WriteFileAtomically(
++          content_path, validated_contents, "HeliumAdBlockSource")) {
++    return false;
++  }
++
++  std::vector<SourceCacheMetadata> updated = *all_metadata;
++  Upsert(std::move(metadata), &updated);
++  if (!WriteMetadata(updated)) {
++    if (content_path != previous_path) {
++      base::DeleteFile(content_path);
++    }
++    return false;
++  }
++  *all_metadata = std::move(updated);
++  if (!previous_path.empty() && previous_path != content_path) {
++    base::DeleteFile(previous_path);
++  }
++  return true;
++}
++
++bool SourceCache::RecordResult(
++    SourceCacheMetadata metadata,
++    std::vector<SourceCacheMetadata>* all_metadata) const {
++  if (!IsValidSourceId(metadata.id) || !base::CreateDirectory(directory_)) {
++    return false;
++  }
++  const auto previous =
++      std::ranges::find(*all_metadata, metadata.id, &SourceCacheMetadata::id);
++  if (previous != all_metadata->end() && metadata.content_digest.empty()) {
++    metadata.content_digest = previous->content_digest;
++  }
++  std::vector<SourceCacheMetadata> updated = *all_metadata;
++  Upsert(std::move(metadata), &updated);
++  if (!WriteMetadata(updated)) {
++    return false;
++  }
++  *all_metadata = std::move(updated);
++  return true;
++}
++
++bool SourceCache::Remove(
++    std::string_view source_id,
++    std::vector<SourceCacheMetadata>* all_metadata) const {
++  if (!IsValidSourceId(source_id)) {
++    return false;
++  }
++  const auto found =
++      std::ranges::find(*all_metadata, source_id, &SourceCacheMetadata::id);
++  const base::FilePath content_path =
++      found == all_metadata->end() ? base::FilePath() : ContentPath(*found);
++  std::vector<SourceCacheMetadata> updated = *all_metadata;
++  std::erase_if(updated, [&](const SourceCacheMetadata& metadata) {
++    return metadata.id == source_id;
++  });
++  if (!WriteMetadata(updated)) {
++    return false;
++  }
++  *all_metadata = std::move(updated);
++  if (!content_path.empty()) {
++    base::DeleteFile(content_path);
++  }
++  return true;
++}
++
++bool SourceCache::WriteMetadata(
++    const std::vector<SourceCacheMetadata>& all_metadata) const {
++  base::ListValue list;
++  for (const SourceCacheMetadata& metadata : all_metadata) {
++    if (!IsValidSourceId(metadata.id)) {
++      continue;
++    }
++    base::DictValue item;
++    item.Set("id", metadata.id);
++    item.Set("content_digest", metadata.content_digest);
++    item.Set("etag", metadata.validators.etag);
++    item.Set("last_modified", metadata.validators.last_modified);
++    item.Set("expiry", base::TimeToValue(metadata.expiry));
++    item.Set("last_success", base::TimeToValue(metadata.last_success));
++    item.Set("last_result", ResultName(metadata.last_result));
++    list.Append(std::move(item));
++  }
++  std::string json;
++  if (!base::JSONWriter::Write(list, &json)) {
++    return false;
++  }
++  return base::ImportantFileWriter::WriteFileAtomically(
++      directory_.AppendASCII(kMetadataFilename), json, "HeliumAdBlockMetadata");
++}
++
++base::FilePath SourceCache::ContentPath(
++    const SourceCacheMetadata& metadata) const {
++  std::string filename = metadata.id;
++  if (!metadata.content_digest.empty()) {
++    filename.append(".").append(metadata.content_digest);
++  }
++  return directory_.AppendASCII(filename + ".txt");
++}
++
++// static
++bool SourceCache::IsValidSourceId(std::string_view source_id) {
++  return !source_id.empty() && source_id.size() <= 128 &&
++         std::ranges::all_of(source_id, [](char c) {
++           return base::IsAsciiAlphaNumeric(c) || c == '-' || c == '_' ||
++                  c == '.';
++         });
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_source_cache.h
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_CACHE_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_CACHE_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/time/time.h"
++#include "components/helium_adblock/core/source/adblock_source_downloader.h"
++
++namespace helium_adblock {
++
++enum class SourceResult {
++  kNever,
++  kSuccess,
++  kNotModified,
++  kNetworkError,
++  kInvalidData,
++  kUnsupported,
++};
++
++struct SourceCacheMetadata {
++  std::string id;
++  SourceValidators validators;
++  // Empty only for metadata written before content-addressed cache files were
++  // introduced.
++  std::string content_digest;
++  base::Time expiry;
++  base::Time last_success;
++  SourceResult last_result = SourceResult::kNever;
++};
++
++class SourceCache {
++ public:
++  explicit SourceCache(base::FilePath directory);
++  ~SourceCache();
++
++  std::vector<SourceCacheMetadata> LoadMetadata() const;
++  std::optional<std::string> LoadContents(
++      const SourceCacheMetadata& metadata) const;
++
++  // Writes content under its digest before atomically publishing metadata.
++  bool Commit(SourceCacheMetadata metadata,
++              std::string_view validated_contents,
++              std::vector<SourceCacheMetadata>* all_metadata) const;
++  bool RecordResult(SourceCacheMetadata metadata,
++                    std::vector<SourceCacheMetadata>* all_metadata) const;
++  // Deletes the cached contents and metadata entry for `source_id`.
++  bool Remove(std::string_view source_id,
++              std::vector<SourceCacheMetadata>* all_metadata) const;
++
++ private:
++  bool WriteMetadata(
++      const std::vector<SourceCacheMetadata>& all_metadata) const;
++  base::FilePath ContentPath(const SourceCacheMetadata& metadata) const;
++  static bool IsValidSourceId(std::string_view source_id);
++
++  base::FilePath directory_;
++};
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_CACHE_H_
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_source_catalog.cc
+@@ -0,0 +1,188 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/source/adblock_source_catalog.h"
++
++#include <algorithm>
++#include <string>
++#include <utility>
++
++#include "base/containers/flat_map.h"
++#include "base/json/json_reader.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "components/helium_adblock/core/source/adblock_refresh_schedule.h"
++
++namespace helium_adblock {
++namespace {
++
++const base::ListValue* FindList(const base::DictValue& value,
++                                std::string_view first,
++                                std::string_view second) {
++  if (const base::ListValue* list = value.FindList(first)) {
++    return list;
++  }
++  return value.FindList(second);
++}
++
++std::vector<std::string> SplitWords(const std::string* words) {
++  if (!words) {
++    return {};
++  }
++  return base::SplitString(*words, base::kWhitespaceASCII,
++                           base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++}
++
++bool IsBundledFilterPath(std::string_view value) {
++  if (!value.starts_with("assets/filters/") || value.starts_with('/') ||
++      value.find('\\') != std::string_view::npos) {
++    return false;
++  }
++  for (std::string_view component : base::SplitStringPiece(
++           value, "/", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    if (component.empty() || component == "." || component == "..") {
++      return false;
++    }
++  }
++  return true;
++}
++
++void ConsiderURL(const std::string& candidate, SourceCatalogEntry* entry) {
++  GURL url(candidate);
++  if (url.is_valid() && url.has_scheme()) {
++    if (!entry->remote_url && url.SchemeIs("https") &&
++        !url.has_username() && !url.has_password() && !url.has_ref()) {
++      entry->remote_url = std::move(url);
++    }
++    return;
++  }
++  // Only helium_filters snapshot paths are packaged as built-in lists.
++  // Other relative paths in uBO-compatible catalogs are fallback metadata.
++  if (IsBundledFilterPath(candidate)) {
++    entry->bundled_paths.push_back(candidate);
++  }
++}
++
++}  // namespace
++
++// static
++std::optional<SourceCatalog> SourceCatalog::Parse(std::string_view json) {
++  std::optional<base::Value> root =
++      base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  if (!root || !root->is_dict()) {
++    return std::nullopt;
++  }
++
++  SourceCatalog result;
++  for (const auto [id, raw_entry] : root->GetDict()) {
++    const base::DictValue* value = raw_entry.GetIfDict();
++    if (!value) {
++      continue;
++    }
++    const std::string* content = value->FindString("content");
++    if (!content || *content != "filters") {
++      continue;
++    }
++
++    SourceCatalogEntry entry;
++    entry.id = id;
++    const std::string* title = value->FindString("title");
++    const std::string* group = value->FindString("group2");
++    if (!group) {
++      group = value->FindString("group");
++    }
++    entry.title = title ? *title : id;
++    entry.group = group ? *group : "custom";
++    // Some upstream entries carry a literal "None" parent to opt out of
++    // clustering.
++    if (const std::string* parent = value->FindString("parent");
++        parent && *parent != "None") {
++      entry.parent = *parent;
++    }
++    entry.tags = SplitWords(value->FindString("tags"));
++    entry.languages = SplitWords(value->FindString("lang"));
++    entry.catalog_default = !value->FindBool("off").value_or(false);
++    if (const std::string* ua = value->FindString("ua")) {
++      entry.mobile = *ua == "mobile";
++    }
++    entry.preferred = value->FindBool("preferred").value_or(false);
++
++    // uBlock Origin's assets.json expresses "updateAfter" in days.
++    const int update_days = value->FindInt("updateAfter").value_or(7);
++    entry.update_after = ClampRefreshInterval(base::Days(update_days));
++
++    if (const std::string* content_url = value->FindString("contentURL")) {
++      ConsiderURL(*content_url, &entry);
++    } else if (const base::ListValue* content_urls =
++                   value->FindList("contentURL")) {
++      for (const base::Value& item : *content_urls) {
++        if (const std::string* url = item.GetIfString()) {
++          ConsiderURL(*url, &entry);
++        }
++      }
++    }
++    if (const base::ListValue* urls = FindList(*value, "cdnURLs", "^cdnURLs")) {
++      for (const base::Value& item : *urls) {
++        if (const std::string* url = item.GetIfString()) {
++          ConsiderURL(*url, &entry);
++        }
++      }
++    }
++
++    // Trusted resources are never granted based on data from the catalog.
++    // This allowlist contains only Helium and uBO-owned built-in source IDs.
++    entry.trusted_scriptlets = base::StartsWith(entry.id, "helium-") ||
++                               base::StartsWith(entry.id, "ublock-");
++    result.entries_.push_back(std::move(entry));
++  }
++
++  return result;
++}
++
++const SourceCatalogEntry* SourceCatalog::Find(std::string_view id) const {
++  const auto it = std::ranges::find(entries_, id, &SourceCatalogEntry::id);
++  return it == entries_.end() ? nullptr : &*it;
++}
++
++void SourceCatalog::ApplyDefaultBaseline(const SourceCatalog& baseline) {
++  base::flat_map<std::string_view, const SourceCatalogEntry*> by_id;
++  for (const SourceCatalogEntry& entry : baseline.entries_) {
++    by_id.emplace(entry.id, &entry);
++  }
++  for (SourceCatalogEntry& entry : entries_) {
++    const auto found = by_id.find(entry.id);
++    const SourceCatalogEntry* baseline_entry =
++        found == by_id.end() ? nullptr : found->second;
++    entry.catalog_default = baseline_entry && baseline_entry->catalog_default;
++    entry.trusted_scriptlets =
++        baseline_entry && baseline_entry->trusted_scriptlets;
++    if (entry.bundled_paths.empty() && baseline_entry) {
++      entry.bundled_paths = baseline_entry->bundled_paths;
++    }
++  }
++}
++
++void SourceCatalog::PromoteMobileDefaults() {
++  for (SourceCatalogEntry& entry : entries_) {
++    if (entry.mobile) {
++      entry.catalog_default = true;
++    }
++  }
++}
++
++std::vector<std::string> SourceCatalog::RegionalDefaults(
++    std::string_view locale) const {
++  std::string language(locale.substr(0, locale.find_first_of("-_")));
++  language = base::ToLowerASCII(language);
++  std::vector<std::string> result;
++  for (const SourceCatalogEntry& entry : entries_) {
++    if (std::ranges::find(entry.languages, language) != entry.languages.end()) {
++      result.push_back(entry.id);
++    }
++  }
++  return result;
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_source_catalog.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_CATALOG_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_CATALOG_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/time/time.h"
++#include "url/gurl.h"
++
++namespace helium_adblock {
++
++struct SourceCatalogEntry {
++  std::string id;
++  std::string title;
++  // Display group from the catalog's "group2" key when present, otherwise
++  // "group".
++  std::string group;
++  // Optional display cluster within the group ("parent" in the catalog).
++  std::string parent;
++  std::vector<std::string> tags;
++  std::vector<std::string> languages;
++  bool catalog_default = false;
++  // Declares a mobile user agent ("ua" in the catalog).
++  bool mobile = false;
++  // Pinned first within its group or cluster.
++  bool preferred = false;
++  // Bundled fallback candidates in catalog order; not every candidate is
++  // present in the shipped assets, so consumers use the first that exists.
++  std::vector<std::string> bundled_paths;
++  std::optional<GURL> remote_url;
++  base::TimeDelta update_after;
++  bool trusted_scriptlets = false;
++};
++
++class SourceCatalog {
++ public:
++  static std::optional<SourceCatalog> Parse(std::string_view json);
++
++  // Restricts which lists are on by default and which may run trusted
++  // scriptlets to what `baseline` (the catalog shipped with the app)
++  // declares, and inherits the baseline's bundled fallback paths. Entries
++  // absent from the baseline become opt-in and untrusted.
++  void ApplyDefaultBaseline(const SourceCatalog& baseline);
++
++  // Marks lists that declare a mobile user agent as on by default.
++  void PromoteMobileDefaults();
++
++  const std::vector<SourceCatalogEntry>& entries() const { return entries_; }
++  const SourceCatalogEntry* Find(std::string_view id) const;
++  std::vector<std::string> RegionalDefaults(std::string_view locale) const;
++
++ private:
++  std::vector<SourceCatalogEntry> entries_;
++};
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_CATALOG_H_
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_source_downloader.cc
+@@ -0,0 +1,230 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/source/adblock_source_downloader.h"
++
++#include <string_view>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "net/base/ip_address.h"
++#include "net/base/load_flags.h"
++#include "net/http/http_request_headers.h"
++#include "net/http/http_response_headers.h"
++#include "net/http/http_status_code.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++
++namespace helium_adblock {
++namespace {
++
++constexpr size_t kMaximumSourceSize = 20 * 1024 * 1024;
++constexpr size_t kMaximumRedirects = 3;
++constexpr int kMaximumRetries = 2;
++constexpr base::TimeDelta kDownloadTimeout = base::Seconds(30);
++
++std::optional<std::string> ReadDownloadedFile(const base::FilePath& path) {
++  std::string contents;
++  if (path.empty() ||
++      !base::ReadFileToStringWithMaxSize(path, &contents, kMaximumSourceSize) ||
++      !base::IsStringUTF8(contents)) {
++    return std::nullopt;
++  }
++  return contents;
++}
++
++std::string GetFirstHeaderValue(const net::HttpResponseHeaders& headers,
++                                std::string_view name) {
++  const std::optional<std::string_view> value =
++      headers.EnumerateHeader(nullptr, name);
++  return value ? std::string(*value) : std::string();
++}
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("helium_adblock_filter_download", R"(
++      semantics {
++        sender: "Helium ad and tracker blocking"
++        description:
++          "Downloads user-enabled filter-list subscriptions."
++        trigger:
++          "A stale enabled subscription, app foregrounding, or Update now."
++        data: "No user data. Conditional HTTP cache validators may be sent."
++        destination: OTHER
++        destination_other: "The filter-list URL selected by the user/catalog."
++      }
++      policy {
++        cookies_allowed: NO
++        setting:
++          "Controlled by Ad & tracker blocking source settings."
++        policy_exception_justification: "Not implemented."
++      })");
++
++}  // namespace
++
++SourceDownloader::SourceDownloader(
++    scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory)
++    : url_loader_factory_(std::move(url_loader_factory)) {}
++
++SourceDownloader::~SourceDownloader() = default;
++
++void SourceDownloader::Download(const GURL& url,
++                                SourceKind source_kind,
++                                SourceValidators validators,
++                                CompletionCallback callback) {
++  Cancel();
++  GURL request_url = url;
++  if (request_url.has_ref()) {
++    // Catalog URLs may carry informational fragments; they are never sent on
++    // the wire.
++    GURL::Replacements replacements;
++    replacements.ClearRef();
++    request_url = request_url.ReplaceComponents(replacements);
++  }
++  if (!IsSafeDownloadURL(request_url, source_kind)) {
++    VLOG(1) << "helium-adblock: rejected unsafe download URL "
++            << request_url.possibly_invalid_spec();
++    SourceDownloadResult result;
++    result.status = SourceDownloadResult::Status::kInvalidData;
++    std::move(callback).Run(std::move(result));
++    return;
++  }
++
++  source_kind_ = source_kind;
++  callback_ = std::move(callback);
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = request_url;
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  // Conditional validators do the caching; the HTTP cache would hide list
++  // updates behind heuristic freshness.
++  request->load_flags = net::LOAD_BYPASS_CACHE;
++  // Content encoding is negotiated (and decoded) by the network stack;
++  // Accept-Encoding is a forbidden header that would get the request
++  // rejected by the network service if set here.
++  if (!validators.etag.empty()) {
++    request->headers.SetHeader(net::HttpRequestHeaders::kIfNoneMatch,
++                               validators.etag);
++  }
++  if (!validators.last_modified.empty()) {
++    request->headers.SetHeader(net::HttpRequestHeaders::kIfModifiedSince,
++                               validators.last_modified);
++  }
++
++  loader_ =
++      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  loader_->SetAllowHttpErrorResults(true);
++  loader_->SetRetryOptions(kMaximumRetries,
++                           network::SimpleURLLoader::RETRY_ON_NETWORK_CHANGE);
++  // A hung request must never wedge the refresh cycle (and the UI's
++  // updating state) forever.
++  loader_->SetTimeoutDuration(kDownloadTimeout);
++  loader_->SetOnRedirectCallback(base::BindRepeating(
++      &SourceDownloader::OnRedirect, weak_factory_.GetWeakPtr()));
++  loader_->DownloadToTempFile(
++      url_loader_factory_.get(),
++      base::BindOnce(&SourceDownloader::OnTempFileReady,
++                     weak_factory_.GetWeakPtr()),
++      kMaximumSourceSize);
++}
++
++void SourceDownloader::Cancel() {
++  weak_factory_.InvalidateWeakPtrs();
++  loader_.reset();
++  callback_.Reset();
++  redirect_count_ = 0;
++  redirect_rejected_ = false;
++}
++
++// static
++bool SourceDownloader::IsSafeDownloadURL(const GURL& url,
++                                         SourceKind source_kind) {
++  if (!url.is_valid() || !url.SchemeIs("https") || url.has_username() ||
++      url.has_password() || url.has_ref()) {
++    return false;
++  }
++  if (source_kind == SourceKind::kBuiltIn) {
++    return true;
++  }
++  if (url.HostIsIPAddress()) {
++    const std::optional<net::IPAddress> address =
++        net::IPAddress::FromIPLiteral(url.HostNoBrackets());
++    return address && address->IsPubliclyRoutable();
++  }
++  return !url.DomainIs("localhost") && !url.DomainIs("local");
++}
++
++void SourceDownloader::OnRedirect(
++    const GURL&,
++    const net::RedirectInfo& redirect_info,
++    const network::mojom::URLResponseHead&,
++    std::vector<std::string>*) {
++  if (++redirect_count_ > kMaximumRedirects ||
++      !IsSafeDownloadURL(redirect_info.new_url, source_kind_)) {
++    VLOG(1) << "helium-adblock: rejected redirect to "
++            << redirect_info.new_url.possibly_invalid_spec();
++    redirect_rejected_ = true;
++    loader_.reset();
++    if (callback_) {
++      SourceDownloadResult result;
++      result.status = SourceDownloadResult::Status::kInvalidData;
++      std::move(callback_).Run(std::move(result));
++    }
++  }
++}
++
++void SourceDownloader::OnTempFileReady(base::FilePath path) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock()},
++      base::BindOnce(&ReadDownloadedFile, std::move(path)),
++      base::BindOnce(&SourceDownloader::OnComplete,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void SourceDownloader::OnComplete(std::optional<std::string> response_body) {
++  if (redirect_rejected_ || !callback_) {
++    return;
++  }
++
++  SourceDownloadResult result;
++  const network::mojom::URLResponseHead* response = loader_->ResponseInfo();
++  int response_code = 0;
++  if (response && response->headers) {
++    response_code = response->headers->response_code();
++    result.http_status = response_code;
++    if (response_code == net::HTTP_NOT_MODIFIED) {
++      result.status = SourceDownloadResult::Status::kNotModified;
++    } else if (response_code == net::HTTP_OK && response_body) {
++      result.status = SourceDownloadResult::Status::kSuccess;
++      result.contents = std::move(*response_body);
++      result.validators.etag =
++          GetFirstHeaderValue(*response->headers, "ETag");
++      result.validators.last_modified = GetFirstHeaderValue(
++          *response->headers, net::HttpResponseHeaders::kLastModified);
++    } else if (response_code == net::HTTP_OK) {
++      // A 200 whose body is missing or not valid UTF-8.
++      result.status = SourceDownloadResult::Status::kInvalidData;
++    } else {
++      result.status = SourceDownloadResult::Status::kNetworkError;
++    }
++  }
++  result.net_error = loader_->NetError();
++  if (result.net_error != net::OK) {
++    result.status = SourceDownloadResult::Status::kNetworkError;
++  }
++  if (result.status != SourceDownloadResult::Status::kSuccess &&
++      result.status != SourceDownloadResult::Status::kNotModified) {
++    VLOG(1) << "helium-adblock: download failed, net_error="
++            << result.net_error << " http_status=" << response_code
++            << " body_bytes="
++            << (response_body ? response_body->size() : size_t{0});
++  }
++  loader_.reset();
++  std::move(callback_).Run(std::move(result));
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/source/adblock_source_downloader.h
+@@ -0,0 +1,87 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_DOWNLOADER_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_DOWNLOADER_H_
++
++#include <cstddef>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "url/gurl.h"
++
++namespace network {
++class SimpleURLLoader;
++namespace mojom {
++class URLResponseHead;
++}
++}  // namespace network
++
++namespace net {
++struct RedirectInfo;
++}
++
++namespace helium_adblock {
++
++enum class SourceKind {
++  kBuiltIn,
++  kCustom,
++};
++
++struct SourceValidators {
++  std::string etag;
++  std::string last_modified;
++};
++
++struct SourceDownloadResult {
++  enum class Status { kSuccess, kNotModified, kNetworkError, kInvalidData };
++  Status status = Status::kNetworkError;
++  int net_error = 0;
++  int http_status = 0;
++  std::string contents;
++  SourceValidators validators;
++};
++
++class SourceDownloader {
++ public:
++  using CompletionCallback = base::OnceCallback<void(SourceDownloadResult)>;
++
++  explicit SourceDownloader(
++      scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory);
++  ~SourceDownloader();
++
++  void Download(const GURL& url,
++                SourceKind source_kind,
++                SourceValidators validators,
++                CompletionCallback callback);
++  void Cancel();
++
++  static bool IsSafeDownloadURL(const GURL& url, SourceKind source_kind);
++
++ private:
++  void OnRedirect(const GURL& url_before_redirect,
++                  const net::RedirectInfo& redirect_info,
++                  const network::mojom::URLResponseHead& response_head,
++                  std::vector<std::string>* removed_headers);
++  void OnTempFileReady(base::FilePath path);
++  void OnComplete(std::optional<std::string> response_body);
++
++  scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  CompletionCallback callback_;
++  SourceKind source_kind_ = SourceKind::kBuiltIn;
++  bool redirect_rejected_ = false;
++  size_t redirect_count_ = 0;
++  base::WeakPtrFactory<SourceDownloader> weak_factory_{this};
++};
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_SOURCE_ADBLOCK_SOURCE_DOWNLOADER_H_

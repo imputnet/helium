@@ -1,0 +1,166 @@
+--- /dev/null
++++ b/components/helium_adblock/core/helium_adblock_service_filtering.cc
+@@ -0,0 +1,163 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/helium_adblock_service.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "components/helium_adblock/core/features.h"
++#include "components/helium_adblock/core/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++
++namespace helium_adblock {
++
++bool HeliumAdBlockService::IsEnabledForURL(const GURL& url,
++                                           bool off_the_record) const {
++  if (!base::FeatureList::IsEnabled(kHeliumAdBlock) || !state_.enabled ||
++      !url.SchemeIsHTTPOrHTTPS()) {
++    return false;
++  }
++  const std::optional<std::string> host = ExceptionHost(url);
++  if (!host) {
++    return false;
++  }
++  if (desired_.regular_exceptions.contains(*host)) {
++    return false;
++  }
++  return !off_the_record || !desired_.incognito_exceptions.contains(*host);
++}
++
++void HeliumAdBlockService::SetSiteException(
++    const GURL& url,
++    bool disabled,
++    bool off_the_record,
++    CompletionCallback completion) {
++  const std::optional<std::string> host = ExceptionHost(url);
++  if (!host) {
++    std::move(completion).Run(false);
++    return;
++  }
++  base::flat_set<std::string>& exceptions =
++      off_the_record ? desired_.incognito_exceptions
++                     : desired_.regular_exceptions;
++  if (disabled) {
++    exceptions.insert(*host);
++  } else {
++    exceptions.erase(*host);
++  }
++  if (!off_the_record) {
++    PersistSiteExceptions();
++  }
++  RequestRebuild(std::move(completion));
++}
++
++void HeliumAdBlockService::MatchRequest(
++    const GURL& url,
++    const GURL& document_url,
++    std::string request_type,
++    std::string method,
++    bool off_the_record,
++    MatchCallback callback) {
++  if (!IsEnabledForURL(document_url, off_the_record)) {
++    std::move(callback).Run(NetworkMatchResult());
++    return;
++  }
++  MatchCacheKey cache_key(url, std::string(document_url.host()), request_type,
++                          method);
++  auto cached = match_cache_.Get(cache_key);
++  if (cached != match_cache_.end()) {
++    std::move(callback).Run(cached->second);
++    return;
++  }
++  worker_.AsyncCall(&AdBlockEngineWorker::MatchRequest)
++      .WithArgs(url, document_url, std::move(request_type), std::move(method))
++      .Then(base::BindOnce(
++          [](base::WeakPtr<HeliumAdBlockService> service,
++             MatchCacheKey cache_key, MatchCallback callback,
++             NetworkMatchResult result) {
++            if (service) {
++              service->match_cache_.Put(std::move(cache_key), result);
++            }
++            std::move(callback).Run(std::move(result));
++          },
++          weak_ptr_factory_.GetWeakPtr(), std::move(cache_key),
++          std::move(callback)));
++}
++
++void HeliumAdBlockService::GetDocumentCosmeticResources(
++    const GURL& url,
++    bool off_the_record,
++    StringCallback callback) {
++  if (!IsEnabledForURL(url, off_the_record)) {
++    std::move(callback).Run(std::string());
++    return;
++  }
++  auto cached = cosmetic_resources_cache_.Get(url.spec());
++  if (cached != cosmetic_resources_cache_.end()) {
++    std::move(callback).Run(cached->second);
++    return;
++  }
++  worker_.AsyncCall(&AdBlockEngineWorker::DocumentCosmeticResources)
++      .WithArgs(url)
++      .Then(base::BindOnce(
++          [](base::WeakPtr<HeliumAdBlockService> service, std::string spec,
++             StringCallback callback, std::string resources) {
++            if (service) {
++              service->cosmetic_resources_cache_.Put(std::move(spec),
++                                                     resources);
++            }
++            std::move(callback).Run(std::move(resources));
++          },
++          weak_ptr_factory_.GetWeakPtr(), url.spec(), std::move(callback)));
++}
++
++void HeliumAdBlockService::GetGenericSelectors(
++    const GURL& url,
++    std::vector<std::string> classes,
++    std::vector<std::string> ids,
++    std::vector<std::string> exceptions,
++    bool off_the_record,
++    StringListCallback callback) {
++  if (!IsEnabledForURL(url, off_the_record)) {
++    std::move(callback).Run({});
++    return;
++  }
++  worker_.AsyncCall(&AdBlockEngineWorker::GenericSelectors)
++      .WithArgs(std::move(classes), std::move(ids), std::move(exceptions))
++      .Then(std::move(callback));
++}
++
++void HeliumAdBlockService::OnIncognitoSessionEnded() {
++  if (desired_.incognito_exceptions.empty()) {
++    return;
++  }
++  desired_.incognito_exceptions.clear();
++  RequestRebuild(base::DoNothing());
++}
++
++void HeliumAdBlockService::PersistSiteExceptions() {
++  base::ListValue exceptions;
++  for (const std::string& host : desired_.regular_exceptions) {
++    exceptions.Append(host);
++  }
++  prefs_->SetList(prefs::kHeliumAdBlockSiteExceptions, std::move(exceptions));
++}
++
++std::optional<std::string> HeliumAdBlockService::ExceptionHost(
++    const GURL& url) const {
++  if (!url.SchemeIsHTTPOrHTTPS() || url.host().empty()) {
++    return std::nullopt;
++  }
++  const std::string domain =
++      net::registry_controlled_domains::GetDomainAndRegistry(
++          url, net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  return base::ToLowerASCII(domain.empty() ? url.host() : domain);
++}
++
++}  // namespace helium_adblock

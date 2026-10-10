@@ -1,0 +1,883 @@
+--- /dev/null
++++ b/components/helium_adblock/core/adblock_engine_builder.cc
+@@ -0,0 +1,399 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/adblock_engine_builder.h"
++
++#include <algorithm>
++#include <memory>
++#include <string_view>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "components/helium_adblock/core/source/adblock_bundled_assets.h"
++#include "components/helium_adblock/core/source/adblock_filter_list_preprocessor.h"
++#include "components/helium_adblock/core/source/adblock_source_cache.h"
++#include "components/helium_adblock/core/source/adblock_source_catalog.h"
++#include "components/helium_adblock/rs/src/lib.rs.h"
++#include "crypto/sha2.h"
++#include "third_party/rust/helium/chromium_crates_io/adblock_engine_version.h"
++
++namespace helium_adblock {
++namespace {
++
++constexpr uint8_t kTrustedScriptletPermission = 1;
++constexpr char kCatalogCacheId[] = "catalog-snapshot";
++
++std::string Digest(std::string_view value) {
++  return base::HexEncodeLower(crypto::SHA256HashString(value));
++}
++
++void AppendFingerprintField(std::string_view value, std::string* output) {
++  output->append(base::NumberToString(value.size()));
++  output->push_back(':');
++  output->append(value);
++}
++
++std::optional<std::string> ReadUTF8File(const base::FilePath& path,
++                                        size_t maximum_size) {
++  std::string contents;
++  if (!base::ReadFileToStringWithMaxSize(path, &contents, maximum_size) ||
++      !base::IsStringUTF8(contents)) {
++    return std::nullopt;
++  }
++  return contents;
++}
++
++std::optional<std::string> ReadBundledUTF8(
++    const base::FilePath& path,
++    std::string_view resource_path,
++    size_t maximum_size,
++    const HeliumAdBlockClient::BundledListReader& bundled_resources) {
++  std::optional<std::string> contents = ReadUTF8File(path, maximum_size);
++  if (!contents) {
++    contents = bundled_resources.read.Run(std::string(resource_path));
++  }
++  if (!contents || contents->size() > maximum_size ||
++      !base::IsStringUTF8(*contents)) {
++    return std::nullopt;
++  }
++  return contents;
++}
++
++std::optional<std::string> GetString(const base::DictValue& dict,
++                                     std::string_view key) {
++  const std::string* value = dict.FindString(key);
++  return value ? std::optional<std::string>(*value) : std::nullopt;
++}
++
++SourceUpdateState CacheState(const SourceCacheMetadata* metadata,
++                             bool bundled,
++                             base::Time now) {
++  if (!metadata) {
++    return bundled ? SourceUpdateState::kBundled : SourceUpdateState::kPending;
++  }
++  if (metadata->last_result == SourceResult::kNetworkError ||
++      metadata->last_result == SourceResult::kInvalidData ||
++      metadata->last_result == SourceResult::kUnsupported) {
++    return SourceUpdateState::kFailed;
++  }
++  if (!metadata->expiry.is_null() && metadata->expiry < now) {
++    return SourceUpdateState::kStale;
++  }
++  return SourceUpdateState::kDownloaded;
++}
++
++std::string SourceFailureName(SourceResult result) {
++  switch (result) {
++    case SourceResult::kNetworkError:
++      return "network";
++    case SourceResult::kInvalidData:
++      return "invalid_data";
++    case SourceResult::kUnsupported:
++      return "unsupported";
++    default:
++      return {};
++  }
++}
++
++const SourceCacheMetadata* FindMetadata(
++    const std::vector<SourceCacheMetadata>& metadata,
++    std::string_view id) {
++  auto found = std::ranges::find(metadata, id, &SourceCacheMetadata::id);
++  return found == metadata.end() ? nullptr : &*found;
++}
++
++std::string PreprocessErrorName(FilterListPreprocessError error) {
++  switch (error) {
++    case FilterListPreprocessError::kInvalidSourceUrl:
++      return "invalid_source_url";
++    case FilterListPreprocessError::kInputTooLarge:
++      return "input_too_large";
++    case FilterListPreprocessError::kMalformedDirective:
++      return "malformed_directive";
++  }
++}
++
++bool LoadCachedEngine(const base::FilePath& directory,
++                      std::string_view fingerprint,
++                      CompiledGeneration* result) {
++  std::optional<std::string> manifest_json = ReadUTF8File(
++      directory.AppendASCII("generation.json"), kMaximumAdBlockManifestSize);
++  if (!manifest_json) {
++    return false;
++  }
++  std::optional<base::Value> parsed =
++      base::JSONReader::Read(*manifest_json, base::JSON_PARSE_RFC);
++  const base::DictValue* manifest = parsed ? parsed->GetIfDict() : nullptr;
++  if (!manifest || GetString(*manifest, "fingerprint") != fingerprint ||
++      manifest->FindInt("format_version") !=
++          kAdBlockGenerationFormatVersion ||
++      GetString(*manifest, "engine_version") != kEngineVersion) {
++    return false;
++  }
++  std::string engine_bytes;
++  if (!base::ReadFileToStringWithMaxSize(
++          directory.AppendASCII("engine.bin"), &engine_bytes,
++          kMaximumSerializedAdBlockEngineSize) ||
++      GetString(*manifest, "engine_digest") != Digest(engine_bytes)) {
++    return false;
++  }
++  result->serialized_engine.assign(engine_bytes.begin(), engine_bytes.end());
++  return true;
++}
++
++}  // namespace
++
++std::string_view GenerationFailureName(GenerationFailure failure) {
++  switch (failure) {
++    case GenerationFailure::kNone:
++      return std::string_view();
++    case GenerationFailure::kBundledAssets:
++      return "bundled_assets";
++    case GenerationFailure::kCatalog:
++      return "catalog";
++    case GenerationFailure::kDomainResolver:
++      return "domain_resolver";
++    case GenerationFailure::kFilterParse:
++      return "filter_parse";
++    case GenerationFailure::kResources:
++      return "resources";
++    case GenerationFailure::kActivation:
++      return "activation";
++    case GenerationFailure::kPersistence:
++      return "persistence";
++  }
++}
++
++CompiledGeneration BuildAdBlockGeneration(
++    base::FilePath directory,
++    base::FilePath assets_root,
++    HeliumAdBlockClient::BundledListReader bundled_lists,
++    EngineConfiguration configuration) {
++  CompiledGeneration result;
++  if (!install_domain_resolver()) {
++    result.failure = GenerationFailure::kDomainResolver;
++    result.failure_detail = "adblock-rust rejected Chromium's domain resolver";
++    return result;
++  }
++
++  SourceCache source_cache(directory.AppendASCII("Sources"));
++  std::optional<std::string> catalog_json = ReadBundledUTF8(
++      GetBundledCatalogPath(assets_root), kBundledCatalogResourcePath,
++      1024 * 1024, bundled_lists);
++  std::optional<std::string> resources_json = ReadBundledUTF8(
++      GetBundledResourcesPath(assets_root), kBundledResourcesResourcePath,
++      2 * 1024 * 1024, bundled_lists);
++  if (!catalog_json || !resources_json) {
++    result.failure = GenerationFailure::kBundledAssets;
++    return result;
++  }
++  std::optional<SourceCatalog> catalog = SourceCatalog::Parse(*catalog_json);
++  if (!catalog) {
++    result.failure = GenerationFailure::kCatalog;
++    return result;
++  }
++  if (configuration.mobile) {
++    catalog->PromoteMobileDefaults();
++  }
++
++  std::vector<SourceCacheMetadata> metadata = source_cache.LoadMetadata();
++  if (configuration.use_service_catalog) {
++    const SourceCacheMetadata* catalog_metadata =
++        FindMetadata(metadata, kCatalogCacheId);
++    std::optional<std::string> cached_catalog =
++        catalog_metadata ? source_cache.LoadContents(*catalog_metadata)
++                         : std::nullopt;
++    if (cached_catalog) {
++      if (std::optional<SourceCatalog> served =
++              SourceCatalog::Parse(*cached_catalog)) {
++        served->ApplyDefaultBaseline(*catalog);
++        catalog = std::move(served);
++        catalog_json = std::move(cached_catalog);
++      }
++    }
++  }
++  result.resources_json = *resources_json;
++
++  const base::Time now = base::Time::Now();
++  base::flat_set<std::string> regional;
++  if (!configuration.regional_defaults_initialized) {
++    std::vector<std::string> recommended =
++        catalog->RegionalDefaults(configuration.locale);
++    regional.insert(recommended.begin(), recommended.end());
++    result.regional_defaults = std::move(recommended);
++  }
++
++  struct EnabledContents {
++    size_t source_index;
++    std::string id;
++    std::string contents;
++    bool trusted = false;
++    GURL source_url;
++  };
++  std::vector<EnabledContents> enabled_contents;
++  std::string source_digest_input;
++
++  for (const SourceCatalogEntry& entry : catalog->entries()) {
++    SourceState state;
++    state.id = entry.id;
++    state.title = entry.title;
++    state.group = entry.group;
++    state.parent = entry.parent;
++    state.preferred = entry.preferred;
++    state.url = entry.remote_url;
++    state.catalog_default = entry.catalog_default;
++    state.update_after = entry.update_after;
++    auto override = configuration.overrides.find(entry.id);
++    if (override != configuration.overrides.end()) {
++      state.explicit_override = override->second;
++    }
++    state.effective_enabled =
++        state.explicit_override.value_or(entry.catalog_default) ||
++        regional.contains(entry.id);
++
++    const SourceCacheMetadata* cache_metadata = FindMetadata(metadata, entry.id);
++    std::optional<std::string> cached =
++        cache_metadata ? source_cache.LoadContents(*cache_metadata)
++                       : std::nullopt;
++    std::optional<std::string> bundled_list;
++    for (const std::string& candidate : entry.bundled_paths) {
++      if (bundled_lists.has.Run(candidate)) {
++        bundled_list = candidate;
++        break;
++      }
++    }
++    state.bundled_available = bundled_list.has_value();
++    state.update_state =
++        CacheState(cache_metadata, bundled_list.has_value(), now);
++    if (cache_metadata) {
++      state.last_successful_update = cache_metadata->last_success;
++      state.failure_category = SourceFailureName(cache_metadata->last_result);
++    }
++
++    std::optional<std::string> contents = std::move(cached);
++    if (!contents && bundled_list) {
++      contents = bundled_lists.read.Run(*bundled_list);
++    }
++    if (configuration.enabled && state.effective_enabled && contents) {
++      enabled_contents.push_back(
++          {result.sources.size(), entry.id, std::move(*contents),
++           entry.trusted_scriptlets,
++           entry.remote_url.value_or(
++               GURL("https://bundled.invalid/" + entry.id))});
++    }
++    result.sources.push_back(std::move(state));
++  }
++
++  for (const CustomSource& custom : configuration.custom_sources) {
++    SourceState state;
++    state.id = custom.id;
++    state.title = custom.title;
++    state.group = "custom";
++    state.url = custom.url;
++    state.built_in = false;
++    state.explicit_override = custom.enabled;
++    state.effective_enabled = custom.enabled;
++    const SourceCacheMetadata* cache_metadata = FindMetadata(metadata, custom.id);
++    std::optional<std::string> contents =
++        cache_metadata ? source_cache.LoadContents(*cache_metadata)
++                       : std::nullopt;
++    state.update_state = CacheState(cache_metadata, false, now);
++    if (cache_metadata) {
++      state.last_successful_update = cache_metadata->last_success;
++      state.failure_category = SourceFailureName(cache_metadata->last_result);
++    }
++    if (configuration.enabled && custom.enabled && contents) {
++      enabled_contents.push_back(
++          {result.sources.size(), custom.id, std::move(*contents), false,
++           custom.url});
++    }
++    result.sources.push_back(std::move(state));
++  }
++
++  struct ProcessedList {
++    std::string contents;
++    uint8_t permissions;
++  };
++  std::vector<ProcessedList> processed_lists;
++  const FilterListPreprocessorEnvironment environment = {
++      .mobile = configuration.mobile,
++      .ublock = true,
++  };
++  for (const EnabledContents& enabled : enabled_contents) {
++    auto processed =
++        PreprocessFilterList(enabled.contents, enabled.source_url, environment);
++    if (!processed.has_value()) {
++      SourceState& source = result.sources[enabled.source_index];
++      source.update_state = SourceUpdateState::kFailed;
++      source.failure_category =
++          "preprocess_" + PreprocessErrorName(processed.error());
++      LOG(WARNING) << "helium-adblock: skipped invalid source " << enabled.id
++                   << ": " << source.failure_category;
++      continue;
++    }
++    if (processed->unsupported_rule_count > 0) {
++      VLOG(1) << "helium-adblock: skipped "
++              << processed->unsupported_rule_count
++              << " unsupported rules from " << enabled.id;
++    }
++    if (processed->ignored_include_count > 0) {
++      VLOG(1) << "helium-adblock: ignored "
++              << processed->ignored_include_count
++              << " include directives from " << enabled.id;
++    }
++    AppendFingerprintField(enabled.id, &source_digest_input);
++    AppendFingerprintField(Digest(processed->contents), &source_digest_input);
++    processed_lists.push_back(
++        {std::move(processed->contents),
++         enabled.trusted ? kTrustedScriptletPermission : uint8_t{0}});
++  }
++
++  std::string fingerprint_input;
++  AppendFingerprintField(kEngineVersion, &fingerprint_input);
++  AppendFingerprintField(base::NumberToString(kAdBlockGenerationFormatVersion),
++                         &fingerprint_input);
++  AppendFingerprintField(Digest(*catalog_json), &fingerprint_input);
++  AppendFingerprintField(Digest(*resources_json), &fingerprint_input);
++  AppendFingerprintField(Digest(source_digest_input), &fingerprint_input);
++  AppendFingerprintField(configuration.mobile ? "mobile" : "desktop",
++                         &fingerprint_input);
++  result.fingerprint = Digest(fingerprint_input);
++
++  if (LoadCachedEngine(directory, result.fingerprint, &result)) {
++    result.from_cache = true;
++  } else {
++    auto engine_filters = new_filter_set();
++    for (const ProcessedList& list : processed_lists) {
++      rust::Slice<const uint8_t> rules(
++          reinterpret_cast<const uint8_t*>(list.contents.data()),
++          list.contents.size());
++      OperationResult operation =
++          engine_filters->add_filter_list(rules, list.permissions);
++      if (!operation.success) {
++        result.failure = GenerationFailure::kFilterParse;
++        result.failure_detail = static_cast<std::string>(operation.error);
++        return result;
++      }
++    }
++    auto engine = engine_from_filter_set(std::move(engine_filters));
++    OperationResult resources = engine->load_resources_json(*resources_json);
++    if (!resources.success) {
++      result.failure = GenerationFailure::kResources;
++      result.failure_detail = static_cast<std::string>(resources.error);
++      return result;
++    }
++    rust::Vec<uint8_t> serialized = engine->serialize();
++    result.serialized_engine.assign(serialized.begin(), serialized.end());
++  }
++
++  result.generation_id = result.fingerprint.substr(0, 20);
++  return result;
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/adblock_engine_builder.h
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_ADBLOCK_ENGINE_BUILDER_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_ADBLOCK_ENGINE_BUILDER_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/flat_map.h"
++#include "base/containers/flat_set.h"
++#include "base/files/file_path.h"
++#include "components/helium_adblock/core/adblock_types.h"
++#include "components/helium_adblock/core/helium_adblock_client.h"
++#include "url/gurl.h"
++
++namespace helium_adblock {
++
++inline constexpr int kAdBlockGenerationFormatVersion = 2;
++inline constexpr size_t kMaximumAdBlockManifestSize = 30 * 1024 * 1024;
++inline constexpr size_t kMaximumSerializedAdBlockEngineSize = 40 * 1024 * 1024;
++
++struct CustomSource {
++  std::string id;
++  GURL url;
++  std::string title;
++  bool enabled = true;
++};
++
++struct EngineConfiguration {
++  bool enabled = false;
++  bool mobile = false;
++  bool use_service_catalog = true;
++  bool regional_defaults_initialized = false;
++  std::string locale;
++  base::flat_map<std::string, bool> overrides;
++  std::vector<CustomSource> custom_sources;
++  base::flat_set<std::string> regular_exceptions;
++  base::flat_set<std::string> incognito_exceptions;
++};
++
++enum class GenerationFailure {
++  kNone,
++  kBundledAssets,
++  kCatalog,
++  kDomainResolver,
++  kFilterParse,
++  kResources,
++  kActivation,
++  kPersistence,
++};
++
++std::string_view GenerationFailureName(GenerationFailure failure);
++
++struct CompiledGeneration {
++  GenerationFailure failure = GenerationFailure::kNone;
++  std::string failure_detail;
++  bool from_cache = false;
++  std::string generation_id;
++  std::string fingerprint;
++  std::string resources_json;
++  std::vector<uint8_t> serialized_engine;
++  std::vector<SourceState> sources;
++  std::vector<std::string> regional_defaults;
++
++  bool success() const { return failure == GenerationFailure::kNone; }
++};
++
++CompiledGeneration BuildAdBlockGeneration(
++    base::FilePath directory,
++    base::FilePath assets_root,
++    HeliumAdBlockClient::BundledListReader bundled_lists,
++    EngineConfiguration configuration);
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_ADBLOCK_ENGINE_BUILDER_H_
+--- /dev/null
++++ b/components/helium_adblock/core/adblock_engine_worker.cc
+@@ -0,0 +1,305 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/adblock_engine_worker.h"
++
++#include <algorithm>
++#include <string_view>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/files/important_file_writer.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/values.h"
++#include "components/helium_adblock/core/adblock_engine_builder.h"
++#include "components/helium_adblock/core/source/adblock_bundled_assets.h"
++#include "components/helium_adblock/core/source/adblock_filter_list_preprocessor.h"
++#include "components/helium_adblock/core/source/adblock_refresh_schedule.h"
++#include "components/helium_adblock/core/source/adblock_source_catalog.h"
++#include "crypto/sha2.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++#include "third_party/rust/helium/chromium_crates_io/adblock_engine_version.h"
++
++namespace helium_adblock {
++namespace {
++
++constexpr char kCatalogCacheId[] = "catalog-snapshot";
++
++std::string Digest(std::string_view value) {
++  return base::HexEncodeLower(crypto::SHA256HashString(value));
++}
++
++const SourceCacheMetadata* FindMetadata(
++    const std::vector<SourceCacheMetadata>& metadata,
++    std::string_view id) {
++  auto found = std::ranges::find(metadata, id, &SourceCacheMetadata::id);
++  return found == metadata.end() ? nullptr : &*found;
++}
++
++rust::Slice<const uint8_t> AsRustSlice(std::string_view contents) {
++  return rust::Slice<const uint8_t>(
++      reinterpret_cast<const uint8_t*>(contents.data()), contents.size());
++}
++
++base::TimeDelta DeclaredRefreshInterval(std::string_view contents,
++                                        base::TimeDelta catalog_interval) {
++  const uint32_t expires_hours =
++      list_metadata(AsRustSlice(contents)).expires_hours;
++  return expires_hours > 0 ? base::Hours(expires_hours) : catalog_interval;
++}
++
++}  // namespace
++
++AdBlockEngineWorker::AdBlockEngineWorker(base::FilePath directory,
++                                         base::FilePath assets_root)
++    : directory_(std::move(directory)),
++      assets_root_(std::move(assets_root)),
++      source_cache_(directory_.AppendASCII("Sources")),
++      source_metadata_(source_cache_.LoadMetadata()),
++      resolver_ready_(install_domain_resolver()) {}
++
++AdBlockEngineWorker::~AdBlockEngineWorker() = default;
++
++EngineActivationResult AdBlockEngineWorker::Activate(
++    std::vector<uint8_t> serialized,
++    std::string resources_json,
++    std::string fingerprint,
++    bool persist) {
++  if (!resolver_ready_) {
++    return {.error = "domain resolver is not installed"};
++  }
++  auto engine = new_engine();
++  OperationResult deserialized =
++      engine->deserialize(rust::Slice<const uint8_t>(serialized.data(),
++                                                     serialized.size()));
++  if (!deserialized.success) {
++    return {.error = static_cast<std::string>(deserialized.error)};
++  }
++  OperationResult resources = engine->load_resources_json(resources_json);
++  if (!resources.success) {
++    return {.error = static_cast<std::string>(resources.error)};
++  }
++
++  if (persist) {
++    base::DictValue manifest;
++    manifest.Set("engine_version", kEngineVersion);
++    manifest.Set("format_version", kAdBlockGenerationFormatVersion);
++    manifest.Set("fingerprint", fingerprint);
++    manifest.Set("engine_digest",
++                 Digest(std::string_view(
++                     reinterpret_cast<const char*>(serialized.data()),
++                     serialized.size())));
++    std::string manifest_json;
++    if (!base::CreateDirectory(directory_) ||
++        !base::JSONWriter::Write(manifest, &manifest_json) ||
++        !base::ImportantFileWriter::WriteFileAtomically(
++            directory_.AppendASCII("engine.bin"),
++            std::string_view(reinterpret_cast<const char*>(serialized.data()),
++                             serialized.size()),
++            "HeliumAdBlockEngine")) {
++      return {.persistence_error = true,
++              .error = "failed to persist engine"};
++    }
++    if (!base::ImportantFileWriter::WriteFileAtomically(
++            directory_.AppendASCII("generation.json"), manifest_json,
++            "HeliumAdBlockGeneration")) {
++      return {.persistence_error = true,
++              .error = "failed to publish generation manifest"};
++    }
++  }
++
++  engine_ = std::move(engine);
++  return {.success = true};
++}
++
++bool AdBlockEngineWorker::CacheSource(std::string id,
++                                      GURL source_url,
++                                      bool mobile,
++                                      std::string contents,
++                                      SourceValidators validators) {
++  const FilterListPreprocessorEnvironment environment = {
++      .mobile = mobile,
++      .ublock = true,
++  };
++  if (!PreprocessFilterList(contents, source_url, environment).has_value()) {
++    return false;
++  }
++  SourceCacheMetadata metadata;
++  metadata.id = std::move(id);
++  metadata.validators = std::move(validators);
++  metadata.last_success = base::Time::Now();
++  metadata.expiry = GetJitteredRefreshTime(
++      metadata.last_success, DeclaredRefreshInterval(contents, base::Days(7)));
++  metadata.last_result = SourceResult::kSuccess;
++  return source_cache_.Commit(std::move(metadata), contents, &source_metadata_);
++}
++
++bool AdBlockEngineWorker::RemoveSource(std::string id) {
++  return source_cache_.Remove(id, &source_metadata_);
++}
++
++SourceValidators AdBlockEngineWorker::ValidatorsFor(std::string id) const {
++  const SourceCacheMetadata* found = FindMetadata(source_metadata_, id);
++  return found ? found->validators : SourceValidators{};
++}
++
++DownloadApplyResult AdBlockEngineWorker::ApplyFilterListDownload(
++    std::string id,
++    GURL source_url,
++    bool mobile,
++    SourceDownloadResult result,
++    base::TimeDelta catalog_interval) {
++  if (result.status == SourceDownloadResult::Status::kSuccess) {
++    const FilterListPreprocessorEnvironment environment = {
++        .mobile = mobile,
++        .ublock = true,
++    };
++    if (!PreprocessFilterList(result.contents, source_url, environment)
++             .has_value()) {
++      result.status = SourceDownloadResult::Status::kInvalidData;
++      result.contents.clear();
++    }
++  }
++  return ApplyDownload(std::move(id), std::move(result), catalog_interval);
++}
++
++DownloadApplyResult AdBlockEngineWorker::ApplyDownload(
++    std::string id,
++    SourceDownloadResult result,
++    base::TimeDelta catalog_interval) {
++  SourceCacheMetadata updated;
++  if (const SourceCacheMetadata* found = FindMetadata(source_metadata_, id)) {
++    updated = *found;
++  }
++  updated.id = std::move(id);
++  const base::Time now = base::Time::Now();
++  switch (result.status) {
++    case SourceDownloadResult::Status::kSuccess:
++      updated.validators = std::move(result.validators);
++      updated.last_success = now;
++      updated.expiry = GetJitteredRefreshTime(
++          now, DeclaredRefreshInterval(result.contents, catalog_interval));
++      updated.last_result = SourceResult::kSuccess;
++      if (source_cache_.Commit(std::move(updated), result.contents,
++                               &source_metadata_)) {
++        return {.persisted = true, .source_available = true};
++      }
++      return {};
++    case SourceDownloadResult::Status::kNotModified: {
++      const SourceCacheMetadata* existing =
++          FindMetadata(source_metadata_, updated.id);
++      std::optional<std::string> contents =
++          existing ? source_cache_.LoadContents(*existing) : std::nullopt;
++      if (!contents) {
++        updated.last_result = SourceResult::kInvalidData;
++        return {.persisted = source_cache_.RecordResult(
++                    std::move(updated), &source_metadata_)};
++      }
++      updated.last_success = now;
++      updated.expiry = GetJitteredRefreshTime(
++          now, DeclaredRefreshInterval(*contents, catalog_interval));
++      updated.last_result = SourceResult::kNotModified;
++      return {.persisted = source_cache_.RecordResult(
++                  std::move(updated), &source_metadata_),
++              .source_available = true};
++    }
++    case SourceDownloadResult::Status::kNetworkError:
++      updated.last_result = SourceResult::kNetworkError;
++      return {.persisted = source_cache_.RecordResult(
++                  std::move(updated), &source_metadata_)};
++    case SourceDownloadResult::Status::kInvalidData:
++      updated.last_result = SourceResult::kInvalidData;
++      return {.persisted = source_cache_.RecordResult(
++                  std::move(updated), &source_metadata_)};
++  }
++}
++
++DownloadApplyResult AdBlockEngineWorker::ApplyCatalogDownload(
++    SourceDownloadResult result) {
++  if (result.status == SourceDownloadResult::Status::kSuccess) {
++    std::optional<SourceCatalog> remote =
++        SourceCatalog::Parse(result.contents);
++    size_t minimum = 1;
++    std::string bundled_json;
++    if (base::ReadFileToStringWithMaxSize(GetBundledCatalogPath(assets_root_),
++                                         &bundled_json, 1024 * 1024)) {
++      if (std::optional<SourceCatalog> bundled =
++              SourceCatalog::Parse(bundled_json)) {
++        minimum = std::max<size_t>(1, bundled->entries().size() / 2);
++      }
++    }
++    if (!remote || remote->entries().size() < minimum) {
++      result.status = SourceDownloadResult::Status::kInvalidData;
++      result.contents.clear();
++    }
++  }
++  return ApplyDownload(kCatalogCacheId, std::move(result), base::Days(7));
++}
++
++NetworkMatchResult AdBlockEngineWorker::MatchRequest(
++    GURL url,
++    GURL document_url,
++    std::string request_type,
++    std::string method) const {
++  NetworkMatchResult response;
++  if (!engine_ || !url.is_valid() || !document_url.is_valid()) {
++    return response;
++  }
++  const bool third_party =
++      !net::registry_controlled_domains::SameDomainOrHost(
++          url, document_url,
++          net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  MatchResult match = (*engine_)->matches(
++      url.spec(), std::string(url.host()), std::string(document_url.host()),
++      request_type, third_party, method);
++  response.blocked = match.blocked;
++  response.important = match.important;
++  response.has_exception = match.has_exception;
++  if (match.has_redirect) {
++    response.redirect = static_cast<std::string>(match.redirect);
++  }
++  if (match.has_rewritten_url) {
++    response.rewritten_url = static_cast<std::string>(match.rewritten_url);
++  }
++  return response;
++}
++
++std::string AdBlockEngineWorker::DocumentCosmeticResources(GURL url) const {
++  if (!engine_ || !url.is_valid()) {
++    return {};
++  }
++  StringResult result = (*engine_)->document_cosmetic_resources(url.spec());
++  if (!result.success) {
++    DLOG(ERROR) << "helium-adblock: cosmetic resource serialization failed: "
++                << static_cast<std::string>(result.error);
++    return {};
++  }
++  return static_cast<std::string>(result.value);
++}
++
++std::vector<std::string> AdBlockEngineWorker::GenericSelectors(
++    std::vector<std::string> classes,
++    std::vector<std::string> ids,
++    std::vector<std::string> exceptions) const {
++  if (!engine_) {
++    return {};
++  }
++  StringListResult result =
++      (*engine_)->generic_selectors(classes, ids, exceptions);
++  if (!result.success) {
++    DLOG(ERROR) << "helium-adblock: generic selector query failed: "
++                << static_cast<std::string>(result.error);
++    return {};
++  }
++  std::vector<std::string> selectors;
++  selectors.reserve(result.value.size());
++  for (const rust::String& selector : result.value) {
++    selectors.push_back(static_cast<std::string>(selector));
++  }
++  return selectors;
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/adblock_engine_worker.h
+@@ -0,0 +1,86 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_ADBLOCK_ENGINE_WORKER_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_ADBLOCK_ENGINE_WORKER_H_
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/time/time.h"
++#include "components/helium_adblock/core/adblock_types.h"
++#include "components/helium_adblock/core/source/adblock_source_cache.h"
++#include "components/helium_adblock/core/source/adblock_source_downloader.h"
++#include "components/helium_adblock/rs/src/lib.rs.h"
++#include "url/gurl.h"
++
++namespace helium_adblock {
++
++struct EngineActivationResult {
++  bool success = false;
++  bool persistence_error = false;
++  std::string error;
++};
++
++struct DownloadApplyResult {
++  bool persisted = false;
++  bool source_available = false;
++};
++
++class AdBlockEngineWorker {
++ public:
++  AdBlockEngineWorker(base::FilePath directory, base::FilePath assets_root);
++  ~AdBlockEngineWorker();
++
++  EngineActivationResult Activate(std::vector<uint8_t> serialized,
++                                  std::string resources_json,
++                                  std::string fingerprint,
++                                  bool persist);
++
++  bool CacheSource(std::string id,
++                   GURL source_url,
++                   bool mobile,
++                   std::string contents,
++                   SourceValidators validators);
++  bool RemoveSource(std::string id);
++  SourceValidators ValidatorsFor(std::string id) const;
++  DownloadApplyResult ApplyFilterListDownload(
++      std::string id,
++      GURL source_url,
++      bool mobile,
++      SourceDownloadResult result,
++      base::TimeDelta catalog_interval);
++  DownloadApplyResult ApplyCatalogDownload(SourceDownloadResult result);
++
++  NetworkMatchResult MatchRequest(GURL url,
++                                  GURL document_url,
++                                  std::string request_type,
++                                  std::string method) const;
++  std::string DocumentCosmeticResources(GURL url) const;
++  std::vector<std::string> GenericSelectors(
++      std::vector<std::string> classes,
++      std::vector<std::string> ids,
++      std::vector<std::string> exceptions) const;
++
++ private:
++  DownloadApplyResult ApplyDownload(
++      std::string id,
++      SourceDownloadResult result,
++      base::TimeDelta catalog_interval);
++
++  base::FilePath directory_;
++  base::FilePath assets_root_;
++  SourceCache source_cache_;
++  std::vector<SourceCacheMetadata> source_metadata_;
++  bool resolver_ready_ = false;
++  std::optional<rust::Box<Engine>> engine_;
++};
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_ADBLOCK_ENGINE_WORKER_H_

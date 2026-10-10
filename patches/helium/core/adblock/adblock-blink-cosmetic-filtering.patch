@@ -1,0 +1,1112 @@
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -45,6 +45,7 @@
+ #include "components/dom_distiller/content/common/mojom/distillability_service.mojom.h"
+ #include "components/dom_distiller/content/common/mojom/distiller_javascript_service.mojom.h"
+ #include "components/dom_distiller/core/dom_distiller_service.h"
++#include "components/helium_adblock/buildflags.h"
+ #include "components/language_detection/content/common/language_detection.mojom.h"
+ #include "components/live_caption/caption_util.h"
+ #include "components/live_caption/pref_names.h"
+@@ -82,6 +83,11 @@
+ #include "third_party/blink/public/public_buildflags.h"
+ #include "ui/accessibility/accessibility_features.h"
+ 
++#if BUILDFLAG(NATIVE_ADBLOCK)
++#include "chrome/browser/helium_adblock/helium_adblock_cosmetic_filter_host.h"
++#include "chrome/common/helium_adblock.mojom.h"
++#endif
++
+ #if BUILDFLAG(ENABLE_UNHANDLED_TAP)
+ #include "chrome/browser/android/contextualsearch/unhandled_tap_notifier_impl.h"  // nogncheck crbug.com/40147906
+ #include "chrome/browser/android/contextualsearch/unhandled_tap_web_contents_observer.h"  // nogncheck crbug.com/40147906
+@@ -424,6 +430,11 @@ void BindCredentialManager(
+ void PopulateChromeFrameBinders(
+     mojo::BinderMapWithContext<content::RenderFrameHost*>* map,
+     content::RenderFrameHost* render_frame_host) {
++#if BUILDFLAG(NATIVE_ADBLOCK)
++  map->Add<chrome::mojom::HeliumAdBlockCosmeticFilterHost>(
++      &helium_adblock::HeliumAdBlockCosmeticFilterHost::Create);
++#endif
++
+   map->Add<glic::mojom::WebClientHandler>(&glic::BindGlicWebClientHandler);
+   // Defense in depth: privileged capability interfaces are not even registered
+   // for a frame outside a privileged process, so a non-PWC frame cannot
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_cosmetic_filter_host.cc
+@@ -0,0 +1,111 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/helium_adblock/helium_adblock_cosmetic_filter_host.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/helium_adblock/helium_adblock_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/helium_adblock/core/helium_adblock_service.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/render_frame_host.h"
++#include "url/gurl.h"
++#include "url/url_constants.h"
++
++namespace helium_adblock {
++namespace {
++
++constexpr size_t kMaximumSelectorValues = 4096;
++constexpr size_t kMaximumSelectorLength = 1024;
++
++bool IsValidSelectorInput(const std::vector<std::string>& values) {
++  if (values.size() > kMaximumSelectorValues) {
++    return false;
++  }
++  for (const std::string& value : values) {
++    if (value.size() > kMaximumSelectorLength) {
++      return false;
++    }
++  }
++  return true;
++}
++
++HeliumAdBlockService* GetService(
++    content::RenderFrameHost& render_frame_host) {
++  Profile* profile =
++      Profile::FromBrowserContext(render_frame_host.GetBrowserContext());
++  return profile ? HeliumAdBlockServiceFactory::GetForProfile(profile)
++                 : nullptr;
++}
++
++GURL GetDocumentURL(content::RenderFrameHost& render_frame_host) {
++  GURL url = render_frame_host.GetLastCommittedURL();
++  if (url.SchemeIs(url::kAboutScheme)) {
++    url = render_frame_host.GetLastCommittedOrigin().GetURL();
++  }
++  return url;
++}
++
++}  // namespace
++
++// static
++void HeliumAdBlockCosmeticFilterHost::Create(
++    content::RenderFrameHost* render_frame_host,
++    mojo::PendingReceiver<chrome::mojom::HeliumAdBlockCosmeticFilterHost>
++        receiver) {
++  new HeliumAdBlockCosmeticFilterHost(*render_frame_host, std::move(receiver));
++}
++
++HeliumAdBlockCosmeticFilterHost::HeliumAdBlockCosmeticFilterHost(
++    content::RenderFrameHost& render_frame_host,
++    mojo::PendingReceiver<chrome::mojom::HeliumAdBlockCosmeticFilterHost>
++        receiver)
++    : DocumentService(render_frame_host, std::move(receiver)),
++      service_(GetService(render_frame_host)),
++      off_the_record_(
++          render_frame_host.GetBrowserContext()->IsOffTheRecord()) {}
++
++HeliumAdBlockCosmeticFilterHost::~HeliumAdBlockCosmeticFilterHost() = default;
++
++void HeliumAdBlockCosmeticFilterHost::GetDocumentResources(
++    GetDocumentResourcesCallback callback) {
++  const GURL url = GetDocumentURL(render_frame_host());
++  if (!service_ || !url.SchemeIsHTTPOrHTTPS()) {
++    std::move(callback).Run(std::string());
++    return;
++  }
++  service_->GetDocumentCosmeticResources(
++      url, off_the_record_,
++      base::BindOnce(
++          [](GetDocumentResourcesCallback callback, std::string resources) {
++            std::move(callback).Run(resources);
++          },
++          std::move(callback)));
++}
++
++void HeliumAdBlockCosmeticFilterHost::GetGenericSelectors(
++    const std::vector<std::string>& classes,
++    const std::vector<std::string>& ids,
++    const std::vector<std::string>& exceptions,
++    GetGenericSelectorsCallback callback) {
++  const GURL url = GetDocumentURL(render_frame_host());
++  if (!service_ || !url.SchemeIsHTTPOrHTTPS() ||
++      !IsValidSelectorInput(classes) || !IsValidSelectorInput(ids) ||
++      !IsValidSelectorInput(exceptions)) {
++    std::move(callback).Run({});
++    return;
++  }
++  service_->GetGenericSelectors(
++      url, classes, ids, exceptions, off_the_record_,
++      base::BindOnce(
++          [](GetGenericSelectorsCallback callback,
++             std::vector<std::string> selectors) {
++            std::move(callback).Run(selectors);
++          },
++          std::move(callback)));
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_cosmetic_filter_host.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_COSMETIC_FILTER_HOST_H_
++#define CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_COSMETIC_FILTER_HOST_H_
++
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "chrome/common/helium_adblock.mojom.h"
++#include "content/public/browser/document_service.h"
++
++namespace content {
++class RenderFrameHost;
++}
++
++namespace helium_adblock {
++
++class HeliumAdBlockService;
++
++class HeliumAdBlockCosmeticFilterHost final
++    : public content::DocumentService<
++          chrome::mojom::HeliumAdBlockCosmeticFilterHost> {
++ public:
++  static void Create(
++      content::RenderFrameHost* render_frame_host,
++      mojo::PendingReceiver<chrome::mojom::HeliumAdBlockCosmeticFilterHost>
++          receiver);
++
++  HeliumAdBlockCosmeticFilterHost(
++      const HeliumAdBlockCosmeticFilterHost&) = delete;
++  HeliumAdBlockCosmeticFilterHost& operator=(
++      const HeliumAdBlockCosmeticFilterHost&) = delete;
++
++  // chrome::mojom::HeliumAdBlockCosmeticFilterHost:
++  void GetDocumentResources(GetDocumentResourcesCallback callback) override;
++  void GetGenericSelectors(const std::vector<std::string>& classes,
++                           const std::vector<std::string>& ids,
++                           const std::vector<std::string>& exceptions,
++                           GetGenericSelectorsCallback callback) override;
++
++ private:
++  HeliumAdBlockCosmeticFilterHost(
++      content::RenderFrameHost& render_frame_host,
++      mojo::PendingReceiver<chrome::mojom::HeliumAdBlockCosmeticFilterHost>
++          receiver);
++  ~HeliumAdBlockCosmeticFilterHost() override;
++
++  raw_ptr<HeliumAdBlockService> service_ = nullptr;
++  const bool off_the_record_;
++};
++
++}  // namespace helium_adblock
++
++#endif  // CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_COSMETIC_FILTER_HOST_H_
+--- a/chrome/common/BUILD.gn
++++ b/chrome/common/BUILD.gn
+@@ -8,6 +8,7 @@ import("//build/util/process_version.gni
+ import("//chrome/browser/downgrade/buildflags.gni")
+ import("//chrome/common/features.gni")
+ import("//components/cdm/common/playready.gni")
++import("//components/helium_adblock/features.gni")
+ import("//components/offline_pages/buildflags/features.gni")
+ import("//components/signin/features.gni")
+ import("//content/public/common/features.gni")
+@@ -705,6 +706,10 @@ mojom("mojo_bindings") {
+     "trusted_vault_encryption_keys_extension.mojom",
+   ]
+ 
++  if (enable_native_adblock) {
++    sources += [ "helium_adblock.mojom" ]
++  }
++
+   deps = [ "//components/lens:lens_mojo" ]
+ 
+   if (is_android) {
+--- a/chrome/common/chrome_isolated_world_ids.h
++++ b/chrome/common/chrome_isolated_world_ids.h
+@@ -19,6 +19,9 @@ enum ChromeIsolatedWorldIDs {
+   // Isolated world ID for internal Chrome features.
+   ISOLATED_WORLD_ID_CHROME_INTERNAL,
+ 
++  // Isolated world ID for Helium's cosmetic-filtering runtime.
++  ISOLATED_WORLD_ID_HELIUM_ADBLOCK,
++
+ #if BUILDFLAG(IS_MAC)
+   // Isolated world ID for AppleScript.
+   ISOLATED_WORLD_ID_APPLESCRIPT,
+--- /dev/null
++++ b/chrome/common/helium_adblock.mojom
+@@ -0,0 +1,15 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module chrome.mojom;
++
++// Access to Helium's cosmetic-filtering engine for a renderer document.
++interface HeliumAdBlockCosmeticFilterHost {
++  GetDocumentResources() => (string resources);
++
++  GetGenericSelectors(array<string> classes,
++                      array<string> ids,
++                      array<string> exceptions) =>
++      (array<string> selectors);
++};
+--- a/chrome/renderer/BUILD.gn
++++ b/chrome/renderer/BUILD.gn
+@@ -6,6 +6,7 @@ import("//build/config/buildflags_paint_
+ import("//chrome/common/features.gni")
+ import("//chrome/common/request_header_integrity/buildflags.gni")
+ import("//components/guest_view/buildflags/buildflags.gni")
++import("//components/helium_adblock/features.gni")
+ import("//components/offline_pages/buildflags/features.gni")
+ import("//components/optimization_guide/features.gni")
+ import("//components/signin/features.gni")
+@@ -254,6 +255,14 @@ static_library("renderer") {
+     ]
+   }
+ 
++  if (enable_native_adblock) {
++    sources += [
++      "helium_adblock_agent.cc",
++      "helium_adblock_agent.h",
++    ]
++    deps += [ "//components/helium_adblock:buildflags" ]
++  }
++
+   if (enable_plugins) {
+     sources += [
+       "plugins/chrome_plugin_placeholder.cc",
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -96,6 +96,7 @@
+ #include "components/feed/feed_feature_list.h"
+ #include "components/grit/components_scaled_resources.h"
+ #include "components/guest_view/buildflags/buildflags.h"
++#include "components/helium_adblock/buildflags.h"
+ #include "components/heap_profiling/in_process/heap_profiler_controller.h"
+ #include "components/history_clusters/core/config.h"
+ #include "components/metrics/call_stacks/call_stack_profile_builder.h"
+@@ -188,6 +189,10 @@
+ #include "url/origin.h"
+ #include "v8/include/v8-isolate.h"
+ 
++#if BUILDFLAG(NATIVE_ADBLOCK)
++#include "chrome/renderer/helium_adblock_agent.h"
++#endif
++
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
+     BUILDFLAG(IS_CHROMEOS)
+ #include "components/webapps/isolated_web_apps/scheme.h"
+@@ -644,6 +649,10 @@ void ChromeContentRendererClient::Render
+       new ChromeRenderFrameObserver(render_frame, web_cache_impl_.get());
+   service_manager::BinderRegistry* registry = render_frame_observer->registry();
+ 
++#if BUILDFLAG(NATIVE_ADBLOCK)
++  new helium_adblock::HeliumAdBlockAgent(render_frame);
++#endif
++
+   new prerender::NoStatePrefetchRenderFrameObserver(render_frame);
+ 
+   auto content_settings_delegate =
+@@ -1450,6 +1459,12 @@ ChromeContentRendererClient::CreateSpeec
+ 
+ void ChromeContentRendererClient::RunScriptsAtDocumentStart(
+     content::RenderFrame* render_frame) {
++#if BUILDFLAG(NATIVE_ADBLOCK)
++  if (auto* agent = helium_adblock::HeliumAdBlockAgent::Get(render_frame)) {
++    agent->RunScriptsAtDocumentStart();
++  }
++#endif
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   extensions::ExtensionsRendererClient::Get()->RunScriptsAtDocumentStart(
+       render_frame);
+@@ -1695,4 +1710,3 @@ void ChromeContentRendererClient::Append
+                   network::mojom::ContentSecurityPolicySource::kHTTP});
+ #endif
+ }
+-
+--- /dev/null
++++ b/chrome/renderer/helium_adblock_agent.cc
+@@ -0,0 +1,240 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/renderer/helium_adblock_agent.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "chrome/common/chrome_isolated_world_ids.h"
++#include "chrome/grit/renderer_resources.h"
++#include "content/public/renderer/render_frame.h"
++#include "content/public/renderer/v8_value_converter.h"
++#include "gin/converter.h"
++#include "gin/function_template.h"
++#include "gin/try_catch.h"
++#include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
++#include "third_party/blink/public/platform/scheduler/web_agent_group_scheduler.h"
++#include "third_party/blink/public/platform/web_isolated_world_info.h"
++#include "third_party/blink/public/platform/web_security_origin.h"
++#include "third_party/blink/public/platform/web_string.h"
++#include "third_party/blink/public/web/web_document.h"
++#include "third_party/blink/public/web/web_local_frame.h"
++#include "third_party/blink/public/web/web_script_source.h"
++#include "ui/base/resource/resource_bundle.h"
++#include "url/gurl.h"
++#include "v8/include/v8.h"
++
++namespace helium_adblock {
++namespace {
++
++constexpr size_t kMaximumInjectedScriptSize = 1024 * 1024;
++
++void EnsureIsolatedWorldInitialized() {
++  static bool initialized = false;
++  if (initialized) {
++    return;
++  }
++  initialized = true;
++
++  blink::WebIsolatedWorldInfo world_info;
++  world_info.security_origin = blink::WebSecurityOrigin::Create(
++      GURL("chrome://helium-adblock"));
++  world_info.content_security_policy = blink::WebString::FromUtf8("");
++  world_info.human_readable_name = "Helium AdBlock";
++  blink::SetIsolatedWorldInfo(ISOLATED_WORLD_ID_HELIUM_ADBLOCK, world_info);
++}
++
++}  // namespace
++
++HeliumAdBlockAgent::HeliumAdBlockAgent(content::RenderFrame* render_frame)
++    : content::RenderFrameObserver(render_frame),
++      content::RenderFrameObserverTracker<HeliumAdBlockAgent>(render_frame),
++      resources_ready_(std::make_unique<base::OneShotEvent>()) {
++  resources_ready_->Signal();
++}
++
++HeliumAdBlockAgent::~HeliumAdBlockAgent() = default;
++
++void HeliumAdBlockAgent::DidCommitProvisionalLoad(
++    ui::PageTransition transition) {
++  weak_ptr_factory_.InvalidateWeakPtrs();
++  host_.reset();
++  document_resources_.reset();
++  resources_ready_ = std::make_unique<base::OneShotEvent>();
++  GetHost()->GetDocumentResources(
++      base::BindOnce(&HeliumAdBlockAgent::OnDocumentResources,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++void HeliumAdBlockAgent::DidCreateScriptContext(
++    v8::Local<v8::Context> context,
++    int world_id) {
++  if (world_id != ISOLATED_WORLD_ID_HELIUM_ADBLOCK) {
++    return;
++  }
++  v8::Isolate* isolate =
++      render_frame()->GetWebFrame()->GetAgentGroupScheduler()->Isolate();
++  v8::HandleScope handle_scope(isolate);
++  gin::TryCatch try_catch(isolate);
++  try_catch.SetVerbose(true);
++  v8::Context::Scope context_scope(context);
++  v8::Local<v8::Object> native = v8::Object::New(isolate);
++  v8::Local<v8::Function> get_generic_selectors;
++  if (!gin::CreateFunctionTemplate(
++           isolate,
++           base::BindRepeating(
++               &HeliumAdBlockAgent::RequestGenericSelectors,
++               weak_ptr_factory_.GetWeakPtr()))
++           ->GetFunction(context)
++           .ToLocal(&get_generic_selectors)) {
++    return;
++  }
++  if (!native
++           ->CreateDataProperty(
++               context, gin::StringToSymbol(isolate, "getGenericSelectors"),
++               get_generic_selectors)
++           .FromMaybe(false)) {
++    return;
++  }
++  context->Global()
++      ->CreateDataProperty(
++          context, gin::StringToSymbol(isolate, "heliumAdBlockNative"), native)
++      .Check();
++}
++
++void HeliumAdBlockAgent::OnDestruct() {
++  delete this;
++}
++
++void HeliumAdBlockAgent::RunScriptsAtDocumentStart() {
++  if (resources_ready_->is_signaled()) {
++    ApplyRules();
++    return;
++  }
++  resources_ready_->Post(
++      FROM_HERE,
++      base::BindOnce(&HeliumAdBlockAgent::ApplyRules,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++void HeliumAdBlockAgent::RequestGenericSelectors(
++    std::vector<std::string> classes,
++    std::vector<std::string> ids,
++    std::vector<std::string> exceptions) {
++  GetHost()->GetGenericSelectors(
++      std::move(classes), std::move(ids), std::move(exceptions),
++      base::BindOnce(&HeliumAdBlockAgent::OnGenericSelectors,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++chrome::mojom::HeliumAdBlockCosmeticFilterHost*
++HeliumAdBlockAgent::GetHost() {
++  if (!host_.is_bound()) {
++    render_frame()->GetBrowserInterfaceBroker().GetInterface(
++        host_.BindNewPipeAndPassReceiver());
++    host_.reset_on_disconnect();
++  }
++  return host_.get();
++}
++
++void HeliumAdBlockAgent::OnDocumentResources(const std::string& resources) {
++  document_resources_ = resources;
++  resources_ready_->Signal();
++}
++
++void HeliumAdBlockAgent::ApplyRules() {
++  if (!document_resources_ || document_resources_->empty()) {
++    return;
++  }
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  if (!frame || frame->IsProvisional()) {
++    return;
++  }
++
++  std::optional<base::Value> parsed =
++      base::JSONReader::Read(*document_resources_, base::JSON_PARSE_RFC);
++  base::DictValue* data = parsed ? parsed->GetIfDict() : nullptr;
++  if (!data) {
++    return;
++  }
++  if (const std::string* injected_script = data->FindString("injected_script");
++      injected_script &&
++      injected_script->size() <= kMaximumInjectedScriptSize) {
++    InjectPageScript(*injected_script);
++  }
++
++  EnsureIsolatedWorldInitialized();
++  std::string runtime_script =
++      ui::ResourceBundle::GetSharedInstance().LoadDataResourceString(
++          IDR_HELIUM_ADBLOCK_COSMETIC_FILTER_JS);
++  if (runtime_script.empty()) {
++    return;
++  }
++  frame->ExecuteScriptInIsolatedWorld(
++      ISOLATED_WORLD_ID_HELIUM_ADBLOCK,
++      blink::WebScriptSource(blink::WebString::FromUtf8(runtime_script)),
++      blink::BackForwardCacheAware::kAllow);
++  CallRuntime("onCosmetic", std::move(*parsed));
++}
++
++void HeliumAdBlockAgent::OnGenericSelectors(
++    const std::vector<std::string>& selectors) {
++  base::ListValue values;
++  for (const std::string& selector : selectors) {
++    values.Append(selector);
++  }
++  CallRuntime("onGeneric", base::Value(std::move(values)));
++}
++
++void HeliumAdBlockAgent::CallRuntime(std::string_view method,
++                                    base::Value argument) {
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  if (!frame) {
++    return;
++  }
++
++  v8::Isolate* isolate = frame->GetAgentGroupScheduler()->Isolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = frame->GetScriptContextFromWorldId(
++      isolate, ISOLATED_WORLD_ID_HELIUM_ADBLOCK);
++  if (context.IsEmpty()) {
++    return;
++  }
++  gin::TryCatch try_catch(isolate);
++  try_catch.SetVerbose(true);
++  v8::Context::Scope context_scope(context);
++
++  v8::Local<v8::Value> runtime_value;
++  if (!context->Global()
++           ->Get(context,
++                 gin::StringToSymbol(isolate, "__heliumAdBlockRuntime"))
++           .ToLocal(&runtime_value) ||
++      !runtime_value->IsObject()) {
++    return;
++  }
++  v8::Local<v8::Object> runtime = runtime_value.As<v8::Object>();
++  v8::Local<v8::Value> method_value;
++  if (!runtime->Get(context, gin::StringToSymbol(isolate, method))
++           .ToLocal(&method_value) ||
++      !method_value->IsFunction()) {
++    return;
++  }
++
++  v8::Local<v8::Value> argv[] = {
++      content::V8ValueConverter::Create()->ToV8Value(argument, context)};
++  frame->RequestExecuteV8Function(context, method_value.As<v8::Function>(),
++                                  runtime, /*argc=*/1, argv, {});
++}
++
++void HeliumAdBlockAgent::InjectPageScript(std::string script) {
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  if (frame) {
++    frame->ExecuteScript(
++        blink::WebScriptSource(blink::WebString::FromUtf8(script)));
++  }
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/chrome/renderer/helium_adblock_agent.h
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_RENDERER_HELIUM_ADBLOCK_AGENT_H_
++#define CHROME_RENDERER_HELIUM_ADBLOCK_AGENT_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/memory/weak_ptr.h"
++#include "base/one_shot_event.h"
++#include "base/values.h"
++#include "chrome/common/helium_adblock.mojom.h"
++#include "content/public/renderer/render_frame_observer.h"
++#include "content/public/renderer/render_frame_observer_tracker.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "v8/include/v8-forward.h"
++
++namespace helium_adblock {
++
++// Owns cosmetic filtering for one Blink RenderFrame. Browser-side filtering
++// remains profile-scoped; this object only applies rules to its current
++// document.
++class HeliumAdBlockAgent final
++    : public content::RenderFrameObserver,
++      public content::RenderFrameObserverTracker<HeliumAdBlockAgent> {
++ public:
++  explicit HeliumAdBlockAgent(content::RenderFrame* render_frame);
++
++  HeliumAdBlockAgent(const HeliumAdBlockAgent&) = delete;
++  HeliumAdBlockAgent& operator=(const HeliumAdBlockAgent&) = delete;
++
++  void RunScriptsAtDocumentStart();
++
++ private:
++  ~HeliumAdBlockAgent() override;
++
++  // content::RenderFrameObserver:
++  void DidCommitProvisionalLoad(ui::PageTransition transition) override;
++  void DidCreateScriptContext(v8::Local<v8::Context> context,
++                              int world_id) override;
++  void OnDestruct() override;
++
++  chrome::mojom::HeliumAdBlockCosmeticFilterHost* GetHost();
++  void RequestGenericSelectors(std::vector<std::string> classes,
++                               std::vector<std::string> ids,
++                               std::vector<std::string> exceptions);
++  void OnDocumentResources(const std::string& resources);
++  void OnGenericSelectors(const std::vector<std::string>& selectors);
++  void ApplyRules();
++  void CallRuntime(std::string_view method, base::Value argument);
++  void InjectPageScript(std::string script);
++
++  std::optional<std::string> document_resources_;
++  std::unique_ptr<base::OneShotEvent> resources_ready_;
++  mojo::Remote<chrome::mojom::HeliumAdBlockCosmeticFilterHost> host_;
++
++  base::WeakPtrFactory<HeliumAdBlockAgent> weak_ptr_factory_{this};
++};
++
++}  // namespace helium_adblock
++
++#endif  // CHROME_RENDERER_HELIUM_ADBLOCK_AGENT_H_
+--- /dev/null
++++ b/chrome/renderer/resources/helium_adblock/cosmetic_filter.js
+@@ -0,0 +1,433 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++(() => {
++  'use strict';
++
++  const native = globalThis.heliumAdBlockNative;
++  if (globalThis.__heliumAdBlockRuntime ||
++      typeof native?.getGenericSelectors !== 'function') {
++    return;
++  }
++
++  const MAX_TRACKED_VALUES = 4096;
++  const MAX_VALUE_LENGTH = 1024;
++  const MAX_COLLECTED_ELEMENTS = 5000;
++  const MAX_PROCEDURAL_RULES = 500;
++  const MAX_PROCEDURAL_ELEMENTS = 2000;
++  let exceptions = [];
++  let generichide = false;
++  let genericTimer = 0;
++  let proceduralTimer = 0;
++  let proceduralRules = [];
++  const knownClasses = new Set();
++  const knownIds = new Set();
++  const pendingClasses = [];
++  const pendingIds = [];
++  const cosmeticStyleSheet = new CSSStyleSheet();
++
++  function addStyle(selectors, declarations) {
++    if (!Array.isArray(selectors)) {
++      return;
++    }
++    let inserted = false;
++    for (const selector of selectors) {
++      if (typeof selector !== 'string' || !selector) {
++        continue;
++      }
++      try {
++        cosmeticStyleSheet.insertRule(
++            `${selector}{${declarations}}`,
++            cosmeticStyleSheet.cssRules.length);
++        inserted = true;
++      } catch {
++      }
++    }
++    if (inserted &&
++        !document.adoptedStyleSheets.includes(cosmeticStyleSheet)) {
++      document.adoptedStyleSheets =
++          [cosmeticStyleSheet, ...document.adoptedStyleSheets];
++    }
++  }
++
++  function query(selector, root = document) {
++    try {
++      return Array.from(root.querySelectorAll(selector))
++          .slice(0, MAX_PROCEDURAL_ELEMENTS);
++    } catch {
++      return [];
++    }
++  }
++
++  function compileRegex(value) {
++    if (!value.startsWith('/')) {
++      return null;
++    }
++    const end = value.lastIndexOf('/');
++    if (end <= 0) {
++      return null;
++    }
++    try {
++      return new RegExp(value.slice(1, end), value.slice(end + 1));
++    } catch {
++      return null;
++    }
++  }
++
++  function matchesValue(pattern, value, exact = false) {
++    const regex = compileRegex(pattern);
++    if (regex) {
++      return regex.test(value);
++    }
++    if (!pattern) {
++      return !value.trim();
++    }
++    return exact ? value === pattern : value.includes(pattern);
++  }
++
++  function unquote(value) {
++    return value.length >= 2 && value.startsWith('"') &&
++            value.endsWith('"') ?
++        value.slice(1, -1) : value;
++  }
++
++  function parseKeyValue(argument) {
++    let separator = argument.indexOf('=');
++    if (argument.startsWith('"')) {
++      const quotedSeparator = argument.indexOf('"=');
++      separator = quotedSeparator < 0 ? -1 : quotedSeparator + 1;
++    }
++    if (separator < 0) {
++      return [unquote(argument), null];
++    }
++    return [
++      unquote(argument.slice(0, separator)),
++      unquote(argument.slice(separator + 1)),
++    ];
++  }
++
++  function applyCssSelector(elements, selector, firstOperator) {
++    if (firstOperator) {
++      return query(selector);
++    }
++    const trimmed = selector.trimStart();
++    const output = [];
++    for (const element of elements) {
++      try {
++        if (selector.startsWith(' ')) {
++          output.push(...query(trimmed, element));
++        } else if (trimmed.startsWith('>')) {
++          const childSelector = trimmed.slice(1).trimStart();
++          output.push(...Array.from(element.children)
++                             .filter(child => child.matches(childSelector)));
++        } else if (trimmed.startsWith('+')) {
++          const sibling = element.nextElementSibling;
++          if (sibling && sibling.matches(trimmed.slice(1).trimStart())) {
++            output.push(sibling);
++          }
++        } else if (trimmed.startsWith('~')) {
++          const siblingSelector = trimmed.slice(1).trimStart();
++          for (let sibling = element.nextElementSibling; sibling;
++               sibling = sibling.nextElementSibling) {
++            if (sibling.matches(siblingSelector)) {
++              output.push(sibling);
++            }
++          }
++        } else if (element.matches(selector)) {
++          output.push(element);
++        }
++      } catch {
++      }
++      if (output.length >= MAX_PROCEDURAL_ELEMENTS) {
++        break;
++      }
++    }
++    return output.slice(0, MAX_PROCEDURAL_ELEMENTS);
++  }
++
++  function proceduralElements(rule) {
++    const operators = Array.isArray(rule.selector) ? rule.selector : [];
++    if (!operators.length) {
++      return [];
++    }
++    let elements = operators[0].type === 'css-selector' ?
++        [] : operators[0].type === 'xpath' ?
++        [document.documentElement] :
++        [document.documentElement, ...query('*')];
++    for (let index = 0; index < operators.length && elements.length; ++index) {
++      const operator = operators[index];
++      const argument = String(operator.arg || '');
++      switch (operator.type) {
++        case 'css-selector':
++          elements = applyCssSelector(elements, argument, index === 0);
++          break;
++        case 'has-text':
++          elements = elements.filter(element =>
++            matchesValue(
++                argument, (element.textContent || '').slice(0, 100000)));
++          break;
++        case 'matches-attr': {
++          const [namePattern, valuePattern] = parseKeyValue(argument);
++          elements = elements.filter(element =>
++            element.getAttributeNames().some(name => {
++              if (!matchesValue(namePattern, name, true)) {
++                return false;
++              }
++              const value = element.getAttribute(name);
++              return value !== null &&
++                  (valuePattern === null ||
++                   matchesValue(valuePattern, value, true));
++            }));
++          break;
++        }
++        case 'matches-css':
++        case 'matches-css-before':
++        case 'matches-css-after': {
++          const separator = argument.indexOf(':');
++          if (separator < 0) {
++            return [];
++          }
++          const property = argument.slice(0, separator).trim();
++          const expected = argument.slice(separator + 1).trim();
++          const pseudo = operator.type === 'matches-css-before' ?
++              '::before' : operator.type === 'matches-css-after' ?
++              '::after' : null;
++          elements = elements.filter(element =>
++            matchesValue(
++                expected,
++                getComputedStyle(element, pseudo).getPropertyValue(property),
++                true));
++          break;
++        }
++        case 'matches-path':
++          if (!matchesValue(
++                  argument, `${location.pathname}${location.search}`)) {
++            return [];
++          }
++          break;
++        case 'min-text-length': {
++          const minimum = Number(argument);
++          elements = Number.isFinite(minimum) ?
++              elements.filter(element =>
++                (element.textContent || '').trim().length >= minimum) :
++              [];
++          break;
++        }
++        case 'upward': {
++          const levels = Number(argument);
++          if (Number.isInteger(levels) && levels > 0 && levels < 256) {
++            elements = elements
++                           .map(element => {
++                             let parent = element;
++                             for (let level = 0; level < levels && parent;
++                                  ++level) {
++                               parent = parent.parentElement;
++                             }
++                             return parent;
++                           })
++                           .filter(element => !!element);
++          } else {
++            elements = elements
++                           .map(element => {
++                             try {
++                               return element.closest(argument);
++                            } catch {
++                               return null;
++                             }
++                           })
++                           .filter(element => !!element);
++          }
++          break;
++        }
++        case 'xpath': {
++          const found = [];
++          for (const element of elements) {
++            try {
++              const result = document.evaluate(
++                  argument, element, null,
++                  XPathResult.ORDERED_NODE_ITERATOR_TYPE);
++              for (let node = result.iterateNext();
++                   node && found.length < MAX_PROCEDURAL_ELEMENTS;
++                   node = result.iterateNext()) {
++                if (node instanceof Element) {
++                  found.push(node);
++                }
++              }
++            } catch {
++            }
++          }
++          elements = found;
++          break;
++        }
++        default:
++          return [];
++      }
++      elements = elements.slice(0, MAX_PROCEDURAL_ELEMENTS);
++    }
++    return elements;
++  }
++
++  function applyProcedural() {
++    for (const rule of proceduralRules) {
++      try {
++        for (const element of proceduralElements(rule)) {
++          const action = rule.action;
++          if (!action) {
++            element.style?.setProperty('display', 'none', 'important');
++          } else if (action.type === 'remove') {
++            element.remove();
++          } else if (action.type === 'style' && element.style) {
++            element.style.cssText += `;${String(action.arg || '')}`;
++          } else if (action.type === 'remove-attr') {
++            element.removeAttribute(String(action.arg || ''));
++          } else if (action.type === 'remove-class') {
++            element.classList.remove(String(action.arg || ''));
++          }
++        }
++      } catch {
++      }
++    }
++  }
++
++  function scheduleProcedural() {
++    if (!proceduralRules.length || proceduralTimer) {
++      return;
++    }
++    proceduralTimer = window.setTimeout(() => {
++      proceduralTimer = 0;
++      applyProcedural();
++    }, 100);
++  }
++
++  function queueValue(known, pending, value) {
++    if (!value || value.length > MAX_VALUE_LENGTH || known.has(value) ||
++        known.size >= MAX_TRACKED_VALUES) {
++      return;
++    }
++    known.add(value);
++    pending.push(value);
++  }
++
++  function collect(root) {
++    let count = 0;
++    const collectElement = element => {
++      queueValue(knownIds, pendingIds, element.id);
++      for (const className of element.classList) {
++        queueValue(knownClasses, pendingClasses, className);
++      }
++    };
++    if (root instanceof Element) {
++      collectElement(root);
++      ++count;
++    }
++    for (const element of root.querySelectorAll('[id],[class]')) {
++      collectElement(element);
++      if (++count >= MAX_COLLECTED_ELEMENTS) {
++        break;
++      }
++    }
++  }
++
++  function scheduleGeneric() {
++    if (generichide || genericTimer ||
++        (!pendingClasses.length && !pendingIds.length)) {
++      return;
++    }
++    genericTimer = window.setTimeout(() => {
++      genericTimer = 0;
++      native.getGenericSelectors(
++          pendingClasses.splice(0), pendingIds.splice(0), exceptions);
++    }, 100);
++  }
++
++  function parseProceduralRules(encodedRules) {
++    const rules = [];
++    for (const encoded of Array.from(encodedRules || [])
++                              .slice(0, MAX_PROCEDURAL_RULES)) {
++      try {
++        const rule = JSON.parse(encoded);
++        if (!Array.isArray(rule.selector) || !rule.selector.length) {
++          continue;
++        }
++        if (rule.selector.length === 1 &&
++            rule.selector[0].type === 'css-selector' &&
++            (!rule.action || rule.action.type === 'style')) {
++          addStyle(
++              [String(rule.selector[0].arg || '')],
++              rule.action ? String(rule.action.arg || '') :
++                            'display:none!important');
++          continue;
++        }
++        rules.push(rule);
++      } catch {
++      }
++    }
++    return rules;
++  }
++
++  function observeDocument() {
++    if (generichide && !proceduralRules.length) {
++      return;
++    }
++    new MutationObserver(records => {
++      for (const record of records.slice(0, 200)) {
++        if (!generichide && record.type === 'attributes' &&
++            record.target instanceof Element) {
++          collect(record.target);
++        }
++        if (record.type === 'childList') {
++          for (const node of Array.from(record.addedNodes).slice(0, 200)) {
++            if (node instanceof Element && !generichide) {
++              collect(node);
++            }
++          }
++        }
++      }
++      scheduleGeneric();
++      scheduleProcedural();
++    }).observe(document, {
++      attributes: !generichide,
++      attributeFilter: !generichide ? ['class', 'id'] : undefined,
++      childList: true,
++      subtree: true,
++    });
++  }
++
++  const runtime = {
++    onCosmetic(resources) {
++      try {
++        exceptions = Array.isArray(resources.exceptions) ?
++            resources.exceptions.filter(
++                value => typeof value === 'string' &&
++                    value.length <= MAX_VALUE_LENGTH)
++                .slice(0, MAX_TRACKED_VALUES) :
++            [];
++        generichide = !!resources.generichide;
++        addStyle(
++            Array.from(resources.hide_selectors || []),
++            'display:none!important');
++        proceduralRules =
++            parseProceduralRules(resources.procedural_actions || []);
++        applyProcedural();
++        if (!generichide) {
++          collect(document);
++          scheduleGeneric();
++        }
++        observeDocument();
++      } catch {
++      }
++    },
++
++    onGeneric(selectors) {
++      addStyle(selectors, 'display:none!important');
++    },
++  };
++
++  Object.defineProperty(globalThis, '__heliumAdBlockRuntime', {
++    configurable: false,
++    enumerable: false,
++    value: runtime,
++    writable: false,
++  });
++})();
+--- a/chrome/renderer/resources/renderer_resources.grd
++++ b/chrome/renderer/resources/renderer_resources.grd
+@@ -12,6 +12,7 @@
+     <includes>
+       <include name="IDR_BLOCKED_PLUGIN_HTML" file="plugins/blocked_plugin.html" flattenhtml="true" type="BINDATA" />
+       <include name="IDR_DISABLED_PLUGIN_HTML" file="plugins/disabled_plugin.html" flattenhtml="true" type="BINDATA" />
++      <include name="IDR_HELIUM_ADBLOCK_COSMETIC_FILTER_JS" file="helium_adblock/cosmetic_filter.js" type="BINDATA" />
+       <include name="IDR_PDF_PLUGIN_HTML" file="plugins/pdf_plugin.html" flattenhtml="true" type="BINDATA" />
+     </includes>
+   </release>
+--- a/chrome/browser/helium_adblock/BUILD.gn
++++ b/chrome/browser/helium_adblock/BUILD.gn
+@@ -10,6 +10,8 @@ source_set("helium_adblock") {
+   sources = [
+     "helium_adblock_client_chrome.cc",
+     "helium_adblock_client_chrome.h",
++    "helium_adblock_cosmetic_filter_host.cc",
++    "helium_adblock_cosmetic_filter_host.h",
+     "helium_adblock_service_factory.cc",
+     "helium_adblock_service_factory.h",
+     "helium_adblock_url_loader_factory.cc",
+@@ -23,6 +25,7 @@ source_set("helium_adblock") {
+     "//chrome/browser:browser_process",
+     "//chrome/browser/profiles:profile",
+     "//chrome/common:constants",
++    "//chrome/common:mojo_bindings",
+     "//components/helium_adblock/resources:adblock_filters",
+     "//components/keyed_service/content",
+     "//components/pref_registry",

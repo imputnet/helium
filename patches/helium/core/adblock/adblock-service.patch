@@ -1,0 +1,730 @@
+--- /dev/null
++++ b/components/helium_adblock/core/BUILD.gn
+@@ -0,0 +1,41 @@
++# Copyright 2026 The Helium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//components/helium_adblock/features.gni")
++
++assert(enable_native_adblock)
++
++source_set("core") {
++  sources = [
++    "adblock_engine_builder.cc",
++    "adblock_engine_builder.h",
++    "adblock_engine_worker.cc",
++    "adblock_engine_worker.h",
++    "adblock_types.h",
++    "features.cc",
++    "features.h",
++    "helium_adblock_client.h",
++    "helium_adblock_service.cc",
++    "helium_adblock_service.h",
++    "helium_adblock_service_filtering.cc",
++    "helium_adblock_service_refresh.cc",
++    "pref_names.cc",
++    "pref_names.h",
++    "//third_party/rust/helium/chromium_crates_io/adblock_engine_version.h",
++  ]
++
++  deps = [
++    "//base",
++    "//components/helium_adblock/core/resolver",
++    "//components/helium_adblock/core/source",
++    "//components/helium_adblock/rs:adblock_engine_rs",
++    "//components/helium_services",
++    "//components/keyed_service/core",
++    "//components/prefs",
++    "//crypto",
++    "//net",
++    "//services/network/public/cpp",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/components/helium_adblock/core/helium_adblock_service.cc
+@@ -0,0 +1,479 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/helium_adblock_service.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <string_view>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/logging.h"
++#include "base/task/thread_pool.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "components/helium_adblock/core/features.h"
++#include "components/helium_adblock/core/pref_names.h"
++#include "components/helium_adblock/core/source/adblock_source_downloader.h"
++#include "components/helium_adblock/rs/src/lib.rs.h"
++#include "components/helium_services/helium_services_helpers.h"
++#include "components/prefs/pref_service.h"
++
++namespace helium_adblock {
++namespace {
++
++rust::Slice<const uint8_t> AsRustSlice(std::string_view contents) {
++  return rust::Slice<const uint8_t>(
++      reinterpret_cast<const uint8_t*>(contents.data()), contents.size());
++}
++
++std::string CustomTitle(std::string_view contents, const GURL& url) {
++  std::string title =
++      static_cast<std::string>(list_metadata(AsRustSlice(contents)).title);
++  if (!title.empty() && title.size() <= 256) {
++    return title;
++  }
++  return std::string(url.host());
++}
++
++}  // namespace
++
++HeliumAdBlockService::HeliumAdBlockService(
++    PrefService* prefs,
++    const base::FilePath& state_directory,
++    std::unique_ptr<HeliumAdBlockClient> client)
++    : prefs_(prefs),
++      client_(std::move(client)),
++      adblock_directory_(state_directory.AppendASCII("AdBlock")),
++      assets_root_(client_->GetBundledAssetsRoot()),
++      bundled_list_reader_(client_->GetBundledListReader()),
++      worker_(base::ThreadPool::CreateSequencedTaskRunner(
++                  {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++                   base::TaskShutdownBehavior::BLOCK_SHUTDOWN}),
++              adblock_directory_, assets_root_) {
++  LoadDesiredConfigurationFromPrefs();
++  client_->OnServiceCreated(this);
++  StartInitialLoad();
++}
++
++HeliumAdBlockService::~HeliumAdBlockService() = default;
++
++const ServiceState& HeliumAdBlockService::GetState() const {
++  return state_;
++}
++
++void HeliumAdBlockService::AddObserver(ServiceObserver* observer) {
++  observers_.AddObserver(observer);
++}
++
++void HeliumAdBlockService::RemoveObserver(ServiceObserver* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void HeliumAdBlockService::SetEnabled(bool enabled,
++                                      CompletionCallback completion) {
++  desired_.enabled = enabled;
++  prefs_->SetBoolean(prefs::kHeliumAdBlockEnabled, enabled);
++  state_.enabled = enabled;
++  NotifyObservers();
++  RequestRebuild(std::move(completion));
++}
++
++const std::vector<SourceState>& HeliumAdBlockService::GetSources() const {
++  return sources_;
++}
++
++void HeliumAdBlockService::SetSourceEnabled(std::string id,
++                                            bool enabled,
++                                            CompletionCallback completion) {
++  auto custom =
++      std::ranges::find(desired_.custom_sources, id, &CustomSource::id);
++  if (custom != desired_.custom_sources.end()) {
++    custom->enabled = enabled;
++    PersistCustomSources();
++  } else {
++    desired_.overrides[id] = enabled;
++    PersistOverrides();
++  }
++  ApplyDesiredStateToSources();
++  NotifyObservers();
++  RequestRebuild(base::BindOnce(
++      [](base::WeakPtr<HeliumAdBlockService> service, std::string id,
++         bool enabled, CompletionCallback completion, bool success) {
++        if (!success || !enabled || !service) {
++          std::move(completion).Run(success);
++          return;
++        }
++        auto source =
++            std::ranges::find(service->sources_, id, &SourceState::id);
++        if (source != service->sources_.end() &&
++            (source->update_state == SourceUpdateState::kPending ||
++             source->update_state == SourceUpdateState::kBundled ||
++             source->update_state == SourceUpdateState::kStale ||
++             source->update_state == SourceUpdateState::kFailed)) {
++          service->Refresh(false, std::move(completion));
++          return;
++        }
++        std::move(completion).Run(true);
++      },
++      weak_ptr_factory_.GetWeakPtr(), std::move(id), enabled,
++      std::move(completion)));
++}
++
++void HeliumAdBlockService::AddCustomSource(GURL url,
++                                           CompletionCallback completion) {
++  if (!SourceDownloader::IsSafeDownloadURL(url, SourceKind::kCustom)) {
++    std::move(completion).Run(false);
++    return;
++  }
++  if (std::ranges::find(desired_.custom_sources, url, &CustomSource::url) !=
++      desired_.custom_sources.end()) {
++    std::move(completion).Run(true);
++    return;
++  }
++
++  auto downloader =
++      std::make_unique<SourceDownloader>(client_->GetURLLoaderFactory());
++  SourceDownloader* downloader_ptr = downloader.get();
++  std::string id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  downloader_ptr->Download(
++      url, SourceKind::kCustom, {},
++      base::BindOnce(
++          [](base::WeakPtr<HeliumAdBlockService> service,
++             std::unique_ptr<SourceDownloader>, std::string id,
++             GURL url, CompletionCallback completion,
++             SourceDownloadResult download) {
++            if (!service) {
++              return;
++            }
++            if (download.status != SourceDownloadResult::Status::kSuccess) {
++              std::move(completion).Run(false);
++              return;
++            }
++            std::string title = CustomTitle(download.contents, url);
++            service->worker_.AsyncCall(&AdBlockEngineWorker::CacheSource)
++                .WithArgs(id, url, service->client_->IsMobilePlatform(),
++                          std::move(download.contents),
++                          std::move(download.validators))
++                .Then(base::BindOnce(
++                    [](base::WeakPtr<HeliumAdBlockService> service,
++                       std::string id, GURL url, std::string title,
++                       CompletionCallback completion, bool success) {
++                      if (!service) {
++                        return;
++                      }
++                      if (!success) {
++                        std::move(completion).Run(false);
++                        return;
++                      }
++                      service->desired_.custom_sources.push_back(
++                          {std::move(id), std::move(url), std::move(title),
++                           true});
++                      service->PersistCustomSources();
++                      service->RequestRebuild(std::move(completion));
++                    },
++                    service, std::move(id), std::move(url), std::move(title),
++                    std::move(completion)));
++          },
++          weak_ptr_factory_.GetWeakPtr(), std::move(downloader), id, url,
++          std::move(completion)));
++}
++
++void HeliumAdBlockService::RemoveCustomSource(std::string id,
++                                              CompletionCallback completion) {
++  const size_t before = desired_.custom_sources.size();
++  std::erase_if(desired_.custom_sources,
++                [&](const CustomSource& source) { return source.id == id; });
++  if (desired_.custom_sources.size() == before) {
++    std::move(completion).Run(false);
++    return;
++  }
++  worker_.AsyncCall(&AdBlockEngineWorker::RemoveSource).WithArgs(id);
++  PersistCustomSources();
++  std::erase_if(sources_,
++                [&](const SourceState& source) { return source.id == id; });
++  NotifyObservers();
++  RequestRebuild(std::move(completion));
++}
++
++void HeliumAdBlockService::ResetToDefaults(CompletionCallback completion) {
++  desired_.overrides.clear();
++  for (const CustomSource& custom : desired_.custom_sources) {
++    worker_.AsyncCall(&AdBlockEngineWorker::RemoveSource).WithArgs(custom.id);
++  }
++  desired_.custom_sources.clear();
++  desired_.regional_defaults_initialized = false;
++  PersistOverrides();
++  PersistCustomSources();
++  prefs_->SetBoolean(prefs::kHeliumAdBlockRegionalDefaultsInitialized, false);
++  std::erase_if(sources_,
++                [](const SourceState& source) { return !source.built_in; });
++  for (SourceState& source : sources_) {
++    source.explicit_override.reset();
++    source.effective_enabled = source.catalog_default;
++  }
++  NotifyObservers();
++  RequestRebuild(base::BindOnce(
++      [](base::WeakPtr<HeliumAdBlockService> service,
++         CompletionCallback completion, bool success) {
++        if (!success || !service) {
++          std::move(completion).Run(success);
++          return;
++        }
++        service->Refresh(false, std::move(completion));
++      },
++      weak_ptr_factory_.GetWeakPtr(), std::move(completion)));
++}
++
++void HeliumAdBlockService::Shutdown() {
++  shutting_down_ = true;
++  weak_ptr_factory_.InvalidateWeakPtrs();
++  observers_.Clear();
++}
++
++void HeliumAdBlockService::StartInitialLoad() {
++  RequestRebuild(base::BindOnce(
++      [](base::WeakPtr<HeliumAdBlockService> service, bool success) {
++        if (service && success) {
++          service->Refresh(false, base::DoNothing());
++        }
++      },
++      weak_ptr_factory_.GetWeakPtr()));
++}
++
++void HeliumAdBlockService::LoadDesiredConfigurationFromPrefs() {
++  desired_ = EngineConfiguration();
++  desired_.enabled = prefs_->GetBoolean(prefs::kHeliumAdBlockEnabled);
++  desired_.regional_defaults_initialized =
++      prefs_->GetBoolean(prefs::kHeliumAdBlockRegionalDefaultsInitialized);
++  for (const auto [id, value] :
++       prefs_->GetDict(prefs::kHeliumAdBlockSourceOverrides)) {
++    if (value.is_bool()) {
++      desired_.overrides.emplace(id, value.GetBool());
++    }
++  }
++  for (const base::Value& value :
++       prefs_->GetList(prefs::kHeliumAdBlockCustomSources)) {
++    const base::DictValue* item = value.GetIfDict();
++    if (!item) {
++      continue;
++    }
++    const std::string* id = item->FindString("id");
++    const std::string* url_string = item->FindString("url");
++    const std::string* title = item->FindString("title");
++    GURL url(url_string ? *url_string : std::string());
++    if (!id || !title ||
++        !SourceDownloader::IsSafeDownloadURL(url, SourceKind::kCustom)) {
++      continue;
++    }
++    desired_.custom_sources.push_back(
++        {*id, std::move(url), *title,
++         item->FindBool("enabled").value_or(true)});
++  }
++  for (const base::Value& value :
++       prefs_->GetList(prefs::kHeliumAdBlockSiteExceptions)) {
++    if (value.is_string()) {
++      desired_.regular_exceptions.insert(value.GetString());
++    }
++  }
++  state_.enabled = desired_.enabled;
++}
++
++void HeliumAdBlockService::PersistOverrides() {
++  base::DictValue overrides;
++  for (const auto& [id, enabled] : desired_.overrides) {
++    overrides.Set(id, enabled);
++  }
++  prefs_->SetDict(prefs::kHeliumAdBlockSourceOverrides, std::move(overrides));
++}
++
++void HeliumAdBlockService::PersistCustomSources() {
++  base::ListValue custom_sources;
++  for (const CustomSource& custom : desired_.custom_sources) {
++    custom_sources.Append(base::DictValue()
++                              .Set("id", custom.id)
++                              .Set("url", custom.url.spec())
++                              .Set("title", custom.title)
++                              .Set("enabled", custom.enabled));
++  }
++  prefs_->SetList(prefs::kHeliumAdBlockCustomSources,
++                  std::move(custom_sources));
++}
++
++void HeliumAdBlockService::ApplyDesiredStateToSources() {
++  for (SourceState& source : sources_) {
++    if (!source.built_in) {
++      auto custom = std::ranges::find(desired_.custom_sources, source.id,
++                                      &CustomSource::id);
++      if (custom != desired_.custom_sources.end()) {
++        source.explicit_override = custom->enabled;
++        source.effective_enabled = custom->enabled;
++      }
++      continue;
++    }
++    auto override = desired_.overrides.find(source.id);
++    if (override != desired_.overrides.end()) {
++      source.explicit_override = override->second;
++      source.effective_enabled = override->second;
++    }
++  }
++}
++
++void HeliumAdBlockService::RequestRebuild(CompletionCallback completion) {
++  if (shutting_down_ || !base::FeatureList::IsEnabled(kHeliumAdBlock)) {
++    std::move(completion).Run(false);
++    return;
++  }
++  pending_rebuild_completions_.push_back(std::move(completion));
++  rebuild_requested_ = true;
++  if (rebuild_in_progress_ || rebuild_debounce_timer_.IsRunning()) {
++    return;
++  }
++  if (!state_.ready) {
++    MaybeStartRebuild();
++    return;
++  }
++  rebuild_debounce_timer_.Start(
++      FROM_HERE, base::Milliseconds(150),
++      base::BindOnce(&HeliumAdBlockService::MaybeStartRebuild,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++void HeliumAdBlockService::MaybeStartRebuild() {
++  if (shutting_down_ || rebuild_in_progress_ || !rebuild_requested_) {
++    return;
++  }
++  rebuild_requested_ = false;
++  rebuild_in_progress_ = true;
++  active_rebuild_completions_ = std::move(pending_rebuild_completions_);
++  state_.failure_category.clear();
++  UpdateVisibleState();
++  NotifyObservers();
++
++  EngineConfiguration configuration = desired_;
++  configuration.locale = client_->GetApplicationLocale();
++  configuration.mobile = client_->IsMobilePlatform();
++  configuration.use_service_catalog =
++      helium::ShouldAccessUBlockAssets(*prefs_);
++  EngineConfiguration snapshot = configuration;
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&BuildAdBlockGeneration, adblock_directory_, assets_root_,
++                     bundled_list_reader_, std::move(snapshot)),
++      base::BindOnce(&HeliumAdBlockService::OnGenerationCompiled,
++                     weak_ptr_factory_.GetWeakPtr(),
++                     std::move(configuration)));
++}
++
++void HeliumAdBlockService::FinishRebuild(
++    GenerationFailure failure,
++    std::string failure_detail) {
++  rebuild_in_progress_ = false;
++  const bool success = failure == GenerationFailure::kNone;
++  if (!success) {
++    state_.failure_category = std::string(GenerationFailureName(failure));
++    LOG(ERROR) << "helium-adblock: rebuild failed, category="
++               << state_.failure_category
++               << (failure_detail.empty() ? std::string()
++                                          : ", detail=" + failure_detail);
++  }
++  UpdateVisibleState();
++  NotifyObservers();
++  std::vector<CompletionCallback> completions =
++      std::move(active_rebuild_completions_);
++  for (CompletionCallback& completion : completions) {
++    std::move(completion).Run(success);
++  }
++  MaybeStartRebuild();
++}
++
++void HeliumAdBlockService::OnGenerationCompiled(
++    EngineConfiguration configuration,
++    CompiledGeneration generation) {
++  if (!generation.success()) {
++    FinishRebuild(generation.failure, std::move(generation.failure_detail));
++    return;
++  }
++  CommitGeneration(std::move(configuration), std::move(generation));
++}
++
++void HeliumAdBlockService::CommitGeneration(EngineConfiguration configuration,
++                                            CompiledGeneration generation) {
++  if (generation.from_cache &&
++      generation.fingerprint == active_engine_fingerprint_) {
++    FinalizeCommit(configuration, std::move(generation));
++    return;
++  }
++  std::vector<uint8_t> serialized = std::move(generation.serialized_engine);
++  std::string resources = std::move(generation.resources_json);
++  std::string fingerprint = generation.fingerprint;
++  const bool persist = !generation.from_cache && configuration.enabled;
++  worker_.AsyncCall(&AdBlockEngineWorker::Activate)
++      .WithArgs(std::move(serialized), std::move(resources),
++                std::move(fingerprint), persist)
++      .Then(base::BindOnce(&HeliumAdBlockService::OnGenerationActivated,
++                           weak_ptr_factory_.GetWeakPtr(),
++                           std::move(configuration), std::move(generation)));
++}
++
++void HeliumAdBlockService::OnGenerationActivated(
++    EngineConfiguration configuration,
++    CompiledGeneration generation,
++    EngineActivationResult result) {
++  if (!result.success) {
++    FinishRebuild(result.persistence_error ? GenerationFailure::kPersistence
++                                           : GenerationFailure::kActivation,
++                  std::move(result.error));
++    return;
++  }
++  FinalizeCommit(configuration, std::move(generation));
++}
++
++void HeliumAdBlockService::FinalizeCommit(
++    const EngineConfiguration& configuration,
++    CompiledGeneration generation) {
++  if (!configuration.regional_defaults_initialized) {
++    for (const std::string& id : generation.regional_defaults) {
++      desired_.overrides.insert({id, true});
++    }
++    desired_.regional_defaults_initialized = true;
++    PersistOverrides();
++    prefs_->SetBoolean(prefs::kHeliumAdBlockRegionalDefaultsInitialized, true);
++  }
++
++  active_engine_fingerprint_ = generation.fingerprint;
++  cosmetic_resources_cache_.Clear();
++  match_cache_.Clear();
++
++  state_.ready = true;
++  state_.enabled = desired_.enabled;
++  state_.generation_id = generation.generation_id;
++  sources_ = std::move(generation.sources);
++  ApplyDesiredStateToSources();
++  for (const std::string& id : refreshing_ids_) {
++    auto source = std::ranges::find(sources_, id, &SourceState::id);
++    if (source != sources_.end()) {
++      source->updating = true;
++    }
++  }
++  FinishRebuild(GenerationFailure::kNone, std::string());
++}
++
++void HeliumAdBlockService::UpdateVisibleState() {
++  const bool rebuild_pending = rebuild_in_progress_ || rebuild_requested_ ||
++                               rebuild_debounce_timer_.IsRunning();
++  state_.updating = refresh_in_progress_ || rebuild_pending;
++  state_.converting = rebuild_pending;
++}
++
++void HeliumAdBlockService::NotifyObservers() {
++  for (ServiceObserver& observer : observers_) {
++    observer.OnHeliumAdBlockStateChanged(state_);
++  }
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/helium_adblock_service.h
+@@ -0,0 +1,201 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_HELIUM_ADBLOCK_SERVICE_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_HELIUM_ADBLOCK_SERVICE_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <tuple>
++#include <utility>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/containers/lru_cache.h"
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/threading/sequence_bound.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "components/helium_adblock/core/adblock_engine_builder.h"
++#include "components/helium_adblock/core/adblock_engine_worker.h"
++#include "components/helium_adblock/core/helium_adblock_client.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "url/gurl.h"
++
++class PrefService;
++
++namespace helium_adblock {
++
++class ServiceObserver : public base::CheckedObserver {
++ public:
++  virtual void OnHeliumAdBlockStateChanged(const ServiceState& state) = 0;
++};
++
++// Platform-agnostic ad and tracker blocking service. The embedder provides
++// bundled asset access, a network loader, and locale information through
++// HeliumAdBlockClient.
++//
++// Configuration mutations (toggles, custom sources, site exceptions) are
++// applied to an authoritative in-memory configuration synchronously,
++// persisted to prefs immediately, and compiled asynchronously. Concurrent
++// mutation requests coalesce into the next compile instead of failing.
++class HeliumAdBlockService : public KeyedService {
++ public:
++  using CompletionCallback = base::OnceCallback<void(bool success)>;
++
++  HeliumAdBlockService(PrefService* prefs,
++                       const base::FilePath& state_directory,
++                       std::unique_ptr<HeliumAdBlockClient> client);
++  ~HeliumAdBlockService() override;
++
++  HeliumAdBlockClient* client() { return client_.get(); }
++
++  const ServiceState& GetState() const;
++  void AddObserver(ServiceObserver* observer);
++  void RemoveObserver(ServiceObserver* observer);
++
++  void SetEnabled(bool enabled, CompletionCallback completion);
++  const std::vector<SourceState>& GetSources() const;
++  void SetSourceEnabled(std::string id,
++                        bool enabled,
++                        CompletionCallback completion);
++  void AddCustomSource(GURL url, CompletionCallback completion);
++  void RemoveCustomSource(std::string id, CompletionCallback completion);
++  void Refresh(bool force, CompletionCallback completion);
++  // Removes every filter-list override and custom source, and re-applies the
++  // catalog and regional defaults.
++  void ResetToDefaults(CompletionCallback completion);
++
++  bool IsEnabledForURL(const GURL& url, bool off_the_record) const;
++  void SetSiteException(const GURL& url,
++                        bool disabled,
++                        bool off_the_record,
++                        CompletionCallback completion);
++
++  using MatchCallback = base::OnceCallback<void(NetworkMatchResult)>;
++  using StringCallback = base::OnceCallback<void(std::string)>;
++  using StringListCallback = base::OnceCallback<void(std::vector<std::string>)>;
++  void MatchRequest(const GURL& url,
++                    const GURL& document_url,
++                    std::string request_type,
++                    std::string method,
++                    bool off_the_record,
++                    MatchCallback callback);
++  void GetDocumentCosmeticResources(const GURL& url,
++                                    bool off_the_record,
++                                    StringCallback callback);
++  void GetGenericSelectors(const GURL& url,
++                           std::vector<std::string> classes,
++                           std::vector<std::string> ids,
++                           std::vector<std::string> exceptions,
++                           bool off_the_record,
++                           StringListCallback callback);
++
++  // Called by the embedder when the incognito session ends; drops
++  // session-scoped site exceptions.
++  void OnIncognitoSessionEnded();
++
++  // KeyedService:
++  void Shutdown() override;
++
++ private:
++  using MatchCacheKey =
++      std::tuple<GURL, std::string, std::string, std::string>;
++
++  void StartInitialLoad();
++  void LoadDesiredConfigurationFromPrefs();
++  void PersistOverrides();
++  void PersistCustomSources();
++  void PersistSiteExceptions();
++  // Reflects the desired configuration in `sources_` so observers see toggles
++  // immediately, before the asynchronous compile commits.
++  void ApplyDesiredStateToSources();
++
++  void RequestRebuild(CompletionCallback completion);
++  void MaybeStartRebuild();
++  void FinishRebuild(GenerationFailure failure, std::string failure_detail);
++  void OnGenerationCompiled(EngineConfiguration configuration,
++                            CompiledGeneration generation);
++  void CommitGeneration(EngineConfiguration configuration,
++                        CompiledGeneration generation);
++  void OnGenerationActivated(
++      EngineConfiguration configuration,
++      CompiledGeneration generation,
++      EngineActivationResult result);
++  void FinalizeCommit(const EngineConfiguration& configuration,
++                      CompiledGeneration generation);
++
++  void StartRefreshCycle(bool force);
++  void StartCatalogRefresh();
++  void OnCatalogValidators(SourceValidators validators);
++  void OnCatalogDownloaded(SourceDownloadResult result);
++  void OnCatalogDownloadRecorded(bool catalog_changed,
++                                 DownloadApplyResult result);
++  void BuildDownloadQueue();
++  void PumpDownloadQueue();
++  void OnRefreshValidators(SourceState source, SourceValidators validators);
++  void OnSourceDownloaded(SourceState source,
++                          std::unique_ptr<SourceDownloader> downloader,
++                          SourceDownloadResult result);
++  void OnSourceDownloadRecorded(std::string id, DownloadApplyResult result);
++  void FinishRefreshCycle();
++  void SetSourceUpdating(const std::string& id, bool updating);
++
++  void UpdateVisibleState();
++  void NotifyObservers();
++  std::optional<std::string> ExceptionHost(const GURL& url) const;
++
++  raw_ptr<PrefService> prefs_;
++  std::unique_ptr<HeliumAdBlockClient> client_;
++  base::FilePath adblock_directory_;
++  base::FilePath assets_root_;
++  // Thread-safe accessors for packaged filter lists; copied into every
++  // compile task.
++  HeliumAdBlockClient::BundledListReader bundled_list_reader_;
++  base::SequenceBound<AdBlockEngineWorker> worker_;
++  ServiceState state_;
++  std::vector<SourceState> sources_;
++  base::ObserverList<ServiceObserver> observers_;
++  bool shutting_down_ = false;
++
++  // Authoritative configuration; see class comment.
++  EngineConfiguration desired_;
++  bool rebuild_requested_ = false;
++  bool rebuild_in_progress_ = false;
++  base::OneShotTimer rebuild_debounce_timer_;
++  // Fingerprint of the generation currently loaded in the worker's engine.
++  std::string active_engine_fingerprint_;
++  // Hot-path filtering query caches, cleared whenever a new generation
++  // commits.
++  base::LRUCache<std::string, std::string> cosmetic_resources_cache_{50};
++  base::LRUCache<MatchCacheKey, NetworkMatchResult> match_cache_{500};
++  std::vector<CompletionCallback> pending_rebuild_completions_;
++  std::vector<CompletionCallback> active_rebuild_completions_;
++
++  bool refresh_in_progress_ = false;
++  bool refresh_force_ = false;
++  bool refresh_pending_ = false;
++  bool refresh_pending_force_ = false;
++  std::vector<CompletionCallback> refresh_completions_;
++  std::vector<SourceState> refresh_queue_;
++  // Ids of sources whose download is in flight or queued in this cycle.
++  base::flat_set<std::string> refreshing_ids_;
++  int active_source_downloads_ = 0;
++  int refresh_failures_ = 0;
++  // Downloads the service catalog; per-source downloaders own themselves
++  // through their completion callbacks.
++  std::unique_ptr<SourceDownloader> refresh_downloader_;
++
++  base::WeakPtrFactory<HeliumAdBlockService> weak_ptr_factory_{this};
++};
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_HELIUM_ADBLOCK_SERVICE_H_

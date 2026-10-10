@@ -1,0 +1,1199 @@
+--- a/tools/crates/gnrt/lib/paths.rs
++++ b/tools/crates/gnrt/lib/paths.rs
+@@ -33,18 +33,35 @@ pub struct ChromiumPaths {
+ 
+     pub third_party_cargo_root: &'static Path,
+     pub third_party_config_file: &'static Path,
++
++    /// Whether gnrt is operating on Helium's separate third-party workspace.
++    pub is_helium_workspace: bool,
+ }
+ 
+ impl ChromiumPaths {
+     /// Create the `ChromiumPaths` resolver. Accesses the filesystem to get the
+     /// checkout root.
+-    pub fn new() -> io::Result<ChromiumPaths> {
++    pub fn new(is_helium_workspace: bool) -> io::Result<ChromiumPaths> {
+         // We should be invoked from the repository root.
+         let cur_dir = env::current_dir()?;
++        let (third_party_dir, third_party_cargo_root, third_party_config_file) =
++            if is_helium_workspace {
++                (
++                    HELIUM_RUST_THIRD_PARTY_DIR,
++                    HELIUM_THIRD_PARTY_CARGO_ROOT,
++                    HELIUM_THIRD_PARTY_CONFIG_FILE,
++                )
++            } else {
++                (
++                    RUST_THIRD_PARTY_DIR,
++                    THIRD_PARTY_CARGO_ROOT,
++                    THIRD_PARTY_CONFIG_FILE,
++                )
++            };
+ 
+         Ok(ChromiumPaths {
+             root: cur_dir.clone(),
+-            third_party: check_path(&cur_dir, RUST_THIRD_PARTY_DIR)?,
++            third_party: check_path(&cur_dir, third_party_dir)?,
+             // We tolerate the Rust sources being missing, as they are only used to generate
+             // rules for the stdlib during Clang/Rust rolls, and they are not checked out for
+             // most machines.
+@@ -62,8 +79,9 @@ impl ChromiumPaths {
+             std_fake_root_config_template: check_path(&cur_dir, STD_FAKE_ROOT_CONFIG_TEMPLATE)?,
+             std_fake_root_cargo_template: check_path(&cur_dir, STD_FAKE_ROOT_CARGO_TEMPLATE)?,
+ 
+-            third_party_cargo_root: check_path(&cur_dir, THIRD_PARTY_CARGO_ROOT)?,
+-            third_party_config_file: check_path(&cur_dir, THIRD_PARTY_CONFIG_FILE)?,
++            third_party_cargo_root: check_path(&cur_dir, third_party_cargo_root)?,
++            third_party_config_file: check_path(&cur_dir, third_party_config_file)?,
++            is_helium_workspace,
+         })
+     }
+ 
+@@ -150,6 +168,11 @@ static STD_FAKE_ROOT_CARGO_TEMPLATE: &st
+ static THIRD_PARTY_CARGO_ROOT: &str = "third_party/rust/chromium_crates_io";
+ static THIRD_PARTY_CONFIG_FILE: &str = "third_party/rust/chromium_crates_io/gnrt_config.toml";
+ 
++static HELIUM_RUST_THIRD_PARTY_DIR: &str = "third_party/rust/helium";
++static HELIUM_THIRD_PARTY_CARGO_ROOT: &str = "third_party/rust/helium/chromium_crates_io";
++static HELIUM_THIRD_PARTY_CONFIG_FILE: &str =
++    "third_party/rust/helium/chromium_crates_io/gnrt_config.toml";
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+--- a/tools/crates/gnrt/gen.rs
++++ b/tools/crates/gnrt/gen.rs
+@@ -277,6 +277,9 @@ fn generate_for_third_party(args: GenCom
+     let all_build_files: HashMap<PathBuf, gn::BuildFile> = {
+         let mut map = HashMap::new();
+         for dep in &dependencies {
++            if paths.is_helium_workspace && dep.is_local {
++                continue;
++            }
+             let build_file = gn::build_file_from_deps(
+                 std::iter::once(dep),
+                 paths,
+--- a/tools/crates/gnrt/vendor.rs
++++ b/tools/crates/gnrt/vendor.rs
+@@ -114,6 +114,12 @@ fn download_crates(args: &VendorCommandA
+         let crate_path = get_vendor_dir_for_package(paths, p.name(), p.version());
+         let crate_dirname = crate_path.file_name().unwrap();
+ 
++        // Local packages are supplied by Chromium and exposed through forwarding
++        // GN targets rather than copied into this workspace.
++        if paths.is_helium_workspace && p.source().is_local() {
++            continue;
++        }
++
+         // Keep directories corresponding to packages from the dependency tree.
+         dirs_to_remove.remove(crate_path.as_os_str());
+ 
+@@ -194,7 +200,8 @@ fn update_vendored_metadata(args: &Vendo
+         graph
+             .packages()
+             .filter(|meta: &PackageMetadata| {
+-                !config.resolve.remove_crates.contains(meta.name())
++                (!paths.is_helium_workspace || !meta.source().is_local())
++                    && !config.resolve.remove_crates.contains(meta.name())
+                     && guppy_resolved_package_ids.contains(&meta.into())
+             })
+             .collect_vec()
+@@ -217,7 +224,10 @@ fn update_vendored_metadata(args: &Vendo
+     remove_stale_build_directories(paths, all_readme_files.keys().cloned().collect())?;
+     generate_readme_files(&config, paths, &all_readme_files, args.dump_template_input)?;
+ 
+-    let dependencies = deps::collect_dependencies(&graph, &config.resolve.root, &config)?;
++    let dependencies: Vec<_> = deps::collect_dependencies(&graph, &config.resolve.root, &config)?
++        .into_iter()
++        .filter(|dependency| !paths.is_helium_workspace || !dependency.is_local)
++        .collect();
+     fill_allow_unsafe_settings(&config, paths, dependencies)?;
+ 
+     Ok(())
+--- /dev/null
++++ b/components/helium_adblock/rs/crates/Cargo.lock
+@@ -0,0 +1,661 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "adblock"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "77420e48225975c472eaea1b7c767af6caebea02d910043b0af7a1271d47ec9c"
++dependencies = [
++ "arrayvec",
++ "base64",
++ "bitflags",
++ "cssparser",
++ "flatbuffers",
++ "idna",
++ "itertools",
++ "memchr",
++ "percent-encoding",
++ "precomputed-hash",
++ "regex",
++ "rustc-hash",
++ "seahash",
++ "selectors",
++ "serde",
++ "serde_json",
++ "thiserror",
++ "url",
++]
++
++[[package]]
++name = "aho-corasick"
++version = "1.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
++dependencies = [
++ "memchr",
++]
++
++[[package]]
++name = "arrayvec"
++version = "0.7.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
++
++[[package]]
++name = "base64"
++version = "0.22.1"
++
++[[package]]
++name = "bitflags"
++version = "2.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "chromium"
++version = "0.1.0"
++dependencies = [
++ "adblock",
++ "serde_json",
++]
++
++[[package]]
++name = "cssparser"
++version = "0.35.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e901edd733a1472f944a45116df3f846f54d37e67e68640ac8bb69689aca2aa"
++dependencies = [
++ "cssparser-macros",
++ "dtoa-short",
++ "itoa",
++ "phf",
++ "smallvec",
++]
++
++[[package]]
++name = "cssparser-macros"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "13b588ba4ac1a99f7f2964d24b3d896ddc6bf847ee3855dbd4366f058cfcd331"
++dependencies = [
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "derive_more"
++version = "2.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
++dependencies = [
++ "derive_more-impl",
++]
++
++[[package]]
++name = "derive_more-impl"
++version = "2.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "rustc_version",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "displaydoc"
++version = "0.2.7"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.3",
++]
++
++[[package]]
++name = "dtoa"
++version = "1.0.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
++
++[[package]]
++name = "dtoa-short"
++version = "0.3.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cd1511a7b6a56299bd043a9c167a6d2bfb37bf84a6dfceaba651168adfb43c87"
++dependencies = [
++ "dtoa",
++]
++
++[[package]]
++name = "either"
++version = "1.18.0"
++
++[[package]]
++name = "flatbuffers"
++version = "25.12.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
++dependencies = [
++ "bitflags",
++ "rustc_version",
++]
++
++[[package]]
++name = "form_urlencoded"
++version = "1.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
++dependencies = [
++ "percent-encoding",
++]
++
++[[package]]
++name = "icu_collections"
++version = "2.2.0"
++dependencies = [
++ "displaydoc",
++ "potential_utf",
++ "utf8_iter",
++ "yoke",
++ "zerofrom",
++ "zerovec",
++]
++
++[[package]]
++name = "icu_locale_core"
++version = "2.3.0"
++dependencies = [
++ "displaydoc",
++ "litemap",
++ "tinystr",
++ "writeable",
++ "zerovec",
++]
++
++[[package]]
++name = "icu_normalizer"
++version = "2.2.0"
++dependencies = [
++ "icu_collections",
++ "icu_normalizer_data",
++ "icu_properties",
++ "icu_provider",
++ "smallvec",
++ "zerovec",
++]
++
++[[package]]
++name = "icu_normalizer_data"
++version = "2.2.0"
++
++[[package]]
++name = "icu_properties"
++version = "2.2.0"
++dependencies = [
++ "icu_collections",
++ "icu_locale_core",
++ "icu_properties_data",
++ "icu_provider",
++ "zerotrie",
++ "zerovec",
++]
++
++[[package]]
++name = "icu_properties_data"
++version = "2.2.0"
++
++[[package]]
++name = "icu_provider"
++version = "2.3.1"
++dependencies = [
++ "displaydoc",
++ "icu_locale_core",
++ "writeable",
++ "yoke",
++ "zerofrom",
++ "zerotrie",
++ "zerovec",
++]
++
++[[package]]
++name = "idna"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de"
++dependencies = [
++ "idna_adapter",
++ "smallvec",
++ "utf8_iter",
++]
++
++[[package]]
++name = "idna_adapter"
++version = "1.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
++dependencies = [
++ "icu_normalizer",
++ "icu_properties",
++]
++
++[[package]]
++name = "itertools"
++version = "0.14.0"
++dependencies = [
++ "either",
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++
++[[package]]
++name = "litemap"
++version = "0.8.3"
++
++[[package]]
++name = "log"
++version = "0.4.34"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++
++[[package]]
++name = "new_debug_unreachable"
++version = "1.0.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
++
++[[package]]
++name = "percent-encoding"
++version = "2.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
++
++[[package]]
++name = "phf"
++version = "0.11.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
++dependencies = [
++ "phf_macros",
++ "phf_shared",
++]
++
++[[package]]
++name = "phf_codegen"
++version = "0.11.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
++dependencies = [
++ "phf_generator",
++ "phf_shared",
++]
++
++[[package]]
++name = "phf_generator"
++version = "0.11.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
++dependencies = [
++ "phf_shared",
++ "rand",
++]
++
++[[package]]
++name = "phf_macros"
++version = "0.11.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
++dependencies = [
++ "phf_generator",
++ "phf_shared",
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "phf_shared"
++version = "0.11.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
++dependencies = [
++ "siphasher",
++]
++
++[[package]]
++name = "potential_utf"
++version = "0.1.6"
++dependencies = [
++ "zerovec",
++]
++
++[[package]]
++name = "precomputed-hash"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "rand"
++version = "0.8.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
++dependencies = [
++ "rand_core",
++]
++
++[[package]]
++name = "rand_core"
++version = "0.6.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
++
++[[package]]
++name = "regex"
++version = "1.12.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
++dependencies = [
++ "aho-corasick",
++ "memchr",
++ "regex-automata",
++ "regex-syntax",
++]
++
++[[package]]
++name = "regex-automata"
++version = "0.4.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
++dependencies = [
++ "aho-corasick",
++ "memchr",
++ "regex-syntax",
++]
++
++[[package]]
++name = "regex-syntax"
++version = "0.8.11"
++
++[[package]]
++name = "rustc-hash"
++version = "2.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
++
++[[package]]
++name = "rustc_version"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
++dependencies = [
++ "semver",
++]
++
++[[package]]
++name = "seahash"
++version = "4.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
++
++[[package]]
++name = "selectors"
++version = "0.32.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09975d3195f34dce9c7b381cb0f00c3c13381d4d3735c0f1a9c894b283b302ab"
++dependencies = [
++ "bitflags",
++ "cssparser",
++ "derive_more",
++ "log",
++ "new_debug_unreachable",
++ "phf",
++ "phf_codegen",
++ "precomputed-hash",
++ "rustc-hash",
++ "servo_arc",
++ "smallvec",
++]
++
++[[package]]
++name = "semver"
++version = "1.0.28"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.3",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.150"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "servo_arc"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "170fb83ab34de17dc69aa7c67482b22218ddb85da56546f9bd6b929e32a05930"
++dependencies = [
++ "stable_deref_trait",
++]
++
++[[package]]
++name = "siphasher"
++version = "1.0.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
++
++[[package]]
++name = "smallvec"
++version = "1.16.0"
++
++[[package]]
++name = "stable_deref_trait"
++version = "1.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "synstructure"
++version = "0.13.2"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "thiserror"
++version = "1.0.69"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
++dependencies = [
++ "thiserror-impl",
++]
++
++[[package]]
++name = "thiserror-impl"
++version = "1.0.69"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "tinystr"
++version = "0.8.4"
++dependencies = [
++ "displaydoc",
++ "zerovec",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.24"
++
++[[package]]
++name = "url"
++version = "2.5.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
++dependencies = [
++ "form_urlencoded",
++ "idna",
++ "percent-encoding",
++ "serde",
++]
++
++[[package]]
++name = "utf8_iter"
++version = "1.0.4"
++
++[[package]]
++name = "writeable"
++version = "0.6.4"
++
++[[package]]
++name = "yoke"
++version = "0.8.3"
++dependencies = [
++ "stable_deref_trait",
++ "yoke-derive",
++ "zerofrom",
++]
++
++[[package]]
++name = "yoke-derive"
++version = "0.8.2"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++ "synstructure",
++]
++
++[[package]]
++name = "zerofrom"
++version = "0.1.8"
++dependencies = [
++ "zerofrom-derive",
++]
++
++[[package]]
++name = "zerofrom-derive"
++version = "0.1.7"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++ "synstructure",
++]
++
++[[package]]
++name = "zerotrie"
++version = "0.2.5"
++dependencies = [
++ "displaydoc",
++ "yoke",
++ "zerofrom",
++]
++
++[[package]]
++name = "zerovec"
++version = "0.11.8"
++dependencies = [
++ "yoke",
++ "zerofrom",
++ "zerovec-derive",
++]
++
++[[package]]
++name = "zerovec-derive"
++version = "0.11.6"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.3",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
+--- /dev/null
++++ b/components/helium_adblock/rs/crates/Cargo.toml
+@@ -0,0 +1,53 @@
++# Copyright 2026 The Helium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++[package]
++name = "chromium"
++version = "0.1.0"
++edition = "2024"
++
++[workspace]
++
++[dependencies]
++adblock = { version = "0.13.2", default-features = false, features = ["css-validation", "full-regex-handling"] }
++serde_json = "1.0.150"
++
++# Reuse compatible crates already vendored and built by Chromium. These path
++# overrides apply only while resolving Helium's workspace.
++[patch.crates-io]
++base64 = { path = "../../chromium_crates_io/vendor/base64-v0_22" }
++displaydoc = { path = "../../chromium_crates_io/vendor/displaydoc-v0_2" }
++either = { path = "../../chromium_crates_io/vendor/either-v1" }
++icu_collections = { path = "../../chromium_crates_io/vendor/icu_collections-v2" }
++icu_locale_core = { path = "../../chromium_crates_io/vendor/icu_locale_core-v2" }
++icu_normalizer = { path = "../../chromium_crates_io/vendor/icu_normalizer-v2" }
++icu_normalizer_data = { path = "../../chromium_crates_io/vendor/icu_normalizer_data-v2" }
++icu_properties = { path = "../../chromium_crates_io/vendor/icu_properties-v2" }
++icu_properties_data = { path = "../../chromium_crates_io/vendor/icu_properties_data-v2" }
++icu_provider = { path = "../../chromium_crates_io/vendor/icu_provider-v2" }
++itertools = { path = "../../chromium_crates_io/vendor/itertools-v0_14" }
++itoa = { path = "../../chromium_crates_io/vendor/itoa-v1" }
++litemap = { path = "../../chromium_crates_io/vendor/litemap-v0_8" }
++log = { path = "../../chromium_crates_io/vendor/log-v0_4" }
++memchr = { path = "../../chromium_crates_io/vendor/memchr-v2" }
++potential_utf = { path = "../../chromium_crates_io/vendor/potential_utf-v0_1" }
++proc-macro2 = { path = "../../chromium_crates_io/vendor/proc-macro2-v1" }
++quote = { path = "../../chromium_crates_io/vendor/quote-v1" }
++regex-syntax = { path = "../../chromium_crates_io/vendor/regex-syntax-v0_8" }
++serde_derive = { path = "../../chromium_crates_io/vendor/serde_derive-v1" }
++smallvec = { path = "../../chromium_crates_io/vendor/smallvec-v1" }
++syn = { path = "../../chromium_crates_io/vendor/syn-v2" }
++synstructure = { path = "../../chromium_crates_io/vendor/synstructure-v0_13" }
++tinystr = { path = "../../chromium_crates_io/vendor/tinystr-v0_8" }
++unicode-ident = { path = "../../chromium_crates_io/vendor/unicode-ident-v1" }
++utf8_iter = { path = "../../chromium_crates_io/vendor/utf8_iter-v1" }
++writeable = { path = "../../chromium_crates_io/vendor/writeable-v0_6" }
++yoke = { path = "../../chromium_crates_io/vendor/yoke-v0_8" }
++yoke-derive = { path = "../../chromium_crates_io/vendor/yoke-derive-v0_8" }
++zerofrom = { path = "../../chromium_crates_io/vendor/zerofrom-v0_1" }
++zerofrom-derive = { path = "../../chromium_crates_io/vendor/zerofrom-derive-v0_1" }
++zerotrie = { path = "../../chromium_crates_io/vendor/zerotrie-v0_2" }
++zerovec = { path = "../../chromium_crates_io/vendor/zerovec-v0_11" }
++zerovec-derive = { path = "../../chromium_crates_io/vendor/zerovec-derive-v0_11" }
++zmij = { path = "../../chromium_crates_io/vendor/zmij-v1" }
+--- /dev/null
++++ b/components/helium_adblock/rs/crates/gnrt_config.toml
+@@ -0,0 +1,54 @@
++# Copyright 2026 The Helium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++[gn]
++build_file_template = "BUILD.gn.hbs"
++readme_file_template = "README.chromium.hbs"
++removed_cargo_template = "removed_Cargo.toml.hbs"
++removed_librs_template = "removed_lib.rs.hbs"
++crate_path_prefix = "//third_party/rust/helium"
++rustc_metadata_prefix = "helium-"
++build_script_name_prefix = "helium_"
++
++[resolve]
++remove_crates = []
++root = "chromium"
++
++[crate.adblock]
++license_files = ['LICENSE']
++extra_kv = { allow_unsafe = true, visibility = ["//components/helium_adblock/rs:*"] }
++
++[crate.cssparser]
++remove_vendored_files = ['docs/.nojekyll']
++
++[crate.derive_more-impl]
++extra_input_roots = ['../doc', '../README.md']
++
++[crate.flatbuffers]
++license_files = ['../../../../../flatbuffers/LICENSE']
++extra_kv = { allow_unsafe = true, allow_unstable_features = ['trusted_len'] }
++
++[crate.seahash]
++license_files = ['../../licenses/MIT']
++remove_vendored_files = ['logo.png']
++
++[crate.serde]
++build_script_outputs = ['private.rs']
++extra_kv = { allow_unsafe = false }
++
++[crate.serde_core]
++build_script_outputs = ['private.rs']
++extra_kv = { allow_unsafe = true }
++
++[crate.serde_json]
++extra_kv = { allow_unsafe = true }
++
++[crate.selectors]
++build_script_outputs = ['ascii_case_insensitive_html_attributes.rs']
++license_files = ['../adblock-v0_13/LICENSE']
++
++[crate.siphasher]
++license_files = ['COPYING']
++extra_input_roots = ['../README.md']
++extra_kv = { allow_unsafe = true }
+--- /dev/null
++++ b/components/helium_adblock/rs/crates/src/lib.rs
+@@ -0,0 +1,6 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Cargo requires the gnrt workspace's root package to expose a target. This
++// placeholder is not the bridge in components/helium_adblock/rs/src/lib.rs.
+--- /dev/null
++++ b/third_party/rust/helium/chromium_crates_io/licenses/MIT
+@@ -0,0 +1,19 @@
++MIT License
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+--- a/build/rust/cargo_crate.gni
++++ b/build/rust/cargo_crate.gni
+@@ -58,6 +58,14 @@ import("//build/rust/rust_static_library
+ #  build_root (optional)
+ #    Filename of build.rs build script.
+ #
++#  build_script_name_prefix (optional)
++#    Prefix for the build script executable name. Use this when the same crate
++#    and epoch are built from more than one GN source directory.
++#
++#  rustc_metadata_prefix (optional)
++#    Prefix for the crate metadata. Use this when the same crate and epoch are
++#    built from more than one GN source directory.
++#
+ #  build_deps (optional)
+ #    Build script dependencies
+ #
+@@ -122,6 +130,9 @@ template("cargo_crate") {
+   } else if (defined(invoker.epoch)) {
+     _rustc_metadata = "${_crate_name}-${invoker.epoch}"
+   }
++  if (defined(invoker.rustc_metadata_prefix) && _rustc_metadata != "") {
++    _rustc_metadata = "${invoker.rustc_metadata_prefix}${_rustc_metadata}"
++  }
+ 
+   _enabled = true
+   if (defined(invoker.enabled)) {
+@@ -136,10 +147,14 @@ template("cargo_crate") {
+ 
+   # Executables need to have unique names. Work out a prefix.
+   if (defined(invoker.build_root)) {
++    _build_script_name_prefix = ""
++    if (defined(invoker.build_script_name_prefix)) {
++      _build_script_name_prefix = invoker.build_script_name_prefix
++    }
++
+     # This name includes the target name to ensure it's unique for each possible
+     # build target in the same BUILD.gn file.
+-    _build_script_name =
+-        "${_crate_name}_${target_name}_${_epochlabel}_build_script"
++    _build_script_name = "${_build_script_name_prefix}${_crate_name}_${target_name}_${_epochlabel}_build_script"
+ 
+     # Where the OUT_DIR will point when running the build script exe, and
+     # compiling the crate library/binaries. This directory must include the
+@@ -266,6 +281,7 @@ template("cargo_crate") {
+                                    "build_deps",
+                                    "build_sources",
+                                    "build_script_inputs",
++                                   "build_script_name_prefix",
+                                    "build_script_outputs",
+                                    "epoch",
+                                    "unit_test_target",
+@@ -273,6 +289,7 @@ template("cargo_crate") {
+                                    "executable_configs",
+                                    "library_configs",
+                                    "proc_macro_configs",
++                                   "rustc_metadata_prefix",
+                                    "rustenv",
+                                    "dev_deps",
+                                    "native_libs_dir",
+--- a/third_party/rust/chromium_crates_io/BUILD.gn.hbs
++++ b/third_party/rust/chromium_crates_io/BUILD.gn.hbs
+@@ -2,7 +2,7 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
+-# @generated from third_party/rust/chromium_crates_io/BUILD.gn.hbs by
++# @generated from {{crate_path_prefix}}/chromium_crates_io/BUILD.gn.hbs by
+ # tools/crates/gnrt.
+ # Do not edit!
+ 
+@@ -10,6 +10,9 @@ import("//build/rust/cargo_crate.gni")
+ 
+ {{#each rules}}
+ cargo_crate("{{this.name}}") {
++  {{#if @root.rustc_metadata_prefix}}
++  rustc_metadata_prefix = "{{@root.rustc_metadata_prefix}}"
++  {{/if}}
+   {{#with this.detail}}
+   {{#if crate_name}}
+   crate_name = "{{crate_name}}"
+@@ -91,14 +94,14 @@ cargo_crate("{{this.name}}") {
+     ":lib",
+     {{/if}}
+     {{#each this.packages}}
+-      "//third_party/rust/{{this.name}}/{{this.epoch}}:lib",
++      "{{@root.crate_path_prefix}}/{{this.name}}/{{this.epoch}}:lib",
+     {{/each}}
+   ]
+   {{else}}
+   if ({{this.cond}}) {
+     deps += [
+       {{#each this.packages}}
+-      "//third_party/rust/{{this.name}}/{{this.epoch}}:lib",
++      "{{@root.crate_path_prefix}}/{{this.name}}/{{this.epoch}}:lib",
+       {{/each}}
+     ]
+   }
+@@ -114,7 +117,7 @@ cargo_crate("{{this.name}}") {
+   {{#if aliased_deps}}
+   aliased_deps = {
+     {{#each aliased_deps}}
+-    {{this.0}} = "//third_party/rust/{{this.1.name}}/{{this.1.epoch}}:lib"
++    {{this.0}} = "{{@root.crate_path_prefix}}/{{this.1.name}}/{{this.1.epoch}}:lib"
+     {{/each}}
+   }
+   {{/if}}
+@@ -122,14 +125,14 @@ cargo_crate("{{this.name}}") {
+   {{#if @first}}
+   build_deps = [
+     {{#each this.packages}}
+-      "//third_party/rust/{{this.name}}/{{this.epoch}}:buildrs_support",
++      "{{@root.crate_path_prefix}}/{{this.name}}/{{this.epoch}}:buildrs_support",
+     {{/each}}
+   ]
+   {{else}}
+   if ({{this.cond}}) {
+     build_deps += [
+     {{#each this.packages}}
+-      "//third_party/rust/{{this.name}}/{{this.epoch}}:buildrs_support",
++      "{{@root.crate_path_prefix}}/{{this.name}}/{{this.epoch}}:buildrs_support",
+     {{/each}}
+     ]
+   }
+@@ -144,6 +147,9 @@ cargo_crate("{{this.name}}") {
+   {{/if}}
+   {{#if build_root}}
+     build_root = "{{build_root}}"
++    {{#if @root.build_script_name_prefix}}
++    build_script_name_prefix = "{{@root.build_script_name_prefix}}"
++    {{/if}}
+     build_sources = [
+       {{#each build_script_sources}}
+         "{{this}}",
+@@ -182,9 +188,9 @@ cargo_crate("{{this.name}}") {
+   {{/if}}
+   {{else}}
+   # Only for usage from third-party crates. Add the crate to
+-  # //third_party/rust/chromium_crates_io/Cargo.toml to use
++  # {{@root.crate_path_prefix}}/chromium_crates_io/Cargo.toml to use
+   # it from first-party code.
+-  visibility = [ "//third_party/rust/*" ]
++  visibility = [ "{{@root.crate_path_prefix}}/*" ]
+   {{/if}}
+   {{#if detail.extra_kv.visibility}}
+     {{#each detail.extra_kv.visibility}}
+@@ -213,7 +219,7 @@ cargo_crate("{{this.name}}") {
+   #####################################################################
+   # Tweaking which GN `config`s apply to this target.
+ 
+-  # Config changes that apply to all `//third_party/rust` crates.
++  # Config changes that apply to all `{{@root.crate_path_prefix}}` crates.
+   _configs_to_remove = [
+     # We don't need code coverage data for any `chromium_crates_io` crates.
+     "//build/config/coverage:default_coverage",
+--- a/tools/crates/gnrt/lib/config.rs
++++ b/tools/crates/gnrt/lib/config.rs
+@@ -140,12 +140,21 @@ impl BuildConfig {
+ }
+ 
+ /// Configures GN output for this session.
+-#[derive(Clone, Debug, Default, Deserialize)]
++#[derive(Clone, Debug, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct GnConfig {
+     /// Path to a handlebars template for an output GN build file. The path is
+     /// relative to the config file.
+     pub build_file_template: std::path::PathBuf,
++    /// Absolute GN path containing generated third-party crate targets.
++    #[serde(default = "default_crate_path_prefix")]
++    pub crate_path_prefix: String,
++    /// Optional prefix used to keep rustc metadata unique across workspaces.
++    #[serde(default)]
++    pub rustc_metadata_prefix: String,
++    /// Optional prefix used to keep build script output names unique.
++    #[serde(default)]
++    pub build_script_name_prefix: String,
+     /// Path to a handlebars template for writing README.chromium files. The
+     /// path is relative to the config file. Only used for
+     /// //third_party/rust crates.
+@@ -161,6 +170,24 @@ pub struct GnConfig {
+     pub removed_librs_template: std::path::PathBuf,
+ }
+ 
++impl Default for GnConfig {
++    fn default() -> Self {
++        Self {
++            build_file_template: Default::default(),
++            crate_path_prefix: default_crate_path_prefix(),
++            rustc_metadata_prefix: Default::default(),
++            build_script_name_prefix: Default::default(),
++            readme_file_template: Default::default(),
++            removed_cargo_template: Default::default(),
++            removed_librs_template: Default::default(),
++        }
++    }
++}
++
++fn default_crate_path_prefix() -> String {
++    "//third_party/rust".to_string()
++}
++
+ /// Configures Cargo Vet output for this session.
+ #[derive(Clone, Debug, Default, Deserialize)]
+ #[serde(deny_unknown_fields)]
+--- a/tools/crates/gnrt/lib/gn.rs
++++ b/tools/crates/gnrt/lib/gn.rs
+@@ -28,6 +28,9 @@ use serde::Serialize;
+ /// * Binary targets for crate executables
+ #[derive(Default, Serialize)]
+ pub struct BuildFile {
++    pub crate_path_prefix: String,
++    pub rustc_metadata_prefix: String,
++    pub build_script_name_prefix: String,
+     pub rules: Vec<Rule>,
+ }
+ 
+@@ -133,7 +136,12 @@ where
+     Iter: IntoIterator<Item = &'a deps::Package>,
+     GetFiles: Fn(&VendoredCrate) -> &'b CrateFiles,
+ {
+-    let mut b = BuildFile { rules: Vec::new() };
++    let mut b = BuildFile {
++        crate_path_prefix: extra_config.gn_config.crate_path_prefix.clone(),
++        rustc_metadata_prefix: extra_config.gn_config.rustc_metadata_prefix.clone(),
++        build_script_name_prefix: extra_config.gn_config.build_script_name_prefix.clone(),
++        rules: Vec::new(),
++    };
+     for dep in deps {
+         let crate_id = dep.crate_id();
+         b.rules.extend(build_rule_from_dep(
+--- a/tools/crates/gnrt/main.rs
++++ b/tools/crates/gnrt/main.rs
+@@ -13,15 +13,30 @@ mod util;
+ mod vendor;
+ 
+ use anyhow::{Context, Result};
+-use clap::{Parser, Subcommand};
++use clap::{Parser, Subcommand, ValueEnum};
+ use gnrt_lib::*;
+ 
+ #[derive(Debug, Parser)]
+ struct GnrtArgs {
++    #[arg(
++        long,
++        global = true,
++        value_enum,
++        default_value_t = ThirdPartyWorkspace::Chromium,
++        help = "Select the third-party Cargo workspace operated on by gnrt"
++    )]
++    third_party_workspace: ThirdPartyWorkspace,
++
+     #[command(subcommand)]
+     command: Command,
+ }
+ 
++#[derive(Clone, Copy, Debug, ValueEnum)]
++enum ThirdPartyWorkspace {
++    Chromium,
++    Helium,
++}
++
+ #[derive(Debug, Subcommand)]
+ enum Command {
+     #[command(about = "Add a new third-party crate dependency in //third_party/rust")]
+@@ -116,7 +131,11 @@ fn main() -> Result<()> {
+ 
+     let args = GnrtArgs::parse();
+ 
+-    let paths = paths::ChromiumPaths::new().context("Could not find chromium checkout paths")?;
++    let paths = paths::ChromiumPaths::new(matches!(
++        args.third_party_workspace,
++        ThirdPartyWorkspace::Helium
++    ))
++    .context("Could not find chromium checkout paths")?;
+ 
+     match args.command {
+         Command::Add(args) => add::add(args, &paths),

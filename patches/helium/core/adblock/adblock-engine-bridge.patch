@@ -1,0 +1,425 @@
+--- /dev/null
++++ b/components/helium_adblock/core/resolver/BUILD.gn
+@@ -0,0 +1,19 @@
++# Copyright 2026 The Helium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//components/helium_adblock/features.gni")
++
++assert(enable_native_adblock)
++
++static_library("resolver") {
++  sources = [
++    "adblock_domain_resolver.cc",
++    "adblock_domain_resolver.h",
++  ]
++  visibility = [ "//components/helium_adblock/core:*" ]
++  deps = [
++    "//components/helium_adblock/rs:adblock_engine_rs",
++    "//net",
++  ]
++}
+--- /dev/null
++++ b/components/helium_adblock/core/resolver/adblock_domain_resolver.cc
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/helium_adblock/core/resolver/adblock_domain_resolver.h"
++
++#include <string>
++
++#include "base/numerics/safe_conversions.h"
++#include "components/helium_adblock/rs/src/lib.rs.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++
++namespace helium_adblock {
++
++DomainPosition ResolveDomainPosition(const std::string& host) {
++  const std::string domain =
++      net::registry_controlled_domains::GetDomainAndRegistry(
++          host,
++          net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  if (domain.empty()) {
++    return DomainPosition{0, base::checked_cast<uint32_t>(host.size())};
++  }
++  const size_t start = host.rfind(domain);
++  if (start == std::string::npos) {
++    return DomainPosition{0, base::checked_cast<uint32_t>(host.size())};
++  }
++  return DomainPosition{base::checked_cast<uint32_t>(start),
++                        base::checked_cast<uint32_t>(start + domain.size())};
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/components/helium_adblock/core/resolver/adblock_domain_resolver.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_ADBLOCK_CORE_RESOLVER_ADBLOCK_DOMAIN_RESOLVER_H_
++#define COMPONENTS_HELIUM_ADBLOCK_CORE_RESOLVER_ADBLOCK_DOMAIN_RESOLVER_H_
++
++#include <string>
++
++namespace helium_adblock {
++
++struct DomainPosition;
++
++DomainPosition ResolveDomainPosition(const std::string& host);
++
++}  // namespace helium_adblock
++
++#endif  // COMPONENTS_HELIUM_ADBLOCK_CORE_RESOLVER_ADBLOCK_DOMAIN_RESOLVER_H_
+--- /dev/null
++++ b/components/helium_adblock/rs/BUILD.gn
+@@ -0,0 +1,27 @@
++# Copyright 2026 The Helium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/rust/rust_static_library.gni")
++import("//components/helium_adblock/features.gni")
++
++assert(enable_native_adblock)
++
++rust_static_library("adblock_engine_rs") {
++  crate_name = "helium_adblock"
++  crate_root = "src/lib.rs"
++  edition = "2024"
++  allow_unsafe = true
++  sources = [ "src/lib.rs" ]
++  cxx_bindings = [ "src/lib.rs" ]
++
++  visibility = [
++    "//components/helium_adblock/core:*",
++    "//components/helium_adblock/core/resolver:*",
++  ]
++
++  deps = [
++    "//third_party/rust/helium/adblock/v0_13:lib",
++    "//third_party/rust/helium/serde_json/v1:lib",
++  ]
++}
+--- /dev/null
++++ b/components/helium_adblock/rs/src/lib.rs
+@@ -0,0 +1,315 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++use std::collections::HashSet;
++use std::fmt::Display;
++use std::sync::OnceLock;
++
++use adblock::lists::{
++    read_list_metadata, ExpiresInterval, FilterSet as InnerFilterSet, ParseOptions,
++};
++use adblock::request::Request;
++use adblock::resources::{PermissionMask, Resource};
++use adblock::url_parser::ResolvesDomain;
++use adblock::Engine as InnerEngine;
++use cxx::{let_cxx_string, CxxString, CxxVector};
++
++pub struct FilterSet {
++    inner: InnerFilterSet,
++}
++
++pub struct Engine {
++    inner: InnerEngine,
++}
++
++#[allow(unsafe_op_in_unsafe_fn)]
++#[cxx::bridge(namespace = "helium_adblock")]
++mod ffi {
++    extern "Rust" {
++        type FilterSet;
++        fn new_filter_set() -> Box<FilterSet>;
++        fn add_filter_list(
++            self: &mut FilterSet,
++            rules: &[u8],
++            permission_mask: u8,
++        ) -> OperationResult;
++
++        fn list_metadata(list: &[u8]) -> ListMetadata;
++
++        type Engine;
++        fn engine_from_filter_set(filter_set: Box<FilterSet>) -> Box<Engine>;
++        fn new_engine() -> Box<Engine>;
++        fn serialize(self: &Engine) -> Vec<u8>;
++        fn deserialize(self: &mut Engine, serialized: &[u8]) -> OperationResult;
++        fn matches(
++            self: &Engine,
++            url: &str,
++            hostname: &str,
++            initiator_hostname: &str,
++            request_type: &str,
++            third_party: bool,
++            method: &str,
++        ) -> MatchResult;
++        fn document_cosmetic_resources(self: &Engine, url: &str) -> StringResult;
++        fn generic_selectors(
++            self: &Engine,
++            classes: &CxxVector<CxxString>,
++            ids: &CxxVector<CxxString>,
++            exceptions: &CxxVector<CxxString>,
++        ) -> StringListResult;
++        fn load_resources_json(
++            self: &mut Engine,
++            resources_json: &str,
++        ) -> OperationResult;
++
++        fn install_domain_resolver() -> bool;
++    }
++
++    unsafe extern "C++" {
++        include!(
++            "components/helium_adblock/core/resolver/adblock_domain_resolver.h"
++        );
++        #[cxx_name = "ResolveDomainPosition"]
++        fn resolve_domain_position(host: &CxxString) -> DomainPosition;
++    }
++
++    struct DomainPosition {
++        start: u32,
++        end: u32,
++    }
++
++    struct OperationResult {
++        success: bool,
++        error: String,
++    }
++
++    // Metadata from a filter list's leading comment block ("special
++    // comments"). `expires_hours` is zero when the list declares no valid
++    // "! Expires:" interval.
++    struct ListMetadata {
++        title: String,
++        expires_hours: u32,
++    }
++
++    struct StringResult {
++        success: bool,
++        value: String,
++        error: String,
++    }
++
++    struct StringListResult {
++        success: bool,
++        value: Vec<String>,
++        error: String,
++    }
++
++    struct MatchResult {
++        blocked: bool,
++        important: bool,
++        has_exception: bool,
++        has_redirect: bool,
++        redirect: String,
++        has_rewritten_url: bool,
++        rewritten_url: String,
++    }
++}
++
++fn operation_success() -> ffi::OperationResult {
++    ffi::OperationResult {
++        success: true,
++        error: String::new(),
++    }
++}
++
++fn operation_error(error: impl Display) -> ffi::OperationResult {
++    ffi::OperationResult {
++        success: false,
++        error: error.to_string(),
++    }
++}
++
++pub fn new_filter_set() -> Box<FilterSet> {
++    Box::new(FilterSet {
++        inner: InnerFilterSet::new(false),
++    })
++}
++
++impl FilterSet {
++    pub fn add_filter_list(
++        &mut self,
++        rules: &[u8],
++        permission_mask: u8,
++    ) -> ffi::OperationResult {
++        let Ok(rules) = std::str::from_utf8(rules) else {
++            return operation_error("filter list is not valid UTF-8");
++        };
++        self.inner.add_filter_list(
++            rules.to_owned(),
++            ParseOptions {
++                permissions: PermissionMask::from_bits(permission_mask),
++                ..Default::default()
++            },
++        );
++        operation_success()
++    }
++}
++
++pub fn list_metadata(list: &[u8]) -> ffi::ListMetadata {
++    let Ok(list) = std::str::from_utf8(list) else {
++        return ffi::ListMetadata {
++            title: String::new(),
++            expires_hours: 0,
++        };
++    };
++    let metadata = read_list_metadata(list);
++    let expires_hours = match metadata.expires {
++        Some(ExpiresInterval::Hours(hours)) => u32::from(hours),
++        Some(ExpiresInterval::Days(days)) => u32::from(days) * 24,
++        None => 0,
++    };
++    ffi::ListMetadata {
++        title: metadata.title.unwrap_or_default(),
++        expires_hours,
++    }
++}
++
++pub fn engine_from_filter_set(filter_set: Box<FilterSet>) -> Box<Engine> {
++    Box::new(Engine {
++        inner: InnerEngine::new_with_filter_set(filter_set.inner),
++    })
++}
++
++pub fn new_engine() -> Box<Engine> {
++    Box::new(Engine {
++        inner: InnerEngine::default(),
++    })
++}
++
++impl Engine {
++    pub fn serialize(&self) -> Vec<u8> {
++        self.inner.serialize()
++    }
++
++    pub fn deserialize(&mut self, serialized: &[u8]) -> ffi::OperationResult {
++        match self.inner.deserialize(serialized) {
++            Ok(()) => operation_success(),
++            Err(error) => operation_error(error),
++        }
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn matches(
++        &self,
++        url: &str,
++        hostname: &str,
++        initiator_hostname: &str,
++        request_type: &str,
++        third_party: bool,
++        method: &str,
++    ) -> ffi::MatchResult {
++        let result = self.inner.check_network_request_subset(
++            &Request::preparsed(
++                url,
++                hostname,
++                initiator_hostname,
++                request_type,
++                third_party,
++                method,
++            ),
++            false,
++            false,
++        );
++        let has_redirect = result.redirect.is_some();
++        let has_rewritten_url = result.rewritten_url.is_some();
++        ffi::MatchResult {
++            blocked: result.should_block(),
++            important: result.important,
++            has_exception: result.exception.is_some(),
++            has_redirect,
++            redirect: result.redirect.unwrap_or_default(),
++            has_rewritten_url,
++            rewritten_url: result.rewritten_url.unwrap_or_default(),
++        }
++    }
++
++    pub fn document_cosmetic_resources(&self, url: &str) -> ffi::StringResult {
++        match serde_json::to_string(&self.inner.url_cosmetic_resources(url)) {
++            Ok(value) => ffi::StringResult {
++                success: true,
++                value,
++                error: String::new(),
++            },
++            Err(error) => ffi::StringResult {
++                success: false,
++                value: String::new(),
++                error: error.to_string(),
++            },
++        }
++    }
++
++    pub fn generic_selectors(
++        &self,
++        classes: &CxxVector<CxxString>,
++        ids: &CxxVector<CxxString>,
++        exceptions: &CxxVector<CxxString>,
++    ) -> ffi::StringListResult {
++        let parse =
++            |values: &CxxVector<CxxString>| -> Result<Vec<String>, std::str::Utf8Error> {
++                values
++                    .iter()
++                    .map(|value| value.to_str().map(str::to_owned))
++                    .collect()
++            };
++        let result = (|| {
++            let classes = parse(classes)?;
++            let ids = parse(ids)?;
++            let exceptions: HashSet<String> =
++                parse(exceptions)?.into_iter().collect();
++            Ok::<_, std::str::Utf8Error>(
++                self.inner
++                    .hidden_class_id_selectors(&classes, &ids, &exceptions),
++            )
++        })();
++        match result {
++            Ok(value) => ffi::StringListResult {
++                success: true,
++                value,
++                error: String::new(),
++            },
++            Err(error) => ffi::StringListResult {
++                success: false,
++                value: Vec::new(),
++                error: error.to_string(),
++            },
++        }
++    }
++
++    pub fn load_resources_json(&mut self, resources_json: &str) -> ffi::OperationResult {
++        match serde_json::from_str::<Vec<Resource>>(resources_json) {
++            Ok(resources) => {
++                self.inner.use_resources(resources);
++                operation_success()
++            }
++            Err(error) => operation_error(error),
++        }
++    }
++}
++
++struct ChromiumDomainResolver;
++
++impl ResolvesDomain for ChromiumDomainResolver {
++    fn get_host_domain(&self, host: &str) -> (usize, usize) {
++        let_cxx_string!(host = host);
++        let position = ffi::resolve_domain_position(&host);
++        (position.start as usize, position.end as usize)
++    }
++}
++
++pub fn install_domain_resolver() -> bool {
++    static INSTALLED: OnceLock<bool> = OnceLock::new();
++    *INSTALLED.get_or_init(|| {
++        adblock::url_parser::set_domain_resolver(Box::new(ChromiumDomainResolver))
++            .is_ok()
++    })
++}

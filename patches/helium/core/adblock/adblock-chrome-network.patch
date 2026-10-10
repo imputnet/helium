@@ -1,0 +1,509 @@
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -20,6 +20,7 @@ import("//components/captive_portal/core
+ import("//components/compose/features.gni")
+ import("//components/enterprise/buildflags/buildflags.gni")
+ import("//components/guest_view/buildflags/buildflags.gni")
++import("//components/helium_adblock/features.gni")
+ import("//components/lens/features.gni")
+ import("//components/offline_pages/buildflags/features.gni")
+ import("//components/on_device_translation/buildflags/features.gni")
+@@ -1164,6 +1165,7 @@ source_set("core") {
+     "//components/headless/select_file_dialog",
+     "//components/heap_profiling/in_process",
+     "//components/heavy_ad_intervention",
++    "//components/helium_adblock:buildflags",
+     "//components/history/content/browser",
+     "//components/history_clusters/core",
+     "//components/history_clusters/history_clusters_internals/webui",
+@@ -1875,6 +1877,10 @@ source_set("core") {
+     deps += [ "//chrome/browser/ui/webui/skills" ]
+   }
+ 
++  if (enable_native_adblock) {
++    deps += [ "//chrome/browser/helium_adblock" ]
++  }
++
+   if (enable_pdf) {
+     deps += [
+       "//chrome/browser/pdf",
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -275,6 +275,7 @@
+ #include "components/google/core/common/google_switches.h"
+ #include "components/guest_view/browser/guest_view_base.h"
+ #include "components/guest_view/buildflags/buildflags.h"
++#include "components/helium_adblock/buildflags.h"
+ #include "components/heap_profiling/in_process/heap_profiler_controller.h"
+ #include "components/keep_alive_registry/keep_alive_types.h"
+ #include "components/keep_alive_registry/scoped_keep_alive.h"
+@@ -458,6 +459,10 @@
+ #include "url/third_party/mozilla/url_parse.h"
+ #include "url/url_constants.h"
+ 
++#if BUILDFLAG(NATIVE_ADBLOCK)
++#include "chrome/browser/helium_adblock/helium_adblock_url_loader_factory.h"
++#endif
++
+ #if BUILDFLAG(IS_WIN)
+ #include "base/files/file_util.h"
+ #include "base/strings/string_tokenizer.h"
+@@ -6721,6 +6726,11 @@ void ChromeContentBrowserClient::WillCre
+       frame, type == URLLoaderFactoryType::kNavigation, request_initiator,
+       isolation_info, factory_builder);
+ 
++#if BUILDFLAG(NATIVE_ADBLOCK)
++  helium_adblock::HeliumAdBlockURLLoaderFactory::MaybeProxyRequest(
++      browser_context, request_initiator, isolation_info, factory_builder);
++#endif
++
+ #if BUILDFLAG(ENABLE_CAPTIVE_PORTAL_DETECTION)
+   if (disable_secure_dns) {
+     WebContents* web_contents = WebContents::FromRenderFrameHost(frame);
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_url_loader_factory.cc
+@@ -0,0 +1,308 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/helium_adblock/helium_adblock_url_loader_factory.h"
++
++#include <memory>
++#include <optional>
++#include <string_view>
++#include <utility>
++
++#include "base/byte_size.h"
++#include "base/check.h"
++#include "base/feature_list.h"
++#include "base/functional/bind.h"
++#include "base/memory/self_deleting.h"
++#include "chrome/browser/helium_adblock/helium_adblock_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/helium_adblock/core/features.h"
++#include "components/helium_adblock/core/helium_adblock_service.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "mojo/public/cpp/system/data_pipe.h"
++#include "mojo/public/cpp/system/data_pipe_producer.h"
++#include "mojo/public/cpp/system/string_data_source.h"
++#include "net/base/data_url.h"
++#include "net/base/net_errors.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/url_loader_factory_builder.h"
++#include "services/network/public/mojom/fetch_api.mojom.h"
++#include "services/network/public/mojom/url_loader.mojom.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "url/url_constants.h"
++
++namespace helium_adblock {
++namespace {
++
++struct RedirectWriteData {
++  mojo::Remote<network::mojom::URLLoaderClient> client;
++  std::string data;
++  std::unique_ptr<mojo::DataPipeProducer> producer;
++};
++
++void OnRedirectDataWritten(std::unique_ptr<RedirectWriteData> write_data,
++                           MojoResult result) {
++  if (result != MOJO_RESULT_OK) {
++    write_data->client->OnComplete(
++        network::URLLoaderCompletionStatus(net::ERR_FAILED));
++    return;
++  }
++
++  network::URLLoaderCompletionStatus status(net::OK);
++  status.encoded_data_length = base::ByteSize(write_data->data.size());
++  status.encoded_body_length = base::ByteSize(write_data->data.size());
++  status.decoded_body_length = base::ByteSize(write_data->data.size());
++  write_data->client->OnComplete(status);
++}
++
++void SendBlockedResponse(
++    mojo::PendingRemote<network::mojom::URLLoaderClient> client) {
++  mojo::Remote<network::mojom::URLLoaderClient>(std::move(client))
++      ->OnComplete(
++          network::URLLoaderCompletionStatus(net::ERR_BLOCKED_BY_CLIENT));
++}
++
++void SendRedirectResponse(
++    const GURL& redirect_url,
++    const std::string& method,
++    mojo::PendingRemote<network::mojom::URLLoaderClient> client) {
++  std::string data;
++  auto response = network::mojom::URLResponseHead::New();
++  net::Error result = net::DataURL::BuildResponse(
++      redirect_url, method, &response->mime_type, &response->charset, &data,
++      &response->headers);
++
++  mojo::Remote<network::mojom::URLLoaderClient> client_remote(
++      std::move(client));
++  if (result != net::OK) {
++    client_remote->OnComplete(network::URLLoaderCompletionStatus(result));
++    return;
++  }
++
++  mojo::ScopedDataPipeProducerHandle producer;
++  mojo::ScopedDataPipeConsumerHandle consumer;
++  if (mojo::CreateDataPipe(nullptr, producer, consumer) != MOJO_RESULT_OK) {
++    client_remote->OnComplete(
++        network::URLLoaderCompletionStatus(net::ERR_INSUFFICIENT_RESOURCES));
++    return;
++  }
++
++  client_remote->OnReceiveResponse(std::move(response), std::move(consumer),
++                                   std::nullopt);
++
++  auto write_data = std::make_unique<RedirectWriteData>();
++  write_data->client = std::move(client_remote);
++  write_data->data = std::move(data);
++  write_data->producer =
++      std::make_unique<mojo::DataPipeProducer>(std::move(producer));
++
++  mojo::DataPipeProducer* producer_ptr = write_data->producer.get();
++  std::string_view contents(write_data->data);
++  producer_ptr->Write(
++      std::make_unique<mojo::StringDataSource>(
++          contents, mojo::StringDataSource::AsyncWritingMode::
++                        STRING_STAYS_VALID_UNTIL_COMPLETION),
++      base::BindOnce(&OnRedirectDataWritten, std::move(write_data)));
++}
++
++std::string RequestTypeForDestination(
++    network::mojom::RequestDestination destination) {
++  using RequestDestination = network::mojom::RequestDestination;
++  switch (destination) {
++    case RequestDestination::kDocument:
++      return "document";
++    case RequestDestination::kFrame:
++    case RequestDestination::kIframe:
++    case RequestDestination::kFencedframe:
++      return "subdocument";
++    case RequestDestination::kImage:
++      return "image";
++    case RequestDestination::kAudio:
++    case RequestDestination::kTrack:
++    case RequestDestination::kVideo:
++      return "media";
++    case RequestDestination::kFont:
++      return "font";
++    case RequestDestination::kScript:
++    case RequestDestination::kServiceWorker:
++    case RequestDestination::kSharedWorker:
++    case RequestDestination::kWorker:
++    case RequestDestination::kAudioWorklet:
++    case RequestDestination::kPaintWorklet:
++    case RequestDestination::kSpeculationRules:
++    case RequestDestination::kJson:
++    case RequestDestination::kText:
++      return "script";
++    case RequestDestination::kStyle:
++      return "stylesheet";
++    case RequestDestination::kEmpty:
++      return "xmlhttprequest";
++    case RequestDestination::kEmbed:
++    case RequestDestination::kObject:
++      return "object";
++    case RequestDestination::kXslt:
++      return "xslt";
++    case RequestDestination::kManifest:
++    case RequestDestination::kReport:
++    case RequestDestination::kWebBundle:
++    case RequestDestination::kWebIdentity:
++    case RequestDestination::kCompressionDictionary:
++    case RequestDestination::kEmailVerification:
++      return "other";
++  }
++  return "other";
++}
++
++GURL OriginURL(const std::optional<url::Origin>& origin) {
++  return origin && !origin->opaque() ? origin->GetURL() : GURL();
++}
++
++}  // namespace
++
++HeliumAdBlockURLLoaderFactory::HeliumAdBlockURLLoaderFactory(
++    mojo::PendingReceiver<network::mojom::URLLoaderFactory> receiver,
++    mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
++    Profile* profile,
++    HeliumAdBlockService* service,
++    url::Origin request_initiator,
++    net::IsolationInfo isolation_info,
++    base::SelfDeletingPassKey pass_key)
++    : network::SelfDeletingURLLoaderFactory(std::move(receiver), pass_key),
++      profile_(profile),
++      service_(service),
++      off_the_record_(profile->IsOffTheRecord()),
++      request_initiator_(std::move(request_initiator)),
++      isolation_info_(std::move(isolation_info)) {
++  profile_observation_.Observe(profile_);
++  target_factory_.Bind(std::move(target_factory));
++  target_factory_.set_disconnect_handler(base::BindOnce(
++      &HeliumAdBlockURLLoaderFactory::OnTargetFactoryDisconnected,
++      base::Unretained(this)));
++}
++
++HeliumAdBlockURLLoaderFactory::~HeliumAdBlockURLLoaderFactory() = default;
++
++// static
++void HeliumAdBlockURLLoaderFactory::MaybeProxyRequest(
++    content::BrowserContext* browser_context,
++    const url::Origin& request_initiator,
++    const net::IsolationInfo& isolation_info,
++    network::URLLoaderFactoryBuilder& factory_builder) {
++  if (!base::FeatureList::IsEnabled(kHeliumAdBlock)) {
++    return;
++  }
++
++  Profile* profile = Profile::FromBrowserContext(browser_context);
++  HeliumAdBlockService* service =
++      HeliumAdBlockServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return;
++  }
++
++  auto [receiver, remote] = factory_builder.Append();
++  base::MakeSelfDeleting<HeliumAdBlockURLLoaderFactory>(
++      std::move(receiver), std::move(remote), profile, service,
++      request_initiator, isolation_info);
++}
++
++void HeliumAdBlockURLLoaderFactory::CreateLoaderAndStart(
++    mojo::PendingReceiver<network::mojom::URLLoader> loader,
++    int32_t request_id,
++    uint32_t options,
++    const network::ResourceRequest& request,
++    mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++    const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  GURL document_url = GetDocumentURL(request);
++  if (!request.url.SchemeIsHTTPOrHTTPS() ||
++      !service_->IsEnabledForURL(document_url, off_the_record_)) {
++    ForwardRequest(std::move(loader), request_id, options, request,
++                   std::move(client), traffic_annotation);
++    return;
++  }
++
++  service_->MatchRequest(
++      request.url, document_url, RequestTypeForDestination(request.destination),
++      request.method, off_the_record_,
++      base::BindOnce(&HeliumAdBlockURLLoaderFactory::OnRequestMatched,
++                     weak_ptr_factory_.GetWeakPtr(), std::move(loader),
++                     request_id, options, request, std::move(client),
++                     traffic_annotation));
++}
++
++void HeliumAdBlockURLLoaderFactory::OnProfileWillBeDestroyed(
++    Profile* profile) {
++  CHECK_EQ(profile_, profile);
++  if (off_the_record_) {
++    service_->OnIncognitoSessionEnded();
++  }
++  profile_observation_.Reset();
++  profile_ = nullptr;
++  service_ = nullptr;
++  DisconnectReceiversAndDestroy();
++}
++
++GURL HeliumAdBlockURLLoaderFactory::GetDocumentURL(
++    const network::ResourceRequest& request) const {
++  if (request.destination == network::mojom::RequestDestination::kDocument) {
++    return request.url;
++  }
++  if (GURL initiator = OriginURL(request.request_initiator);
++      !initiator.is_empty()) {
++    return initiator;
++  }
++  if (!request_initiator_.opaque()) {
++    return request_initiator_.GetURL();
++  }
++  if (GURL frame = OriginURL(isolation_info_.frame_origin());
++      !frame.is_empty()) {
++    return frame;
++  }
++  return OriginURL(isolation_info_.top_frame_origin());
++}
++
++void HeliumAdBlockURLLoaderFactory::OnRequestMatched(
++    mojo::PendingReceiver<network::mojom::URLLoader> loader,
++    int32_t request_id,
++    uint32_t options,
++    network::ResourceRequest request,
++    mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++    net::MutableNetworkTrafficAnnotationTag traffic_annotation,
++    NetworkMatchResult result) {
++  if (result.blocked && !result.has_exception) {
++    GURL redirect_url(result.redirect);
++    if (redirect_url.SchemeIs(url::kDataScheme)) {
++      SendRedirectResponse(redirect_url, request.method, std::move(client));
++    } else {
++      SendBlockedResponse(std::move(client));
++    }
++    return;
++  }
++
++  if (!result.has_exception && !result.rewritten_url.empty()) {
++    GURL rewritten_url(result.rewritten_url);
++    if (rewritten_url.SchemeIsHTTPOrHTTPS()) {
++      request.url = std::move(rewritten_url);
++    }
++  }
++
++  ForwardRequest(std::move(loader), request_id, options, request,
++                 std::move(client), traffic_annotation);
++}
++
++void HeliumAdBlockURLLoaderFactory::ForwardRequest(
++    mojo::PendingReceiver<network::mojom::URLLoader> loader,
++    int32_t request_id,
++    uint32_t options,
++    const network::ResourceRequest& request,
++    mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++    const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
++  target_factory_->CreateLoaderAndStart(std::move(loader), request_id, options,
++                                        request, std::move(client),
++                                        traffic_annotation);
++}
++
++void HeliumAdBlockURLLoaderFactory::OnTargetFactoryDisconnected() {
++  DisconnectReceiversAndDestroy();
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_url_loader_factory.h
+@@ -0,0 +1,109 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_URL_LOADER_FACTORY_H_
++#define CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_URL_LOADER_FACTORY_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/profiles/profile_observer.h"
++#include "components/helium_adblock/core/adblock_types.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "net/base/isolation_info.h"
++#include "services/network/public/cpp/self_deleting_url_loader_factory.h"
++#include "services/network/public/mojom/url_loader_factory.mojom.h"
++#include "url/origin.h"
++
++namespace content {
++class BrowserContext;
++}
++
++namespace network {
++struct ResourceRequest;
++class URLLoaderFactoryBuilder;
++}
++
++class Profile;
++
++namespace helium_adblock {
++
++class HeliumAdBlockService;
++
++// Applies Helium's network filtering before requests reach Chromium's network
++// service. One proxy is created for each content URLLoaderFactory and lives as
++// long as its Mojo connection.
++class HeliumAdBlockURLLoaderFactory final
++    : public network::SelfDeletingURLLoaderFactory,
++      public ProfileObserver {
++ public:
++  HeliumAdBlockURLLoaderFactory(
++      mojo::PendingReceiver<network::mojom::URLLoaderFactory> receiver,
++      mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
++      Profile* profile,
++      HeliumAdBlockService* service,
++      url::Origin request_initiator,
++      net::IsolationInfo isolation_info,
++      base::SelfDeletingPassKey pass_key);
++  HeliumAdBlockURLLoaderFactory(const HeliumAdBlockURLLoaderFactory&) = delete;
++  HeliumAdBlockURLLoaderFactory& operator=(
++      const HeliumAdBlockURLLoaderFactory&) = delete;
++
++  static void MaybeProxyRequest(
++      content::BrowserContext* browser_context,
++      const url::Origin& request_initiator,
++      const net::IsolationInfo& isolation_info,
++      network::URLLoaderFactoryBuilder& factory_builder);
++
++  // network::mojom::URLLoaderFactory:
++  void CreateLoaderAndStart(
++      mojo::PendingReceiver<network::mojom::URLLoader> loader,
++      int32_t request_id,
++      uint32_t options,
++      const network::ResourceRequest& request,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
++      override;
++
++  // ProfileObserver:
++  void OnProfileWillBeDestroyed(Profile* profile) override;
++
++ private:
++  ~HeliumAdBlockURLLoaderFactory() override;
++
++  GURL GetDocumentURL(const network::ResourceRequest& request) const;
++  void OnRequestMatched(
++      mojo::PendingReceiver<network::mojom::URLLoader> loader,
++      int32_t request_id,
++      uint32_t options,
++      network::ResourceRequest request,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      net::MutableNetworkTrafficAnnotationTag traffic_annotation,
++      NetworkMatchResult result);
++  void ForwardRequest(
++      mojo::PendingReceiver<network::mojom::URLLoader> loader,
++      int32_t request_id,
++      uint32_t options,
++      const network::ResourceRequest& request,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation);
++  void OnTargetFactoryDisconnected();
++
++  raw_ptr<Profile> profile_;
++  raw_ptr<HeliumAdBlockService> service_;
++  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
++  const bool off_the_record_;
++  const url::Origin request_initiator_;
++  const net::IsolationInfo isolation_info_;
++  mojo::Remote<network::mojom::URLLoaderFactory> target_factory_;
++  base::WeakPtrFactory<HeliumAdBlockURLLoaderFactory> weak_ptr_factory_{this};
++};
++
++}  // namespace helium_adblock
++
++#endif  // CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_URL_LOADER_FACTORY_H_
+--- a/chrome/browser/helium_adblock/BUILD.gn
++++ b/chrome/browser/helium_adblock/BUILD.gn
+@@ -12,6 +12,8 @@ source_set("helium_adblock") {
+     "helium_adblock_client_chrome.h",
+     "helium_adblock_service_factory.cc",
+     "helium_adblock_service_factory.h",
++    "helium_adblock_url_loader_factory.cc",
++    "helium_adblock_url_loader_factory.h",
+   ]
+ 
+   public_deps = [ "//components/helium_adblock/core" ]
+@@ -25,7 +27,12 @@ source_set("helium_adblock") {
+     "//components/keyed_service/content",
+     "//components/pref_registry",
+     "//content/public/browser",
++    "//mojo/public/cpp/bindings",
++    "//mojo/public/cpp/system",
++    "//net",
+     "//services/network/public/cpp",
++    "//services/network/public/mojom",
+     "//ui/base",
++    "//url",
+   ]
+ }

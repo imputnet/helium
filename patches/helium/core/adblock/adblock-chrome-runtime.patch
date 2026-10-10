@@ -1,0 +1,385 @@
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -19,6 +19,7 @@ import("//chrome/browser/buildflags.gni"
+ import("//chrome/chrome_paks.gni")
+ import("//chrome/common/features.gni")
+ import("//chrome/process_version_rc_template.gni")
++import("//components/helium_adblock/features.gni")
+ import("//components/optimization_guide/features.gni")
+ import("//content/public/common/features.gni")
+ import("//extensions/buildflags/buildflags.gni")
+@@ -173,6 +174,12 @@ if (!is_android && !is_mac) {
+     data = [ "$root_out_dir/resources.pak" ]
+     data_deps = []
+ 
++    if (enable_native_adblock) {
++      data_deps += [
++        "//components/helium_adblock/resources:adblock_desktop_assets",
++      ]
++    }
++
+     if (is_win || is_linux || is_chromeos) {
+       deps += [ "//components/webapps/isolated_web_apps:scheme" ]
+     }
+@@ -1089,6 +1096,12 @@ if (is_win) {
+       "//chrome/browser/mac:install",
+     ]
+ 
++    if (enable_native_adblock) {
++      public_deps += [
++        "//components/helium_adblock/resources:adblock_desktop_assets",
++      ]
++    }
++
+     if (icu_use_data_file) {
+       sources += [ "$root_out_dir/icudtl.dat" ]
+       public_deps += [ "//third_party/icu:icudata" ]
+--- /dev/null
++++ b/chrome/browser/helium_adblock/BUILD.gn
+@@ -0,0 +1,31 @@
++# Copyright 2026 The Helium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//components/helium_adblock/features.gni")
++
++assert(enable_native_adblock)
++
++source_set("helium_adblock") {
++  sources = [
++    "helium_adblock_client_chrome.cc",
++    "helium_adblock_client_chrome.h",
++    "helium_adblock_service_factory.cc",
++    "helium_adblock_service_factory.h",
++  ]
++
++  public_deps = [ "//components/helium_adblock/core" ]
++
++  deps = [
++    "//base",
++    "//chrome/browser:browser_process",
++    "//chrome/browser/profiles:profile",
++    "//chrome/common:constants",
++    "//components/helium_adblock/resources:adblock_filters",
++    "//components/keyed_service/content",
++    "//components/pref_registry",
++    "//content/public/browser",
++    "//services/network/public/cpp",
++    "//ui/base",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_service_factory.cc
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/helium_adblock/helium_adblock_service_factory.h"
++
++#include <memory>
++
++#include "chrome/browser/helium_adblock/helium_adblock_client_chrome.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_selections.h"
++#include "components/helium_adblock/core/helium_adblock_service.h"
++#include "components/helium_adblock/core/pref_names.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++
++namespace helium_adblock {
++
++// static
++HeliumAdBlockService* HeliumAdBlockServiceFactory::GetForProfile(
++    Profile* profile) {
++  return static_cast<HeliumAdBlockService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++// static
++HeliumAdBlockServiceFactory* HeliumAdBlockServiceFactory::GetInstance() {
++  static base::NoDestructor<HeliumAdBlockServiceFactory> instance;
++  return instance.get();
++}
++
++HeliumAdBlockServiceFactory::HeliumAdBlockServiceFactory()
++    : ProfileKeyedServiceFactory(
++          "HeliumAdBlockService",
++          ProfileSelections::BuildRedirectedInIncognito()) {}
++
++HeliumAdBlockServiceFactory::~HeliumAdBlockServiceFactory() = default;
++
++std::unique_ptr<KeyedService>
++HeliumAdBlockServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  Profile* profile = Profile::FromBrowserContext(context);
++  return std::make_unique<HeliumAdBlockService>(
++      profile->GetPrefs(), profile->GetPath(),
++      std::make_unique<HeliumAdBlockClientChrome>(profile));
++}
++
++void HeliumAdBlockServiceFactory::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterBooleanPref(prefs::kHeliumAdBlockEnabled, false);
++  registry->RegisterDictionaryPref(prefs::kHeliumAdBlockSourceOverrides);
++  registry->RegisterListPref(prefs::kHeliumAdBlockCustomSources);
++  registry->RegisterListPref(prefs::kHeliumAdBlockSiteExceptions);
++  registry->RegisterBooleanPref(
++      prefs::kHeliumAdBlockRegionalDefaultsInitialized, false);
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_service_factory.h
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_SERVICE_FACTORY_H_
++#define CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_SERVICE_FACTORY_H_
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace helium_adblock {
++
++class HeliumAdBlockService;
++
++class HeliumAdBlockServiceFactory final : public ProfileKeyedServiceFactory {
++ public:
++  static HeliumAdBlockService* GetForProfile(Profile* profile);
++  static HeliumAdBlockServiceFactory* GetInstance();
++
++  HeliumAdBlockServiceFactory(const HeliumAdBlockServiceFactory&) = delete;
++  HeliumAdBlockServiceFactory& operator=(const HeliumAdBlockServiceFactory&) =
++      delete;
++
++ private:
++  friend base::NoDestructor<HeliumAdBlockServiceFactory>;
++
++  HeliumAdBlockServiceFactory();
++  ~HeliumAdBlockServiceFactory() override;
++
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  void RegisterProfilePrefs(
++      user_prefs::PrefRegistrySyncable* registry) override;
++};
++
++}  // namespace helium_adblock
++
++#endif  // CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_SERVICE_FACTORY_H_
+--- a/chrome/browser/profiles/BUILD.gn
++++ b/chrome/browser/profiles/BUILD.gn
+@@ -6,6 +6,7 @@ import("//chrome/common/features.gni")
+ import("//components/captive_portal/core/features.gni")
+ import("//components/enterprise/buildflags/buildflags.gni")
+ import("//components/guest_view/buildflags/buildflags.gni")
++import("//components/helium_adblock/features.gni")
+ import("//components/offline_pages/buildflags/features.gni")
+ import("//components/on_device_translation/buildflags/features.gni")
+ import("//components/signin/features.gni")
+@@ -868,6 +869,7 @@ source_set("profiles_extra_parts_impl")
+     "//components/commerce/core:feature_list",
+     "//components/commerce/core:persisted_state_db_content_proto",
+     "//components/enterprise/content",
++    "//components/helium_adblock:buildflags",
+     "//components/manta",
+     "//components/omnibox/browser",
+     "//components/optimization_guide/core",
+@@ -893,6 +895,10 @@ source_set("profiles_extra_parts_impl")
+     "//chrome/browser/search/background",
+   ]
+ 
++  if (enable_native_adblock) {
++    deps += [ "//chrome/browser/helium_adblock" ]
++  }
++
+   if (is_android) {
+     deps += [
+       "//chrome/browser/auxiliary_search",
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -299,6 +299,7 @@
+ #include "components/commerce/core/proto/persisted_state_db_content.pb.h"
+ #include "components/enterprise/buildflags/buildflags.h"
+ #include "components/enterprise/content/clipboard_restriction_service.h"
++#include "components/helium_adblock/buildflags.h"
+ #include "components/offline_pages/buildflags/buildflags.h"
+ #include "components/on_device_translation/buildflags/buildflags.h"
+ #include "components/password_manager/content/browser/password_manager_log_router_factory.h"
+@@ -326,6 +327,10 @@
+ #include "ui/base/device_form_factor.h"
+ #include "ui/webui/buildflags.h"
+ 
++#if BUILDFLAG(NATIVE_ADBLOCK)
++#include "chrome/browser/helium_adblock/helium_adblock_service_factory.h"
++#endif
++
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
+     BUILDFLAG(IS_CHROMEOS)
+ #include "components/enterprise/network_header_injection/core/features.h"  // nogncheck
+@@ -1087,6 +1092,9 @@ void ChromeBrowserMainExtraPartsProfiles
+   GoogleGroupsManagerFactory::GetInstance();
+   HatsServiceFactory::GetInstance();
+   HeavyAdServiceFactory::GetInstance();
++#if BUILDFLAG(NATIVE_ADBLOCK)
++  helium_adblock::HeliumAdBlockServiceFactory::GetInstance();
++#endif
+   HidChooserContextFactory::GetInstance();
+   HidPolicyAllowedDevicesFactory::GetInstance();
+ #if !BUILDFLAG(IS_ANDROID)
+--- a/chrome/chrome_paks.gni
++++ b/chrome/chrome_paks.gni
+@@ -9,6 +9,7 @@ import("//chrome/browser/buildflags.gni"
+ import("//chrome/common/features.gni")
+ import("//components/compose/features.gni")
+ import("//components/enterprise/buildflags/buildflags.gni")
++import("//components/helium_adblock/features.gni")
+ import("//components/safe_browsing/buildflags.gni")
+ import("//extensions/buildflags/buildflags.gni")
+ import("//pdf/features.gni")
+@@ -191,6 +192,13 @@ template("chrome_extra_paks") {
+       sources += invoker.additional_paks
+     }
+ 
++    if (enable_native_adblock) {
++      sources += [
++        "$root_gen_dir/components/helium_adblock/resources/adblock_filters/adblock_filters.pak",
++      ]
++      deps += [ "//components/helium_adblock/resources:adblock_filters" ]
++    }
++
+     if (enable_extensions_core) {
+       sources += [
+         "$root_gen_dir/chrome/component_extension_resources.pak",
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_client_chrome.cc
+@@ -0,0 +1,84 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/helium_adblock/helium_adblock_client_chrome.h"
++
++#include <optional>
++#include <string>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/path_service.h"
++#include "build/build_config.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/chrome_paths.h"
++#include "components/helium_adblock/resources/adblock_filters/grit/adblock_filters_map.h"
++#include "content/public/browser/storage_partition.h"
++#include "ui/base/resource/resource_bundle.h"
++
++namespace helium_adblock {
++namespace {
++
++std::optional<int> FindBundledResourceId(const std::string& path) {
++  for (const webui::ResourcePath& resource : kAdblockFilters) {
++    if (path == resource.path) {
++      return resource.id;
++    }
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> ReadBundledResource(const std::string& path) {
++  std::optional<int> resource_id = FindBundledResourceId(path);
++  if (!resource_id) {
++    return std::nullopt;
++  }
++  return ui::ResourceBundle::GetSharedInstance().LoadDataResourceString(
++      *resource_id);
++}
++
++}  // namespace
++
++HeliumAdBlockClientChrome::HeliumAdBlockClientChrome(Profile* profile)
++    : profile_(profile) {
++  CHECK(profile_);
++  CHECK_EQ(profile_, profile_->GetOriginalProfile());
++}
++
++HeliumAdBlockClientChrome::~HeliumAdBlockClientChrome() = default;
++
++scoped_refptr<network::SharedURLLoaderFactory>
++HeliumAdBlockClientChrome::GetURLLoaderFactory() {
++  return profile_->GetDefaultStoragePartition()
++      ->GetURLLoaderFactoryForBrowserProcess();
++}
++
++std::string HeliumAdBlockClientChrome::GetApplicationLocale() {
++  return g_browser_process->GetApplicationLocale();
++}
++
++bool HeliumAdBlockClientChrome::IsMobilePlatform() const {
++  return BUILDFLAG(IS_ANDROID);
++}
++
++base::FilePath HeliumAdBlockClientChrome::GetBundledAssetsRoot() {
++  base::FilePath resources_directory;
++  if (!base::PathService::Get(chrome::DIR_RESOURCES, &resources_directory)) {
++    return base::FilePath();
++  }
++  return resources_directory.AppendASCII("helium_adblock");
++}
++
++HeliumAdBlockClient::BundledListReader
++HeliumAdBlockClientChrome::GetBundledListReader() {
++  return {
++      .has = base::BindRepeating([](const std::string& path) {
++        return FindBundledResourceId(path).has_value();
++      }),
++      .read = base::BindRepeating(&ReadBundledResource),
++  };
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_client_chrome.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_CLIENT_CHROME_H_
++#define CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_CLIENT_CHROME_H_
++
++#include "base/memory/raw_ptr.h"
++#include "components/helium_adblock/core/helium_adblock_client.h"
++
++class Profile;
++
++namespace helium_adblock {
++
++class HeliumAdBlockClientChrome final : public HeliumAdBlockClient {
++ public:
++  explicit HeliumAdBlockClientChrome(Profile* profile);
++  ~HeliumAdBlockClientChrome() override;
++
++  HeliumAdBlockClientChrome(const HeliumAdBlockClientChrome&) = delete;
++  HeliumAdBlockClientChrome& operator=(const HeliumAdBlockClientChrome&) =
++      delete;
++
++  scoped_refptr<network::SharedURLLoaderFactory> GetURLLoaderFactory() override;
++  std::string GetApplicationLocale() override;
++  bool IsMobilePlatform() const override;
++  base::FilePath GetBundledAssetsRoot() override;
++  BundledListReader GetBundledListReader() override;
++
++ private:
++  raw_ptr<Profile> profile_;
++};
++
++}  // namespace helium_adblock
++
++#endif  // CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_CLIENT_CHROME_H_

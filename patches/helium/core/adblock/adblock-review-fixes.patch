@@ -1,0 +1,526 @@
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -409,6 +409,7 @@
+ #include "net/base/url_util.h"
+ #include "net/cookies/cookie_setting_override.h"
+ #include "net/cookies/site_for_cookies.h"
++#include "net/http/http_request_headers.h"
+ #include "net/ssl/client_cert_store.h"
+ #include "net/ssl/ssl_cert_request_info.h"
+ #include "net/ssl/ssl_private_key.h"
+@@ -461,6 +462,7 @@
+ 
+ #if BUILDFLAG(NATIVE_ADBLOCK)
+ #include "chrome/browser/helium_adblock/helium_adblock_url_loader_factory.h"
++#include "chrome/browser/helium_adblock/helium_adblock_websocket.h"
+ #endif
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -6846,10 +6848,15 @@ ChromeContentBrowserClient::
+ 
+ bool ChromeContentBrowserClient::WillInterceptWebSocket(
+     content::RenderFrameHost* frame) {
+-#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   if (!frame) {
+     return false;
+   }
++#if BUILDFLAG(NATIVE_ADBLOCK)
++  if (helium_adblock::ShouldInterceptWebSocket(frame)) {
++    return true;
++  }
++#endif
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   const auto* web_request_api =
+       extensions::BrowserContextKeyedAPIFactory<extensions::WebRequestAPI>::Get(
+           frame->GetBrowserContext());
+@@ -6891,6 +6898,9 @@ void ChromeContentBrowserClient::CreateW
+     mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+         handshake_client,
+     content::ContentBrowserClient::WebSocketOptions options) {
++#if BUILDFLAG(NATIVE_ADBLOCK)
++  factory = helium_adblock::MaybeWrapWebSocketFactory(frame, std::move(factory));
++#endif
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   // TODO(crbug.com/40195467): Request w/o a frame also should be proxied.
+   if (!frame) {
+@@ -6900,11 +6910,21 @@ void ChromeContentBrowserClient::CreateW
+       extensions::BrowserContextKeyedAPIFactory<extensions::WebRequestAPI>::Get(
+           frame->GetBrowserContext());
+ 
+-  DCHECK(web_request_api);
+-  web_request_api->ProxyWebSocket(
+-      frame, std::move(factory), url, site_for_cookies, user_agent,
+-      std::move(handshake_client), std::move(options.header_client));
++  if (web_request_api && web_request_api->MayHaveProxiesForFrame(frame)) {
++    web_request_api->ProxyWebSocket(
++        frame, std::move(factory), url, site_for_cookies, user_agent,
++        std::move(handshake_client), std::move(options.header_client));
++    return;
++  }
+ #endif
++  std::vector<network::mojom::HttpHeaderPtr> additional_headers;
++  if (user_agent) {
++    additional_headers.push_back(network::mojom::HttpHeader::New(
++        net::HttpRequestHeaders::kUserAgent, *user_agent));
++  }
++  std::move(factory).Run(url, std::move(additional_headers),
++                         std::move(handshake_client), mojo::NullRemote(),
++                         std::move(options.header_client));
+ }
+ 
+ void ChromeContentBrowserClient::WillCreateWebTransport(
+--- a/chrome/browser/helium_adblock/BUILD.gn
++++ b/chrome/browser/helium_adblock/BUILD.gn
+@@ -16,6 +16,8 @@ source_set("helium_adblock") {
+     "helium_adblock_service_factory.h",
+     "helium_adblock_url_loader_factory.cc",
+     "helium_adblock_url_loader_factory.h",
++    "helium_adblock_websocket.cc",
++    "helium_adblock_websocket.h",
+   ]
+ 
+   public_deps = [ "//components/helium_adblock/core" ]
+--- a/chrome/browser/helium_adblock/helium_adblock_url_loader_factory.cc
++++ b/chrome/browser/helium_adblock/helium_adblock_url_loader_factory.cc
+@@ -24,11 +24,13 @@
+ #include "mojo/public/cpp/system/string_data_source.h"
+ #include "net/base/data_url.h"
+ #include "net/base/net_errors.h"
++#include "net/http/http_request_headers.h"
+ #include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/cpp/url_loader_factory_builder.h"
+ #include "services/network/public/mojom/fetch_api.mojom.h"
+ #include "services/network/public/mojom/url_loader.mojom.h"
+ #include "services/network/public/mojom/url_response_head.mojom.h"
++#include "third_party/blink/public/mojom/loader/resource_load_info.mojom-shared.h"
+ #include "url/url_constants.h"
+ 
+ namespace helium_adblock {
+@@ -105,10 +107,22 @@ void SendRedirectResponse(
+       base::BindOnce(&OnRedirectDataWritten, std::move(write_data)));
+ }
+ 
+-std::string RequestTypeForDestination(
+-    network::mojom::RequestDestination destination) {
++std::string RequestTypeForRequest(const network::ResourceRequest& request) {
+   using RequestDestination = network::mojom::RequestDestination;
+-  switch (destination) {
++  using ResourceType = blink::mojom::ResourceType;
++
++  switch (static_cast<ResourceType>(request.resource_type)) {
++    case ResourceType::kPing:
++      return "ping";
++    case ResourceType::kCspReport:
++      return "csp_report";
++    case ResourceType::kXhr:
++      return "xmlhttprequest";
++    default:
++      break;
++  }
++
++  switch (request.destination) {
+     case RequestDestination::kDocument:
+       return "document";
+     case RequestDestination::kFrame:
+@@ -136,7 +150,7 @@ std::string RequestTypeForDestination(
+     case RequestDestination::kStyle:
+       return "stylesheet";
+     case RequestDestination::kEmpty:
+-      return "xmlhttprequest";
++      return "other";
+     case RequestDestination::kEmbed:
+     case RequestDestination::kObject:
+       return "object";
+@@ -153,6 +167,12 @@ std::string RequestTypeForDestination(
+   return "other";
+ }
+ 
++bool CanRewriteRequest(std::string_view method) {
++  return method == net::HttpRequestHeaders::kGetMethod ||
++         method == net::HttpRequestHeaders::kHeadMethod ||
++         method == net::HttpRequestHeaders::kOptionsMethod;
++}
++
+ GURL OriginURL(const std::optional<url::Origin>& origin) {
+   return origin && !origin->opaque() ? origin->GetURL() : GURL();
+ }
+@@ -221,8 +241,8 @@ void HeliumAdBlockURLLoaderFactory::Crea
+   }
+ 
+   service_->MatchRequest(
+-      request.url, document_url, RequestTypeForDestination(request.destination),
+-      request.method, off_the_record_,
++      request.url, document_url, RequestTypeForRequest(request), request.method,
++      off_the_record_,
+       base::BindOnce(&HeliumAdBlockURLLoaderFactory::OnRequestMatched,
+                      weak_ptr_factory_.GetWeakPtr(), std::move(loader),
+                      request_id, options, request, std::move(client),
+@@ -268,7 +288,7 @@ void HeliumAdBlockURLLoaderFactory::OnRe
+     mojo::PendingRemote<network::mojom::URLLoaderClient> client,
+     net::MutableNetworkTrafficAnnotationTag traffic_annotation,
+     NetworkMatchResult result) {
+-  if (result.blocked && !result.has_exception) {
++  if (result.blocked) {
+     GURL redirect_url(result.redirect);
+     if (redirect_url.SchemeIs(url::kDataScheme)) {
+       SendRedirectResponse(redirect_url, request.method, std::move(client));
+@@ -278,7 +298,7 @@ void HeliumAdBlockURLLoaderFactory::OnRe
+     return;
+   }
+ 
+-  if (!result.has_exception && !result.rewritten_url.empty()) {
++  if (!result.rewritten_url.empty() && CanRewriteRequest(request.method)) {
+     GURL rewritten_url(result.rewritten_url);
+     if (rewritten_url.SchemeIsHTTPOrHTTPS()) {
+       request.url = std::move(rewritten_url);
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_websocket.cc
+@@ -0,0 +1,118 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/helium_adblock/helium_adblock_websocket.h"
++
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/helium_adblock/helium_adblock_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/helium_adblock/core/helium_adblock_service.h"
++#include "content/public/browser/render_frame_host.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "net/base/net_errors.h"
++#include "net/http/http_request_headers.h"
++#include "services/network/public/mojom/websocket.mojom.h"
++
++namespace helium_adblock {
++namespace {
++
++using WebSocketFactory = content::ContentBrowserClient::WebSocketFactory;
++
++void OnWebSocketMatched(
++    WebSocketFactory factory,
++    GURL url,
++    std::vector<network::mojom::HttpHeaderPtr> additional_headers,
++    mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++        handshake_client,
++    mojo::PendingRemote<network::mojom::WebSocketAuthenticationHandler>
++        authentication_handler,
++    mojo::PendingRemote<network::mojom::TrustedHeaderClient> header_client,
++    NetworkMatchResult result) {
++  if (result.blocked) {
++    mojo::Remote<network::mojom::WebSocketHandshakeClient>(
++        std::move(handshake_client))
++        ->OnFailure(std::string(), net::ERR_BLOCKED_BY_CLIENT, -1);
++    return;
++  }
++
++  if (!result.rewritten_url.empty()) {
++    GURL rewritten_url(result.rewritten_url);
++    if (rewritten_url.SchemeIsWSOrWSS()) {
++      url = std::move(rewritten_url);
++    }
++  }
++
++  std::move(factory).Run(
++      url, std::move(additional_headers), std::move(handshake_client),
++      std::move(authentication_handler), std::move(header_client));
++}
++
++void MatchWebSocket(
++    base::WeakPtr<Profile> profile,
++    GURL document_url,
++    WebSocketFactory factory,
++    const GURL& url,
++    std::vector<network::mojom::HttpHeaderPtr> additional_headers,
++    mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++        handshake_client,
++    mojo::PendingRemote<network::mojom::WebSocketAuthenticationHandler>
++        authentication_handler,
++    mojo::PendingRemote<network::mojom::TrustedHeaderClient> header_client) {
++  if (!profile) {
++    std::move(factory).Run(
++        url, std::move(additional_headers), std::move(handshake_client),
++        std::move(authentication_handler), std::move(header_client));
++    return;
++  }
++
++  HeliumAdBlockService* service =
++      HeliumAdBlockServiceFactory::GetForProfile(profile.get());
++  if (!service) {
++    std::move(factory).Run(
++        url, std::move(additional_headers), std::move(handshake_client),
++        std::move(authentication_handler), std::move(header_client));
++    return;
++  }
++
++  service->MatchRequest(
++      url, document_url, "websocket", net::HttpRequestHeaders::kGetMethod,
++      profile->IsOffTheRecord(),
++      base::BindOnce(&OnWebSocketMatched, std::move(factory), url,
++                     std::move(additional_headers), std::move(handshake_client),
++                     std::move(authentication_handler),
++                     std::move(header_client)));
++}
++
++}  // namespace
++
++bool ShouldInterceptWebSocket(content::RenderFrameHost* frame) {
++  if (!frame) {
++    return false;
++  }
++  Profile* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
++  if (!profile) {
++    return false;
++  }
++  HeliumAdBlockService* service =
++      HeliumAdBlockServiceFactory::GetForProfile(profile);
++  return service && service->IsEnabledForURL(frame->GetLastCommittedURL(),
++                                             profile->IsOffTheRecord());
++}
++
++WebSocketFactory MaybeWrapWebSocketFactory(content::RenderFrameHost* frame,
++                                           WebSocketFactory factory) {
++  if (!ShouldInterceptWebSocket(frame)) {
++    return factory;
++  }
++  Profile* profile = Profile::FromBrowserContext(frame->GetBrowserContext());
++  return base::BindOnce(&MatchWebSocket, profile->GetWeakPtr(),
++                        frame->GetLastCommittedURL(), std::move(factory));
++}
++
++}  // namespace helium_adblock
+--- /dev/null
++++ b/chrome/browser/helium_adblock/helium_adblock_websocket.h
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Helium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_WEBSOCKET_H_
++#define CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_WEBSOCKET_H_
++
++#include "content/public/browser/content_browser_client.h"
++
++namespace content {
++class RenderFrameHost;
++}
++
++namespace helium_adblock {
++
++bool ShouldInterceptWebSocket(content::RenderFrameHost* frame);
++
++content::ContentBrowserClient::WebSocketFactory MaybeWrapWebSocketFactory(
++    content::RenderFrameHost* frame,
++    content::ContentBrowserClient::WebSocketFactory factory);
++
++}  // namespace helium_adblock
++
++#endif  // CHROME_BROWSER_HELIUM_ADBLOCK_HELIUM_ADBLOCK_WEBSOCKET_H_
+--- a/components/helium_adblock/core/adblock_engine_builder.h
++++ b/components/helium_adblock/core/adblock_engine_builder.h
+@@ -12,7 +12,6 @@
+ #include <vector>
+ 
+ #include "base/containers/flat_map.h"
+-#include "base/containers/flat_set.h"
+ #include "base/files/file_path.h"
+ #include "components/helium_adblock/core/adblock_types.h"
+ #include "components/helium_adblock/core/helium_adblock_client.h"
+@@ -39,8 +38,6 @@ struct EngineConfiguration {
+   std::string locale;
+   base::flat_map<std::string, bool> overrides;
+   std::vector<CustomSource> custom_sources;
+-  base::flat_set<std::string> regular_exceptions;
+-  base::flat_set<std::string> incognito_exceptions;
+ };
+ 
+ enum class GenerationFailure {
+--- a/components/helium_adblock/core/adblock_engine_worker.cc
++++ b/components/helium_adblock/core/adblock_engine_worker.cc
+@@ -256,8 +256,6 @@ NetworkMatchResult AdBlockEngineWorker::
+       url.spec(), std::string(url.host()), std::string(document_url.host()),
+       request_type, third_party, method);
+   response.blocked = match.blocked;
+-  response.important = match.important;
+-  response.has_exception = match.has_exception;
+   if (match.has_redirect) {
+     response.redirect = static_cast<std::string>(match.redirect);
+   }
+--- a/components/helium_adblock/core/adblock_types.h
++++ b/components/helium_adblock/core/adblock_types.h
+@@ -54,8 +54,6 @@ struct ServiceState {
+ 
+ struct NetworkMatchResult {
+   bool blocked = false;
+-  bool important = false;
+-  bool has_exception = false;
+   std::string redirect;
+   std::string rewritten_url;
+ };
+--- a/components/helium_adblock/core/helium_adblock_service.cc
++++ b/components/helium_adblock/core/helium_adblock_service.cc
+@@ -246,6 +246,8 @@ void HeliumAdBlockService::StartInitialL
+ 
+ void HeliumAdBlockService::LoadDesiredConfigurationFromPrefs() {
+   desired_ = EngineConfiguration();
++  regular_site_exceptions_.clear();
++  incognito_site_exceptions_.clear();
+   desired_.enabled = prefs_->GetBoolean(prefs::kHeliumAdBlockEnabled);
+   desired_.regional_defaults_initialized =
+       prefs_->GetBoolean(prefs::kHeliumAdBlockRegionalDefaultsInitialized);
+@@ -276,7 +278,7 @@ void HeliumAdBlockService::LoadDesiredCo
+   for (const base::Value& value :
+        prefs_->GetList(prefs::kHeliumAdBlockSiteExceptions)) {
+     if (value.is_string()) {
+-      desired_.regular_exceptions.insert(value.GetString());
++      regular_site_exceptions_.insert(value.GetString());
+     }
+   }
+   state_.enabled = desired_.enabled;
+--- a/components/helium_adblock/core/helium_adblock_service.h
++++ b/components/helium_adblock/core/helium_adblock_service.h
+@@ -42,10 +42,11 @@ class ServiceObserver : public base::Che
+ // bundled asset access, a network loader, and locale information through
+ // HeliumAdBlockClient.
+ //
+-// Configuration mutations (toggles, custom sources, site exceptions) are
+-// applied to an authoritative in-memory configuration synchronously,
+-// persisted to prefs immediately, and compiled asynchronously. Concurrent
+-// mutation requests coalesce into the next compile instead of failing.
++// Configuration mutations are applied to an authoritative in-memory
++// configuration synchronously and persisted to prefs immediately. Filter-list
++// changes are compiled asynchronously, while site exceptions take effect
++// immediately without changing the engine. Concurrent compilation requests
++// coalesce into the next compile instead of failing.
+ class HeliumAdBlockService : public KeyedService {
+  public:
+   using CompletionCallback = base::OnceCallback<void(bool success)>;
+@@ -167,6 +168,8 @@ class HeliumAdBlockService : public Keye
+ 
+   // Authoritative configuration; see class comment.
+   EngineConfiguration desired_;
++  base::flat_set<std::string> regular_site_exceptions_;
++  base::flat_set<std::string> incognito_site_exceptions_;
+   bool rebuild_requested_ = false;
+   bool rebuild_in_progress_ = false;
+   base::OneShotTimer rebuild_debounce_timer_;
+--- a/components/helium_adblock/core/helium_adblock_service_filtering.cc
++++ b/components/helium_adblock/core/helium_adblock_service_filtering.cc
+@@ -7,7 +7,6 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+-#include "base/functional/callback_helpers.h"
+ #include "base/strings/string_util.h"
+ #include "base/values.h"
+ #include "components/helium_adblock/core/features.h"
+@@ -27,10 +26,10 @@ bool HeliumAdBlockService::IsEnabledForU
+   if (!host) {
+     return false;
+   }
+-  if (desired_.regular_exceptions.contains(*host)) {
++  if (regular_site_exceptions_.contains(*host)) {
+     return false;
+   }
+-  return !off_the_record || !desired_.incognito_exceptions.contains(*host);
++  return !off_the_record || !incognito_site_exceptions_.contains(*host);
+ }
+ 
+ void HeliumAdBlockService::SetSiteException(
+@@ -44,17 +43,21 @@ void HeliumAdBlockService::SetSiteExcept
+     return;
+   }
+   base::flat_set<std::string>& exceptions =
+-      off_the_record ? desired_.incognito_exceptions
+-                     : desired_.regular_exceptions;
++      off_the_record ? incognito_site_exceptions_ : regular_site_exceptions_;
++  bool changed = false;
+   if (disabled) {
+-    exceptions.insert(*host);
++    changed = exceptions.insert(*host).second;
+   } else {
+-    exceptions.erase(*host);
++    changed = exceptions.erase(*host) != 0;
++  }
++  if (!changed) {
++    std::move(completion).Run(true);
++    return;
+   }
+   if (!off_the_record) {
+     PersistSiteExceptions();
+   }
+-  RequestRebuild(std::move(completion));
++  std::move(completion).Run(true);
+ }
+ 
+ void HeliumAdBlockService::MatchRequest(
+@@ -134,16 +137,15 @@ void HeliumAdBlockService::GetGenericSel
+ }
+ 
+ void HeliumAdBlockService::OnIncognitoSessionEnded() {
+-  if (desired_.incognito_exceptions.empty()) {
++  if (incognito_site_exceptions_.empty()) {
+     return;
+   }
+-  desired_.incognito_exceptions.clear();
+-  RequestRebuild(base::DoNothing());
++  incognito_site_exceptions_.clear();
+ }
+ 
+ void HeliumAdBlockService::PersistSiteExceptions() {
+   base::ListValue exceptions;
+-  for (const std::string& host : desired_.regular_exceptions) {
++  for (const std::string& host : regular_site_exceptions_) {
+     exceptions.Append(host);
+   }
+   prefs_->SetList(prefs::kHeliumAdBlockSiteExceptions, std::move(exceptions));
+--- a/components/helium_adblock/core/source/adblock_source_downloader.cc
++++ b/components/helium_adblock/core/source/adblock_source_downloader.cc
+@@ -29,11 +29,18 @@ constexpr size_t kMaximumRedirects = 3;
+ constexpr int kMaximumRetries = 2;
+ constexpr base::TimeDelta kDownloadTimeout = base::Seconds(30);
+ 
+-std::optional<std::string> ReadDownloadedFile(const base::FilePath& path) {
++std::optional<std::string> ReadDownloadedFile(base::FilePath path) {
++  if (path.empty()) {
++    return std::nullopt;
++  }
++
+   std::string contents;
+-  if (path.empty() ||
+-      !base::ReadFileToStringWithMaxSize(path, &contents, kMaximumSourceSize) ||
+-      !base::IsStringUTF8(contents)) {
++  const bool read =
++      base::ReadFileToStringWithMaxSize(path, &contents, kMaximumSourceSize);
++  if (!base::DeleteFile(path)) {
++    VLOG(1) << "helium-adblock: failed to delete downloaded temporary file";
++  }
++  if (!read || !base::IsStringUTF8(contents)) {
+     return std::nullopt;
+   }
+   return contents;
+--- a/components/helium_adblock/rs/src/lib.rs
++++ b/components/helium_adblock/rs/src/lib.rs
+@@ -106,8 +106,6 @@ mod ffi {
+ 
+     struct MatchResult {
+         blocked: bool,
+-        important: bool,
+-        has_exception: bool,
+         has_redirect: bool,
+         redirect: String,
+         has_rewritten_url: bool,
+@@ -224,8 +222,6 @@ impl Engine {
+         let has_rewritten_url = result.rewritten_url.is_some();
+         ffi::MatchResult {
+             blocked: result.should_block(),
+-            important: result.important,
+-            has_exception: result.exception.is_some(),
+             has_redirect,
+             redirect: result.redirect.unwrap_or_default(),
+             has_rewritten_url,
