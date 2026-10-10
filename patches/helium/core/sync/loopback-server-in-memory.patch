@@ -440,7 +440,7 @@
      "//components/autofill/core/browser:payments_sync_utils",
 --- /dev/null
 +++ b/components/sync/engine/loopback_server/loopback_server_state_delta.cc
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,296 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -527,6 +527,55 @@
 +}
 +
 +}  // namespace
++
++// static
++std::optional<std::vector<uint8_t>> LoopbackServerStateCodec::CreateDelta(
++    base::span<const uint8_t> before,
++    base::span<const uint8_t> after) {
++  auto base = ParseBoundedProto<sync_pb::LoopbackServerProto>(before);
++  auto resulting = ParseBoundedProto<sync_pb::LoopbackServerProto>(after);
++  if (!base || !resulting || base->version() != resulting->version() ||
++      base->store_birthday() != resulting->store_birthday() ||
++      resulting->last_version_assigned() < base->last_version_assigned() ||
++      !std::ranges::starts_with(resulting->keystore_keys(),
++                                base->keystore_keys())) {
++    return std::nullopt;
++  }
++
++  sync_pb::LoopbackServerStateDelta delta;
++  delta.set_format_version(kLoopbackStateDeltaFormatVersion);
++  delta.set_last_version_assigned(resulting->last_version_assigned());
++  delta.mutable_keystore_keys()->CopyFrom(resulting->keystore_keys());
++
++  const EntityIndex base_entities = IndexState(*base);
++  const EntityIndex resulting_entities = IndexState(*resulting);
++  for (const auto& entity : resulting->entities()) {
++    const auto original = base_entities.find(entity.entity().id_string());
++    if (original != base_entities.end() &&
++        base->entities(original->second).SerializeAsString() ==
++            entity.SerializeAsString()) {
++      continue;
++    }
++    // Replay requires changed entries to advance the server version.
++    if (entity.entity().version() <= base->last_version_assigned()) {
++      return std::nullopt;
++    }
++    delta.add_upserted_entities()->CopyFrom(entity);
++  }
++  for (const auto& entity : base->entities()) {
++    if (!resulting_entities.contains(entity.entity().id_string())) {
++      delta.add_removed_entity_ids(entity.entity().id_string());
++    }
++  }
++  if (delta.upserted_entities().empty() && delta.removed_entity_ids().empty() &&
++      base->last_version_assigned() == resulting->last_version_assigned() &&
++      std::ranges::equal(base->keystore_keys(), resulting->keystore_keys())) {
++    return std::nullopt;
++  }
++
++  auto serialized = SerializeBoundedProto(delta);
++  return serialized ? std::make_optional(std::move(*serialized)) : std::nullopt;
++}
 +
 +SyncVaultStateValidationResult LoopbackServerStateCodec::ValidateSnapshot(
 +    base::span<const uint8_t> state) const {
@@ -690,13 +739,16 @@
 +}  // namespace syncer
 --- /dev/null
 +++ b/components/sync/engine/loopback_server/loopback_server_state_delta.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,38 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#ifndef COMPONENTS_SYNC_ENGINE_LOOPBACK_SERVER_LOOPBACK_SERVER_STATE_DELTA_H_
 +#define COMPONENTS_SYNC_ENGINE_LOOPBACK_SERVER_LOOPBACK_SERVER_STATE_DELTA_H_
++
++#include <optional>
++#include <vector>
 +
 +#include "components/sync/engine/sync_vault/sync_vault_state_codec.h"
 +
@@ -710,6 +762,12 @@
 + public:
 +  LoopbackServerStateCodec() = default;
 +  ~LoopbackServerStateCodec() override = default;
++
++  // Diff snapshots produced by LoopbackServer. Resets or changes that cannot
++  // be replayed as a delta return nullopt so the caller writes a full snapshot.
++  static std::optional<std::vector<uint8_t>> CreateDelta(
++      base::span<const uint8_t> before,
++      base::span<const uint8_t> after);
 +
 +  SyncVaultStateValidationResult ValidateSnapshot(
 +      base::span<const uint8_t> state) const override;
