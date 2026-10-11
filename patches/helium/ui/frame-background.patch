@@ -1,40 +1,6 @@
---- a/chrome/browser/ui/views/frame/themed_background.cc
-+++ b/chrome/browser/ui/views/frame/themed_background.cc
-@@ -24,22 +24,13 @@ bool WillPaintCustomImage(const views::V
-   return theme_provider->HasCustomImage(id);
- }
- 
--bool IsFrameActive(const views::View* view) {
--  return view->GetWidget() ? view->GetWidget()->ShouldPaintAsActive() : true;
--}
--
- std::pair<int, ui::ColorId> GetThemeChoiceInfo(
-     ThemedBackground::ThemeChoice theme_choice,
-     const views::View* view) {
-   switch (theme_choice) {
-     case ThemedBackground::ThemeChoice::kToolbarTheme:
--      return {IDR_THEME_TOOLBAR, kColorToolbar};
-     case ThemedBackground::ThemeChoice::kFrameTheme:
--      if (IsFrameActive(view)) {
--        return {IDR_THEME_FRAME, ui::kColorFrameActive};
--      } else {
--        return {IDR_THEME_FRAME_INACTIVE, ui::kColorFrameInactive};
--      }
-+      return {IDR_THEME_TOOLBAR, kColorToolbar};
-     default:
-       NOTREACHED();
-   }
 --- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
-@@ -17,6 +17,7 @@
- #include "chrome/browser/ui/browser_element_identifiers.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
- #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
-+#include "chrome/browser/ui/color/chrome_color_id.h"
- #include "chrome/browser/ui/frame/window_frame_util.h"
- #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
- #include "chrome/browser/ui/layout_constants.h"
-@@ -26,6 +27,7 @@
+@@ -26,6 +26,7 @@
  #include "chrome/browser/ui/ui_features.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
@@ -42,107 +8,97 @@
  #include "chrome/browser/ui/views/tab_search_bubble_host.h"
  #include "chrome/browser/ui/views/tabs/browser_tab_strip_controller.h"
  #include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
-@@ -160,9 +162,10 @@ HorizontalTabStripRegionViewOld::Horizon
+@@ -57,6 +58,8 @@
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/ui_base_features.h"
+ #include "ui/compositor/layer.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
+ #include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/geometry/point.h"
+ #include "ui/views/accessible_pane_view.h"
+@@ -69,6 +72,7 @@
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_utils.h"
++#include "ui/views/widget/widget.h"
+ 
+ #if BUILDFLAG(IS_MAC)
+ constexpr int kTabStripRegionInternalPaddingMac = 12;
+@@ -76,6 +80,17 @@ constexpr int kTabStripRegionInternalPad
+ 
+ namespace {
+ 
++class CascadingFrameBackgroundColor final
++    : public views::CascadingProperty<SkColor> {
++ public:
++  SkColor GetValue(const views::View* view) const override {
++    const bool active =
++        !view->GetWidget() || view->GetWidget()->ShouldPaintAsActive();
++    return view->GetColorProvider()->GetColor(active ? ui::kColorFrameActive
++                                                     : ui::kColorFrameInactive);
++  }
++};
++
+ class FrameGrabHandle : public views::View {
+   METADATA_HEADER(FrameGrabHandle, views::View)
+ 
+@@ -160,9 +175,11 @@ HorizontalTabStripRegionViewOld::Horizon
      BrowserView* browser_view)
      : browser_view_(browser_view),
        action_view_controller_(std::make_unique<views::ActionViewController>()) {
 -  views::SetCascadingColorProviderColor(
--      this, views::kCascadingBackgroundColor,
++  views::SetCascadingProperty(
+       this, views::kCascadingBackgroundColor,
 -      kColorTabBackgroundInactiveFrameInactive);
-+  views::SetCascadingColorProviderColor(this, views::kCascadingBackgroundColor,
-+                                        kColorToolbar);
++      std::make_unique<CascadingFrameBackgroundColor>());
 +  SetBackground(std::make_unique<ThemedBackground>(
-+      browser_view, ThemedBackground::kToolbarTheme));
++      browser_view, ThemedBackground::kFrameTheme));
+ 
+   SetLayoutManager(std::make_unique<views::FlexLayout>())
+       ->SetOrientation(views::LayoutOrientation::kHorizontal);
+@@ -757,9 +774,11 @@ HorizontalTabStripRegionViewNew::Horizon
+           ui::TouchUiController::Get()->RegisterCallback(base::BindRepeating(
+               &HorizontalTabStripRegionViewNew::UpdateButtonBorders,
+               base::Unretained(this)))) {
+-  views::SetCascadingColorProviderColor(
++  views::SetCascadingProperty(
+       this, views::kCascadingBackgroundColor,
+-      kColorTabBackgroundInactiveFrameInactive);
++      std::make_unique<CascadingFrameBackgroundColor>());
++  SetBackground(std::make_unique<ThemedBackground>(
++      browser_view, ThemedBackground::kFrameTheme));
  
    SetLayoutManager(std::make_unique<views::FlexLayout>())
        ->SetOrientation(views::LayoutOrientation::kHorizontal);
 --- a/chrome/browser/ui/views/frame/layout/browser_view_layout_impl.cc
 +++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_impl.cc
-@@ -314,11 +314,9 @@ void BrowserViewLayoutImpl::ConfigureTop
+@@ -314,11 +314,10 @@ void BrowserViewLayoutImpl::ConfigureTop
      const BrowserLayoutParams& params,
      CustomCornersBackground* background) {
    if (is_fullscreen(delegate().GetBrowserWindowState())) {
 -    // When in immersive mode, top container is painted with the frame color.
 -    // The color matches the active frame, allowing the tabstrip to paint
 -    // correctly.
-+    // When in immersive mode, top container is painted with the toolbar theme.
++    // When in immersive mode, paint the frame theme behind the tabstrip.
++    // Built-in themes use the same color for the frame and toolbar.
      background->SetVisible(true);
 -    background->SetPrimaryColor(ui::kColorFrameActive);
-+    background->SetPrimaryColor(CustomCornersBackground::ToolbarTheme());
++    background->SetPrimaryColor(CustomCornersBackground::FrameTheme());
    } else {
      // No need to paint otherwise.
      background->SetVisible(false);
---- a/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
-+++ b/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
-@@ -24,6 +24,7 @@
- #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
- #include "chrome/browser/ui/cocoa/fullscreen/fullscreen_menubar_tracker.h"
- #include "chrome/browser/ui/cocoa/fullscreen/fullscreen_toolbar_controller.h"
-+#include "chrome/browser/ui/color/chrome_color_id.h"
- #include "chrome/browser/ui/color/chrome_color_provider_utils.h"
- #include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
- #include "chrome/browser/ui/exclusive_access/fullscreen_controller.h"
-@@ -506,7 +507,7 @@ void BrowserFrameViewMac::OnPaint(gfx::C
-   }
+--- a/chrome/browser/ui/views/tabs/tab_strip.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip.cc
+@@ -1164,11 +1164,6 @@ TabStrip::TabStrip(
+       hover_card_controller_(std::move(hover_card_controller)),
+       drag_context_(*AddChildView(std::make_unique<TabDragContextImpl>(this))),
+       style_(TabStyle::Get()) {
+-  // TODO(pbos): This is probably incorrect, the background of individual tabs
+-  // depend on their selected state. This should probably be pushed down into
+-  // tabs.
+-  views::SetCascadingColorProviderColor(this, views::kCascadingBackgroundColor,
+-                                        kColorToolbar);
+   Init();
  
-   const SkColor frame_color =
--      GetFrameColor(BrowserFrameActiveState::kUseCurrent);
-+      GetColorProvider()->GetColor(kColorToolbar);
-   canvas->DrawColor(frame_color);
- 
-   auto* theme_service = ThemeServiceFactory::GetForProfile(
-@@ -585,7 +586,7 @@ void BrowserFrameViewMac::UpdateCaptionB
-         views::CreateSolidBackground(
-             is_glass_frame_eligible_
-                 ? SK_ColorTRANSPARENT
--                : GetFrameColor(BrowserFrameActiveState::kUseCurrent)));
-+                : GetColorProvider()->GetColor(kColorToolbar)));
-   }
- }
- 
---- a/chrome/browser/ui/views/frame/browser_frame_view_win.cc
-+++ b/chrome/browser/ui/views/frame/browser_frame_view_win.cc
-@@ -607,7 +607,7 @@ bool BrowserFrameViewWin::ShouldShowWind
- }
- 
- SkColor BrowserFrameViewWin::GetTitlebarColor() const {
--  return GetFrameColor(BrowserFrameActiveState::kUseCurrent);
-+  return GetColorProvider()->GetColor(kColorToolbar);
- }
- 
- void BrowserFrameViewWin::PaintTitlebar(gfx::Canvas* canvas) const {
---- a/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc
-+++ b/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc
-@@ -636,7 +636,7 @@ void OpaqueBrowserFrameView::OnPaint(gfx
-   }
- 
-   const bool active = ShouldPaintAsActive();
--  SkColor frame_color = GetFrameColor(BrowserFrameActiveState::kUseCurrent);
-+  SkColor frame_color = GetColorProvider()->GetColor(kColorToolbar);
-   if (window_title_) {
-     window_title_->SetEnabledColor(
-         GetCaptionColor(BrowserFrameActiveState::kUseCurrent));
-@@ -660,13 +660,7 @@ void OpaqueBrowserFrameView::OnPaint(gfx
- 
-       frame_caption_button->SetPaintAsActive(active);
- 
--      const bool button_in_top_container =
--          button->GetBoundsInScreen().Intersects(
--              GetBrowserView()->top_container()->GetBoundsInScreen());
--      SkColor background_color =
--          button_in_top_container ? GetColorProvider()->GetColor(kColorToolbar)
--                                  : frame_color;
--      frame_caption_button->SetBackgroundColor(background_color);
-+      frame_caption_button->SetBackgroundColor(frame_color);
-     }
-   }
- 
-@@ -949,7 +943,7 @@ void OpaqueBrowserFrameView::
-   if (caption_button_placeholder_container_) {
-     caption_button_placeholder_container_->SetBackground(
-         views::CreateSolidBackground(
--            GetFrameColor(BrowserFrameActiveState::kUseCurrent)));
-+            GetColorProvider()->GetColor(kColorToolbar)));
-   }
- }
- 
+   SetProperty(views::kElementIdentifierKey, kTabStripElementId);
