@@ -1,0 +1,296 @@
+--- a/components/bookmarks/browser/bookmark_load_details.h
++++ b/components/bookmarks/browser/bookmark_load_details.h
+@@ -120,6 +120,10 @@
+   // assigned/decoded.
+   void PopulateNodeIdsForLocalOrSyncablePermanentNodes();
+ 
++  // Recreates the local-or-syncable permanent nodes after a failed decode so
++  // another source can be decoded without retaining partially loaded state.
++  void ResetLocalOrSyncablePermanentNodes();
++
+   // Adds managed nodes. May be called at most once.
+   // PopulateNodeIdsForLocalOrSyncablePermanentNodes() must have been invoked
+   // before this function.
+--- a/components/bookmarks/browser/bookmark_load_details.cc
++++ b/components/bookmarks/browser/bookmark_load_details.cc
+@@ -122,6 +122,33 @@
+   }
+ }
+ 
++void BookmarkLoadDetails::ResetLocalOrSyncablePermanentNodes() {
++  CHECK(bb_node_);
++  CHECK(other_folder_node_);
++  CHECK(mobile_folder_node_);
++  CHECK(!has_managed_node_);
++
++  // Local-or-syncable permanent nodes are always the first three root children.
++  root_node_->Remove(0);
++  root_node_->Remove(0);
++  root_node_->Remove(0);
++
++  bb_node_ = static_cast<BookmarkPermanentNode*>(
++      root_node_->Add(BookmarkPermanentNode::CreateBookmarkBar(
++          /*id=*/0, /*is_account_node=*/false), 0));
++  other_folder_node_ = static_cast<BookmarkPermanentNode*>(
++      root_node_->Add(BookmarkPermanentNode::CreateOtherBookmarks(
++          /*id=*/0, /*is_account_node=*/false), 1));
++  mobile_folder_node_ = static_cast<BookmarkPermanentNode*>(
++      root_node_->Add(BookmarkPermanentNode::CreateMobileBookmarks(
++          /*id=*/0, /*is_account_node=*/false), 2));
++
++  const base::Time current_timestamp = base::Time::Now();
++  bb_node_->set_date_added(current_timestamp);
++  other_folder_node_->set_date_added(current_timestamp);
++  mobile_folder_node_->set_date_added(current_timestamp);
++}
++
+ void BookmarkLoadDetails::AddManagedNode(
+     std::unique_ptr<BookmarkPermanentNode> managed_node) {
+   CHECK(managed_node);
+--- a/components/bookmarks/browser/model_loader.cc
++++ b/components/bookmarks/browser/model_loader.cc
+@@ -13,6 +13,8 @@
+ #include "base/json/json_reader.h"
+ #include "base/json/json_string_value_serializer.h"
+ #include "base/memory/scoped_refptr.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/numerics/clamped_math.h"
+ #include "base/synchronization/waitable_event.h"
+ #include "base/task/bind_post_task.h"
+@@ -91,6 +93,22 @@
+   return std::move(*root).TakeDict();
+ }
+ 
++bool PreserveFailedBookmarksFile(const base::FilePath& file_path) {
++  // Keep the failed primary before allowing a recovered model to become
++  // authoritative. This runs only after a backup has fully decoded.
++  for (int attempt = 0; attempt < 1000; ++attempt) {
++    const std::string extension =
++        attempt == 0
++            ? "corrupt"
++            : base::StrCat({"corrupt-", base::NumberToString(attempt)});
++    const base::FilePath preserved_path = file_path.AddExtensionASCII(extension);
++    if (!base::PathExists(preserved_path)) {
++      return base::Move(file_path, preserved_path);
++    }
++  }
++  return false;
++}
++
+ void ReadBookmarksInSecondaryFileAndVerifyContentOnBackgroundSequence(
+     std::string primary_json_string,
+     scoped_refptr<const os_crypt_async::Encryptor> encryptor,
+@@ -334,42 +352,84 @@
+     const StorageFileEncryptionType local_or_syncable_encryption_type =
+         local_or_syncable_storage_file_read_config
+             .primary_source_encryption_type;
++    const base::FilePath local_or_syncable_primary_path =
++        local_or_syncable_encryption_type == StorageFileEncryptionType::kEncrypted
++            ? encrypted_local_or_syncable_file_path
++            : local_or_syncable_file_path;
++    const bool primary_existed =
++        base::PathExists(local_or_syncable_primary_path);
+     std::string sync_metadata_str;
+     int64_t max_node_id = 0;
+-    const base::expected<std::string, metrics::BookmarksFileLoadResult>
+-        json_string = ReadFile(encryptor, local_or_syncable_encryption_type,
+-                               local_or_syncable_encryption_type ==
+-                                       StorageFileEncryptionType::kEncrypted
+-                                   ? encrypted_local_or_syncable_file_path
+-                                   : local_or_syncable_file_path,
+-                               metrics::StorageFileForUma::kLocalOrSyncable);
++    base::expected<std::string, metrics::BookmarksFileLoadResult> json_string =
++        ReadFile(encryptor, local_or_syncable_encryption_type,
++                 local_or_syncable_primary_path,
++                 metrics::StorageFileForUma::kLocalOrSyncable);
+     base::expected<base::DictValue, metrics::BookmarksFileLoadResult>
+         root_dict = json_string.and_then(DeserializeStringToDict);
+-    BookmarkCodec codec;
+-    if (!root_dict.has_value()) {
++    metrics::BookmarksFileLoadResult primary_result = root_dict.error_or(
++        metrics::BookmarksFileLoadResult::kSuccess);
++    auto codec = std::make_unique<BookmarkCodec>();
++    bool decoded = root_dict.has_value() &&
++                   codec->Decode(*root_dict, ids_assigned_to_account_nodes,
++                                 details->bb_node(), details->other_folder_node(),
++                                 details->mobile_folder_node(), &max_node_id,
++                                 &sync_metadata_str);
++    if (root_dict.has_value() && !decoded) {
++      primary_result =
++          metrics::BookmarksFileLoadResult::kBookmarkCodecDecodingFailed;
++      details->ResetLocalOrSyncablePermanentNodes();
++    }
++
++    if (!decoded && primary_existed) {
++      const base::FilePath backup_path =
++          local_or_syncable_primary_path.ReplaceExtension(kBackupExtension);
++      base::expected<std::string, metrics::BookmarksFileLoadResult>
++          backup_json_string =
++              ReadFile(encryptor, local_or_syncable_encryption_type, backup_path,
++                       metrics::StorageFileForUma::kLocalOrSyncable);
++      base::expected<base::DictValue, metrics::BookmarksFileLoadResult>
++          backup_root_dict =
++              backup_json_string.and_then(DeserializeStringToDict);
++      if (backup_root_dict.has_value()) {
++        auto backup_codec = std::make_unique<BookmarkCodec>();
++        max_node_id = 0;
++        decoded = backup_codec->Decode(
++            *backup_root_dict, ids_assigned_to_account_nodes, details->bb_node(),
++            details->other_folder_node(), details->mobile_folder_node(),
++            &max_node_id, &sync_metadata_str);
++        if (decoded && PreserveFailedBookmarksFile(
++                           local_or_syncable_primary_path)) {
++          codec = std::move(backup_codec);
++          json_string = std::move(backup_json_string);
++          root_dict = std::move(backup_root_dict);
++        } else {
++          decoded = false;
++          details->ResetLocalOrSyncablePermanentNodes();
++        }
++      }
++    }
++
++    if (!decoded) {
+       OnFileLoaded(metrics::StorageFileForUma::kLocalOrSyncable,
+                    local_or_syncable_encryption_type,
+                    local_or_syncable_storage_file_read_config,
+-                   root_dict.error());
+-    } else if (codec.Decode(*root_dict,
+-                            std::move(ids_assigned_to_account_nodes),
+-                            details->bb_node(), details->other_folder_node(),
+-                            details->mobile_folder_node(), &max_node_id,
+-                            &sync_metadata_str)) {
++                   primary_result);
++    } else {
+       details->set_local_or_syncable_sync_metadata_str(
+           std::move(sync_metadata_str));
+       details->set_max_id(std::max(max_node_id, details->max_id()));
+       details->set_ids_reassigned(details->ids_reassigned() ||
+-                                  codec.ids_reassigned());
++                                  codec->ids_reassigned());
+       details->set_required_recovery(details->required_recovery() ||
+-                                     codec.required_recovery());
++                                     codec->required_recovery());
+       details->set_local_or_syncable_reassigned_ids_per_old_id(
+-          codec.release_reassigned_ids_per_old_id());
++          codec->release_reassigned_ids_per_old_id());
+ 
+       // Record metrics that indicate whether or not IDs were reassigned for
+       // local-or-syncable bookmarks.
+       metrics::RecordIdsReassignedOnProfileLoad(
+-          metrics::StorageFileForUma::kLocalOrSyncable, codec.ids_reassigned());
++          metrics::StorageFileForUma::kLocalOrSyncable,
++          codec->ids_reassigned());
+       OnFileLoaded(metrics::StorageFileForUma::kLocalOrSyncable,
+                    local_or_syncable_encryption_type,
+                    local_or_syncable_storage_file_read_config,
+@@ -403,12 +463,6 @@
+                           metrics::StorageFileForUma::kLocalOrSyncable,
+                           local_or_syncable_file_path);
+       }
+-    } else {
+-      OnFileLoaded(
+-          metrics::StorageFileForUma::kLocalOrSyncable,
+-          local_or_syncable_encryption_type,
+-          local_or_syncable_storage_file_read_config,
+-          metrics::BookmarksFileLoadResult::kBookmarkCodecDecodingFailed);
+     }
+   }
+ 
+--- a/components/bookmarks/browser/model_loader_unittest.cc
++++ b/components/bookmarks/browser/model_loader_unittest.cc
+@@ -335,8 +335,93 @@
+       base::StrCat(
+           {kBookmarksFileLoadResultMetricName, ".Account", ".ClearText"}),
+       /*expected_count=*/0);
++}
++
++TEST(ModelLoaderTest, RecoverLocalBookmarksFromValidBackup) {
++  base::test::TaskEnvironment task_environment;
++  const base::FilePath temp_dir = base::CreateUniqueTempDirectoryScopedToTest();
++  const base::FilePath primary = temp_dir.AppendASCII("Bookmarks");
++  const base::FilePath backup = primary.ReplaceExtension(kBackupExtension);
++  const base::FilePath encrypted = temp_dir.AppendASCII("BookmarksEncrypted");
++  ASSERT_TRUE(base::WriteFile(primary, "not json"));
++  ASSERT_TRUE(base::CopyFile(
++      GetTestDataDir().AppendASCII("bookmarks/model_with_sync_metadata_1.json"),
++      backup));
++
++  scoped_refptr<const os_crypt_async::Encryptor> encryptor =
++      os_crypt_async::GetTestEncryptorForTesting();
++  base::test::TestFuture<std::unique_ptr<BookmarkLoadDetails>> details_future;
++  ModelLoader::Create()->Load(
++      encryptor, primary, encrypted, base::FilePath(), base::FilePath(),
++      LoadManagedNodeCallback(), base::DoNothing(), base::DoNothing(), {},
++      details_future.GetCallback());
++
++  const std::unique_ptr<BookmarkLoadDetails> details = details_future.Take();
++  ASSERT_NE(nullptr, details);
++  EXPECT_EQ(1u, details->bb_node()->children().size());
++  EXPECT_EQ(1u, details->other_folder_node()->children().size());
++  EXPECT_EQ(1u, details->mobile_folder_node()->children().size());
++  EXPECT_EQ("dummy-sync-metadata-1",
++            details->local_or_syncable_sync_metadata_str());
++  EXPECT_FALSE(base::PathExists(primary));
++  EXPECT_TRUE(base::PathExists(primary.AddExtensionASCII("corrupt")));
++  EXPECT_TRUE(base::PathExists(backup));
+ }
+ 
++TEST(ModelLoaderTest, RecoverLocalBookmarksAfterCodecFailure) {
++  base::test::TaskEnvironment task_environment;
++  const base::FilePath temp_dir = base::CreateUniqueTempDirectoryScopedToTest();
++  const base::FilePath primary = temp_dir.AppendASCII("Bookmarks");
++  const base::FilePath backup = primary.ReplaceExtension(kBackupExtension);
++  const base::FilePath encrypted = temp_dir.AppendASCII("BookmarksEncrypted");
++  ASSERT_TRUE(base::CopyFile(
++      GetTestDataDir().AppendASCII("bookmarks/model_without_version.json"),
++      primary));
++  ASSERT_TRUE(base::CopyFile(
++      GetTestDataDir().AppendASCII("bookmarks/model_with_sync_metadata_1.json"),
++      backup));
++
++  scoped_refptr<const os_crypt_async::Encryptor> encryptor =
++      os_crypt_async::GetTestEncryptorForTesting();
++  base::test::TestFuture<std::unique_ptr<BookmarkLoadDetails>> details_future;
++  ModelLoader::Create()->Load(
++      encryptor, primary, encrypted, base::FilePath(), base::FilePath(),
++      LoadManagedNodeCallback(), base::DoNothing(), base::DoNothing(), {},
++      details_future.GetCallback());
++
++  const std::unique_ptr<BookmarkLoadDetails> details = details_future.Take();
++  ASSERT_NE(nullptr, details);
++  EXPECT_EQ(1u, details->bb_node()->children().size());
++  EXPECT_EQ(1u, details->other_folder_node()->children().size());
++  EXPECT_EQ(1u, details->mobile_folder_node()->children().size());
++  EXPECT_TRUE(base::PathExists(primary.AddExtensionASCII("corrupt")));
++}
++
++TEST(ModelLoaderTest, InvalidBackupIsNotPromoted) {
++  base::test::TaskEnvironment task_environment;
++  const base::FilePath temp_dir = base::CreateUniqueTempDirectoryScopedToTest();
++  const base::FilePath primary = temp_dir.AppendASCII("Bookmarks");
++  const base::FilePath backup = primary.ReplaceExtension(kBackupExtension);
++  const base::FilePath encrypted = temp_dir.AppendASCII("BookmarksEncrypted");
++  ASSERT_TRUE(base::WriteFile(primary, "bad primary"));
++  ASSERT_TRUE(base::WriteFile(backup, "bad backup"));
++
++  scoped_refptr<const os_crypt_async::Encryptor> encryptor =
++      os_crypt_async::GetTestEncryptorForTesting();
++  base::test::TestFuture<std::unique_ptr<BookmarkLoadDetails>> details_future;
++  ModelLoader::Create()->Load(
++      encryptor, primary, encrypted, base::FilePath(), base::FilePath(),
++      LoadManagedNodeCallback(), base::DoNothing(), base::DoNothing(), {},
++      details_future.GetCallback());
++
++  const std::unique_ptr<BookmarkLoadDetails> details = details_future.Take();
++  ASSERT_NE(nullptr, details);
++  EXPECT_TRUE(details->bb_node()->children().empty());
++  EXPECT_TRUE(base::PathExists(primary));
++  EXPECT_TRUE(base::PathExists(backup));
++  EXPECT_FALSE(base::PathExists(primary.AddExtensionASCII("corrupt")));
++}
++
+ TEST(ModelLoaderTest, LoadNonEmptyModel) {
+   base::HistogramTester histogram_tester;
+   base::test::TaskEnvironment task_environment;
