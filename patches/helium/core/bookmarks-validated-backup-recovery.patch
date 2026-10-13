@@ -49,31 +49,54 @@
    CHECK(managed_node);
 --- a/components/bookmarks/browser/model_loader.cc
 +++ b/components/bookmarks/browser/model_loader.cc
-@@ -13,6 +13,8 @@
+@@ -13,6 +13,9 @@
  #include "base/json/json_reader.h"
  #include "base/json/json_string_value_serializer.h"
++#include "base/logging.h"
  #include "base/memory/scoped_refptr.h"
+ #include "base/numerics/clamped_math.h"
 +#include "base/strings/strcat.h"
 +#include "base/strings/string_number_conversions.h"
- #include "base/numerics/clamped_math.h"
  #include "base/synchronization/waitable_event.h"
  #include "base/task/bind_post_task.h"
-@@ -91,6 +93,22 @@
+@@ -91,6 +94,44 @@
    return std::move(*root).TakeDict();
  }
  
-+bool PreserveFailedBookmarksFile(const base::FilePath& file_path) {
-+  // Keep the failed primary before allowing a recovered model to become
-+  // authoritative. This runs only after a backup has fully decoded.
++bool PromoteValidatedBookmarksBackup(const base::FilePath& primary_path,
++                                     const base::FilePath& backup_path) {
++  base::FilePath preserved_path;
 +  for (int attempt = 0; attempt < 1000; ++attempt) {
 +    const std::string extension =
 +        attempt == 0
 +            ? "corrupt"
 +            : base::StrCat({"corrupt-", base::NumberToString(attempt)});
-+    const base::FilePath preserved_path = file_path.AddExtensionASCII(extension);
-+    if (!base::PathExists(preserved_path)) {
-+      return base::Move(file_path, preserved_path);
++    const base::FilePath candidate = primary_path.AddExtensionASCII(extension);
++    if (base::PathExists(candidate)) {
++      continue;
 +    }
++    if (!base::Move(primary_path, candidate)) {
++      return false;
++    }
++    preserved_path = candidate;
++    break;
++  }
++  if (preserved_path.empty()) {
++    return false;
++  }
++
++  // The backup has already been read, decrypted, parsed, and decoded
++  // successfully. Promote its on-disk bytes into the primary slot so recovery
++  // does not depend on a later model save, which might never happen or might
++  // fail again while the disk is full. Both paths are in the same directory.
++  if (base::Move(backup_path, primary_path)) {
++    return true;
++  }
++
++  if (!base::Move(preserved_path, primary_path)) {
++    LOG(ERROR) << "Failed to restore Bookmarks primary after backup promotion "
++                  "failure: "
++               << primary_path;
 +  }
 +  return false;
 +}
@@ -81,7 +104,7 @@
  void ReadBookmarksInSecondaryFileAndVerifyContentOnBackgroundSequence(
      std::string primary_json_string,
      scoped_refptr<const os_crypt_async::Encryptor> encryptor,
-@@ -334,42 +352,84 @@
+@@ -334,42 +375,84 @@
      const StorageFileEncryptionType local_or_syncable_encryption_type =
          local_or_syncable_storage_file_read_config
              .primary_source_encryption_type;
@@ -139,8 +162,8 @@
 +            *backup_root_dict, ids_assigned_to_account_nodes, details->bb_node(),
 +            details->other_folder_node(), details->mobile_folder_node(),
 +            &max_node_id, &sync_metadata_str);
-+        if (decoded && PreserveFailedBookmarksFile(
-+                           local_or_syncable_primary_path)) {
++        if (decoded && PromoteValidatedBookmarksBackup(
++                           local_or_syncable_primary_path, backup_path)) {
 +          codec = std::move(backup_codec);
 +          json_string = std::move(backup_json_string);
 +          root_dict = std::move(backup_root_dict);
@@ -185,7 +208,7 @@
        OnFileLoaded(metrics::StorageFileForUma::kLocalOrSyncable,
                     local_or_syncable_encryption_type,
                     local_or_syncable_storage_file_read_config,
-@@ -403,12 +463,6 @@
+@@ -403,12 +486,6 @@
                            metrics::StorageFileForUma::kLocalOrSyncable,
                            local_or_syncable_file_path);
        }
@@ -200,7 +223,7 @@
  
 --- a/components/bookmarks/browser/model_loader_unittest.cc
 +++ b/components/bookmarks/browser/model_loader_unittest.cc
-@@ -335,8 +335,93 @@
+@@ -335,8 +335,115 @@
        base::StrCat(
            {kBookmarksFileLoadResultMetricName, ".Account", ".ClearText"}),
        /*expected_count=*/0);
@@ -232,11 +255,31 @@
 +  EXPECT_EQ(1u, details->mobile_folder_node()->children().size());
 +  EXPECT_EQ("dummy-sync-metadata-1",
 +            details->local_or_syncable_sync_metadata_str());
-+  EXPECT_FALSE(base::PathExists(primary));
++  EXPECT_TRUE(base::PathExists(primary));
 +  EXPECT_TRUE(base::PathExists(primary.AddExtensionASCII("corrupt")));
-+  EXPECT_TRUE(base::PathExists(backup));
- }
- 
++  EXPECT_FALSE(base::PathExists(backup));
++
++  // Recovery must repair the primary on disk immediately. A second load with
++  // no intervening bookmark mutation must therefore succeed without a backup.
++  base::test::TestFuture<std::unique_ptr<BookmarkLoadDetails>>
++      second_details_future;
++  ModelLoader::Create()->Load(
++      encryptor, primary, encrypted, base::FilePath(), base::FilePath(),
++      LoadManagedNodeCallback(), base::DoNothing(), base::DoNothing(), {},
++      second_details_future.GetCallback());
++
++  const std::unique_ptr<BookmarkLoadDetails> second_details =
++      second_details_future.Take();
++  ASSERT_NE(nullptr, second_details);
++  EXPECT_EQ(1u, second_details->bb_node()->children().size());
++  EXPECT_EQ(1u, second_details->other_folder_node()->children().size());
++  EXPECT_EQ(1u, second_details->mobile_folder_node()->children().size());
++  EXPECT_EQ("dummy-sync-metadata-1",
++            second_details->local_or_syncable_sync_metadata_str());
++  EXPECT_FALSE(
++      base::PathExists(primary.AddExtensionASCII("corrupt-1")));
++}
++
 +TEST(ModelLoaderTest, RecoverLocalBookmarksAfterCodecFailure) {
 +  base::test::TaskEnvironment task_environment;
 +  const base::FilePath temp_dir = base::CreateUniqueTempDirectoryScopedToTest();
@@ -263,7 +306,9 @@
 +  EXPECT_EQ(1u, details->bb_node()->children().size());
 +  EXPECT_EQ(1u, details->other_folder_node()->children().size());
 +  EXPECT_EQ(1u, details->mobile_folder_node()->children().size());
++  EXPECT_TRUE(base::PathExists(primary));
 +  EXPECT_TRUE(base::PathExists(primary.AddExtensionASCII("corrupt")));
++  EXPECT_FALSE(base::PathExists(backup));
 +}
 +
 +TEST(ModelLoaderTest, InvalidBackupIsNotPromoted) {
@@ -289,8 +334,8 @@
 +  EXPECT_TRUE(base::PathExists(primary));
 +  EXPECT_TRUE(base::PathExists(backup));
 +  EXPECT_FALSE(base::PathExists(primary.AddExtensionASCII("corrupt")));
-+}
-+
+ }
+ 
  TEST(ModelLoaderTest, LoadNonEmptyModel) {
    base::HistogramTester histogram_tester;
    base::test::TaskEnvironment task_environment;
