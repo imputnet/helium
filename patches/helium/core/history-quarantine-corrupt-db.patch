@@ -1,0 +1,99 @@
+--- a/components/history/core/browser/history_backend.cc
++++ b/components/history/core/browser/history_backend.cc
+@@ -34,6 +34,8 @@
+ #include "base/observer_list.h"
+ #include "base/rand_util.h"
+ #include "base/strings/escape.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/strcat.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -306,8 +308,62 @@
+ 
+   // Check whether the URLs for our key are valid.
+   return top_level_url->is_valid() && frame_url->is_valid();
++}
++
++base::FilePath SQLiteSidecarPath(const base::FilePath& database_path,
++                                 base::FilePath::StringType suffix) {
++  return base::FilePath(database_path.value() + suffix);
+ }
++
++bool QuarantineHistoryDatabaseFiles(const base::FilePath& history_path) {
++  if (!base::PathExists(history_path)) {
++    return false;
++  }
+ 
++  const base::FilePath quarantine_path = history_path.AddExtensionASCII(
++      base::StrCat({"corrupt-", base::NumberToString(
++                                    base::Time::Now()
++                                        .ToDeltaSinceWindowsEpoch()
++                                        .InMicroseconds())}));
++
++  using FilePair = std::pair<base::FilePath, base::FilePath>;
++  std::vector<FilePair> files;
++  auto add_sidecar = [&](base::FilePath::StringType suffix) {
++    base::FilePath source = SQLiteSidecarPath(history_path, suffix);
++    if (base::PathExists(source)) {
++      files.emplace_back(source, SQLiteSidecarPath(quarantine_path, suffix));
++    }
++  };
++
++  // Move sidecars first and the primary database last. If any move fails,
++  // restore everything already moved so the original database set remains
++  // under its primary stem.
++  add_sidecar(FILE_PATH_LITERAL("-journal"));
++  add_sidecar(FILE_PATH_LITERAL("-wal"));
++  add_sidecar(FILE_PATH_LITERAL("-shm"));
++  files.emplace_back(history_path, quarantine_path);
++
++  size_t moved_count = 0;
++  for (; moved_count < files.size(); ++moved_count) {
++    if (!base::Move(files[moved_count].first, files[moved_count].second)) {
++      break;
++    }
++  }
++  if (moved_count == files.size()) {
++    return true;
++  }
++
++  while (moved_count > 0) {
++    --moved_count;
++    if (!base::Move(files[moved_count].second, files[moved_count].first)) {
++      LOG(ERROR) << "Failed to restore History database file after quarantine "
++                    "failure: "
++                 << files[moved_count].first;
++    }
++  }
++  return false;
++}
++
+ }  // namespace
+ 
+ std::u16string FormatUrlForRedirectComparison(const GURL& url) {
+@@ -3815,17 +3871,20 @@
+     journeys_sync_bridge_->OnDatabaseError();
+   }
+ 
+-  // Rollback transaction because Raze() cannot be called from within a
+-  // transaction. Deleting the object causes the rollback in the destructor.
++  // End the active transaction before closing the database handles.
+   singleton_transaction_.reset();
+ 
+-  db_->Raze();
+-
+   // The expirer keeps tabs on the active databases. Tell it about the
+   // databases which will be closed.
+   expirer_.SetDatabases(nullptr, nullptr);
+ 
++  const base::FilePath history_path = history_dir_.Append(kHistoryFilename);
+   CloseAllDatabases();
++
++  if (!QuarantineHistoryDatabaseFiles(history_path)) {
++    LOG(ERROR) << "Failed to quarantine catastrophic History database; "
++                  "leaving the original database intact";
++  }
+ }
+ 
+ void HistoryBackend::SetSyncDeviceInfo(SyncDeviceInfoMap sync_device_info) {
