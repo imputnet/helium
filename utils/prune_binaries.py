@@ -151,7 +151,7 @@ CONTINGENT_PATHS = (
     'third_party/webgl/',
 )
 
-# paths needed to build with the chromium toolchain
+# path prefixes needed to build with the chromium toolchain
 BUILD_DEPENDENCY_PATHS = (
     'build/linux/',
     'buildtools/linux64/',
@@ -167,6 +167,8 @@ BUILD_DEPENDENCY_PATHS = (
     'third_party/llvm-libclang/',
     'third_party/ninja/',
     'third_party/node/linux/',
+    'third_party/rust/chromium_crates_io/vendor/windows_aarch64_msvc-',
+    'third_party/rust/chromium_crates_io/vendor/windows_x86_64_msvc-',
     'third_party/rust-toolchain/',
     'third_party/siso/cipd/',
     'third_party/typescript/',
@@ -183,15 +185,19 @@ KEEP_FILES = (
 KEEP_SUFFIXES = ('.gn', '.gni', '.grd', '.grdp', '.isolate', '.pydeps')
 
 
-def prune_files(unpack_root, prune_list):
+def prune_files(unpack_root, prune_list, keep_build_dependencies=False):
     """
     Delete files under unpack_root listed in prune_list. Returns an iterable of unremovable files.
 
     unpack_root is a pathlib.Path to the directory to be pruned
     prune_list is an iterable of files to be removed.
+    keep_build_dependencies preserves build dependencies listed in prune_list.
     """
     unremovable_files = set()
     for relative_file in prune_list:
+        if keep_build_dependencies and Path(relative_file).as_posix().startswith(
+                BUILD_DEPENDENCY_PATHS):
+            continue
         file_path = unpack_root / relative_file
         try:
             file_path.unlink()
@@ -214,7 +220,7 @@ def _prune_path(path, unpack_root=None):
     """
     for node in sorted(path.rglob('*'), key=lambda l: len(str(l)), reverse=True):
         if unpack_root is not None and (node.suffix in KEEP_SUFFIXES
-                                        or str(node.relative_to(unpack_root)) in KEEP_FILES):
+                                        or node.relative_to(unpack_root).as_posix() in KEEP_FILES):
             continue
         if node.is_file() or node.is_symlink():
             try:
@@ -265,7 +271,7 @@ def _callback(args):
     prune_dirs(args.directory, args.keep_contingent_paths, args.sysroot,
                args.keep_build_dependencies)
     prune_list = tuple(filter(len, args.pruning_list.read_text(encoding=ENCODING).splitlines()))
-    unremovable_files = prune_files(args.directory, prune_list)
+    unremovable_files = prune_files(args.directory, prune_list, args.keep_build_dependencies)
     if unremovable_files:
         file_list = '\n'.join(f for f in itertools.islice(unremovable_files, 5))
         if len(unremovable_files) > 5:
@@ -289,7 +295,7 @@ def main():
     keep_options.add_argument(
         '--keep-build-dependencies',
         action='store_true',
-        help='Keep build tools and sysroots, but prune other contingent paths.')
+        help='Keep build dependencies, but prune other binaries and contingent paths.')
     parser.add_argument('--sysroot',
                         choices=('amd64', 'i386'),
                         help=('Skip pruning the sysroot for the specified architecture. '

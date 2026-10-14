@@ -86,11 +86,22 @@ def _process_relative_to(unpack_root, relative_to):
         get_logger().error('Could not find relative_to directory in extracted files: %s',
                            relative_to)
         raise FileNotFoundError()
+
+    def merge(source, destination):
+        if (source.is_dir() and not source.is_symlink() and destination.is_dir()
+                and not destination.is_symlink()):
+            for child in source.iterdir():
+                merge(child, destination / child.name)
+            source.rmdir()
+        else:
+            if destination.is_symlink() or destination.is_file():
+                destination.unlink()
+            elif destination.is_dir():
+                shutil.rmtree(destination)
+            source.rename(destination)
+
     for src_path in relative_root.iterdir():
-        dest_path = unpack_root / src_path.name
-        if os.path.isdir(dest_path):
-            shutil.rmtree(dest_path)
-        src_path.rename(dest_path)
+        merge(src_path, unpack_root / src_path.name)
     relative_root.rmdir()
 
 
