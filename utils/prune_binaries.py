@@ -214,7 +214,7 @@ def _prune_path(path, unpack_root=None):
     """
     for node in sorted(path.rglob('*'), key=lambda l: len(str(l)), reverse=True):
         if unpack_root is not None and (node.suffix in KEEP_SUFFIXES
-                                        or str(node.relative_to(unpack_root)) in KEEP_FILES):
+                                        or node.relative_to(unpack_root).as_posix() in KEEP_FILES):
             continue
         if node.is_file() or node.is_symlink():
             try:
