@@ -109,18 +109,18 @@
  #endif
 --- a/chrome/common/webui_url_constants.h
 +++ b/chrome/common/webui_url_constants.h
-@@ -513,6 +513,8 @@ inline constexpr char kChromeUIProfilePi
- inline constexpr char kChromeUIProfilePickerOmniboxEverywhereQuery[] =
-     "omnibox-everywhere";
- inline constexpr char kChromeUIProfilePickerUrl[] = "chrome://profile-picker/";
+@@ -187,6 +187,8 @@ inline constexpr char kChromeUIGlicExper
+ inline constexpr char kChromeUIHangUIHost[] = "uithreadhang";
+ inline constexpr char kChromeUIHelpHost[] = "help";
+ inline constexpr char kChromeUIHelpURL[] = "chrome://help/";
 +inline constexpr char kHeliumSetupHost[] = "setup";
 +inline constexpr char kHeliumSetupURL[] = "chrome://setup";
- inline constexpr char kChromeUIHistorySyncOptinHost[] = "history-sync-optin";
- inline constexpr char kChromeUIHistorySyncOptinURL[] =
-     "chrome://history-sync-optin/";
+ inline constexpr char kChromeUIHistoryHost[] = "history";
+ inline constexpr char kChromeUIHistorySyncedTabs[] = "/syncedTabs";
+ inline constexpr char kChromeUIHistoryURL[] = "chrome://history/";
 --- a/chrome/browser/ui/webui/BUILD.gn
 +++ b/chrome/browser/ui/webui/BUILD.gn
-@@ -50,6 +50,7 @@ source_set("configs") {
+@@ -50,6 +50,7 @@
      ":gcm_internals_ui",
      ":net_export_ui",
      ":ntp_tiles_internals_ui",
@@ -128,7 +128,7 @@
      ":signin_internals_ui",
      ":webui",
      "//chrome/browser/actor/ui:actor_overlay",
-@@ -650,6 +651,36 @@ source_set("chrome_web_ui_controller_fac
+@@ -650,6 +651,44 @@
    }
  }
  
@@ -146,20 +146,28 @@
 +    "//chrome/common",
 +    "//components/prefs",
 +    "//content/public/browser",
-+    "//extensions/browser",
++    "//extensions/buildflags",
 +  ]
 +  deps = [
 +    "//base",
 +    "//chrome/browser:browser_process",
-+    "//chrome/browser/extensions",
 +    "//chrome/browser/profiles",
-+    "//chrome/browser/ui/webui/settings",
++    "//chrome/browser/profiles:profile_util",
 +    "//components/helium_onboarding:generated_resources",
 +    "//components/helium_onboarding:localized_strings",
 +    "//components/helium_services",
-+    "//extensions/common",
 +    "//ui/webui",
 +  ]
++  if (enable_extensions) {
++    public_deps += [ "//extensions/browser" ]
++    deps += [
++      "//chrome/browser/extensions",
++      "//extensions/common",
++    ]
++  }
++  if (!is_android) {
++    deps += [ "//chrome/browser/ui/webui/settings" ]
++  }
 +}
 +
  if (enable_extensions_core) {
@@ -167,14 +175,14 @@
      sources = [ "managed_ui_handler.cc" ]
 --- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
 +++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
-@@ -47,6 +47,7 @@
- #include "chrome/browser/ui/webui/notebooks_internals/notebooks_internals_ui_config.h"
- #include "chrome/browser/ui/webui/ntp_tiles_internals_ui.h"
- #include "chrome/browser/ui/webui/omnibox/omnibox_ui.h"
+@@ -215,6 +215,7 @@
+ 
+ #if !BUILDFLAG(IS_CHROMEOS) && !BUILDFLAG(IS_ANDROID)
+ #include "chrome/browser/ui/webui/default_browser/default_browser_modal_ui.h"
 +#include "chrome/browser/ui/webui/onboarding/onboarding_page_ui.h"
- #include "chrome/browser/ui/webui/policy/policy_ui.h"
- #include "chrome/browser/ui/webui/predictors/predictors_ui.h"
- #include "chrome/browser/ui/webui/regional_capabilities_internals/regional_capabilities_internals_ui.h"
+ #include "chrome/browser/ui/webui/intro/intro_ui.h"
+ #include "chrome/browser/ui/webui/signin/managed_user_profile_notice_ui.h"
+ #include "chrome/browser/ui/webui/signin/profile_customization_ui.h"
 @@ -492,6 +493,7 @@ void RegisterChromeWebUIConfigs() {
    map.AddWebUIConfig(std::make_unique<DefaultBrowserModalUIConfig>());
    map.AddWebUIConfig(std::make_unique<ManagedUserProfileNoticeUIConfig>());
@@ -273,38 +281,56 @@
 +#endif  // CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_PAGE_UI_H_
 --- /dev/null
 +++ b/chrome/browser/ui/webui/onboarding/onboarding_handler.cc
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,324 @@
 +// Copyright 2025 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/webui/onboarding/onboarding_handler.h"
 +
++#include <string_view>
++
++#include "base/containers/fixed_flat_set.h"
 +#include "base/functional/bind.h"
 +#include "base/strings/string_util.h"
-+#include "base/strings/utf_string_conversions.h"
 +#include "base/values.h"
-+#include "chrome/browser/browser_process.h"
-+#include "chrome/browser/extensions/webstore_install_with_prompt.h"
 +#include "chrome/browser/profiles/profile.h"
++#include "components/helium_services/pref_names.h"
++#include "components/helium_services/schema.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_ui.h"
++
++#if !BUILDFLAG(IS_ANDROID)
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/browser_process.h"
 +#include "chrome/browser/profiles/profile_attributes_storage.h"
 +#include "chrome/browser/profiles/profile_manager.h"
 +#include "chrome/browser/profiles/profiles_state.h"
-+#include "extensions/browser/webstore_install_result.h"
-+#include "components/helium_services/pref_names.h"
-+#include "components/helium_services/schema.h"
-+#include "components/prefs/pref_change_registrar.h"
-+#include "components/prefs/pref_service.h"
++#endif
++
++#if BUILDFLAG(ENABLE_EXTENSIONS)
++#include "chrome/browser/extensions/webstore_install_with_prompt.h"
 +#include "content/public/browser/web_contents.h"
-+#include "content/public/browser/web_ui.h"
 +#include "extensions/browser/extension_registrar.h"
 +#include "extensions/browser/extension_registry.h"
 +#include "extensions/common/extension.h"
++#endif
++
++#if BUILDFLAG(IS_ANDROID)
++namespace {
++constexpr auto kAndroidOnboardingPrefs = base::MakeFixedFlatSet<std::string_view>({
++    prefs::kHeliumServicesEnabled,
++    prefs::kHeliumBangsEnabled,
++    prefs::kHeliumServicesConsented,
++    prefs::kHeliumDidOnboarding,
++});
++}  // namespace
++#endif
 +
 +OnboardingMessageHandler::OnboardingMessageHandler(
 +    content::BrowserContext* browser_context)
 +    : browser_context_(browser_context),
-+      profile_(Profile::FromBrowserContext(browser_context)),
++      profile_(Profile::FromBrowserContext(browser_context_)),
 +      pref_service_(profile_->GetPrefs()) {
 +  pref_change_registrar_.Init(pref_service_);
 +
@@ -337,10 +363,12 @@
 +}
 +
 +void OnboardingMessageHandler::OnPreferencesChanged() {
-+  AllowJavascript();
-+  FireWebUIListener("helium-prefs-changed", GetPreferencesDict());
++  if (IsJavascriptAllowed()) {
++    FireWebUIListener("helium-prefs-changed", GetPreferencesDict());
++  }
 +}
 +
++#if BUILDFLAG(ENABLE_EXTENSIONS)
 +void OnboardingMessageHandler::OnExtensionLoaded(
 +    content::BrowserContext*,
 +    const extensions::Extension* extension) {
@@ -364,6 +392,8 @@
 +                    base::DictValue().Set(extension->id(), false));
 +}
 +
++#endif
++
 +void OnboardingMessageHandler::RegisterMessages() {
 +  web_ui()->RegisterMessageCallback(
 +      "getPrefs",
@@ -377,6 +407,7 @@
 +      "acceptLatestSchema",
 +      base::BindRepeating(&OnboardingMessageHandler::HandleAcceptSchema,
 +                          base::Unretained(this)));
++#if !BUILDFLAG(IS_ANDROID)
 +  web_ui()->RegisterMessageCallback(
 +      "getProfileName",
 +      base::BindRepeating(&OnboardingMessageHandler::HandleGetProfileName,
@@ -385,6 +416,8 @@
 +      "setProfileName",
 +      base::BindRepeating(&OnboardingMessageHandler::HandleSetProfileName,
 +                          base::Unretained(this)));
++#endif
++#if BUILDFLAG(ENABLE_EXTENSIONS)
 +  web_ui()->RegisterMessageCallback(
 +      "getExtensions",
 +      base::BindRepeating(&OnboardingMessageHandler::HandleGetExtensions,
@@ -393,8 +426,10 @@
 +      "installExtension",
 +      base::BindRepeating(&OnboardingMessageHandler::HandleInstallExtension,
 +                          base::Unretained(this)));
++#endif
 +}
 +
++#if BUILDFLAG(ENABLE_EXTENSIONS)
 +void OnboardingMessageHandler::HandleGetExtensions(
 +    const base::ListValue& args) {
 +  CHECK_EQ(1U, args.size());
@@ -480,6 +515,8 @@
 +      base::DictValue().Set("error", error).Set("code", result));
 +}
 +
++#endif
++
 +void OnboardingMessageHandler::HandleGetPreferences(
 +    const base::ListValue& args) {
 +  CHECK_EQ(1U, args.size());
@@ -490,6 +527,7 @@
 +                            base::Value(GetPreferencesDict()));
 +}
 +
++#if !BUILDFLAG(IS_ANDROID)
 +void OnboardingMessageHandler::HandleGetProfileName(
 +    const base::ListValue& args) {
 +  CHECK_EQ(1U, args.size());
@@ -520,6 +558,8 @@
 +  }
 +}
 +
++#endif
++
 +void OnboardingMessageHandler::HandleSetPreference(
 +    const base::ListValue& args) {
 +  if (args.size() == 0) {
@@ -538,9 +578,20 @@
 +  }
 +
 +  const auto& pref_name = prefs::kHeliumPrefPrefix + args[1].GetString();
++#if BUILDFLAG(IS_ANDROID)
++  if (!kAndroidOnboardingPrefs.contains(pref_name)) {
++    return RejectJavascriptCallback(callback_id, "Unsupported preference");
++  }
++#endif
++
 +  auto* pref = pref_service_->FindPreference(pref_name);
 +  if (!pref) {
 +    return RejectJavascriptCallback(callback_id, pref_name + " does not exist");
++  }
++
++  if (pref->IsManaged()) {
++    return RejectJavascriptCallback(callback_id,
++                                    "Preference cannot be changed");
 +  }
 +
 +  if (args[2].type() != pref->GetType()) {
@@ -557,7 +608,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/ui/webui/onboarding/onboarding_handler.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,94 @@
 +// Copyright 2025 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -565,26 +616,35 @@
 +#ifndef CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_HANDLER_H_
 +#define CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_HANDLER_H_
 +
-+#include <optional>
 +#include <string>
 +
 +#include "base/memory/raw_ptr.h"
++#include "base/values.h"
++#include "build/build_config.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "content/public/browser/web_ui_message_handler.h"
++#include "extensions/buildflags/buildflags.h"
++
++#if BUILDFLAG(ENABLE_EXTENSIONS)
 +#include "base/memory/weak_ptr.h"
 +#include "base/scoped_observation.h"
-+#include "base/values.h"
-+#include "chrome/browser/profiles/profile.h"
-+#include "extensions/browser/webstore_install_result.h"
-+#include "components/prefs/pref_change_registrar.h"
-+#include "components/prefs/pref_service.h"
-+#include "content/public/browser/web_ui_message_handler.h"
 +#include "extensions/browser/extension_registry_observer.h"
++#include "extensions/browser/webstore_install_result.h"
++#endif
++
++class PrefService;
++class Profile;
 +
 +namespace content {
 +class BrowserContext;
 +}
 +
++#if !BUILDFLAG(ENABLE_EXTENSIONS)
++class OnboardingMessageHandler : public content::WebUIMessageHandler {
++#else
 +class OnboardingMessageHandler : public content::WebUIMessageHandler,
 +                                 public extensions::ExtensionRegistryObserver {
++#endif
 + public:
 +  explicit OnboardingMessageHandler(content::BrowserContext* browser_context);
 +  OnboardingMessageHandler(const OnboardingMessageHandler&) = delete;
@@ -598,11 +658,16 @@
 +  void HandleGetPreferences(const base::ListValue& args);
 +  void HandleAcceptSchema(const base::ListValue& args);
 +  void HandleSetPreference(const base::ListValue& args);
++  void OnPreferencesChanged();
++
++#if !BUILDFLAG(IS_ANDROID)
 +  void HandleGetProfileName(const base::ListValue& args);
 +  void HandleSetProfileName(const base::ListValue& args);
++#endif
++
++#if BUILDFLAG(ENABLE_EXTENSIONS)
 +  void HandleGetExtensions(const base::ListValue& args);
 +  void HandleInstallExtension(const base::ListValue& args);
-+  void OnPreferencesChanged();
 +
 +  void DoInstallExtension(const std::string& callback_id,
 +                          const std::string& extension_id);
@@ -619,11 +684,14 @@
 +  void OnExtensionUnloaded(content::BrowserContext*,
 +                           const extensions::Extension*,
 +                           extensions::UnloadedExtensionReason) override;
++#endif
 +
-+  raw_ptr<content::BrowserContext> browser_context_ = nullptr;
-+  raw_ptr<Profile> profile_ = nullptr;
-+  raw_ptr<PrefService> pref_service_ = nullptr;
++  raw_ptr<content::BrowserContext> browser_context_;
++  raw_ptr<Profile> profile_;
++  raw_ptr<PrefService> pref_service_;
 +  PrefChangeRegistrar pref_change_registrar_;
++
++#if BUILDFLAG(ENABLE_EXTENSIONS)
 +
 +  base::WeakPtrFactory<OnboardingMessageHandler> weak_ptr_factory_{this};
 +
@@ -631,6 +699,7 @@
 +  base::ScopedObservation<extensions::ExtensionRegistry,
 +                          extensions::ExtensionRegistryObserver>
 +      extension_registry_observation_{this};
++#endif
 +};
 +
 +#endif  // CHROME_BROWSER_UI_WEBUI_ONBOARDING_ONBOARDING_HANDLER_H_
