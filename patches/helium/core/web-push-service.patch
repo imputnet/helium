@@ -1,0 +1,1250 @@
+--- a/components/gcm_driver/gcm_profile_service.h
++++ b/components/gcm_driver/gcm_profile_service.h
+@@ -86,8 +86,8 @@ class GCMProfileService : public KeyedSe
+ 
+   GCMDriver* driver() const { return driver_.get(); }
+ 
+- protected:
+-  // Used for constructing fake GCMProfileService for testing purpose.
++  // Used for constructing fake GCMProfileService for testing purpose,
++  // and for Helium's autopush driver.
+   explicit GCMProfileService(std::unique_ptr<GCMDriver> driver);
+ 
+  private:
+--- a/components/helium_services/helium_services_helpers.cc
++++ b/components/helium_services/helium_services_helpers.cc
+@@ -113,6 +113,11 @@ bool ShouldAccessUBlockAssets(const Pref
+             prefs.GetBoolean(prefs::kHeliumUBlockAssetsEnabled);
+ }
+ 
++bool ShouldAccessPushService(const PrefService& prefs) {
++  return ShouldAccessServices(prefs) &&
++         prefs.GetBoolean(prefs::kHeliumWebPushEnabled);
++}
++
+ GURL GetExtensionUpdateURL(const PrefService& prefs) {
+     if (!ShouldAccessExtensionService(prefs)) {
+         return GetDummyURL();
+@@ -172,6 +177,21 @@ GURL GetUBlockAssetsURL(const PrefServic
+     return GetServicesBaseURL(prefs).Resolve("/ubo/assets.json");
+ }
+ 
++GURL GetPushServiceURL(const PrefService& prefs) {
++  if (!ShouldAccessPushService(prefs)) {
++    return GetDummyURL();
++  }
++
++  GURL user_url(prefs.GetString(prefs::kHeliumPushServer));
++  if (user_url.is_valid() &&
++      (user_url.SchemeIs(url::kWssScheme) ||
++       (user_url.SchemeIs(url::kWsScheme) && net::IsLocalhost(user_url)))) {
++    return user_url;
++  }
++
++  return GURL(kHeliumDefaultPushServer);
++}
++
+ void ConfigurePrefChangeRegistrarFor(std::string_view pref_name,
+     PrefChangeRegistrar& registrar, const base::RepeatingClosure& observer) {
+   registrar.Add(prefs::kHeliumServicesEnabled, observer);
+--- a/components/helium_services/helium_services_helpers.h
++++ b/components/helium_services/helium_services_helpers.h
+@@ -18,6 +18,8 @@ const char kHeliumDefaultOrigin[] =
+ const char kHeliumDummyOrigin[] =
+     "https://helium-services-are-disabled.qjz9zk";
+ 
++const char kHeliumDefaultPushServer[] = "wss://push.helium.computer/";
++
+ bool ShouldAccessServices(const PrefService& prefs);
+ 
+ COMPONENT_EXPORT(HELIUM) bool ShouldFetchBangs(const PrefService& prefs);
+@@ -25,6 +27,7 @@ COMPONENT_EXPORT(HELIUM) bool ShouldAcce
+ COMPONENT_EXPORT(HELIUM) bool ShouldAccessUpdateService(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) bool ShouldAccessComponentUpdateService(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) bool ShouldAccessUBlockAssets(const PrefService& prefs);
++COMPONENT_EXPORT(HELIUM) bool ShouldAccessPushService(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetServicesBaseURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetDummyURL();
+ COMPONENT_EXPORT(HELIUM) GURL GetExtensionUpdateURL(const PrefService& prefs);
+@@ -33,6 +36,7 @@ COMPONENT_EXPORT(HELIUM) GURL GetSpellch
+ COMPONENT_EXPORT(HELIUM) GURL GetBrowserUpdateURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetComponentUpdateURL(const PrefService* prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetUBlockAssetsURL(const PrefService& prefs);
++COMPONENT_EXPORT(HELIUM) GURL GetPushServiceURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) std::optional<GURL> GetValidUserOverridenURL(std::string_view user_url_);
+ COMPONENT_EXPORT(HELIUM) void ConfigurePrefChangeRegistrarFor(std::string_view pref_name,
+                             PrefChangeRegistrar& registrar, const base::RepeatingClosure& observer);
+--- a/components/helium_services/pref_names.h
++++ b/components/helium_services/pref_names.h
+@@ -41,6 +41,10 @@ inline constexpr char kHeliumSpellcheckE
+ 
+ inline constexpr char kHeliumUBlockAssetsEnabled[] =
+     "helium.services.ublock_assets";
++
++inline constexpr char kHeliumWebPushEnabled[] = "helium.services.web_push";
++
++inline constexpr char kHeliumPushServer[] = "helium.services.push_server";
+ }  // namespace prefs
+ 
+ #endif  // COMPONENTS_HELIUM_SERVICES_PREF_NAMES_H_
+--- a/components/push_messaging/push_messaging_utils.cc
++++ b/components/push_messaging/push_messaging_utils.cc
+@@ -30,7 +30,8 @@ std::string GetGcmEndpointForChannel(ver
+ 
+ GURL CreateEndpoint(version_info::Channel channel,
+                     const std::string& subscription_id) {
+-  const GURL endpoint(GetGcmEndpointForChannel(channel) + subscription_id);
++  // Helium's autopush driver uses the full push endpoint as the token.
++  const GURL endpoint(subscription_id);
+   DCHECK(endpoint.is_valid());
+   return endpoint;
+ }
+--- a/components/streaming_client/streaming_websocket_client.cc
++++ b/components/streaming_client/streaming_websocket_client.cc
+@@ -40,11 +40,13 @@ StreamingWebSocketClient::StreamingWebSo
+     const GURL& service_url,
+     network::mojom::NetworkContext* network_context,
+     net::NetworkTrafficAnnotationTag traffic_annotation,
+-    Delegate* delegate)
++    Delegate* delegate,
++    network::mojom::WebSocketMessageType message_type)
+     : service_url_(service_url),
+       network_context_(network_context),
+       traffic_annotation_(traffic_annotation),
+       delegate_(delegate),
++      message_type_(message_type),
+       readable_watcher_(FROM_HERE, mojo::SimpleWatcher::ArmingPolicy::MANUAL) {}
+ 
+ StreamingWebSocketClient::~StreamingWebSocketClient() = default;
+@@ -98,8 +100,10 @@ void StreamingWebSocketClient::Connect()
+ 
+   std::vector<network::mojom::HttpHeaderPtr> additional_headers =
+       delegate_->GetAdditionalHeaders();
+-  additional_headers.push_back(network::mojom::HttpHeader::New(
+-      "X-WebChannel-Content-Type", "application/x-protobuf"));
++  if (message_type_ == network::mojom::WebSocketMessageType::BINARY) {
++    additional_headers.push_back(network::mojom::HttpHeader::New(
++        "X-WebChannel-Content-Type", "application/x-protobuf"));
++  }
+ 
+   network_context_->CreateWebSocket(
+       service_url_, requested_protocols, net::StorageAccessApiStatus::kNone,
+@@ -124,10 +128,9 @@ void StreamingWebSocketClient::Connect()
+ void StreamingWebSocketClient::InternalWrite(base::span<const uint8_t> data) {
+   CHECK(state_ == State::kOpen);
+ 
+-  // Use the BINARY message type because the message is a binary-encoded
++  // BINARY is used by default because the message is a binary-encoded
+   // protobuf. The TEXT message type would be used for JSON.
+-  websocket_->SendMessage(network::mojom::WebSocketMessageType::BINARY,
+-                          data.size());
++  websocket_->SendMessage(message_type_, data.size());
+   MojoResult result = writable_->WriteAllData(data);
+   if (result != MOJO_RESULT_OK) {
+     OnError("Failed to write to WebSocket.");
+@@ -214,7 +217,7 @@ void StreamingWebSocketClient::OnDataFra
+ 
+   const size_t old_size = pending_read_data_index_;
+   const size_t new_size = old_size + data_len;
+-  if ((type != network::mojom::WebSocketMessageType::BINARY &&
++  if ((type != message_type_ &&
+        type != network::mojom::WebSocketMessageType::CONTINUATION) ||
+       data_len > std::numeric_limits<uint32_t>::max() || new_size < old_size ||
+       new_size > kMaxIncomingMessageSize) {
+--- a/components/streaming_client/streaming_websocket_client.h
++++ b/components/streaming_client/streaming_websocket_client.h
+@@ -80,7 +80,9 @@ class StreamingWebSocketClient
+   StreamingWebSocketClient(const GURL& service_url,
+                            network::mojom::NetworkContext* network_context,
+                            net::NetworkTrafficAnnotationTag traffic_annotation,
+-                           Delegate* delegate);
++                           Delegate* delegate,
++                           network::mojom::WebSocketMessageType message_type =
++                               network::mojom::WebSocketMessageType::BINARY);
+   ~StreamingWebSocketClient() override;
+ 
+   StreamingWebSocketClient(const StreamingWebSocketClient&) = delete;
+@@ -149,6 +151,7 @@ class StreamingWebSocketClient
+   const raw_ptr<network::mojom::NetworkContext> network_context_;
+   const net::NetworkTrafficAnnotationTag traffic_annotation_;
+   raw_ptr<Delegate> delegate_;
++  const network::mojom::WebSocketMessageType message_type_;
+ 
+   std::vector<uint8_t> pending_read_data_;
+   size_t pending_read_data_index_ = 0;
+--- a/chrome/browser/gcm/BUILD.gn
++++ b/chrome/browser/gcm/BUILD.gn
+@@ -4,6 +4,8 @@
+ 
+ source_set("gcm") {
+   sources = [
++    "autopush_driver.cc",
++    "autopush_driver.h",
+     "gcm_product_util.cc",
+     "gcm_product_util.h",
+     "gcm_profile_service_factory.cc",
+@@ -27,12 +29,16 @@ source_set("gcm") {
+     "//chrome/common:constants",
+     "//chrome/common:version_header",
+     "//components/gcm_driver/instance_id",
++    "//components/helium_services",
+     "//components/offline_pages/buildflags",
+     "//components/pref_registry",
+     "//components/prefs",
++    "//components/push_messaging",
++    "//components/streaming_client",
+     "//components/version_info",
+     "//content/public/browser",
+     "//mojo/public/cpp/bindings",
++    "//net",
+     "//services/network/public/cpp",
+     "//services/network/public/mojom",
+   ]
+--- /dev/null
++++ b/chrome/browser/gcm/autopush_driver.cc
+@@ -0,0 +1,727 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/gcm/autopush_driver.h"
++
++#include <utility>
++
++#include "base/base64url.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_util.h"
++#include "base/strings/string_view_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/uuid.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/gcm_driver/common/gcm_message.h"
++#include "components/gcm_driver/gcm_backoff_policy.h"
++#include "components/gcm_driver/gcm_driver_constants.h"
++#include "components/helium_services/helium_services_helpers.h"
++#include "components/helium_services/pref_names.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "components/push_messaging/app_identifier.h"
++#include "content/public/browser/network_service_instance.h"
++#include "content/public/browser/storage_partition.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++
++namespace gcm {
++
++namespace {
++
++// Holds the UAID, channel registrations and InstanceID data.
++constexpr char kStatePref[] = "gcm.autopush";
++constexpr char kServerKey[] = "server";
++constexpr char kUaidKey[] = "uaid";
++constexpr char kChannelsKey[] = "channels";
++constexpr char kInstanceIDsKey[] = "instance_ids";
++
++constexpr char kAppIdKey[] = "app_id";
++constexpr char kEntityKey[] = "entity";
++constexpr char kEndpointKey[] = "endpoint";
++constexpr char kIdKey[] = "id";
++constexpr char kExtraKey[] = "extra";
++
++// Wildcard used by InstanceIDHandler::DeleteAllTokensForApp().
++constexpr char kWildcard[] = "*";
++
++constexpr base::TimeDelta kPingInterval = base::Minutes(5);
++constexpr base::TimeDelta kRequestTimeout = base::Seconds(10);
++
++// Notification headers, as sent by autopush, mapped to the HTTP header names
++// that GCMEncryptionProvider expects.
++constexpr std::pair<const char*, const char*> kNotificationHeaders[] = {
++    {"encoding", "content-encoding"},
++    {"crypto_key", "crypto-key"},
++    {"encryption", "encryption"},
++};
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("helium_web_push", R"(
++        semantics {
++          sender: "Helium Web Push"
++          description:
++            "Keeps a WebSocket connection to an autopush-compatible push "
++            "server, which delivers end-to-end encrypted push messages to "
++            "websites the user has allowed to send notifications."
++          trigger:
++            "A website subscribes to push messages, or the browser starts "
++            "while at least one push subscription exists."
++          data:
++            "A random user agent ID issued by the push server, the random "
++            "channel IDs of all push subscriptions, and the website's "
++            "application server key when subscribing."
++          destination: OTHER
++          destination_other:
++            "The Helium push server, or a push server chosen by the user."
++        }
++        policy {
++          cookies_allowed: NO
++          setting:
++            "Can be disabled in Settings > Privacy and security > "
++            "Helium services."
++          policy_exception_justification: "Not implemented."
++        })");
++
++bool IsPushApp(const std::string& app_id) {
++  return base::StartsWith(app_id, push_messaging::kAppIdentifierPrefix);
++}
++
++bool Matches(const std::string& pattern, const std::string* value) {
++  return pattern == kWildcard || (value && *value == pattern);
++}
++
++}  // namespace
++
++AutopushDriver::PendingRegistration::PendingRegistration() = default;
++AutopushDriver::PendingRegistration::PendingRegistration(
++    PendingRegistration&&) = default;
++AutopushDriver::PendingRegistration&
++AutopushDriver::PendingRegistration::operator=(PendingRegistration&&) = default;
++AutopushDriver::PendingRegistration::~PendingRegistration() = default;
++
++AutopushDriver::AutopushDriver(
++    Profile* profile,
++    const scoped_refptr<base::SequencedTaskRunner>& blocking_task_runner)
++    : GCMDriver(profile->GetPath().Append(gcm_driver::kGCMStoreDirname),
++                blocking_task_runner),
++      profile_(profile),
++      backoff_(&GetGCMBackoffPolicy()),
++      ping_timer_(FROM_HERE,
++                  kPingInterval,
++                  base::BindRepeating(&AutopushDriver::OnPingTimer,
++                                      base::Unretained(this))) {
++  registrar_.Init(prefs());
++  auto on_prefs_changed = base::BindRepeating(&AutopushDriver::OnPrefsChanged,
++                                              base::Unretained(this));
++  helium::ConfigurePrefChangeRegistrarFor(prefs::kHeliumWebPushEnabled,
++                                          registrar_, on_prefs_changed);
++  registrar_.Add(prefs::kHeliumPushServer, on_prefs_changed);
++
++  content::GetNetworkConnectionTracker()->AddNetworkConnectionObserver(this);
++}
++
++AutopushDriver::~AutopushDriver() = default;
++
++// static
++void AutopushDriver::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterDictionaryPref(kStatePref);
++}
++
++void AutopushDriver::Shutdown() {
++  content::GetNetworkConnectionTracker()->RemoveNetworkConnectionObserver(this);
++  registrar_.RemoveAll();
++  // Not called from a client callback, so the client can go away right now.
++  client_.reset();
++  Disconnect();
++  GCMDriver::Shutdown();
++}
++
++void AutopushDriver::AddAppHandler(const std::string& app_id,
++                                   GCMAppHandler* handler) {
++  GCMDriver::AddAppHandler(app_id, handler);
++  if (app_id == push_messaging::kAppIdentifierPrefix) {
++    MaybeConnect();
++  }
++}
++
++void AutopushDriver::RemoveAppHandler(const std::string& app_id) {
++  GCMDriver::RemoveAppHandler(app_id);
++  if (app_id == push_messaging::kAppIdentifierPrefix) {
++    Disconnect();
++  }
++}
++
++void AutopushDriver::ValidateRegistration(
++    const std::string& app_id,
++    const std::vector<std::string>& sender_ids,
++    const std::string& registration_id,
++    ValidateRegistrationCallback callback) {
++  std::move(callback).Run(false);
++}
++
++void AutopushDriver::AddConnectionObserver(GCMConnectionObserver* observer) {}
++
++void AutopushDriver::RemoveConnectionObserver(GCMConnectionObserver* observer) {
++}
++
++GCMClient* AutopushDriver::GetGCMClientForTesting() const {
++  return nullptr;
++}
++
++bool AutopushDriver::IsStarted() const {
++  return client_ != nullptr;
++}
++
++bool AutopushDriver::IsConnected() const {
++  return hello_done_;
++}
++
++void AutopushDriver::GetGCMStatistics(GetGCMStatisticsCallback callback,
++                                      ClearActivityLogs clear_logs) {
++  std::move(callback).Run(GCMClient::GCMStatistics());
++}
++
++void AutopushDriver::SetGCMRecording(
++    const GCMStatisticsRecordingCallback& callback,
++    bool recording) {}
++
++void AutopushDriver::SetAccountTokens(
++    const std::vector<GCMClient::AccountTokenInfo>& account_tokens) {}
++
++void AutopushDriver::UpdateAccountMapping(
++    const AccountMapping& account_mapping) {}
++
++void AutopushDriver::RemoveAccountMapping(const CoreAccountId& account_id) {}
++
++base::Time AutopushDriver::GetLastTokenFetchTime() {
++  return base::Time();
++}
++
++void AutopushDriver::SetLastTokenFetchTime(const base::Time& time) {}
++
++InstanceIDHandler* AutopushDriver::GetInstanceIDHandlerInternal() {
++  return this;
++}
++
++void AutopushDriver::AddHeartbeatInterval(const std::string& scope,
++                                          int interval_ms) {}
++
++void AutopushDriver::RemoveHeartbeatInterval(const std::string& scope) {}
++
++// Only InstanceID-based push subscriptions are supported, so the legacy GCM
++// registration and messaging paths always report GCM as disabled.
++GCMClient::Result AutopushDriver::EnsureStarted(
++    GCMClient::StartMode start_mode) {
++  return GCMClient::GCM_DISABLED;
++}
++
++void AutopushDriver::RegisterImpl(const std::string& app_id,
++                                  const std::vector<std::string>& sender_ids) {}
++
++void AutopushDriver::UnregisterImpl(const std::string& app_id) {}
++
++void AutopushDriver::SendImpl(const std::string& app_id,
++                              const std::string& receiver_id,
++                              const OutgoingMessage& message) {}
++
++void AutopushDriver::RecordDecryptionFailure(const std::string& app_id,
++                                             GCMDecryptionResult result) {}
++
++void AutopushDriver::GetToken(const std::string& app_id,
++                              const std::string& authorized_entity,
++                              const std::string& scope,
++                              base::TimeDelta time_to_live,
++                              GetTokenCallback callback) {
++  if (!IsPushApp(app_id) || !helium::ShouldAccessPushService(*prefs())) {
++    std::move(callback).Run(std::string(), GCMClient::GCM_DISABLED);
++    return;
++  }
++
++  if (const std::string* channel_id =
++          FindChannelID(app_id, authorized_entity)) {
++    const std::string* endpoint =
++        channels().FindDict(*channel_id)->FindString(kEndpointKey);
++    std::move(callback).Run(*endpoint, GCMClient::SUCCESS);
++    return;
++  }
++
++  for (const auto& [channel_id, pending] : pending_registrations_) {
++    if (pending.app_id == app_id &&
++        pending.authorized_entity == authorized_entity) {
++      std::move(callback).Run(std::string(),
++                              GCMClient::ASYNC_OPERATION_PENDING);
++      return;
++    }
++  }
++
++  const std::string channel_id =
++      base::Uuid::GenerateRandomV4().AsLowercaseString();
++  PendingRegistration& registration = pending_registrations_[channel_id];
++  registration.app_id = app_id;
++  registration.authorized_entity = authorized_entity;
++  registration.callback = std::move(callback);
++
++  if (hello_done_) {
++    SendRegister(channel_id);
++  } else {
++    // Don't make the site wait for a reconnect backoff.
++    reconnect_timer_.Stop();
++    MaybeConnect();
++  }
++}
++
++void AutopushDriver::ValidateToken(const std::string& app_id,
++                                   const std::string& authorized_entity,
++                                   const std::string& scope,
++                                   const std::string& token,
++                                   ValidateTokenCallback callback) {
++  const std::string* channel_id = FindChannelID(app_id, authorized_entity);
++  std::move(callback).Run(
++      channel_id &&
++      *channels().FindDict(*channel_id)->FindString(kEndpointKey) == token);
++}
++
++void AutopushDriver::DeleteToken(const std::string& app_id,
++                                 const std::string& authorized_entity,
++                                 const std::string& scope,
++                                 DeleteTokenCallback callback) {
++  std::vector<std::string> removed;
++  for (const auto [channel_id, channel] : channels()) {
++    const base::DictValue& dict = channel.GetDict();
++    if (*dict.FindString(kAppIdKey) == app_id &&
++        Matches(authorized_entity, dict.FindString(kEntityKey))) {
++      removed.push_back(channel_id);
++    }
++  }
++
++  if (!removed.empty()) {
++    ScopedDictPrefUpdate update(prefs(), kStatePref);
++    base::DictValue* stored = update->EnsureDict(kChannelsKey);
++    for (const std::string& channel_id : removed) {
++      stored->Remove(channel_id);
++      // The server doesn't need to hear about this if we're offline, since
++      // the channel won't be included in the next hello.
++      if (hello_done_) {
++        Send(base::DictValue()
++                 .Set("messageType", "unregister")
++                 .Set("channelID", channel_id));
++      }
++    }
++  }
++
++  if (!ShouldConnect()) {
++    Disconnect();
++  }
++
++  std::move(callback).Run(GCMClient::SUCCESS);
++}
++
++void AutopushDriver::AddInstanceIDData(const std::string& app_id,
++                                       const std::string& instance_id,
++                                       const std::string& extra_data) {
++  if (!IsPushApp(app_id)) {
++    return;
++  }
++
++  ScopedDictPrefUpdate update(prefs(), kStatePref);
++  update->EnsureDict(kInstanceIDsKey)
++      ->Set(app_id, base::DictValue()
++                        .Set(kIdKey, instance_id)
++                        .Set(kExtraKey, extra_data));
++}
++
++void AutopushDriver::RemoveInstanceIDData(const std::string& app_id) {
++  if (!IsPushApp(app_id)) {
++    return;
++  }
++
++  ScopedDictPrefUpdate update(prefs(), kStatePref);
++  update->EnsureDict(kInstanceIDsKey)->Remove(app_id);
++}
++
++void AutopushDriver::GetInstanceIDData(const std::string& app_id,
++                                       GetInstanceIDDataCallback callback) {
++  std::string instance_id;
++  std::string extra_data;
++  const base::DictValue* instance_ids =
++      prefs()->GetDict(kStatePref).FindDict(kInstanceIDsKey);
++  const base::DictValue* data =
++      instance_ids ? instance_ids->FindDict(app_id) : nullptr;
++  if (IsPushApp(app_id) && data) {
++    if (const std::string* id = data->FindString(kIdKey)) {
++      instance_id = *id;
++    }
++    if (const std::string* extra = data->FindString(kExtraKey)) {
++      extra_data = *extra;
++    }
++  }
++
++  // Posted, like other drivers do. It still runs before any InstanceID
++  // operation queued after the InstanceID was created.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(callback), std::move(instance_id),
++                                std::move(extra_data)));
++}
++
++void AutopushDriver::OnMessage(std::vector<uint8_t> message) {
++  std::optional<base::DictValue> dict = base::JSONReader::ReadDict(
++      base::as_string_view(message), base::JSON_PARSE_RFC);
++  if (!dict) {
++    OnConnectionLost();
++    return;
++  }
++
++  if (hello_done_) {
++    timeout_timer_.Stop();
++    ping_timer_.Reset();
++  }
++
++  const std::string* type = dict->FindString("messageType");
++  if (!type) {
++    // Ping reply.
++    return;
++  }
++
++  if (*type == "hello") {
++    HandleHello(*dict);
++  } else if (!hello_done_) {
++    OnConnectionLost();
++  } else if (*type == "register") {
++    HandleRegister(*dict);
++  } else if (*type == "notification") {
++    HandleNotification(*dict);
++  }
++}
++
++void AutopushDriver::OnConnectionError(const std::string& message,
++                                       int net_error,
++                                       int response_code) {
++  OnConnectionLost();
++}
++
++void AutopushDriver::OnDropChannel(bool was_clean,
++                                   uint16_t code,
++                                   const std::string& reason,
++                                   std::optional<base::TimeDelta> elapsed) {
++  OnConnectionLost();
++}
++
++void AutopushDriver::OnError(const std::string& message) {
++  OnConnectionLost();
++}
++
++void AutopushDriver::OnClose() {
++  OnConnectionLost();
++}
++
++void AutopushDriver::OnConnectionChanged(
++    net::NetworkChangeNotifier::ConnectionType type) {
++  if (type == net::NetworkChangeNotifier::CONNECTION_NONE) {
++    return;
++  }
++
++  backoff_.Reset();
++  if (hello_done_) {
++    // The socket may not have survived the network change.
++    OnPingTimer();
++  } else if (reconnect_timer_.IsRunning()) {
++    reconnect_timer_.Stop();
++    MaybeConnect();
++  }
++}
++
++PrefService* AutopushDriver::prefs() const {
++  return profile_->GetPrefs();
++}
++
++const base::DictValue& AutopushDriver::channels() const {
++  static const base::NoDestructor<base::DictValue> kEmpty;
++  const base::DictValue* channels =
++      prefs()->GetDict(kStatePref).FindDict(kChannelsKey);
++  return channels ? *channels : *kEmpty;
++}
++
++const std::string* AutopushDriver::FindChannelID(
++    const std::string& app_id,
++    const std::string& authorized_entity) const {
++  for (const auto [channel_id, channel] : channels()) {
++    const base::DictValue& dict = channel.GetDict();
++    if (*dict.FindString(kAppIdKey) == app_id &&
++        *dict.FindString(kEntityKey) == authorized_entity) {
++      return &channel_id;
++    }
++  }
++  return nullptr;
++}
++
++bool AutopushDriver::ShouldConnect() const {
++  return helium::ShouldAccessPushService(*prefs()) &&
++         app_handlers().contains(push_messaging::kAppIdentifierPrefix) &&
++         (!channels().empty() || !pending_registrations_.empty());
++}
++
++void AutopushDriver::MaybeConnect() {
++  if (client_ || reconnect_timer_.IsRunning()) {
++    return;
++  }
++
++  if (helium::ShouldAccessPushService(*prefs())) {
++    // Registrations from a different server are useless, so drop them. Sites
++    // will see their subscription disappear and can subscribe again.
++    const std::string server = helium::GetPushServiceURL(*prefs()).spec();
++    const std::string* stored_server =
++        prefs()->GetDict(kStatePref).FindString(kServerKey);
++    if (!stored_server || *stored_server != server) {
++      ScopedDictPrefUpdate update(prefs(), kStatePref);
++      update->Set(kServerKey, server);
++      update->Remove(kUaidKey);
++      update->Remove(kChannelsKey);
++    }
++  }
++
++  if (ShouldConnect()) {
++    Connect();
++  } else {
++    Disconnect();
++  }
++}
++
++void AutopushDriver::Connect() {
++  server_url_ = helium::GetPushServiceURL(*prefs());
++  client_ = std::make_unique<streaming_client::StreamingWebSocketClient>(
++      server_url_, profile_->GetDefaultStoragePartition()->GetNetworkContext(),
++      kTrafficAnnotation, this, network::mojom::WebSocketMessageType::TEXT);
++
++  base::ListValue channel_ids;
++  for (const auto [channel_id, channel] : channels()) {
++    channel_ids.Append(channel_id);
++  }
++
++  base::DictValue hello = base::DictValue()
++                              .Set("messageType", "hello")
++                              .Set("use_webpush", true)
++                              .Set("channelIDs", std::move(channel_ids));
++  if (const std::string* uaid =
++          prefs()->GetDict(kStatePref).FindString(kUaidKey)) {
++    hello.Set("uaid", *uaid);
++  }
++
++  // Sending connects the client, and the hello is sent once it's open.
++  Send(std::move(hello));
++  timeout_timer_.Start(FROM_HERE, kRequestTimeout, this,
++                       &AutopushDriver::OnConnectionLost);
++}
++
++void AutopushDriver::Disconnect() {
++  reconnect_timer_.Stop();
++  timeout_timer_.Stop();
++  ping_timer_.Stop();
++  hello_done_ = false;
++
++  if (client_) {
++    client_->Close();
++    // This may be called from within a client callback.
++    base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(
++        FROM_HERE, std::move(client_));
++  }
++
++  auto pending = std::move(pending_registrations_);
++  pending_registrations_.clear();
++  for (auto& [channel_id, registration] : pending) {
++    std::move(registration.callback)
++        .Run(std::string(), GCMClient::NETWORK_ERROR);
++  }
++}
++
++void AutopushDriver::OnConnectionLost() {
++  Disconnect();
++  if (!ShouldConnect()) {
++    return;
++  }
++
++  backoff_.InformOfRequest(false);
++  reconnect_timer_.Start(
++      FROM_HERE, backoff_.GetTimeUntilRelease(),
++      base::BindOnce(&AutopushDriver::MaybeConnect, base::Unretained(this)));
++}
++
++void AutopushDriver::OnPrefsChanged() {
++  if (helium::ShouldAccessPushService(*prefs()) && client_ &&
++      helium::GetPushServiceURL(*prefs()) == server_url_) {
++    return;
++  }
++
++  Disconnect();
++  backoff_.Reset();
++  MaybeConnect();
++}
++
++void AutopushDriver::OnPingTimer() {
++  if (Send(base::DictValue())) {
++    timeout_timer_.Start(FROM_HERE, kRequestTimeout, this,
++                         &AutopushDriver::OnConnectionLost);
++  }
++}
++
++bool AutopushDriver::Send(base::DictValue message) {
++  std::optional<std::string> json = base::WriteJson(message);
++  // A failed write reports the error synchronously, which disconnects.
++  client_->Send(std::vector<uint8_t>(json->begin(), json->end()));
++  return client_ != nullptr;
++}
++
++bool AutopushDriver::SendRegister(const std::string& channel_id) {
++  // The authorized entity is the base64url-encoded application server key.
++  const std::string& key =
++      pending_registrations_.at(channel_id).authorized_entity;
++  if (!Send(base::DictValue()
++                .Set("messageType", "register")
++                .Set("channelID", channel_id)
++                .Set("key", key))) {
++    return false;
++  }
++
++  // The connection can stay alive while the server never answers this.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&AutopushDriver::OnRegisterTimeout,
++                     weak_ptr_factory_.GetWeakPtr(), channel_id),
++      kRequestTimeout);
++  return true;
++}
++
++void AutopushDriver::OnRegisterTimeout(const std::string& channel_id) {
++  auto registration = pending_registrations_.extract(channel_id);
++  if (registration.empty()) {
++    return;
++  }
++
++  std::move(registration.mapped().callback)
++      .Run(std::string(), GCMClient::SERVER_ERROR);
++  if (!ShouldConnect()) {
++    Disconnect();
++  }
++}
++
++void AutopushDriver::HandleHello(const base::DictValue& message) {
++  const std::string* uaid = message.FindString("uaid");
++  if (hello_done_ || message.FindInt("status") != 200 || !uaid ||
++      uaid->empty()) {
++    OnConnectionLost();
++    return;
++  }
++
++  const std::string* old_uaid =
++      prefs()->GetDict(kStatePref).FindString(kUaidKey);
++  if (old_uaid && *old_uaid != *uaid) {
++    // The server doesn't know us anymore, so our channels are gone too.
++    ScopedDictPrefUpdate(prefs(), kStatePref)->Remove(kChannelsKey);
++  }
++  ScopedDictPrefUpdate(prefs(), kStatePref)->Set(kUaidKey, *uaid);
++
++  hello_done_ = true;
++  timeout_timer_.Stop();
++  backoff_.InformOfRequest(true);
++
++  if (!ShouldConnect()) {
++    Disconnect();
++    return;
++  }
++
++  ping_timer_.Reset();
++
++  // Sending can disconnect, which clears pending_registrations_.
++  std::vector<std::string> channel_ids;
++  for (const auto& [channel_id, registration] : pending_registrations_) {
++    channel_ids.push_back(channel_id);
++  }
++  for (const std::string& channel_id : channel_ids) {
++    if (!SendRegister(channel_id)) {
++      return;
++    }
++  }
++}
++
++void AutopushDriver::HandleRegister(const base::DictValue& message) {
++  const std::string* channel_id = message.FindString("channelID");
++  if (!channel_id) {
++    return;
++  }
++
++  auto it = pending_registrations_.find(base::ToLowerASCII(*channel_id));
++  if (it == pending_registrations_.end()) {
++    return;
++  }
++
++  const std::string pending_id = it->first;
++  PendingRegistration registration = std::move(it->second);
++  pending_registrations_.erase(it);
++
++  const std::string* endpoint = message.FindString("pushEndpoint");
++  if (message.FindInt("status") != 200 || !endpoint ||
++      !GURL(*endpoint).is_valid()) {
++    std::move(registration.callback)
++        .Run(std::string(), GCMClient::SERVER_ERROR);
++    if (!ShouldConnect()) {
++      Disconnect();
++    }
++    return;
++  }
++
++  ScopedDictPrefUpdate(prefs(), kStatePref)
++      ->EnsureDict(kChannelsKey)
++      ->Set(pending_id, base::DictValue()
++                            .Set(kAppIdKey, registration.app_id)
++                            .Set(kEntityKey, registration.authorized_entity)
++                            .Set(kEndpointKey, *endpoint));
++
++  std::move(registration.callback).Run(*endpoint, GCMClient::SUCCESS);
++}
++
++void AutopushDriver::HandleNotification(const base::DictValue& message) {
++  const std::string* channel_id = message.FindString("channelID");
++  const std::string* version = message.FindString("version");
++  if (!channel_id || !version) {
++    return;
++  }
++
++  const std::string normalized_id = base::ToLowerASCII(*channel_id);
++  if (const base::DictValue* channel = channels().FindDict(normalized_id)) {
++    IncomingMessage incoming;
++    incoming.sender_id = *channel->FindString(kEntityKey);
++    incoming.message_id = *version;
++
++    const std::string* data = message.FindString("data");
++    if (data && !base::Base64UrlDecode(
++                    *data, base::Base64UrlDecodePolicy::IGNORE_PADDING,
++                    &incoming.raw_data)) {
++      return;
++    }
++
++    if (const base::DictValue* headers = message.FindDict("headers")) {
++      for (const auto& [from, to] : kNotificationHeaders) {
++        if (const std::string* value = headers->FindString(from)) {
++          incoming.data[to] = *value;
++        }
++      }
++    }
++
++    DispatchMessage(*channel->FindString(kAppIdKey), incoming);
++  }
++
++  Send(base::DictValue()
++           .Set("messageType", "ack")
++           .Set("updates",
++                base::ListValue().Append(base::DictValue()
++                                             .Set("channelID", *channel_id)
++                                             .Set("version", *version)
++                                             .Set("code", 100))));
++}
++
++}  // namespace gcm
+--- /dev/null
++++ b/chrome/browser/gcm/autopush_driver.h
+@@ -0,0 +1,181 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_GCM_AUTOPUSH_DRIVER_H_
++#define CHROME_BROWSER_GCM_AUTOPUSH_DRIVER_H_
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/timer/timer.h"
++#include "base/values.h"
++#include "components/gcm_driver/gcm_driver.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/streaming_client/streaming_websocket_client.h"
++#include "net/base/backoff_entry.h"
++#include "services/network/public/cpp/network_connection_tracker.h"
++#include "url/gurl.h"
++
++class PrefService;
++class Profile;
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace gcm {
++
++// GCMDriver that delivers Web Push messages through an autopush-compatible
++// server, such as minipush. Other GCM users see GCM as disabled.
++class AutopushDriver
++    : public GCMDriver,
++      protected InstanceIDHandler,
++      public streaming_client::StreamingWebSocketClient::Delegate,
++      public network::NetworkConnectionTracker::NetworkConnectionObserver {
++ public:
++  AutopushDriver(
++      Profile* profile,
++      const scoped_refptr<base::SequencedTaskRunner>& blocking_task_runner);
++  AutopushDriver(const AutopushDriver&) = delete;
++  AutopushDriver& operator=(const AutopushDriver&) = delete;
++  ~AutopushDriver() override;
++
++  static void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++
++  // GCMDriver:
++  void Shutdown() override;
++  void AddAppHandler(const std::string& app_id,
++                     GCMAppHandler* handler) override;
++  void RemoveAppHandler(const std::string& app_id) override;
++  void ValidateRegistration(const std::string& app_id,
++                            const std::vector<std::string>& sender_ids,
++                            const std::string& registration_id,
++                            ValidateRegistrationCallback callback) override;
++  void AddConnectionObserver(GCMConnectionObserver* observer) override;
++  void RemoveConnectionObserver(GCMConnectionObserver* observer) override;
++  GCMClient* GetGCMClientForTesting() const override;
++  bool IsStarted() const override;
++  bool IsConnected() const override;
++  void GetGCMStatistics(GetGCMStatisticsCallback callback,
++                        ClearActivityLogs clear_logs) override;
++  void SetGCMRecording(const GCMStatisticsRecordingCallback& callback,
++                       bool recording) override;
++  void SetAccountTokens(
++      const std::vector<GCMClient::AccountTokenInfo>& account_tokens) override;
++  void UpdateAccountMapping(const AccountMapping& account_mapping) override;
++  void RemoveAccountMapping(const CoreAccountId& account_id) override;
++  base::Time GetLastTokenFetchTime() override;
++  void SetLastTokenFetchTime(const base::Time& time) override;
++  InstanceIDHandler* GetInstanceIDHandlerInternal() override;
++  void AddHeartbeatInterval(const std::string& scope, int interval_ms) override;
++  void RemoveHeartbeatInterval(const std::string& scope) override;
++
++ protected:
++  // GCMDriver:
++  GCMClient::Result EnsureStarted(GCMClient::StartMode start_mode) override;
++  void RegisterImpl(const std::string& app_id,
++                    const std::vector<std::string>& sender_ids) override;
++  void UnregisterImpl(const std::string& app_id) override;
++  void SendImpl(const std::string& app_id,
++                const std::string& receiver_id,
++                const OutgoingMessage& message) override;
++  void RecordDecryptionFailure(const std::string& app_id,
++                               GCMDecryptionResult result) override;
++
++  // InstanceIDHandler:
++  void GetToken(const std::string& app_id,
++                const std::string& authorized_entity,
++                const std::string& scope,
++                base::TimeDelta time_to_live,
++                GetTokenCallback callback) override;
++  void ValidateToken(const std::string& app_id,
++                     const std::string& authorized_entity,
++                     const std::string& scope,
++                     const std::string& token,
++                     ValidateTokenCallback callback) override;
++  void DeleteToken(const std::string& app_id,
++                   const std::string& authorized_entity,
++                   const std::string& scope,
++                   DeleteTokenCallback callback) override;
++  void AddInstanceIDData(const std::string& app_id,
++                         const std::string& instance_id,
++                         const std::string& extra_data) override;
++  void RemoveInstanceIDData(const std::string& app_id) override;
++  void GetInstanceIDData(const std::string& app_id,
++                         GetInstanceIDDataCallback callback) override;
++
++ private:
++  struct PendingRegistration {
++    PendingRegistration();
++    PendingRegistration(PendingRegistration&&);
++    PendingRegistration& operator=(PendingRegistration&&);
++    ~PendingRegistration();
++
++    std::string app_id;
++    std::string authorized_entity;
++    GetTokenCallback callback;
++  };
++
++  // streaming_client::StreamingWebSocketClient::Delegate:
++  void OnMessage(std::vector<uint8_t> message) override;
++  void OnConnectionError(const std::string& message,
++                         int net_error,
++                         int response_code) override;
++  void OnDropChannel(bool was_clean,
++                     uint16_t code,
++                     const std::string& reason,
++                     std::optional<base::TimeDelta> elapsed) override;
++  void OnError(const std::string& message) override;
++  void OnClose() override;
++
++  // network::NetworkConnectionTracker::NetworkConnectionObserver:
++  void OnConnectionChanged(
++      net::NetworkChangeNotifier::ConnectionType type) override;
++
++  PrefService* prefs() const;
++  const base::DictValue& channels() const;
++  const std::string* FindChannelID(const std::string& app_id,
++                                   const std::string& authorized_entity) const;
++
++  bool ShouldConnect() const;
++  void MaybeConnect();
++  void Connect();
++  void Disconnect();
++  void OnConnectionLost();
++  void OnPrefsChanged();
++  void OnPingTimer();
++
++  // These return false if sending failed and dropped the connection.
++  bool Send(base::DictValue message);
++  bool SendRegister(const std::string& channel_id);
++  void OnRegisterTimeout(const std::string& channel_id);
++  void HandleHello(const base::DictValue& message);
++  void HandleRegister(const base::DictValue& message);
++  void HandleNotification(const base::DictValue& message);
++
++  const raw_ptr<Profile> profile_;
++  PrefChangeRegistrar registrar_;
++
++  std::unique_ptr<streaming_client::StreamingWebSocketClient> client_;
++  GURL server_url_;
++  bool hello_done_ = false;
++  std::map<std::string, PendingRegistration> pending_registrations_;
++
++  net::BackoffEntry backoff_;
++  base::OneShotTimer reconnect_timer_;
++  base::OneShotTimer timeout_timer_;
++  base::RetainingOneShotTimer ping_timer_;
++
++  base::WeakPtrFactory<AutopushDriver> weak_ptr_factory_{this};
++};
++
++}  // namespace gcm
++
++#endif  // CHROME_BROWSER_GCM_AUTOPUSH_DRIVER_H_
+--- a/chrome/browser/gcm/gcm_product_util.cc
++++ b/chrome/browser/gcm/gcm_product_util.cc
+@@ -7,6 +7,7 @@
+ #include <string_view>
+ 
+ #include "base/strings/string_util.h"
++#include "chrome/browser/gcm/autopush_driver.h"
+ #include "chrome/common/chrome_version.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+@@ -53,6 +54,7 @@ void RegisterPrefs(PrefRegistrySimple* r
+ 
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   RegisterPrefs(registry);
++  AutopushDriver::RegisterProfilePrefs(registry);
+ }
+ 
+ }  // namespace gcm
+--- a/chrome/browser/gcm/gcm_profile_service_factory.cc
++++ b/chrome/browser/gcm/gcm_profile_service_factory.cc
+@@ -26,9 +26,11 @@
+ #include "services/network/public/mojom/network_context.mojom.h"
+ 
+ #if !BUILDFLAG(IS_ANDROID)
++#include "chrome/browser/gcm/autopush_driver.h"
+ #include "chrome/browser/gcm/gcm_product_util.h"
+ #include "chrome/common/channel_info.h"
+ #include "components/gcm_driver/gcm_client_factory.h"
++#include "components/push_messaging/push_messaging_features.h"
+ #include "content/public/browser/browser_context.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+@@ -171,6 +173,11 @@ GCMProfileServiceFactory::BuildServiceIn
+   service = std::make_unique<GCMProfileService>(profile->GetPath(),
+                                                 blocking_task_runner);
+ #else
++  if (base::FeatureList::IsEnabled(features::kHeliumWebPush)) {
++    return std::make_unique<GCMProfileService>(
++        std::make_unique<AutopushDriver>(profile, blocking_task_runner));
++  }
++
+   service = std::make_unique<GCMProfileService>(
+       profile->GetPrefs(), profile->GetPath(),
+       base::BindRepeating(&RequestProxyResolvingSocketFactory,
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -242,6 +242,8 @@ void RegisterBrowserUserPrefs(user_prefs
+     registry->RegisterBooleanPref(prefs::kHeliumServicesConsented, false);
+     registry->RegisterBooleanPref(prefs::kHeliumUpdateFetchingEnabled, true);
+     registry->RegisterBooleanPref(prefs::kHeliumUBlockAssetsEnabled, true);
++    registry->RegisterBooleanPref(prefs::kHeliumWebPushEnabled, true);
++    registry->RegisterStringPref(prefs::kHeliumPushServer, "");
+   }
+ 
+   registry->RegisterBooleanPref(
+--- a/components/push_messaging/push_messaging_features.cc
++++ b/components/push_messaging/push_messaging_features.cc
+@@ -17,4 +17,8 @@ BASE_FEATURE(kPushSubscriptionWithExpira
+ BASE_FEATURE(kPushMessagingGcmEndpointWebpushPath,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++// TODO: bump the Helium services schema before enabling this by default.
++// See components/helium_services/schema.cc.
++BASE_FEATURE(kHeliumWebPush, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ }  // namespace features
+--- a/components/push_messaging/push_messaging_features.h
++++ b/components/push_messaging/push_messaging_features.h
+@@ -19,6 +19,10 @@ BASE_DECLARE_FEATURE(kPushSubscriptionWi
+ // Feature flag to control use of new /wp/ path based Webpush endpoints.
+ BASE_DECLARE_FEATURE(kPushMessagingGcmEndpointWebpushPath);
+ 
++// Delivers push messages through an autopush-compatible push service instead
++// of GCM.
++BASE_DECLARE_FEATURE(kHeliumWebPush);
++
+ }  // namespace features
+ 
+ #endif  // COMPONENTS_PUSH_MESSAGING_PUSH_MESSAGING_FEATURES_H_
+--- a/chrome/browser/ui/webui/BUILD.gn
++++ b/chrome/browser/ui/webui/BUILD.gn
+@@ -676,6 +676,7 @@ source_set("onboarding") {
+     "//components/helium_onboarding:generated_resources",
+     "//components/helium_onboarding:localized_strings",
+     "//components/helium_services",
++    "//components/push_messaging",
+     "//extensions/common",
+     "//ui/webui",
+   ]
+--- a/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
++++ b/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/webui/onboarding/onboarding_page_ui.h"
+ 
++#include "base/feature_list.h"
+ #include "base/strings/strcat.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -15,6 +16,7 @@
+ #include "components/helium_onboarding/helium_onboarding_localized_strings.h"
+ #include "components/helium_onboarding/resources/grit/helium_onboarding_generated.h"
+ #include "components/helium_onboarding/resources/grit/helium_onboarding_generated_map.h"
++#include "components/push_messaging/push_messaging_features.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_ui_controller.h"
+ #include "content/public/browser/web_ui_data_source.h"
+@@ -37,6 +39,8 @@ HeliumOnboardingPage::HeliumOnboardingPa
+                               IDR_HELIUM_ONBOARDING_INDEX_HTML);
+   source->AddLocalizedStrings(helium_onboarding::kLocalizedStrings);
+   source->UseStringsJs();
++  source->AddBoolean("webPushAvailable",
++                     base::FeatureList::IsEnabled(features::kHeliumWebPush));
+ 
+ #if BUILDFLAG(IS_MAC)
+   source->AddBoolean("showMacImportPermissionNotice",
+--- a/components/helium_services/schema.cc
++++ b/components/helium_services/schema.cc
+@@ -32,6 +32,15 @@ ServicesChangelog& GetChangelog() {
+             "Automatic component updates are now available. They're managed by the same toggle that enables automatic browser updates.\n"
+             "From now on, you'll be notified about major changes to Helium services. Even though these notifications are extremely rare, you can choose to ignore them and accept all future changes automatically."
+           }
++          // TODO: before enabling kHeliumWebPush by default, add this entry,
++          // bump kHeliumCurrentSchemaVersion to 2 and require
++          // HasAcceptedSchema(prefs, 2) in ShouldAccessPushService().
++          // {
++          //   2,
++          //   "Push notifications are now available. When a website you've "
++          //   "allowed to send notifications subscribes to them, Helium "
++          //   "keeps a connection to the Helium push server to receive them."
++          // }
+       });
+ 
+   return kHeliumSchemaChangelog;

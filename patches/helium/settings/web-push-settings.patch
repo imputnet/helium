@@ -1,0 +1,215 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -1679,6 +1679,24 @@
+     <message name="IDS_SETTINGS_HELIUM_SERVICES_UBO_DESCRIPTION" desc="Description of the toggle for automatic update downloads">
+       Helium will fetch fresh filter lists for uBlock Origin. All requests to lists are proxied to protect your privacy. When disabled, default filter lists will be loaded from local storage, which are only updated along with Helium. Optional filter lists will be requested without proxying.
+     </message>
++    <message name="IDS_SETTINGS_HELIUM_SERVICES_WEB_PUSH" desc="Toggle for receiving web push notifications">
++      Allow receiving push notifications
++    </message>
++    <message name="IDS_SETTINGS_HELIUM_SERVICES_WEB_PUSH_DESCRIPTION" desc="Description of the toggle for receiving web push notifications">
++      Websites you allow to send notifications can deliver them through a push server, even when they aren't open. Helium only connects to the push server while at least one website is subscribed. Push messages are end-to-end encrypted. When disabled, websites can't subscribe to push notifications.
++    </message>
++    <message name="IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_HELIUM" desc="Radio button for using the default Helium push server">
++      Helium push server
++    </message>
++    <message name="IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_CUSTOM" desc="Radio button for using a custom push server">
++      Other
++    </message>
++    <message name="IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_ARIA_LABEL" desc="ARIA label of the text input for a custom push server">
++      Custom push server URL
++    </message>
++    <message name="IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_INVALID" desc="Validation error shown when the custom push server URL is invalid.">
++      Invalid push server URL
++    </message>
+     <message name="IDS_SETTINGS_HELIUM_SERVICES_OVERRIDE" desc="Text input for overriding the Helium services server">
+       Use your own instance of Helium services
+     </message>
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -469,6 +469,9 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumUBlockAssetsEnabled] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumWebPushEnabled] =
++      settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumPushServer] = settings_api::PrefType::kString;
+   (*s_allowlist)[::prefs::kHeliumServicesOrigin] =
+       settings_api::PrefType::kString;
+   (*s_allowlist)[::prefs::kHeliumServicesConsented] =
+--- a/chrome/browser/resources/settings/privacy_page/services_page.html
++++ b/chrome/browser/resources/settings/privacy_page/services_page.html
+@@ -37,6 +37,12 @@
+         padding: calc(var(--cr-section-padding) / 2) var(--cr-section-padding);
+         justify-content: space-between;
+     }
++
++    #pushServer {
++        padding-inline-start: var(--cr-section-indent-padding);
++        padding-inline-end: var(--cr-section-padding);
++        padding-bottom: var(--cr-section-vertical-padding);
++    }
+ </style>
+ 
+ <settings-subpage page-title="$i18n{heliumServicesTitle}" route-path$="[[routePath]]">
+@@ -109,6 +115,40 @@
+                 label="$i18n{heliumUboToggle}"
+                 sub-label="$i18n{heliumUboToggleDescription}">
+             </settings-toggle-button>
++            <template is="dom-if" if="[[webPushAvailable_]]">
++            <settings-toggle-button id="webPushToggleButton"
++                pref="{{prefs.helium.services.web_push}}"
++                label="$i18n{heliumWebPushToggle}"
++                sub-label="$i18n{heliumWebPushToggleDescription}">
++            </settings-toggle-button>
++            <cr-collapse opened="[[prefs.helium.services.web_push.value]]">
++                <div id="pushServer">
++                    <cr-radio-group selected="[[pushServerMode_]]"
++                        on-selected-changed="onPushServerModeChange_">
++                        <cr-radio-button name="helium"
++                            label="$i18n{heliumPushServerHelium}">
++                        </cr-radio-button>
++                        <cr-radio-button name="custom"
++                            label="$i18n{heliumPushServerCustom}">
++                        </cr-radio-button>
++                    </cr-radio-group>
++                    <cr-input
++                        hidden="[[!isCustomPushServer_(pushServerMode_)]]"
++                        placeholder="wss://"
++                        value="[[prefs.helium.services.push_server.value]]"
++                        pattern="wss://.+|ws://(localhost|127[.]0[.]0[.]1)((:|/).*)?"
++                        on-keydown="onOriginOverrideKeydown_"
++                        on-change="onPushServerChange_"
++                        type="url"
++                        maxlength="256"
++                        aria-label="$i18n{heliumPushServerLabel}"
++                        auto-validate
++                        error-message="$i18n{heliumPushServerInvalid}"
++                        spellcheck="false">
++                    </cr-input>
++                </div>
++            </cr-collapse>
++            </template>
+         </cr-collapse>
+     </div>
+     </template>
+--- a/chrome/browser/resources/settings/privacy_page/services_page.ts
++++ b/chrome/browser/resources/settings/privacy_page/services_page.ts
+@@ -10,6 +10,8 @@ import 'chrome://resources/cr_elements/c
+ import 'chrome://resources/cr_elements/cr_collapse/cr_collapse.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+ import 'chrome://resources/cr_elements/cr_input/cr_input.js';
++import 'chrome://resources/cr_elements/cr_radio_button/cr_radio_button.js';
++import 'chrome://resources/cr_elements/cr_radio_group/cr_radio_group.js';
+ 
+ import {PrefsMixin} from '/shared/settings/prefs/prefs_mixin.js';
+ import {HelpBubbleMixin} from 'chrome://resources/cr_components/help_bubble/help_bubble_mixin.js';
+@@ -86,6 +88,14 @@ export class SettingsHeliumServicesPageE
+           value: CrashReportingMode.ASK,
+         }),
+       },
++      pushServerMode_: {
++        type: String,
++        value: 'helium',
++      },
++      webPushAvailable_: {
++        type: Boolean,
++        value: () => loadTimeData.getBoolean('heliumWebPushAvailable'),
++      },
+     };
+   }
+ 
+@@ -94,6 +104,14 @@ export class SettingsHeliumServicesPageE
+   declare private crashReportingPref_:
+       chrome.settingsPrivate.PrefObject<number>;
+   declare private ignoreChecked_: boolean;
++  declare private pushServerMode_: string;
++  declare private webPushAvailable_: boolean;
++
++  static get observers() {
++    return [
++      'onPushServerPrefChanged_(prefs.helium.services.push_server.value)'
++    ];
++  }
+ 
+   private toOrigin(thing: string) {
+     try {
+@@ -168,6 +186,29 @@ export class SettingsHeliumServicesPageE
+     this.setPrefValue('helium.services.origin_override', target.value);
+   }
+ 
++  private onPushServerPrefChanged_(server: string) {
++    // An empty server means the Helium one, so show the choice that's used.
++    this.pushServerMode_ = server ? 'custom' : 'helium';
++  }
++
++  private isCustomPushServer_(mode: string) {
++    return mode === 'custom';
++  }
++
++  private onPushServerModeChange_(event: CustomEvent<{value: string}>) {
++    this.pushServerMode_ = event.detail.value;
++    if (!this.isCustomPushServer_(this.pushServerMode_)) {
++      this.setPrefValue('helium.services.push_server', '');
++    }
++  }
++
++  private onPushServerChange_(event: Event) {
++    const target = event.target as CrInputElement;
++    if (!target.invalid) {
++      this.setPrefValue('helium.services.push_server', target.value);
++    }
++  }
++
+   private onServicesPendingButtonClick_() {
+     window.open('chrome://setup', '_blank');
+   }
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -97,6 +97,7 @@
+ #include "components/permissions/features.h"
+ #include "components/personal_context/core/url_constants.h"
+ #include "components/prefs/pref_service.h"
++#include "components/push_messaging/push_messaging_features.h"
+ #include "components/safe_browsing/core/common/features.h"
+ #include "components/safe_browsing/core/common/hashprefix_realtime/hash_realtime_utils.h"
+ #include "components/saved_tab_groups/public/features.h"
+@@ -2604,6 +2605,17 @@ void AddPrivacyStrings(content::WebUIDat
+         IDS_SETTINGS_HELIUM_SERVICES_UBO},
+       {"heliumUboToggleDescription",
+         IDS_SETTINGS_HELIUM_SERVICES_UBO_DESCRIPTION},
++      {"heliumWebPushToggle", IDS_SETTINGS_HELIUM_SERVICES_WEB_PUSH},
++      {"heliumWebPushToggleDescription",
++       IDS_SETTINGS_HELIUM_SERVICES_WEB_PUSH_DESCRIPTION},
++      {"heliumPushServerHelium",
++       IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_HELIUM},
++      {"heliumPushServerCustom",
++       IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_CUSTOM},
++      {"heliumPushServerLabel",
++       IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_ARIA_LABEL},
++      {"heliumPushServerInvalid",
++       IDS_SETTINGS_HELIUM_SERVICES_PUSH_SERVER_INVALID},
+       {"heliumOriginOverride", IDS_SETTINGS_HELIUM_SERVICES_OVERRIDE},
+       {"heliumOriginOverrideDescription",
+         IDS_SETTINGS_HELIUM_SERVICES_OVERRIDE_DESCRIPTION},
+@@ -2884,6 +2896,10 @@ void AddPrivacyStrings(content::WebUIDat
+        IDS_SETTINGS_SECURITY_JAVASCRIPT_GUARDRAILS_MANAGE_SITE_EXCEPTIONS_DESCRIPTION}};
+   html_source->AddLocalizedStrings(kLocalizedStrings);
+ 
++  html_source->AddBoolean(
++      "heliumWebPushAvailable",
++      base::FeatureList::IsEnabled(features::kHeliumWebPush));
++
+   html_source->AddString("cookiesSettingsHelpCenterURL",
+                          chrome::kCookiesSettingsHelpCenterURL);
+ 
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -325,6 +325,7 @@ source_set("impl") {
+     "//components/personal_context/core",
+     "//components/prefs",
+     "//components/privacy_sandbox",
++    "//components/push_messaging",
+     "//components/safe_browsing/core/common:features",
+     "//components/safe_browsing/core/common:safe_browsing_prefs",
+     "//components/safe_browsing/core/common/hashprefix_realtime:hash_realtime_utils",
