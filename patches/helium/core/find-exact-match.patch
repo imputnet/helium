@@ -1,3 +1,202 @@
+--- a/pdf/pdf_view_web_plugin.cc
++++ b/pdf/pdf_view_web_plugin.cc
+@@ -1036,6 +1036,7 @@ blink::WebURL PdfViewWebPlugin::LinkAtPo
+ 
+ bool PdfViewWebPlugin::StartFind(const blink::WebString& search_text,
+                                  bool case_sensitive,
++                                 bool whole_word,
+                                  int identifier) {
+   if (find_identifier_ == -1) {
+     // Only go through this code path when `find_identifier_` is -1. i.e. The
+@@ -1049,7 +1050,7 @@ bool PdfViewWebPlugin::StartFind(const b
+ 
+   ResetRecentlySentFindUpdate();
+   find_identifier_ = identifier;
+-  engine_->StartFind(search_text.Utf16(), case_sensitive);
++  engine_->StartFind(search_text.Utf16(), case_sensitive, whole_word);
+   return true;
+ }
+ 
+--- a/pdf/pdf_view_web_plugin.h
++++ b/pdf/pdf_view_web_plugin.h
+@@ -323,6 +323,7 @@ class PdfViewWebPlugin final : public PD
+   blink::WebURL LinkAtPosition(const gfx::Point& /*position*/) const override;
+   bool StartFind(const blink::WebString& search_text,
+                  bool case_sensitive,
++                 bool whole_word,
+                  int identifier) override;
+   void SelectFindResult(bool forward, int identifier) override;
+   void StopFind() override;
+--- a/pdf/pdf_view_web_plugin_unittest.cc
++++ b/pdf/pdf_view_web_plugin_unittest.cc
+@@ -1955,7 +1955,8 @@ TEST_F(PdfViewWebPluginTest, EnteredEdit
+ }
+ 
+ TEST_F(PdfViewWebPluginTest, NotifyNumberOfFindResultsChanged) {
+-  plugin_->StartFind("x", /*case_sensitive=*/false, /*identifier=*/123);
++  plugin_->StartFind("x", /*case_sensitive=*/false, /*whole_word=*/false,
++                     /*identifier=*/123);
+ 
+   const std::vector<gfx::Rect> tickmarks = {gfx::Rect(1, 2), gfx::Rect(3, 4)};
+   plugin_->UpdateTickMarks(tickmarks);
+--- a/pdf/pdfium/pdfium_engine.cc
++++ b/pdf/pdfium/pdfium_engine.cc
+@@ -23,6 +23,7 @@
+ #include "base/containers/span.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "base/i18n/break_iterator.h"
+ #include "base/i18n/rtl.h"
+ #include "base/location.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -1620,10 +1621,10 @@ void PDFiumEngine::SearchForFragment(
+     int char_to_start_searching_from,
+     int page_to_search,
+     AddSearchResultCallback add_result_callback) {
+-  SearchUsingICU(term, /*case_sensitive=*/false, /*first_search=*/false,
+-                 char_to_start_searching_from, /*last_char_index_to_search=*/-1,
+-                 page_to_search, page_to_search,
+-                 std::move(add_result_callback));
++  SearchUsingICU(term, /*case_sensitive=*/false, /*whole_word=*/false,
++                 /*first_search=*/false, char_to_start_searching_from,
++                 /*last_char_index_to_search=*/-1, page_to_search,
++                 page_to_search, std::move(add_result_callback));
+ }
+ 
+ void PDFiumEngine::SetCaretBrowsingEnabled(bool enabled) {
+@@ -1663,8 +1664,8 @@ void PDFiumEngine::SetCaretBlinkInterval
+   }
+ }
+ 
+-void PDFiumEngine::ContinueFind(bool case_sensitive) {
+-  StartFind(current_find_text_, case_sensitive);
++void PDFiumEngine::ContinueFind(bool case_sensitive, bool whole_word) {
++  StartFind(current_find_text_, case_sensitive, whole_word);
+ }
+ 
+ bool PDFiumEngine::HandleInputEvent(const blink::WebInputEvent& event) {
+@@ -2589,7 +2590,9 @@ bool PDFiumEngine::OnChar(const blink::W
+   return rv;
+ }
+ 
+-void PDFiumEngine::StartFind(const std::u16string& text, bool case_sensitive) {
++void PDFiumEngine::StartFind(const std::u16string& text,
++                             bool case_sensitive,
++                             bool whole_word) {
+   // If the caller asks StartFind() to search for no text, then this is an
+   // error on the part of the caller. The `blink::FindInPage` code guarantees it
+   // is not empty, so this should never happen.
+@@ -2606,7 +2609,9 @@ void PDFiumEngine::StartFind(const std::
+   client_->MaybeShowSearchifyInProgress();
+ #endif
+ 
+-  bool first_search = (current_find_text_ != text);
++  bool first_search = current_find_text_ != text ||
++                      current_find_case_sensitive_ != case_sensitive ||
++                      current_find_whole_word_ != whole_word;
+   int char_to_start_searching_from = 0;
+   if (first_search) {
+     // Do not move `selection_` here, as StopFind() expects to start with the
+@@ -2614,6 +2619,8 @@ void PDFiumEngine::StartFind(const std::
+     std::vector<PDFiumRange> old_selection = selection_;
+     StopFind();
+     current_find_text_ = text;
++    current_find_case_sensitive_ = case_sensitive;
++    current_find_whole_word_ = whole_word;
+ 
+     if (old_selection.empty()) {
+       // Start searching from the beginning of the document.
+@@ -2633,7 +2640,7 @@ void PDFiumEngine::StartFind(const std::
+   int current_page = next_page_to_search_;
+ 
+   if (pages_[current_page]->available()) {
+-    SearchUsingICU(text, case_sensitive, first_search,
++    SearchUsingICU(text, case_sensitive, whole_word, first_search,
+                    char_to_start_searching_from, last_char_index_to_search_,
+                    current_page, last_page_to_search_,
+                    base::BindRepeating(&PDFiumEngine::AddFindResult,
+@@ -2674,17 +2681,18 @@ void PDFiumEngine::StartFind(const std::
+   // In unit tests, just call ContinueFind() directly for simplicity and reduce
+   // the need to use RunLoops.
+   if (doc_loader_set_for_testing_) {
+-    ContinueFind(case_sensitive);
++    ContinueFind(case_sensitive, whole_word);
+   } else {
+     base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-        FROM_HERE,
+-        base::BindOnce(&PDFiumEngine::ContinueFind,
+-                       find_weak_factory_.GetWeakPtr(), case_sensitive));
++        FROM_HERE, base::BindOnce(&PDFiumEngine::ContinueFind,
++                                  find_weak_factory_.GetWeakPtr(),
++                                  case_sensitive, whole_word));
+   }
+ }
+ 
+ void PDFiumEngine::SearchUsingICU(const std::u16string& term,
+                                   bool case_sensitive,
++                                  bool whole_word,
+                                   bool first_search,
+                                   int char_to_start_searching_from,
+                                   int last_char_index_to_search,
+@@ -2725,6 +2733,18 @@ void PDFiumEngine::SearchUsingICU(const
+   std::vector<PDFiumEngineClient::SearchStringResult> results =
+       client_->SearchString(adjusted_term, adjusted_page_text_data.page_text,
+                             case_sensitive);
++  if (whole_word) {
++    // Like web pages, only keep matches that start and end on a word boundary.
++    base::i18n::BreakIterator words(adjusted_page_text_data.page_text,
++                                    base::i18n::BreakIterator::BREAK_WORD);
++    if (!words.Init()) {
++      return;
++    }
++    std::erase_if(results, [&words](const auto& result) {
++      return !words.IsStartOfWord(result.start_index) ||
++             !words.IsEndOfWord(result.start_index + result.length);
++    });
++  }
+   for (const auto& result : results) {
+     // Need to convert from adjusted page text start to page text start, by
+     // incrementing for all the characters adjusted before it in the string.
+--- a/pdf/pdfium/pdfium_engine.h
++++ b/pdf/pdfium/pdfium_engine.h
+@@ -240,7 +240,9 @@ class PDFiumEngine : public DocumentLoad
+       base::span<const int> page_indices,
+       const blink::WebPrintParams& print_params);
+   void PrintEnd();
+-  void StartFind(const std::u16string& text, bool case_sensitive);
++  void StartFind(const std::u16string& text,
++                 bool case_sensitive,
++                 bool whole_word = false);
+   bool SelectFindResult(bool forward);
+   void StopFind();
+   virtual void ZoomUpdated(double new_zoom_level);
+@@ -923,7 +925,7 @@ class PDFiumEngine : public DocumentLoad
+   void UpdateTickMarks();
+ 
+   // Called to continue searching so we don't block the main thread.
+-  void ContinueFind(bool case_sensitive);
++  void ContinueFind(bool case_sensitive, bool whole_word);
+ 
+   // Inserts a find result into `find_results_`, which is sorted.
+   void AddFindResult(PDFiumRange result);
+@@ -938,6 +940,7 @@ class PDFiumEngine : public DocumentLoad
+   // Search a page ourself using ICU.
+   void SearchUsingICU(const std::u16string& term,
+                       bool case_sensitive,
++                      bool whole_word,
+                       bool first_search,
+                       int char_to_start_searching_from,
+                       int last_char_index_to_search,
+@@ -1334,6 +1337,9 @@ class PDFiumEngine : public DocumentLoad
+ 
+   // The current text used for searching.
+   std::u16string current_find_text_;
++  // The match options of the current search.
++  bool current_find_case_sensitive_ = false;
++  bool current_find_whole_word_ = false;
+   // The results found.
+   std::vector<PDFiumRange> find_results_;
+   // Whether a search is in progress.
 --- a/third_party/blink/public/mojom/frame/find_in_page.mojom
 +++ b/third_party/blink/public/mojom/frame/find_in_page.mojom
 @@ -108,6 +108,9 @@ struct FindOptions {
@@ -10,6 +209,16 @@
    // Whether this operation is the first request or a follow-up.
    bool new_session = true;
  
+--- a/third_party/blink/public/web/web_plugin.h
++++ b/third_party/blink/public/web/web_plugin.h
+@@ -256,6 +256,7 @@ class WebPlugin {
+   // search.
+   virtual bool StartFind(const WebString& search_text,
+                          bool case_sensitive,
++                         bool whole_word,
+                          int identifier) {
+     return false;
+   }
 --- a/third_party/blink/renderer/core/editing/finder/find_task_controller.cc
 +++ b/third_party/blink/renderer/core/editing/finder/find_task_controller.cc
 @@ -113,6 +113,7 @@ class FindTaskController::FindTask final
@@ -19,6 +228,43 @@
 +                            .SetWholeWord(options_->whole_word)
                              .SetStartingInSelection(options_->new_session);
      const auto start_time = base::TimeTicks::Now();
+ 
+@@ -264,6 +265,8 @@ void FindTaskController::DidFinishTask(
+   // Remember what we search for last time, so we can skip searching if more
+   // letters are added to the search string (and last outcome was 0).
+   last_search_string_ = search_text;
++  last_search_match_case_ = options.match_case;
++  last_search_whole_word_ = options.whole_word;
+ 
+   if (next_starting_position.IsNotNull()) {
+     resume_finding_from_range_ = MakeGarbageCollected<Range>(
+@@ -321,8 +324,12 @@ bool FindTaskController::ShouldFindMatch
+   // If the frame completed the scoping operation and found 0 matches the last
+   // time it was searched, then we don't have to search it again if the user is
+   // just adding to the search string or sending the same search string again.
++  // That's not true for whole words, where more letters can finish a word, or
++  // when the match options changed.
+   if (last_find_request_completed_with_no_matches_ &&
+-      !last_search_string_.empty()) {
++      !last_search_string_.empty() && !options.whole_word &&
++      !last_search_whole_word_ &&
++      options.match_case == last_search_match_case_) {
+     // Check to see if the search string prefixes match.
+     if (search_text.starts_with(last_search_string_)) {
+       return false;  // Don't search this frame, it will be fruitless.
+--- a/third_party/blink/renderer/core/editing/finder/find_task_controller.h
++++ b/third_party/blink/renderer/core/editing/finder/find_task_controller.h
+@@ -123,6 +123,11 @@ class CORE_EXPORT FindTaskController fin
+   // again if the user is just adding to the search (making it more specific).
+   String last_search_string_;
+ 
++  // The match options of the last search, since changing them can find text
++  // that the last search couldn't.
++  bool last_search_match_case_ = false;
++  bool last_search_whole_word_ = false;
++
+   int match_yield_check_interval_;
+ };
  
 --- a/third_party/blink/renderer/core/editing/finder/text_finder.cc
 +++ b/third_party/blink/renderer/core/editing/finder/text_finder.cc
@@ -30,3 +276,14 @@
                                  .SetWrappingAround(wrap_within_frame)
                                  .SetStartingInSelection(options.new_session)
                                  .SetRubySupported(true);
+--- a/third_party/blink/renderer/core/frame/find_in_page.cc
++++ b/third_party/blink/renderer/core/frame/find_in_page.cc
+@@ -77,7 +77,7 @@ void FindInPage::Find(int request_id,
+       LocalFrame* core_frame = frame_->GetFrame();
+       core_frame->GetPage()->GetFocusController().SetFocusedFrame(core_frame);
+     } else if (!plugin->StartFind(search_text, options->match_case,
+-                                  request_id)) {
++                                  options->whole_word, request_id)) {
+       // Send "no results"
+       ReportFindInPageMatchCount(request_id, 0 /* count */,
+                                  true /* final_update */);

@@ -1,6 +1,6 @@
 --- a/chrome/browser/ui/find_bar/find_bar_state.cc
 +++ b/chrome/browser/ui/find_bar/find_bar_state.cc
-@@ -76,3 +76,11 @@ std::u16string FindBarState::GetSearchPr
+@@ -76,3 +76,29 @@ std::u16string FindBarState::GetSearchPr
  
    return text;
  }
@@ -12,17 +12,60 @@
 +bool FindBarState::ShouldMatchWholeWord() const {
 +  return whole_word_;
 +}
++
++void FindBarState::SetMatchCase(bool match_case) {
++  match_case_ = match_case;
++  observers_.Notify(&Observer::OnMatchOptionsChanged);
++}
++
++void FindBarState::SetWholeWord(bool whole_word) {
++  whole_word_ = whole_word;
++  observers_.Notify(&Observer::OnMatchOptionsChanged);
++}
++
++void FindBarState::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void FindBarState::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
 --- a/chrome/browser/ui/find_bar/find_bar_state.h
 +++ b/chrome/browser/ui/find_bar/find_bar_state.h
-@@ -44,11 +44,18 @@ class FindBarState : public KeyedService
+@@ -9,6 +9,8 @@
+ #include <string>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
+ #include "components/find_in_page/find_tab_helper.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "ui/base/data_transfer_policy/data_transfer_endpoint.h"
+@@ -28,6 +30,12 @@ class BrowserContext;
+ class FindBarState : public KeyedService,
+                      public find_in_page::FindTabHelper::Delegate {
+  public:
++  class Observer : public base::CheckedObserver {
++   public:
++    // Called when case sensitivity or whole word matching changes.
++    virtual void OnMatchOptionsChanged() = 0;
++  };
++
+   explicit FindBarState(content::BrowserContext* browser_context);
+ 
+   FindBarState(const FindBarState&) = delete;
+@@ -44,11 +52,22 @@ class FindBarState : public KeyedService
                           content::WebContents* web_contents) override;
    std::u16string GetSearchPrepopulateText(
        content::WebContents* web_contents) override;
 +  bool ShouldMatchCase() const override;
 +  bool ShouldMatchWholeWord() const override;
 +
-+  void set_match_case(bool match_case) { match_case_ = match_case; }
-+  void set_whole_word(bool whole_word) { whole_word_ = whole_word; }
++  void SetMatchCase(bool match_case);
++  void SetWholeWord(bool whole_word);
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
  
   private:
    raw_ptr<Profile> profile_;
@@ -30,6 +73,7 @@
    std::optional<ui::DataTransferEndpoint> last_prepopulate_source_dte_;
 +  bool match_case_ = false;
 +  bool whole_word_ = false;
++  base::ObserverList<Observer> observers_;
  };
  
  #endif  // CHROME_BROWSER_UI_FIND_BAR_FIND_BAR_STATE_H_
@@ -157,7 +201,7 @@
  }
  
  ///////////////////////////////////////////////////////////////////////////////
-@@ -472,9 +534,28 @@ gfx::Size FindBarView::CalculatePreferre
+@@ -472,9 +534,37 @@ gfx::Size FindBarView::CalculatePreferre
    // up part of the space for the input textfield. This prevents the overall
    // width from changing every time the match count text changes.
    size.set_width(size.width() - match_count_text_->GetPreferredSize().width());
@@ -183,10 +227,19 @@
 +  AnimationProgressed(animation);
 +}
 +
++void FindBarView::OnMatchOptionsChanged() {
++  FindBarState* state = find_bar_state_observation_.GetSource();
++  match_case_toggle_->AnimateIsOn(state->ShouldMatchCase());
++  whole_word_toggle_->AnimateIsOn(state->ShouldMatchWholeWord());
++  if (find_bar_host_ && find_bar_host_->IsVisible()) {
++    FindNext();
++  }
++}
++
  ////////////////////////////////////////////////////////////////////////////////
  // FindBarView, DropdownBarHostDelegate implementation:
  
-@@ -631,6 +712,43 @@ void FindBarView::FindNext(bool reverse)
+@@ -631,6 +721,47 @@ void FindBarView::FindNext(bool reverse)
    }
  }
  
@@ -206,25 +259,29 @@
 +
 +void FindBarView::OnMatchCaseChanged() {
 +  if (FindBarState* state = GetFindBarState()) {
-+    state->set_match_case(match_case_toggle_->GetIsOn());
-+    FindNext();
++    state->SetMatchCase(match_case_toggle_->GetIsOn());
 +  }
 +}
 +
 +void FindBarView::OnWholeWordChanged() {
 +  if (FindBarState* state = GetFindBarState()) {
-+    state->set_whole_word(whole_word_toggle_->GetIsOn());
-+    FindNext();
++    state->SetWholeWord(whole_word_toggle_->GetIsOn());
 +  }
 +}
 +
 +FindBarState* FindBarView::GetFindBarState() {
-+  content::WebContents* web_contents =
-+      find_bar_host_ ? find_bar_host_->GetFindBarController()->web_contents()
-+                     : nullptr;
-+  return web_contents ? FindBarStateFactory::GetForBrowserContext(
-+                            web_contents->GetBrowserContext())
-+                      : nullptr;
++  if (!find_bar_state_observation_.IsObserving()) {
++    content::WebContents* web_contents =
++        find_bar_host_ ? find_bar_host_->GetFindBarController()->web_contents()
++                       : nullptr;
++    if (!web_contents) {
++      return nullptr;
++    }
++    find_bar_state_observation_.Observe(
++        FindBarStateFactory::GetForBrowserContext(
++            web_contents->GetBrowserContext()));
++  }
++  return find_bar_state_observation_.GetSource();
 +}
 +
  void FindBarView::EndFindSession() {
@@ -232,8 +289,12 @@
      return;
 --- a/chrome/browser/ui/views/find_bar_view.h
 +++ b/chrome/browser/ui/views/find_bar_view.h
-@@ -13,6 +13,8 @@
+@@ -11,8 +11,12 @@
+ 
+ #include "base/gtest_prod_util.h"
  #include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/find_bar/find_bar_state.h"
  #include "chrome/browser/ui/views/chrome_views_export.h"
  #include "ui/base/interaction/element_identifier.h"
 +#include "ui/gfx/animation/slide_animation.h"
@@ -241,15 +302,7 @@
  #include "ui/views/controls/button/button.h"
  #include "ui/views/controls/button/image_button.h"
  #include "ui/views/controls/textfield/textfield.h"
-@@ -22,6 +24,7 @@
- 
- class FindBarHost;
- class FindBarMatchCountLabel;
-+class FindBarState;
- 
- namespace find_in_page {
- class FindNotificationDetails;
-@@ -35,6 +38,7 @@ namespace views {
+@@ -35,6 +39,7 @@ namespace views {
  class Painter;
  class Separator;
  class Textfield;
@@ -257,17 +310,18 @@
  }  // namespace views
  
  ////////////////////////////////////////////////////////////////////////////////
-@@ -45,7 +49,8 @@ class Textfield;
+@@ -45,7 +50,9 @@ class Textfield;
  //
  ////////////////////////////////////////////////////////////////////////////////
  class FindBarView : public views::BoxLayoutView,
 -                    public views::TextfieldController {
 +                    public views::TextfieldController,
-+                    public views::AnimationDelegateViews {
++                    public views::AnimationDelegateViews,
++                    public FindBarState::Observer {
    METADATA_HEADER(FindBarView, views::BoxLayoutView)
  
   public:
-@@ -113,6 +118,10 @@ class FindBarView : public views::BoxLay
+@@ -113,6 +120,13 @@ class FindBarView : public views::BoxLay
                           callback) override;
    std::unique_ptr<ui::ScopedClipboardWriter> CreateClipboardWriter() override;
  
@@ -275,26 +329,31 @@
 +  void AnimationProgressed(const gfx::Animation* animation) override;
 +  void AnimationEnded(const gfx::Animation* animation) override;
 +
++  // FindBarState::Observer:
++  void OnMatchOptionsChanged() override;
++
   private:
    FRIEND_TEST_ALL_PREFIXES(LegacyFindInPageTest, AccessibleName);
    const views::ViewAccessibility&
-@@ -127,6 +136,15 @@ class FindBarView : public views::BoxLay
+@@ -127,6 +141,17 @@ class FindBarView : public views::BoxLay
    // End the current find session and close the find bubble.
    void EndFindSession();
  
 +  // Slides the find options in or out.
 +  void ToggleOptions();
 +
-+  // Remembers a switch and reruns the search with it.
++  // Saves a switch, which updates every open find bar.
 +  void OnMatchCaseChanged();
 +  void OnWholeWordChanged();
 +
++  // Returns the profile's find state, and starts listening to it so the
++  // switches stay in sync across windows.
 +  FindBarState* GetFindBarState();
 +
    // Updates the appearance for the match count label.
    void UpdateMatchCountAppearance(bool no_match);
  
-@@ -149,6 +167,12 @@ class FindBarView : public views::BoxLay
+@@ -149,6 +174,15 @@ class FindBarView : public views::BoxLay
    raw_ptr<views::ImageButton> find_previous_button_;
    raw_ptr<views::ImageButton> find_next_button_;
    raw_ptr<views::ImageButton> close_button_;
@@ -304,6 +363,9 @@
 +  raw_ptr<views::ToggleButton> whole_word_toggle_;
 +
 +  gfx::SlideAnimation options_animation_{this};
++
++  base::ScopedObservation<FindBarState, FindBarState::Observer>
++      find_bar_state_observation_{this};
  };
  
  BEGIN_VIEW_BUILDER(/* no export */, FindBarView, views::BoxLayoutView)
