@@ -1,0 +1,90 @@
+--- a/components/find_in_page/find_tab_helper.cc
++++ b/components/find_in_page/find_tab_helper.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "components/find_in_page/find_tab_helper.h"
+ 
++#include <optional>
++#include <string_view>
+ #include <utility>
+ 
+ #include "base/observer_list.h"
+@@ -21,6 +23,29 @@ using content::WebContents;
+ 
+ namespace find_in_page {
+ 
++namespace {
++
++// Quoted searches like "this" only match that exact word, so they skip "This"
++// and "thistle". The closing quote can be left off while typing.
++std::optional<std::u16string_view> GetExactSearch(std::u16string_view text) {
++  if (!text.starts_with(u'"')) {
++    return std::nullopt;
++  }
++
++  text.remove_prefix(1);
++  if (text.ends_with(u'"')) {
++    text.remove_suffix(1);
++  }
++
++  if (text.empty()) {
++    return std::nullopt;
++  }
++
++  return text;
++}
++
++}  // namespace
++
+ // static
+ int FindTabHelper::find_request_id_counter_ = -1;
+ 
+@@ -88,7 +113,15 @@ void FindTabHelper::StartFinding(std::u1
+   options->new_session = new_session;
+   options->find_match = find_match;
+   options->run_synchronously_for_testing = run_synchronously_for_testing;
+-  GetWebContents().Find(current_find_request_id_, find_text_,
++
++  std::u16string_view search_text = find_text_;
++  if (const auto exact_search = GetExactSearch(find_text_)) {
++    search_text = *exact_search;
++    options->match_case = true;
++    options->whole_word = true;
++  }
++
++  GetWebContents().Find(current_find_request_id_, std::u16string(search_text),
+                         std::move(options), /*skip_delay=*/false);
+ }
+ 
+--- a/third_party/blink/public/mojom/frame/find_in_page.mojom
++++ b/third_party/blink/public/mojom/frame/find_in_page.mojom
+@@ -108,6 +108,9 @@ struct FindOptions {
+   // Whether search should be case-sensitive.
+   bool match_case = false;
+ 
++  // Whether matches must be whole words.
++  bool whole_word = false;
++
+   // Whether this operation is the first request or a follow-up.
+   bool new_session = true;
+ 
+--- a/third_party/blink/renderer/core/editing/finder/find_task_controller.cc
++++ b/third_party/blink/renderer/core/editing/finder/find_task_controller.cc
+@@ -113,6 +113,7 @@ class FindTaskController::FindTask final
+     auto find_options = FindOptions()
+                             .SetBackwards(!options_->forward)
+                             .SetCaseInsensitive(!options_->match_case)
++                            .SetWholeWord(options_->whole_word)
+                             .SetStartingInSelection(options_->new_session);
+     const auto start_time = base::TimeTicks::Now();
+ 
+--- a/third_party/blink/renderer/core/editing/finder/text_finder.cc
++++ b/third_party/blink/renderer/core/editing/finder/text_finder.cc
+@@ -245,6 +245,7 @@ bool TextFinder::FindInternal(int identi
+   const auto find_options = FindOptions()
+                                 .SetBackwards(!options.forward)
+                                 .SetCaseInsensitive(!options.match_case)
++                                .SetWholeWord(options.whole_word)
+                                 .SetWrappingAround(wrap_within_frame)
+                                 .SetStartingInSelection(options.new_session)
+                                 .SetRubySupported(true);
