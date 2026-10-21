@@ -37,22 +37,17 @@
  #include "base/i18n/rtl.h"
  #include "base/location.h"
  #include "base/metrics/histogram_functions.h"
-@@ -1620,10 +1621,10 @@ void PDFiumEngine::SearchForFragment(
+@@ -1670,7 +1671,8 @@ void PDFiumEngine::SearchForFragment(
      int char_to_start_searching_from,
      int page_to_search,
      AddSearchResultCallback add_result_callback) {
 -  SearchUsingICU(term, /*case_sensitive=*/false, /*first_search=*/false,
--                 char_to_start_searching_from, /*last_char_index_to_search=*/-1,
--                 page_to_search, page_to_search,
--                 std::move(add_result_callback));
 +  SearchUsingICU(term, /*case_sensitive=*/false, /*whole_word=*/false,
-+                 /*first_search=*/false, char_to_start_searching_from,
-+                 /*last_char_index_to_search=*/-1, page_to_search,
-+                 page_to_search, std::move(add_result_callback));
- }
- 
- void PDFiumEngine::SetCaretBrowsingEnabled(bool enabled) {
-@@ -1663,8 +1664,8 @@ void PDFiumEngine::SetCaretBlinkInterval
++                 /*first_search=*/false,
+                  char_to_start_searching_from, /*last_char_index_to_search=*/-1,
+                  page_to_search, page_to_search,
+                  std::move(add_result_callback));
+@@ -1713,8 +1715,8 @@ void PDFiumEngine::SetCaretBlinkInterval
    }
  }
  
@@ -63,7 +58,7 @@
  }
  
  bool PDFiumEngine::HandleInputEvent(const blink::WebInputEvent& event) {
-@@ -2589,7 +2590,9 @@ bool PDFiumEngine::OnChar(const blink::W
+@@ -2639,7 +2641,9 @@ bool PDFiumEngine::OnChar(const blink::W
    return rv;
  }
  
@@ -74,7 +69,7 @@
    // If the caller asks StartFind() to search for no text, then this is an
    // error on the part of the caller. The `blink::FindInPage` code guarantees it
    // is not empty, so this should never happen.
-@@ -2606,7 +2609,9 @@ void PDFiumEngine::StartFind(const std::
+@@ -2656,7 +2660,9 @@ void PDFiumEngine::StartFind(const std::
    client_->MaybeShowSearchifyInProgress();
  #endif
  
@@ -85,7 +80,7 @@
    int char_to_start_searching_from = 0;
    if (first_search) {
      // Do not move `selection_` here, as StopFind() expects to start with the
-@@ -2614,6 +2619,8 @@ void PDFiumEngine::StartFind(const std::
+@@ -2664,6 +2670,8 @@ void PDFiumEngine::StartFind(const std::
      std::vector<PDFiumRange> old_selection = selection_;
      StopFind();
      current_find_text_ = text;
@@ -94,7 +89,7 @@
  
      if (old_selection.empty()) {
        // Start searching from the beginning of the document.
-@@ -2633,7 +2640,7 @@ void PDFiumEngine::StartFind(const std::
+@@ -2683,7 +2691,7 @@ void PDFiumEngine::StartFind(const std::
    int current_page = next_page_to_search_;
  
    if (pages_[current_page]->available()) {
@@ -103,7 +98,7 @@
                     char_to_start_searching_from, last_char_index_to_search_,
                     current_page, last_page_to_search_,
                     base::BindRepeating(&PDFiumEngine::AddFindResult,
-@@ -2674,17 +2681,18 @@ void PDFiumEngine::StartFind(const std::
+@@ -2724,17 +2732,19 @@ void PDFiumEngine::StartFind(const std::
    // In unit tests, just call ContinueFind() directly for simplicity and reduce
    // the need to use RunLoops.
    if (doc_loader_set_for_testing_) {
@@ -111,12 +106,11 @@
 +    ContinueFind(case_sensitive, whole_word);
    } else {
      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
--        FROM_HERE,
--        base::BindOnce(&PDFiumEngine::ContinueFind,
+         FROM_HERE,
+         base::BindOnce(&PDFiumEngine::ContinueFind,
 -                       find_weak_factory_.GetWeakPtr(), case_sensitive));
-+        FROM_HERE, base::BindOnce(&PDFiumEngine::ContinueFind,
-+                                  find_weak_factory_.GetWeakPtr(),
-+                                  case_sensitive, whole_word));
++                       find_weak_factory_.GetWeakPtr(), case_sensitive,
++                       whole_word));
    }
  }
  
@@ -126,25 +120,52 @@
                                    bool first_search,
                                    int char_to_start_searching_from,
                                    int last_char_index_to_search,
-@@ -2725,6 +2733,18 @@ void PDFiumEngine::SearchUsingICU(const
+@@ -2775,6 +2785,24 @@ void PDFiumEngine::SearchUsingICU(const
    std::vector<PDFiumEngineClient::SearchStringResult> results =
        client_->SearchString(adjusted_term, adjusted_page_text_data.page_text,
                              case_sensitive);
++
++  // Like web pages, only keep whole words. Word boundaries come from the full
++  // page text, since the searched text can start or end inside a word.
++  std::u16string page_text;
 +  if (whole_word) {
-+    // Like web pages, only keep matches that start and end on a word boundary.
-+    base::i18n::BreakIterator words(adjusted_page_text_data.page_text,
-+                                    base::i18n::BreakIterator::BREAK_WORD);
-+    if (!words.Init()) {
-+      return;
-+    }
-+    std::erase_if(results, [&words](const auto& result) {
-+      return !words.IsStartOfWord(result.start_index) ||
-+             !words.IsEndOfWord(result.start_index + result.length);
-+    });
++    PDFiumAPIStringBufferAdapter<std::u16string> api_string_adapter(
++        &page_text, original_char_count, false);
++    unsigned short* data =
++        reinterpret_cast<unsigned short*>(api_string_adapter.GetData());
++    int written = FPDFText_GetText(text_page, 0, original_char_count, data);
++    api_string_adapter.Close(written);
 +  }
++  base::i18n::BreakIterator words(page_text,
++                                  base::i18n::BreakIterator::BREAK_WORD);
++  if (whole_word && !words.Init()) {
++    return;
++  }
++
    for (const auto& result : results) {
      // Need to convert from adjusted page text start to page text start, by
      // incrementing for all the characters adjusted before it in the string.
+@@ -2801,6 +2829,10 @@ void PDFiumEngine::SearchUsingICU(const
+     int text_start =
+         page_text_result_start_index + text_to_start_searching_from;
+     int text_end = text_start + page_text_result_length;
++    if (whole_word &&
++        (!words.IsStartOfWord(text_start) || !words.IsEndOfWord(text_end))) {
++      continue;
++    }
+     int char_start = FPDFText_GetCharIndexFromTextIndex(text_page, text_start);
+     int char_end = FPDFText_GetCharIndexFromTextIndex(text_page, text_end);
+ 
+@@ -4864,7 +4896,8 @@ gfx::Size PDFiumEngine::ApplyDocumentLay
+   if (!current_find_text.empty()) {
+     // Clear the UI.
+     client_->NotifyNumberOfFindResultsChanged(0, false);
+-    StartFind(current_find_text, false);
++    StartFind(current_find_text, current_find_case_sensitive_,
++              current_find_whole_word_);
+   }
+ 
+   // Restore current page. After a rotation, the page heights have changed but
 --- a/pdf/pdfium/pdfium_engine.h
 +++ b/pdf/pdfium/pdfium_engine.h
 @@ -240,7 +240,9 @@ class PDFiumEngine : public DocumentLoad
