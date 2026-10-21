@@ -1,0 +1,451 @@
+--- a/chrome/browser/ui/find_bar/find_bar_state.cc
++++ b/chrome/browser/ui/find_bar/find_bar_state.cc
+@@ -78,3 +78,29 @@ std::u16string FindBarState::GetSearchPr
+ 
+   return text;
+ }
++
++bool FindBarState::ShouldMatchCase() const {
++  return match_case_;
++}
++
++bool FindBarState::ShouldMatchWholeWord() const {
++  return whole_word_;
++}
++
++void FindBarState::SetMatchCase(bool match_case) {
++  match_case_ = match_case;
++  observers_.Notify(&Observer::OnMatchOptionsChanged);
++}
++
++void FindBarState::SetWholeWord(bool whole_word) {
++  whole_word_ = whole_word;
++  observers_.Notify(&Observer::OnMatchOptionsChanged);
++}
++
++void FindBarState::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void FindBarState::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
+--- a/chrome/browser/ui/find_bar/find_bar_state.h
++++ b/chrome/browser/ui/find_bar/find_bar_state.h
+@@ -9,6 +9,8 @@
+ #include <string>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
+ #include "components/find_in_page/find_tab_helper.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "ui/base/data_transfer_policy/data_transfer_endpoint.h"
+@@ -28,6 +30,12 @@ class BrowserContext;
+ class FindBarState : public KeyedService,
+                      public find_in_page::FindTabHelper::Delegate {
+  public:
++  class Observer : public base::CheckedObserver {
++   public:
++    // Called when case sensitivity or whole word matching changes.
++    virtual void OnMatchOptionsChanged() = 0;
++  };
++
+   explicit FindBarState(content::BrowserContext* browser_context);
+ 
+   FindBarState(const FindBarState&) = delete;
+@@ -44,11 +52,22 @@ class FindBarState : public KeyedService
+                          content::WebContents* web_contents) override;
+   std::u16string GetSearchPrepopulateText(
+       content::WebContents* web_contents) override;
++  bool ShouldMatchCase() const override;
++  bool ShouldMatchWholeWord() const override;
++
++  void SetMatchCase(bool match_case);
++  void SetWholeWord(bool whole_word);
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
+ 
+  private:
+   raw_ptr<Profile> profile_;
+   std::u16string last_prepopulate_text_;
+   std::optional<ui::DataTransferEndpoint> last_prepopulate_source_dte_;
++  bool match_case_ = false;
++  bool whole_word_ = false;
++  base::ObserverList<Observer> observers_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_FIND_BAR_FIND_BAR_STATE_H_
+--- a/chrome/browser/ui/views/find_bar_view.cc
++++ b/chrome/browser/ui/views/find_bar_view.cc
+@@ -53,6 +53,7 @@
+ #include "ui/views/bubble/bubble_border.h"
+ #include "ui/views/controls/button/image_button_factory.h"
+ #include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/controls/button/toggle_button.h"
+ #include "ui/views/controls/highlight_path_generator.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/separator.h"
+@@ -74,6 +75,26 @@ void SetCommonButtonAttributes(views::Im
+ constexpr int kBasePadding = 4;
+ constexpr int kHorizontalGap = 6;
+ 
++views::Builder<views::BoxLayoutView> CreateOptionRow(
++    int message_id,
++    raw_ptr<views::ToggleButton>* toggle,
++    views::Button::PressedCallback callback) {
++  const std::u16string label = l10n_util::GetStringUTF16(message_id);
++  return views::Builder<views::BoxLayoutView>()
++      .SetCrossAxisAlignment(views::BoxLayout::CrossAxisAlignment::kCenter)
++      .SetInsideBorderInsets(gfx::Insets::VH(kBasePadding, kHorizontalGap))
++      .AddChildren(views::Builder<views::Label>()
++                       .SetText(label)
++                       .SetEnabledColor(kColorFindBarForeground)
++                       .SetHorizontalAlignment(gfx::ALIGN_LEFT)
++                       .SetProperty(views::kBoxLayoutFlexKey,
++                                    views::BoxLayoutFlexSpecification()),
++                   views::Builder<views::ToggleButton>()
++                       .CopyAddressTo(toggle)
++                       .SetAccessibleName(label)
++                       .SetCallback(std::move(callback)));
++}
++
+ }  // namespace
+ 
+ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(FindBarView, kElementId);
+@@ -162,7 +183,8 @@ END_METADATA
+ ////////////////////////////////////////////////////////////////////////////////
+ // FindBarView, public:
+ 
+-FindBarView::FindBarView(FindBarHost* host) {
++FindBarView::FindBarView(FindBarHost* host)
++    : views::AnimationDelegateViews(this) {
+   // Normally we could space objects horizontally by simply passing a constant
+   // value to BoxLayout for between-child spacing.  But for the vector image
+   // buttons, we want the spacing to apply between the inner "glyph" portions
+@@ -235,6 +257,13 @@ FindBarView::FindBarView(FindBarHost* ho
+                       gfx::Insets(horizontal_margin +
+                                   chrome_refresh_separator_vertical_margin)),
+               views::Builder<views::ImageButton>()
++                  .CopyAddressTo(&options_button_)
++                  .SetTooltipText(l10n_util::GetStringUTF16(
++                      IDS_FIND_IN_PAGE_OPTIONS_TOOLTIP))
++                  .SetCallback(base::BindRepeating(&FindBarView::ToggleOptions,
++                                                   base::Unretained(this)))
++                  .SetProperty(views::kMarginsKey, image_button_margins),
++              views::Builder<views::ImageButton>()
+                   .CopyAddressTo(&find_previous_button_)
+                   .SetAccessibleName(
+                       l10n_util::GetStringUTF16(IDS_ACCNAME_PREVIOUS))
+@@ -275,6 +304,18 @@ FindBarView::FindBarView(FindBarHost* ho
+ 
+   // Theme-aware image models.
+   views::SetImageFromVectorIconWithColor(
++      options_button_, vector_icons::kTuneIcon,
++      {kColorFindBarButtonIcon, kColorFindBarButtonIconDisabled});
++  options_button_->SetImageModel(
++      views::Button::STATE_HOVERED,
++      ui::ImageModel::FromVectorIcon(vector_icons::kTuneIcon,
++                                     kColorFindBarButtonIconHovered));
++  options_button_->SetImageModel(
++      views::Button::STATE_PRESSED,
++      ui::ImageModel::FromVectorIcon(vector_icons::kTuneIcon,
++                                     kColorFindBarButtonIconHovered));
++
++  views::SetImageFromVectorIconWithColor(
+       find_previous_button_,
+       features::IsRoundedIconsEnabled() ? vector_icons::kKeyboardArrowUpIcon
+                                         : kKeyboardArrowUpChromeRefreshOldIcon,
+@@ -337,6 +378,24 @@ FindBarView::FindBarView(FindBarHost* ho
+   SetProperty(views::kElementIdentifierKey, kElementId);
+   AddChildView(std::move(main_container));
+ 
++  options_container_ = AddChildView(
++      views::Builder<views::BoxLayoutView>()
++          .SetOrientation(views::BoxLayout::Orientation::kVertical)
++          .SetInsideBorderInsets(gfx::Insets::TLBR(
++              0, kBasePadding * 2, kBasePadding, kBasePadding * 2))
++          .SetVisible(false)
++          .AddChildren(views::Builder<views::Separator>().SetColorId(
++                           ui::kColorSeparator),
++                       CreateOptionRow(
++                           IDS_FIND_IN_PAGE_MATCH_CASE, &match_case_toggle_,
++                           base::BindRepeating(&FindBarView::OnMatchCaseChanged,
++                                               base::Unretained(this))),
++                       CreateOptionRow(
++                           IDS_FIND_IN_PAGE_WHOLE_WORD, &whole_word_toggle_,
++                           base::BindRepeating(&FindBarView::OnWholeWordChanged,
++                                               base::Unretained(this))))
++          .Build());
++
+   const float corner_radius = layout_provider->GetCornerRadiusMetric(
+       views::ShapeContextTokens::kFindBarViewRadius);
+   {
+@@ -356,6 +415,7 @@ FindBarView::FindBarView(FindBarHost* ho
+   SetCommonButtonAttributes(find_previous_button_);
+   SetCommonButtonAttributes(find_next_button_);
+   SetCommonButtonAttributes(close_button_);
++  SetCommonButtonAttributes(options_button_);
+ }
+ 
+ FindBarView::~FindBarView() = default;
+@@ -438,7 +498,9 @@ void FindBarView::ClearMatchCount() {
+ 
+ bool FindBarView::ContainsFocus() const {
+   return find_text_->HasFocus() || find_previous_button_->HasFocus() ||
+-         find_next_button_->HasFocus() || close_button_->HasFocus();
++         find_next_button_->HasFocus() || close_button_->HasFocus() ||
++         options_button_->HasFocus() || match_case_toggle_->HasFocus() ||
++         whole_word_toggle_->HasFocus();
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -473,9 +535,37 @@ gfx::Size FindBarView::CalculatePreferre
+   // up part of the space for the input textfield. This prevents the overall
+   // width from changing every time the match count text changes.
+   size.set_width(size.width() - match_count_text_->GetPreferredSize().width());
++
++  // While the options slide in or out, only count the part that's showing.
++  if (options_container_->GetVisible()) {
++    const int options_height = options_container_->GetPreferredSize().height();
++    size.Enlarge(0, options_animation_.CurrentValueBetween(0, options_height) -
++                        options_height);
++  }
+   return size;
+ }
+ 
++void FindBarView::AnimationProgressed(const gfx::Animation* animation) {
++  PreferredSizeChanged();
++  if (find_bar_host_) {
++    find_bar_host_->MoveWindowIfNecessary();
++  }
++}
++
++void FindBarView::AnimationEnded(const gfx::Animation* animation) {
++  options_container_->SetVisible(options_animation_.IsShowing());
++  AnimationProgressed(animation);
++}
++
++void FindBarView::OnMatchOptionsChanged() {
++  FindBarState* state = find_bar_state_observation_.GetSource();
++  match_case_toggle_->AnimateIsOn(state->ShouldMatchCase());
++  whole_word_toggle_->AnimateIsOn(state->ShouldMatchWholeWord());
++  if (find_bar_host_ && find_bar_host_->IsVisible()) {
++    FindNext();
++  }
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ // FindBarView, DropdownBarHostDelegate implementation:
+ 
+@@ -632,6 +722,52 @@ void FindBarView::FindNext(bool reverse)
+   }
+ }
+ 
++void FindBarView::ToggleOptions() {
++  if (options_animation_.IsShowing()) {
++    options_animation_.Hide();
++    return;
++  }
++
++  if (FindBarState* state = GetFindBarState()) {
++    match_case_toggle_->SetIsOn(state->ShouldMatchCase());
++    whole_word_toggle_->SetIsOn(state->ShouldMatchWholeWord());
++  }
++  options_container_->SetVisible(true);
++  options_animation_.Show();
++}
++
++void FindBarView::OnMatchCaseChanged() {
++  if (FindBarState* state = GetFindBarState()) {
++    state->SetMatchCase(match_case_toggle_->GetIsOn());
++  }
++}
++
++void FindBarView::OnWholeWordChanged() {
++  if (FindBarState* state = GetFindBarState()) {
++    state->SetWholeWord(whole_word_toggle_->GetIsOn());
++  }
++}
++
++FindBarState* FindBarView::GetFindBarState() {
++  if (find_bar_state_observation_.IsObserving()) {
++    return find_bar_state_observation_.GetSource();
++  }
++
++  content::WebContents* web_contents =
++      find_bar_host_ ? find_bar_host_->GetFindBarController()->web_contents()
++                     : nullptr;
++  if (!web_contents) {
++    return nullptr;
++  }
++
++  FindBarState* state = FindBarStateFactory::GetForBrowserContext(
++      web_contents->GetBrowserContext());
++  if (state) {
++    find_bar_state_observation_.Observe(state);
++  }
++  return state;
++}
++
+ void FindBarView::EndFindSession() {
+   if (!find_bar_host_) {
+     return;
+--- a/chrome/browser/ui/views/find_bar_view.h
++++ b/chrome/browser/ui/views/find_bar_view.h
+@@ -11,8 +11,12 @@
+ 
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/find_bar/find_bar_state.h"
+ #include "chrome/browser/ui/views/chrome_views_export.h"
+ #include "ui/base/interaction/element_identifier.h"
++#include "ui/gfx/animation/slide_animation.h"
++#include "ui/views/animation/animation_delegate_views.h"
+ #include "ui/views/controls/button/button.h"
+ #include "ui/views/controls/button/image_button.h"
+ #include "ui/views/controls/textfield/textfield.h"
+@@ -35,6 +39,7 @@ namespace views {
+ class Painter;
+ class Separator;
+ class Textfield;
++class ToggleButton;
+ }  // namespace views
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -45,7 +50,9 @@ class Textfield;
+ //
+ ////////////////////////////////////////////////////////////////////////////////
+ class FindBarView : public views::BoxLayoutView,
+-                    public views::TextfieldController {
++                    public views::TextfieldController,
++                    public views::AnimationDelegateViews,
++                    public FindBarState::Observer {
+   METADATA_HEADER(FindBarView, views::BoxLayoutView)
+ 
+  public:
+@@ -113,6 +120,13 @@ class FindBarView : public views::BoxLay
+                          callback) override;
+   std::unique_ptr<ui::ScopedClipboardWriter> CreateClipboardWriter() override;
+ 
++  // views::AnimationDelegateViews:
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override;
++
++  // FindBarState::Observer:
++  void OnMatchOptionsChanged() override;
++
+  private:
+   FRIEND_TEST_ALL_PREFIXES(LegacyFindInPageTest, AccessibleName);
+   const views::ViewAccessibility&
+@@ -127,6 +141,17 @@ class FindBarView : public views::BoxLay
+   // End the current find session and close the find bubble.
+   void EndFindSession();
+ 
++  // Slides the find options in or out.
++  void ToggleOptions();
++
++  // Saves a switch, which updates every open find bar.
++  void OnMatchCaseChanged();
++  void OnWholeWordChanged();
++
++  // Returns the profile's find state, and starts listening to it so the
++  // switches stay in sync across windows.
++  FindBarState* GetFindBarState();
++
+   // Updates the appearance for the match count label.
+   void UpdateMatchCountAppearance(bool no_match);
+ 
+@@ -149,6 +174,15 @@ class FindBarView : public views::BoxLay
+   raw_ptr<views::ImageButton> find_previous_button_;
+   raw_ptr<views::ImageButton> find_next_button_;
+   raw_ptr<views::ImageButton> close_button_;
++  raw_ptr<views::ImageButton> options_button_;
++  raw_ptr<views::View> options_container_;
++  raw_ptr<views::ToggleButton> match_case_toggle_;
++  raw_ptr<views::ToggleButton> whole_word_toggle_;
++
++  gfx::SlideAnimation options_animation_{this};
++
++  base::ScopedObservation<FindBarState, FindBarState::Observer>
++      find_bar_state_observation_{this};
+ };
+ 
+ BEGIN_VIEW_BUILDER(/* no export */, FindBarView, views::BoxLayoutView)
+--- a/components/find_in_page/find_tab_helper.cc
++++ b/components/find_in_page/find_tab_helper.cc
+@@ -58,8 +58,13 @@ void FindTabHelper::StartFinding(std::u1
+     return;
+   }
+ 
++  const bool match_case =
++      case_sensitive || (delegate_ && delegate_->ShouldMatchCase());
++  const bool whole_word = delegate_ && delegate_->ShouldMatchWholeWord();
++
+   bool new_session = find_text_ != search_string ||
+-                     (last_search_case_sensitive_ != case_sensitive) ||
++                     (last_search_case_sensitive_ != match_case) ||
++                     (last_search_whole_word_ != whole_word) ||
+                      find_op_aborted_;
+ 
+   // Continuing here would just find the same results, potentially causing
+@@ -69,13 +74,15 @@ void FindTabHelper::StartFinding(std::u1
+ 
+   previous_find_text_ = find_text_;
+   find_text_ = search_string;
+-  last_search_case_sensitive_ = case_sensitive;
++  last_search_case_sensitive_ = match_case;
++  last_search_whole_word_ = whole_word;
+   find_op_aborted_ = false;
+   should_find_match_ = find_match;
+ 
+   auto options = blink::mojom::FindOptions::New();
+   options->forward = forward_direction;
+-  options->match_case = case_sensitive;
++  options->match_case = match_case;
++  options->whole_word = whole_word;
+   options->new_session = new_session;
+   options->find_match = find_match;
+   options->run_synchronously_for_testing = run_synchronously_for_testing;
+--- a/components/find_in_page/find_tab_helper.h
++++ b/components/find_in_page/find_tab_helper.h
+@@ -34,6 +34,10 @@ class FindTabHelper : public content::We
+     virtual std::u16string GetSearchPrepopulateText(
+         content::WebContents* web_contents) = 0;
+ 
++    // Whether searches should care about case, and skip partial words.
++    virtual bool ShouldMatchCase() const = 0;
++    virtual bool ShouldMatchWholeWord() const = 0;
++
+    protected:
+     virtual ~Delegate() = default;
+   };
+@@ -184,6 +188,9 @@ class FindTabHelper : public content::We
+   // Whether the last search was case sensitive or not.
+   bool last_search_case_sensitive_ = false;
+ 
++  // Whether the last search skipped partial words or not.
++  bool last_search_whole_word_ = false;
++
+   // The last find result. This object contains details about the number of
+   // matches, the find selection rectangle, etc. The UI can access this
+   // information to build its presentation.
+--- a/components/find_in_page_strings.grdp
++++ b/components/find_in_page_strings.grdp
+@@ -27,5 +27,14 @@
+   <message name="IDS_FIND_IN_PAGE_CLOSE_TOOLTIP" desc="The tooltip for the close button">
+     Close find bar
+   </message>
++  <message name="IDS_FIND_IN_PAGE_OPTIONS_TOOLTIP" desc="The tooltip for the button that shows find options">
++    Find options
++  </message>
++  <message name="IDS_FIND_IN_PAGE_MATCH_CASE" desc="Label for the find bar switch that makes searches case sensitive">
++    Case sensitive
++  </message>
++  <message name="IDS_FIND_IN_PAGE_WHOLE_WORD" desc="Label for the find bar switch that only matches whole words">
++    Exact match
++  </message>
+ 
+ </grit-part>
