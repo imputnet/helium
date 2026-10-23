@@ -1,0 +1,493 @@
+--- a/chrome/browser/ui/tabs/split_tab_metrics.h
++++ b/chrome/browser/ui/tabs/split_tab_metrics.h
+@@ -30,7 +30,8 @@
+   kNewTabButton = 10,
+   kLinkClick = 11,
+   kMacMenuBar = 12,
+-  kMaxValue = kMacMenuBar
++  kTabStripAltClick = 13,
++  kMaxValue = kTabStripAltClick
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/enums.xml:SplitTabCreatedSource)
+ 
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -3458,7 +3458,28 @@
+   base::UmaHistogramCounts1000("Tab.ContextMenu.AddToSplit.SelectedTabsCount",
+                                selection_model_.size());
+ 
+-  std::vector<int> indices = GetIndicesForCommand(context_index);
++  ExecuteAddToNewSplit(GetIndicesForCommand(context_index), layout,
++                       split_tabs::SplitTabCreatedSource::kTabContextMenu);
++}
++
++void TabStripModel::ToggleSplitForTab(int index) {
++  if (!ContainsIndex(index) || active_index() == kNoTab) {
++    return;
++  }
++
++  if (const auto split = GetSplitForTab(index)) {
++    RemoveSplit(*split);
++    return;
++  }
++
++  ExecuteAddToNewSplit({index}, split_tabs::SplitTabLayout::kSideBySide,
++                       split_tabs::SplitTabCreatedSource::kTabStripAltClick);
++}
++
++void TabStripModel::ExecuteAddToNewSplit(
++    std::vector<int> indices,
++    split_tabs::SplitTabLayout layout,
++    split_tabs::SplitTabCreatedSource source) {
+   // There are three cases for adding to a split.
+   // 1. Selecting an inactive tab and making it a split with the active.
+   // 2. Selecting active and inactive tab and creating a split
+@@ -3472,9 +3493,9 @@
+   // This callback results in creating a split. It is either sent to the
+   // deletion dialog that owns it and is responsible for calling it or if no
+   // group is deleted it is simply called here.
+-  base::OnceCallback<void()> callback = base::BindOnce(
+-      &TabStripModelDelegate::NewSplitTab, base::Unretained(delegate_), indices,
+-      layout, split_tabs::SplitTabCreatedSource::kTabContextMenu);
++  base::OnceCallback<void()> callback =
++      base::BindOnce(&TabStripModelDelegate::NewSplitTab,
++                     base::Unretained(delegate_), indices, layout, source);
+ 
+   // If we are splitting the active tab no group can be deleted.
+   if (!indices.empty()) {
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -845,6 +845,11 @@
+   void ExecuteAddToNewSplitCommand(int context_index,
+                                    split_tabs::SplitTabLayout layout);
+ 
++  // Splits the clicked tab with the active tab, or separates it if already
++  // split. Clicking the active tab opens the split tab chooser. Other selected
++  // tabs are ignored.
++  void ToggleSplitForTab(int index);
++
+   // Returns true if 'CommandToggleTabMuted' will mute. `index` is the
+   // index supplied to `ExecuteContextMenuCommand`.
+   bool WillContextMenuMuteTabs(int index);
+@@ -1257,6 +1262,10 @@
+   void RemoveSplitImpl(split_tabs::SplitTabId split_id,
+                        SplitTabChange::SplitTabRemoveReason reason);
+ 
++  void ExecuteAddToNewSplit(std::vector<int> indices,
++                            split_tabs::SplitTabLayout layout,
++                            split_tabs::SplitTabCreatedSource source);
++
+   void UpdateTabInSplitImpl(tabs::TabInterface* split_tab,
+                             int update_index,
+                             SplitUpdateType update_type);
+--- a/chrome/browser/ui/views/event_utils.cc
++++ b/chrome/browser/ui/views/event_utils.cc
+@@ -16,6 +16,12 @@
+ bool IsPossibleDispositionEvent(const ui::Event& event) {
+   return event.IsMouseEvent() && (event.flags() & (ui::EF_LEFT_MOUSE_BUTTON |
+                                                    ui::EF_MIDDLE_MOUSE_BUTTON));
++}
++
++bool IsSplitViewClick(const ui::MouseEvent& event) {
++  return event.IsOnlyLeftMouseButton() && event.IsAltDown() &&
++         !event.IsShiftDown() && !event.IsControlDown() &&
++         !event.IsCommandDown() && !event.IsAltGrDown();
+ }
+ 
+ std::optional<ReorderDirection> GetReorderCommandForKeyboardEvent(
+--- a/chrome/browser/ui/views/event_utils.h
++++ b/chrome/browser/ui/views/event_utils.h
+@@ -13,6 +13,7 @@
+ namespace ui {
+ class Event;
+ class KeyEvent;
++class MouseEvent;
+ }
+ 
+ namespace event_utils {
+@@ -20,6 +21,9 @@
+ // Returns true if the specified event may have a
+ // WindowOptionDisposition.
+ CHROME_VIEWS_EXPORT bool IsPossibleDispositionEvent(const ui::Event& event);
++
++// Returns true for an Alt/Option + left click without selection modifiers.
++CHROME_VIEWS_EXPORT bool IsSplitViewClick(const ui::MouseEvent& event);
+ 
+ enum class ReorderDirection {
+   // The item should move to a previous entry in an ordered list (this
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -642,6 +642,13 @@
+   RecordMousePressedInTab();
+   UpdateHoverCard(nullptr, TabSlotController::HoverCardUpdateType::kEvent);
+ 
++  split_view_click_location_.reset();
++  split_view_click_dragged_ = false;
++  if (event_utils::IsSplitViewClick(event)) {
++    split_view_click_location_ = event.location();
++    return true;
++  }
++
+   // Capture the selection model before selection changes.
+   const ui::ListSelectionModel original_selection_model =
+       controller->GetSelectionModel();
+@@ -680,6 +687,21 @@
+   CHECK(collection_node_);
+ 
+   auto* controller = collection_node_->GetController();
++  if (split_view_click_location_) {
++    const bool should_split =
++        !split_view_click_dragged_ && event_utils::IsSplitViewClick(event) &&
++        HitTestPoint(event.location()) &&
++        !ExceededDragThreshold(event.location() - *split_view_click_location_);
++    split_view_click_location_.reset();
++    shift_pressed_on_mouse_down_ = false;
++    if (should_split) {
++      auto* model =
++          GetTabInterface()->GetBrowserWindowInterface()->GetTabStripModel();
++      model->ToggleSplitForTab(model->GetIndexOfTab(GetTabInterface()));
++    }
++    return;
++  }
++
+   base::WeakPtr<TabView> self = weak_ptr_factory_.GetWeakPtr();
+   if (event.IsOnlyMiddleMouseButton()) {
+     if (HitTestPoint(event.location())) {
+@@ -700,6 +722,10 @@
+   shift_pressed_on_mouse_down_ = false;
+ }
+ 
++void TabView::OnMouseCaptureLost() {
++  split_view_click_location_.reset();
++}
++
+ void TabView::OnMouseMoved(const ui::MouseEvent& event) {
+   // Hover state is handled by the parent if it is split.
+   if (split_) {
+@@ -744,6 +770,11 @@
+ }
+ 
+ bool TabView::OnMouseDragged(const ui::MouseEvent& event) {
++  if (split_view_click_location_) {
++    split_view_click_dragged_ |=
++        ExceededDragThreshold(event.location() - *split_view_click_location_);
++    return true;
++  }
+   // Protect against key presses when the tab is animating out. Drag events may
+   // call this function after the node has been deleted.
+   if (!collection_node_) {
+--- a/chrome/browser/ui/views/tabs/common/tab_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_view.h
+@@ -25,6 +25,7 @@
+ #include "third_party/skia/include/core/SkScalar.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/point.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/layout/layout_manager_base.h"
+ #include "ui/views/masked_targeter_delegate.h"
+@@ -135,6 +136,7 @@
+   bool OnKeyReleased(const ui::KeyEvent& event) override;
+   bool OnMousePressed(const ui::MouseEvent& event) override;
+   void OnMouseReleased(const ui::MouseEvent& event) override;
++  void OnMouseCaptureLost() override;
+   void OnMouseMoved(const ui::MouseEvent& event) override;
+   void OnMouseEntered(const ui::MouseEvent& event) override;
+   void OnMouseExited(const ui::MouseEvent& event) override;
+@@ -243,6 +245,8 @@
+   bool collapsed_ = false;
+   bool pinned_ = false;
+   bool shift_pressed_on_mouse_down_ = false;
++  std::optional<gfx::Point> split_view_click_location_;
++  bool split_view_click_dragged_ = false;
+   bool should_fill_background_tab_color_ = false;
+ 
+   std::unique_ptr<GlowHoverController> hover_controller_;
+--- a/chrome/browser/ui/views/tabs/common/tab_view_browsertest.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_browsertest.cc
+@@ -35,11 +35,14 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view_horizontal_layout.h"
+ #include "chrome/browser/ui/views/tabs/hovercard/tab_hover_card_bubble_view.h"
++#include "chrome/browser/ui/views/tabs/tab.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_close_button.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_icon.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_title.h"
++#include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/tabs/tab_style_views.h"
+ #include "chrome/browser/ui/views/test/vertical_tabs_browser_test_mixin.h"
++#include "chrome/common/webui_url_constants.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "chrome/test/base/in_process_browser_test.h"
+ #include "chrome/test/base/ui_test_utils.h"
+@@ -169,6 +172,182 @@
+   std::unique_ptr<views::test::MockActivationController> activation_controller_;
+ #endif
+ };
++
++class SplitViewAltClickTest : public TabViewTest,
++                              public testing::WithParamInterface<bool> {
++ public:
++  void SetUpOnMainThread() override {
++    TabViewTest::SetUpOnMainThread();
++    if (!GetParam()) {
++      ExitVerticalTabsMode();
++    }
++  }
++
++  views::View* GetClickTarget(int index) {
++    RunScheduledLayouts();
++    if (GetParam()) {
++      return root_node()
++          ->GetNodeForHandle(
++              tab_strip_model()->GetTabAtIndex(index)->GetHandle())
++          ->view();
++    }
++    return BrowserView::GetBrowserViewForBrowser(browser())
++        ->horizontal_tab_strip_for_testing()
++        ->tab_at(index);
++  }
++
++  ui::MouseEvent MouseEvent(ui::EventType type,
++                            const gfx::Point& location,
++                            int modifiers = ui::EF_ALT_DOWN) {
++    return ui::MouseEvent(type, location, location, ui::EventTimeForNow(),
++                          ui::EF_LEFT_MOUSE_BUTTON | modifiers,
++                          ui::EF_LEFT_MOUSE_BUTTON);
++  }
++
++  void ClickTab(int index, int modifiers = ui::EF_ALT_DOWN) {
++    views::View* target = GetClickTarget(index);
++    const gfx::Point location = target->GetLocalBounds().CenterPoint();
++    target->OnMousePressed(
++        MouseEvent(ui::EventType::kMousePressed, location, modifiers));
++    target->OnMouseReleased(
++        MouseEvent(ui::EventType::kMouseReleased, location, modifiers));
++  }
++
++ private:
++  const gfx::AnimationTestApi::RenderModeResetter disable_rich_animations_ =
++      gfx::AnimationTestApi::SetRichAnimationRenderMode(
++          gfx::Animation::RichAnimationRenderMode::FORCE_DISABLED);
++};
++
++IN_PROC_BROWSER_TEST_P(SplitViewAltClickTest, CreateAndSeparateSplit) {
++  AppendTab();
++  AppendTab();
++  auto* active = tab_strip_model()->GetActiveTab();
++  auto* clicked = tab_strip_model()->GetTabAtIndex(0);
++  auto* other = tab_strip_model()->GetTabAtIndex(1);
++
++  ClickTab(0);
++
++  ASSERT_EQ(3, tab_strip_model()->count());
++  ASSERT_TRUE(active->IsSplit());
++  EXPECT_EQ(active->GetSplit(), clicked->GetSplit());
++  EXPECT_FALSE(other->IsSplit());
++  EXPECT_EQ(active, tab_strip_model()->GetActiveTab());
++
++  ClickTab(tab_strip_model()->GetIndexOfTab(clicked));
++
++  EXPECT_FALSE(active->IsSplit());
++  EXPECT_FALSE(clicked->IsSplit());
++  EXPECT_EQ(3, tab_strip_model()->count());
++}
++
++IN_PROC_BROWSER_TEST_P(SplitViewAltClickTest, ActiveTabOpensChooser) {
++  AppendTab();
++  auto* active = tab_strip_model()->GetActiveTab();
++
++  ClickTab(tab_strip_model()->active_index());
++
++  ASSERT_EQ(3, tab_strip_model()->count());
++  ASSERT_TRUE(active->IsSplit());
++  auto* chooser = tab_strip_model()->GetActiveTab();
++  EXPECT_NE(active, chooser);
++  EXPECT_EQ(active->GetSplit(), chooser->GetSplit());
++  ASSERT_TRUE(content::WaitForLoadStop(chooser->GetContents()));
++  EXPECT_EQ(GURL(chrome::kChromeUISplitViewNewTabPageURL),
++            chooser->GetContents()->GetLastCommittedURL());
++}
++
++IN_PROC_BROWSER_TEST_P(SplitViewAltClickTest, IgnoreOtherSelectedTabs) {
++  AppendTab();
++  AppendTab();
++  tab_strip_model()->AddSelectionFromAnchorTo(0);
++  ASSERT_EQ(3u, tab_strip_model()->selection_model().size());
++  auto* active = tab_strip_model()->GetActiveTab();
++  auto* clicked = tab_strip_model()->GetTabAtIndex(1);
++  auto* other = tab_strip_model()->GetTabAtIndex(2);
++
++  ClickTab(1);
++
++  ASSERT_TRUE(active->IsSplit());
++  EXPECT_EQ(active->GetSplit(), clicked->GetSplit());
++  EXPECT_FALSE(other->IsSplit());
++  EXPECT_EQ(3, tab_strip_model()->count());
++}
++
++IN_PROC_BROWSER_TEST_P(SplitViewAltClickTest, ReplaceActiveSplit) {
++  AppendTab();
++  AppendTab();
++  auto* active = tab_strip_model()->GetActiveTab();
++  auto* first = tab_strip_model()->GetTabAtIndex(0);
++  auto* second = tab_strip_model()->GetTabAtIndex(1);
++  ClickTab(0);
++  ASSERT_TRUE(active->IsSplit());
++
++  ClickTab(tab_strip_model()->GetIndexOfTab(second));
++
++  ASSERT_TRUE(active->IsSplit());
++  EXPECT_EQ(active->GetSplit(), second->GetSplit());
++  EXPECT_FALSE(first->IsSplit());
++  EXPECT_EQ(3, tab_strip_model()->count());
++}
++
++IN_PROC_BROWSER_TEST_P(SplitViewAltClickTest, OtherModifiersDoNotSplit) {
++  AppendTab();
++  for (int modifiers : {0, ui::EF_ALT_DOWN | ui::EF_SHIFT_DOWN,
++                        ui::EF_ALT_DOWN | ui::EF_CONTROL_DOWN,
++                        ui::EF_ALT_DOWN | ui::EF_COMMAND_DOWN,
++                        ui::EF_ALT_DOWN | ui::EF_ALTGR_DOWN}) {
++    ClickTab(0, modifiers);
++    EXPECT_EQ(2, tab_strip_model()->count());
++    EXPECT_TRUE(tab_strip_model()->ListSplits().empty());
++  }
++}
++
++IN_PROC_BROWSER_TEST_P(SplitViewAltClickTest, DragDoesNotSplitOrSwitchTabs) {
++  AppendTab();
++  auto* active = tab_strip_model()->GetActiveTab();
++  views::View* target = GetClickTarget(0);
++  const gfx::Point origin = target->GetLocalBounds().CenterPoint();
++  const gfx::Point destination = origin + gfx::Vector2d(40, 0);
++  target->OnMousePressed(MouseEvent(ui::EventType::kMousePressed, origin));
++  target->OnMouseDragged(MouseEvent(ui::EventType::kMouseDragged, destination));
++  target->OnMouseDragged(MouseEvent(ui::EventType::kMouseDragged, origin));
++  target->OnMouseReleased(MouseEvent(ui::EventType::kMouseReleased, origin));
++
++  EXPECT_EQ(active, tab_strip_model()->GetActiveTab());
++  EXPECT_TRUE(tab_strip_model()->ListSplits().empty());
++}
++
++IN_PROC_BROWSER_TEST_P(SplitViewAltClickTest, ReleasedModifierCancelsSplit) {
++  AppendTab();
++  auto* active = tab_strip_model()->GetActiveTab();
++  views::View* target = GetClickTarget(0);
++  const gfx::Point location = target->GetLocalBounds().CenterPoint();
++  target->OnMousePressed(MouseEvent(ui::EventType::kMousePressed, location));
++  target->OnMouseReleased(
++      MouseEvent(ui::EventType::kMouseReleased, location, 0));
++
++  EXPECT_EQ(active, tab_strip_model()->GetActiveTab());
++  EXPECT_TRUE(tab_strip_model()->ListSplits().empty());
++  ClickTab(0, 0);
++  EXPECT_NE(active, tab_strip_model()->GetActiveTab());
++  EXPECT_TRUE(tab_strip_model()->ListSplits().empty());
++}
++
++IN_PROC_BROWSER_TEST_P(SplitViewAltClickTest, LostCaptureCancelsSplit) {
++  AppendTab();
++  views::View* target = GetClickTarget(0);
++  const gfx::Point location = target->GetLocalBounds().CenterPoint();
++  target->OnMousePressed(MouseEvent(ui::EventType::kMousePressed, location));
++  target->OnMouseCaptureLost();
++
++  ClickTab(0, 0);
++
++  EXPECT_EQ(0, tab_strip_model()->active_index());
++  EXPECT_TRUE(tab_strip_model()->ListSplits().empty());
++}
++
++INSTANTIATE_TEST_SUITE_P(All, SplitViewAltClickTest, testing::Bool());
+ 
+ IN_PROC_BROWSER_TEST_F(TabViewTest, IconDataChanged) {
+   ASSERT_TRUE(embedded_test_server()->Start());
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
+@@ -36,6 +36,7 @@
+ #include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/tabs/tab_data.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -730,6 +731,13 @@
+                                TabSlotController::HoverCardUpdateType::kEvent);
+   controller_->OnMouseEventInTab(this, event);
+ 
++  split_view_click_location_.reset();
++  split_view_click_dragged_ = false;
++  if (event_utils::IsSplitViewClick(event)) {
++    split_view_click_location_ = event.location();
++    return true;
++  }
++
+   // Allow a right click from touch to drag, which corresponds to a long click.
+   if (event.IsOnlyLeftMouseButton() ||
+       (event.IsOnlyRightMouseButton() && event.flags() & ui::EF_FROM_TOUCH)) {
+@@ -770,6 +778,11 @@
+ }
+ 
+ bool Tab::OnMouseDragged(const ui::MouseEvent& event) {
++  if (split_view_click_location_) {
++    split_view_click_dragged_ |=
++        ExceededDragThreshold(event.location() - *split_view_click_location_);
++    return true;
++  }
+   // TODO: ensure ignoring return value is ok.
+   std::ignore = controller_->ContinueDrag(this, event);
+   return true;
+@@ -778,6 +791,22 @@
+ void Tab::OnMouseReleased(const ui::MouseEvent& event) {
+   base::WeakPtr<Tab> self = weak_ptr_factory_.GetWeakPtr();
+   controller_->OnMouseEventInTab(this, event);
++
++  if (split_view_click_location_) {
++    const bool should_split =
++        !split_view_click_dragged_ && event_utils::IsSplitViewClick(event) &&
++        !closing() && HitTestPoint(event.location()) &&
++        !ExceededDragThreshold(event.location() - *split_view_click_location_);
++    split_view_click_location_.reset();
++    shift_pressed_on_mouse_down_ = false;
++    if (should_split) {
++      if (auto* browser = controller_->GetBrowserWindowInterface()) {
++        auto* model = browser->GetTabStripModel();
++        model->ToggleSplitForTab(model->GetIndexOfTab(tab_handle_.Get()));
++      }
++    }
++    return;
++  }
+ 
+   // Notify the drag helper that we're done with any potential drag operations.
+   // Clean up the drag helper, which is re-created on the next mouse press.
+@@ -824,6 +853,7 @@
+ }
+ 
+ void Tab::OnMouseCaptureLost() {
++  split_view_click_location_.reset();
+   controller_->EndDrag(EndDragReason::kCaptureLost);
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/tab.h
++++ b/chrome/browser/ui/views/tabs/tab.h
+@@ -357,6 +357,8 @@
+   // Whether the shift key was pressed at the start of the click. Used on mouse
+   // up.
+   bool shift_pressed_on_mouse_down_ = false;
++  std::optional<gfx::Point> split_view_click_location_;
++  bool split_view_click_dragged_ = false;
+   bool should_fill_background_tab_color_ = false;
+ 
+   std::unique_ptr<TabCloseButtonObserver> tab_close_button_observer_;
+--- a/tools/metrics/histograms/metadata/tab/enums.xml
++++ b/tools/metrics/histograms/metadata/tab/enums.xml
+@@ -367,6 +367,7 @@
+   <int value="10" label="New tab button"/>
+   <int value="11" label="Link click shortcut"/>
+   <int value="12" label="Mac menu bar"/>
++  <int value="13" label="Tab strip Alt click"/>
+ </enum>
+ 
+ <!-- LINT.ThenChange(//chrome/browser/ui/tabs/split_tab_metrics.h:SplitTabCreatedSource) -->
