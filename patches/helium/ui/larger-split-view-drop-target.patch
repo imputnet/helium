@@ -1,0 +1,116 @@
+--- a/chrome/browser/ui/views/frame/multi_contents_drop_target_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_drop_target_view.cc
+@@ -214,11 +214,14 @@
+       percentage = kNudgeToFullTargetSizePercentage;
+       break;
+     case DropTargetState::kFull:
++      if (drag_type == DragType::kTab) {
++        // Keep the hit area and preview proportional on large windows, and
++        // leave the center available for ordinary tab dragging.
++        return web_contents_size * (kDropTargetTargetSizePercentage / 100.0);
++      }
+       min_size = kDropTargetMinSize;
+       max_size = kDropTargetMaxSize;
+-      percentage = drag_type == DragType::kTab
+-                       ? kDropTargetTargetSizePercentage
+-                       : kDropTargetForLinkTargetSizePercentage;
++      percentage = kDropTargetForLinkTargetSizePercentage;
+       break;
+     default:
+       NOTREACHED();
+--- a/chrome/browser/ui/views/frame/multi_contents_drop_target_view.h
++++ b/chrome/browser/ui/views/frame/multi_contents_drop_target_view.h
+@@ -34,7 +34,7 @@
+ 
+   static constexpr int kDropTargetMinSize = 120;
+   static constexpr int kDropTargetMaxSize = 360;
+-  static constexpr int kDropTargetTargetSizePercentage = 20;
++  static constexpr int kDropTargetTargetSizePercentage = 35;
+   static constexpr int kDropTargetForLinkTargetSizePercentage = 20;
+   static constexpr int kNudgeMinSize = 80;
+   static constexpr int kNudgeMaxSize = 200;
+--- a/chrome/browser/ui/views/frame/multi_contents_drop_target_view_unittest.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_drop_target_view_unittest.cc
+@@ -293,13 +293,13 @@
+              MultiContentsDropTargetView::DragType::kTab);
+   EXPECT_TRUE(view->GetVisible());
+ 
+-  // Size is clamped to the minimum.
+-  EXPECT_EQ(MultiContentsDropTargetView::kDropTargetMinSize,
+-            view->GetSizeForAvailableSpace(400));
+-
+-  // Size is clamped to the maximum.
+-  EXPECT_EQ(MultiContentsDropTargetView::kDropTargetMaxSize,
+-            view->GetSizeForAvailableSpace(3000));
++  // Small windows retain a center region instead of using a fixed minimum.
++  EXPECT_EQ(35, view->GetSizeForAvailableSpace(100));
++  EXPECT_EQ(140, view->GetSizeForAvailableSpace(400));
++
++  // Large windows are not limited by the link target's fixed maximum.
++  EXPECT_EQ(1050, view->GetSizeForAvailableSpace(3000));
++  EXPECT_EQ(1344, view->GetSizeForAvailableSpace(3840));
+ 
+   // Size is the target percentage of the web contents size.
+   EXPECT_EQ(
+--- a/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller_unittest.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller_unittest.cc
+@@ -512,6 +512,39 @@
+   EXPECT_FALSE(drop_target_view().GetVisible());
+ }
+ 
++TEST_P(MultiContentsViewDropTargetControllerParamTest,
++       TabDropAreaScalesWithViewport) {
++  const auto [side, rtl] = GetParam();
++  for (int size : {400, 2000, 4000}) {
++    SCOPED_TRACE(size);
++    drop_target_view().parent()->SetSize(gfx::Size(size, size));
++
++    const auto point_at_inset = [&](int percentage) {
++      const int inset = size * percentage / 100;
++      if (side == DropSide::BOTTOM) {
++        return gfx::Point(size / 2, size - inset);
++      }
++      const bool is_left = (side == DropSide::START) != rtl;
++      return gfx::Point(is_left ? inset : size - inset, size / 2);
++    };
++
++    // Both the trigger and the visible target extend to 35% of the viewport.
++    DragTabTo(point_at_inset(34));
++    FastForward(base::Seconds(2));
++    ASSERT_TRUE(drop_target_view().IsVisibleAndNotClosing());
++    EXPECT_EQ(side, drop_target_view().side());
++    EXPECT_TRUE(controller().CanDropTab());
++    EXPECT_EQ(size * 35 / 100,
++              drop_target_view().GetSizeForAvailableSpace(size));
++
++    // Moving past the boundary returns to ordinary tab dragging.
++    DragTabTo(point_at_inset(36));
++    FastForward(base::Seconds(2));
++    EXPECT_FALSE(drop_target_view().GetVisible());
++    EXPECT_FALSE(controller().CanDropTab());
++  }
++}
++
+ // Tests that the drop target is hidden when dragging more than one tab.
+ TEST_P(MultiContentsViewDropTargetControllerParamTest,
+        OnTabDragUpdated_HidesTargetWhenDraggingMultipleTabs) {
+@@ -1128,7 +1161,8 @@
+        {"max_distance_threshold", "1000"}});
+ 
+   constexpr int kWidthForForMaxDropTargetSize =
+-      (MultiContentsDropTargetView::kDropTargetMaxSize * 100.0f) /
++      (MultiContentsDropTargetView::kDropTargetMaxSize * 100 +
++       MultiContentsDropTargetView::kDropTargetTargetSizePercentage - 1) /
+       MultiContentsDropTargetView::kDropTargetTargetSizePercentage;
+ 
+   views::View* parent = drop_target_view().parent();
+@@ -1211,7 +1245,8 @@
+   views::View* parent = drop_target_view().parent();
+ 
+   constexpr int kWidthForForMaxDropTargetSize =
+-      (MultiContentsDropTargetView::kDropTargetMaxSize * 100.0f) /
++      (MultiContentsDropTargetView::kDropTargetMaxSize * 100 +
++       MultiContentsDropTargetView::kDropTargetTargetSizePercentage - 1) /
+       MultiContentsDropTargetView::kDropTargetTargetSizePercentage;
+ 
+   parent->SetSize(gfx::Size(kWidthForForMaxDropTargetSize, 500));
