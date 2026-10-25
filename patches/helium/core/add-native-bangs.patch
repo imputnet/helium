@@ -22,7 +22,7 @@
  #include <memory>
  
  #include "base/values.h"
-+#include "components/search_engines/template_url_bang_manager.h"
++#include "components/search_engines/template_url_bang.h"
  
  namespace TemplateURLPrepopulateData {
  struct PrepopulatedEngine;
@@ -34,16 +34,17 @@
  #endif  // COMPONENTS_SEARCH_ENGINES_TEMPLATE_URL_DATA_UTIL_H_
 --- a/components/search_engines/BUILD.gn
 +++ b/components/search_engines/BUILD.gn
-@@ -47,6 +47,8 @@ static_library("search_engines") {
+@@ -47,6 +47,9 @@ static_library("search_engines") {
      "search_terms_data.h",
      "template_url.cc",
      "template_url.h",
++    "template_url_bang.h",
 +    "template_url_bang_manager.cc",
 +    "template_url_bang_manager.h",
      "template_url_data.cc",
      "template_url_data.h",
      "template_url_data_util.cc",
-@@ -94,6 +96,7 @@ static_library("search_engines") {
+@@ -94,6 +97,7 @@ static_library("search_engines") {
      "//components/country_codes",
      "//components/crash/core/common:crash_key",
      "//components/database_utils",
@@ -53,15 +54,15 @@
      "//components/lens:lens_url_utils",
 --- a/components/search_engines/template_url_data_util.cc
 +++ b/components/search_engines/template_url_data_util.cc
-@@ -15,6 +15,7 @@
+@@ -13,6 +13,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/values.h"
  #include "components/search_engines/default_search_manager.h"
++#include "components/search_engines/template_url_bang.h"
  #include "components/search_engines/template_url_data.h"
  #include "components/search_engines/template_url_starter_pack_data.h"
-+#include "components/search_engines/template_url_bang_manager.h"
  #include "third_party/search_engines_data/resources/definitions/prepopulated_engines.h"
- #include "ui/base/l10n/l10n_util.h"
- #include "url/gurl.h"
-@@ -528,3 +529,20 @@ std::unique_ptr<TemplateURLData> Templat
+@@ -528,3 +529,21 @@ std::unique_ptr<TemplateURLData> Templat
  
    return turl;
  }
@@ -76,6 +77,7 @@
 +  favicon_url.path() = "/favicon.ico";
 +  turl.favicon_url = std::move(favicon_url);
 +  turl.bang_id = 1 + bang.id;
++  turl.bang_category = bang.category;
 +
 +  turl.safe_for_autoreplace = false;
 +  turl.GenerateSyncGUID();
@@ -84,16 +86,20 @@
 +}
 --- a/components/search_engines/template_url_service.cc
 +++ b/components/search_engines/template_url_service.cc
-@@ -39,6 +39,8 @@
+@@ -37,9 +37,12 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
  #include "base/strings/utf_string_conversions.h"
++#include "base/task/thread_pool.h"
  #include "build/build_config.h"
  #include "components/country_codes/country_codes.h"
-+#include "components/helium_services/pref_names.h"
-+#include "components/helium_services/helium_services_helpers.h"
  #include "components/google/core/common/google_util.h"
++#include "components/helium_services/helium_services_helpers.h"
++#include "components/helium_services/pref_names.h"
  #include "components/metrics/profile_metrics_service.h"
  #include "components/omnibox/common/omnibox_feature_configs.h"
-@@ -61,7 +63,9 @@
+ #include "components/omnibox/common/omnibox_features.h"
+@@ -61,7 +64,9 @@
  #include "components/search_engines/search_engines_switches.h"
  #include "components/search_engines/search_terms_data.h"
  #include "components/search_engines/template_url.h"
@@ -103,7 +109,7 @@
  #include "components/search_engines/template_url_prepopulate_data.h"
  #include "components/search_engines/template_url_prepopulate_data_resolver.h"
  #include "components/search_engines/template_url_service_client.h"
-@@ -77,6 +81,7 @@
+@@ -77,6 +82,7 @@
  #include "components/sync/protocol/search_engine_specifics.pb.h"
  #include "components/url_formatter/url_fixer.h"
  #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
@@ -111,7 +117,28 @@
  #include "url/gurl.h"
  #include "url/origin.h"
  #include "url/third_party/mozilla/url_parse.h"
-@@ -596,6 +601,7 @@ class TemplateURLService::PreLoadingProv
+@@ -413,6 +419,20 @@ bool ShouldAutocollect() {
+   return !command_line.HasSwitch("disable-search-engine-collection");
+ }
+ 
++TemplateURL::OwnedTemplateURLVector PrepareBangEntries(
++    scoped_refptr<const Bangs::Catalogue> catalogue,
++    std::unique_ptr<SearchTermsData> search_terms_data) {
++  TemplateURL::OwnedTemplateURLVector entries;
++  entries.reserve(catalogue->entries.size());
++  for (const auto& bang : catalogue->entries) {
++    auto entry = std::make_unique<TemplateURL>(TemplateURLDataFromBang(bang),
++                                               TemplateURL::LOCAL);
++    entry->url_ref().IsValid(*search_terms_data);
++    entries.push_back(std::move(entry));
++  }
++  return entries;
++}
++
+ }  // namespace
+ 
+ // TemplateURLService::LessWithPrefix -----------------------------------------
+@@ -596,6 +616,7 @@ class TemplateURLService::PreLoadingProv
  
  TemplateURLService::TemplateURLService(
      PrefService& prefs,
@@ -119,16 +146,17 @@
      search_engines::SearchEngineChoiceService& search_engine_choice_service,
      TemplateURLPrepopulateData::Resolver& prepopulate_data_resolver,
      regional_capabilities::RegionalCapabilitiesService&
-@@ -613,6 +619,8 @@ TemplateURLService::TemplateURLService(
+@@ -613,6 +634,9 @@ TemplateURLService::TemplateURLService(
        profile_metrics_service_(profile_metrics_service),
        search_terms_data_(std::move(search_terms_data)),
        web_data_service_(web_data_service),
-+      url_loader_factory_(std::move(url_loader_factory)),
-+      bang_manager_(Bangs::BangManager::GetInstance()),
++      bang_manager_(
++          std::make_unique<Bangs::BangManager>(prefs,
++                                               std::move(url_loader_factory))),
        client_(std::move(client)),
        dsp_change_callback_(dsp_change_callback),
        pre_loading_providers_(std::make_unique<PreLoadingProviders>()),
-@@ -629,6 +637,7 @@ TemplateURLService::TemplateURLService(
+@@ -629,6 +653,7 @@ TemplateURLService::TemplateURLService(
  
  TemplateURLService::TemplateURLService(
      PrefService& prefs,
@@ -136,7 +164,7 @@
      search_engines::SearchEngineChoiceService& search_engine_choice_service,
      TemplateURLPrepopulateData::Resolver& prepopulate_data_resolver,
      regional_capabilities::RegionalCapabilitiesService&
-@@ -637,6 +646,7 @@ TemplateURLService::TemplateURLService(
+@@ -637,6 +662,7 @@ TemplateURLService::TemplateURLService(
      base::span<const TemplateURLService::Initializer> initializers)
      : TemplateURLService(
            prefs,
@@ -144,7 +172,7 @@
            search_engine_choice_service,
            prepopulate_data_resolver,
            regional_capabilities_service,
-@@ -719,6 +729,10 @@ bool TemplateURLService::ShowInActivesLi
+@@ -719,6 +745,10 @@ bool TemplateURLService::ShowInActivesLi
  }
  
  bool TemplateURLService::HiddenFromLists(const TemplateURL* t_url) const {
@@ -155,47 +183,132 @@
    switch (t_url->policy_origin()) {
      case TemplateURLData::PolicyOrigin::kDefaultSearchProvider:
        return false;
-@@ -1645,11 +1659,39 @@ void TemplateURLService::Load() {
+@@ -1026,12 +1056,18 @@ void TemplateURLService::RegisterExtensi
  
-   if (web_data_service_) {
-     load_handle_ = web_data_service_->GetKeywords(this);
-+    LoadBangs();
-   } else {
-     ChangeToLoadedState();
+ TemplateURLService::TemplateURLVector TemplateURLService::GetTemplateURLs() {
+   TemplateURLVector result;
++  result.reserve(template_urls_.size());
+   for (const auto& turl : template_urls_) {
+     result.push_back(turl.get());
+   }
+   return result;
+ }
+ 
++bool TemplateURLService::ContainsTemplateURL(const TemplateURL* url) const {
++  return std::ranges::contains(template_urls_, url,
++                               &std::unique_ptr<TemplateURL>::get);
++}
++
+ std::unique_ptr<search_engines::ChoiceScreenData>
+ TemplateURLService::GetChoiceScreenData() {
+   return search_engine_choice_service_->GetChoiceScreenData(
+@@ -1339,6 +1375,10 @@ bool TemplateURLService::CanMakeDefault(
+ void TemplateURLService::SetUserSelectedDefaultSearchProvider(
+     TemplateURL* url,
+     search_engines::ChoiceMadeLocation choice_made_location) {
++  if (url && url->bang_id()) {
++    return;
++  }
++
+   // Omnibox keywords cannot be made default. Extension-controlled search
+   // engines can be made default only by the extension itself because they
+   // aren't persisted.
+@@ -1650,6 +1690,85 @@ void TemplateURLService::Load() {
    }
  }
  
 +void TemplateURLService::LoadBangs() {
-+  VLOG(2) << "LoadBangs() called";
++  if (!loaded_ || !bang_manager_) {
++    return;
++  }
++
 +  bang_manager_->LoadBangs(
-+      url_loader_factory_, prefs_.get(),
-+      base::BindOnce(&TemplateURLService::BangsLoadedCallback,
-+                     weak_ptr_factory_.GetWeakPtr()));
++      base::BindRepeating(&TemplateURLService::BangsLoadedCallback,
++                          weak_ptr_factory_.GetWeakPtr()));
 +}
 +
-+void TemplateURLService::BangsLoadedCallback() {
-+  VLOG(2) << "BangsLoadedCallback() called";
++void TemplateURLService::BangsLoadedCallback(
++    const Bangs::BangManager::Result& bangs) {
++  if (!bangs || bangs == bang_catalogue_) {
++    return;
++  }
 +
-+  for (const auto& bang : bang_manager_->GetBangs()) {
-+    auto template_data = TemplateURLDataFromBang(bang);
++  CHECK(loaded_);
++  bang_catalogue_ = bangs;
++  bang_weak_ptr_factory_.InvalidateWeakPtrs();
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&PrepareBangEntries, bangs,
++                     SearchTermsData::MakeSnapshot(search_terms_data_.get())),
++      base::BindOnce(
++          [](base::WeakPtr<TemplateURLService> service,
++             TemplateURL::OwnedTemplateURLVector entries) {
++            if (service) {
++              service->OnBangsPrepared(std::move(entries));
++            } else {
++              base::ThreadPool::PostTask(
++                  FROM_HERE, {base::TaskPriority::USER_VISIBLE},
++                  base::DoNothingWithBoundArgs(std::move(entries)));
++            }
++          },
++          bang_weak_ptr_factory_.GetWeakPtr()));
++}
 +
-+    if (!GetTemplateURLForKeyword(template_data.keyword())) {
-+      template_data.id = ++next_id_;
++void TemplateURLService::OnBangsPrepared(
++    TemplateURL::OwnedTemplateURLVector entries) {
++  TemplateURL::OwnedTemplateURLVector removed;
++  {
++    Scoper scoper(this);
++    if (std::ranges::any_of(template_urls_, [](const auto& turl) {
++          return turl->bang_id() != 0;
++        })) {
++      provider_map_ = std::make_unique<SearchHostToURLsMap>();
++      for (auto& turl : template_urls_) {
++        if (!turl->bang_id()) {
++          continue;
++        }
++        CHECK_NE(turl.get(), GetDefaultSearchProvider());
++        RemoveFromMaps(turl.get(), /*update_host_map=*/false);
++        if (client_) {
++          client_->DeleteAllSearchTermsForKeyword(turl->id());
++        }
++        removed.push_back(std::move(turl));
++      }
++      std::erase(template_urls_, nullptr);
++      provider_map_->Init(template_urls_, search_terms_data());
++      model_mutated_notification_pending_ = true;
++    }
 +
-+      auto t_url = std::make_unique<TemplateURL>(
-+        std::move(template_data), TemplateURL::Type::LOCAL);
-+      auto t_ptr = t_url.get();
-+
-+      template_urls_.push_back(std::move(t_url));
-+      AddToMaps(t_ptr);
++    template_urls_.reserve(template_urls_.size() + entries.size());
++    for (auto& turl : entries) {
++      if (GetTemplateURLForKeyword(turl->keyword())) {
++        continue;
++      }
++      turl->set_id(++next_id_);
++      auto* turl_ptr = turl.get();
++      template_urls_.push_back(std::move(turl));
++      AddToMaps(turl_ptr);
++      model_mutated_notification_pending_ = true;
 +    }
 +  }
++  base::ThreadPool::PostTask(
++      FROM_HERE, {base::TaskPriority::USER_VISIBLE},
++      base::DoNothingWithBoundArgs(std::move(removed), std::move(entries)));
 +}
 +
  base::CallbackListSubscription TemplateURLService::RegisterOnLoadedCallback(
      base::OnceClosure callback) {
    return loaded_ ? base::CallbackListSubscription()
-@@ -2645,6 +2687,13 @@ void TemplateURLService::Init() {
+@@ -1938,6 +2057,8 @@ void TemplateURLService::OnHistoryURLVis
+ }
+ 
+ void TemplateURLService::Shutdown() {
++  bang_manager_.reset();
++  bang_weak_ptr_factory_.InvalidateWeakPtrs();
+   for (auto& observer : model_observers_) {
+     observer.OnTemplateURLServiceShuttingDown();
+   }
+@@ -2645,6 +2766,13 @@ void TemplateURLService::Init() {
            &TemplateURLService::OnDefaultSearchProviderGUIDChanged,
            base::Unretained(this)));
  
@@ -209,14 +322,40 @@
    DefaultSearchManager::Source source = DefaultSearchManager::FROM_USER;
    const TemplateURLData* dse =
        default_search_manager_.GetDefaultSearchEngine(&source);
+@@ -2689,7 +2817,8 @@ void TemplateURLService::ApplyInitialize
+   }
+ }
+ 
+-void TemplateURLService::RemoveFromMaps(const TemplateURL* template_url) {
++void TemplateURLService::RemoveFromMaps(const TemplateURL* template_url,
++                                        bool update_host_map) {
+   const std::u16string& keyword = template_url->keyword();
+ 
+   // Remove from |keyword_to_turl_|. No need to find the best
+@@ -2727,7 +2856,7 @@ void TemplateURLService::RemoveFromMaps(
+   }
+ 
+   // |provider_map_| is only initialized after loading has completed.
+-  if (loaded_) {
++  if (loaded_ && update_host_map) {
+     provider_map_->Remove(template_url);
+   }
+ }
+@@ -2797,6 +2926,11 @@ void TemplateURLService::ChangeToLoadedS
+   ApplyEnterpriseSearchChanges(pre_loading_providers_->TakeSearchEngines());
+   pre_loading_providers_.reset();
+ 
++  // Load saved engine IDs before allocating IDs for bangs.
++  if (web_data_service_ || load_failed_) {
++    LoadBangs();
++  }
++
+   if (on_loaded_callback_for_sync_) {
+     std::move(on_loaded_callback_for_sync_).Run();
+   }
 --- a/components/search_engines/template_url_service.h
 +++ b/components/search_engines/template_url_service.h
-@@ -35,10 +35,12 @@
- #include "components/search_engines/search_host_to_urls_map.h"
- #include "components/search_engines/search_terms_data.h"
- #include "components/search_engines/template_url.h"
-+#include "components/search_engines/template_url_bang_manager.h"
- #include "components/search_engines/template_url_starter_pack_data.h"
+@@ -39,10 +39,16 @@
  #include "components/sync/model/sync_change.h"
  #include "components/sync/model/syncable_service.h"
  #include "components/webdata/common/web_data_service_consumer.h"
@@ -224,7 +363,16 @@
  #if BUILDFLAG(IS_ANDROID)
  #include "base/android/scoped_java_ref.h"
  #endif
-@@ -151,6 +153,7 @@ class TemplateURLService final : public
+ 
++namespace Bangs {
++class BangManager;
++class Catalogue;
++}  // namespace Bangs
++
+ class GURL;
+ class PrefService;
+ class TemplateURLServiceClient;
+@@ -151,6 +157,7 @@ class TemplateURLService final : public
  
    TemplateURLService(
        PrefService& prefs,
@@ -232,7 +380,7 @@
        search_engines::SearchEngineChoiceService& search_engine_choice_service,
        TemplateURLPrepopulateData::Resolver& prepopulate_data_resolver,
        regional_capabilities::RegionalCapabilitiesService&
-@@ -165,6 +168,7 @@ class TemplateURLService final : public
+@@ -165,6 +172,7 @@ class TemplateURLService final : public
    // some template URL data.
    explicit TemplateURLService(
        PrefService& prefs,
@@ -240,7 +388,17 @@
        search_engines::SearchEngineChoiceService& search_engine_choice_service,
        TemplateURLPrepopulateData::Resolver& prepopulate_data_resolver,
        regional_capabilities::RegionalCapabilitiesService&
-@@ -518,6 +522,8 @@ class TemplateURLService final : public
+@@ -319,6 +327,9 @@ class TemplateURLService final : public
+   // by TemplateURLService and should not be deleted.
+   TemplateURLVector GetTemplateURLs();
+ 
++  // Checks membership without dereferencing the pointer or copying the list.
++  bool ContainsTemplateURL(const TemplateURL* url) const;
++
+   // Returns key information needed to show a search engine choice screen, like
+   // the template URLs for the engines to show. See
+   // `search_engines::ChoiceScreenData` for more details.
+@@ -518,6 +529,8 @@ class TemplateURLService final : public
    // OnTemplateURLServiceChanged.
    void Load();
  
@@ -249,58 +407,79 @@
    // Registers a callback to be called when the service has loaded.
    //
    // If the service has already loaded, this function does nothing.
-@@ -754,6 +760,8 @@ class TemplateURLService final : public
+@@ -754,13 +767,17 @@ class TemplateURLService final : public
  
    void Init();
  
-+  void BangsLoadedCallback();
++  void BangsLoadedCallback(const scoped_refptr<const Bangs::Catalogue>& bangs);
++  void OnBangsPrepared(TemplateURL::OwnedTemplateURLVector entries);
 +
    // Simulate a loaded `TemplateURLService`.
    void ApplyInitializersForTesting(
        base::span<const TemplateURLService::Initializer> initializers);
-@@ -959,6 +967,10 @@ class TemplateURLService final : public
+ 
+   // Removes `template_url` from various internal maps
+   // (`keyword_to_turl_`, `guid_to_turl_`, `id_to_turl_`, `provider_map_`).
+-  void RemoveFromMaps(const TemplateURL* template_url);
++  void RemoveFromMaps(const TemplateURL* template_url,
++                      bool update_host_map = true);
+ 
+   // Adds `template_url` to various internal maps
+   // (`keyword_to_turl_`, `guid_to_turl_`, `id_to_turl_`, `provider_map_`) if
+@@ -959,6 +976,9 @@ class TemplateURLService final : public
    // Service used to store entries.
    scoped_refptr<KeywordWebDataService> web_data_service_;
  
-+  scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory_;
-+
-+  Bangs::BangManager* bang_manager_;
++  std::unique_ptr<Bangs::BangManager> bang_manager_;
++  scoped_refptr<const Bangs::Catalogue> bang_catalogue_;
 +
    std::unique_ptr<TemplateURLServiceClient> client_;
  
    // This closure is run when the default search provider is set to Google.
+@@ -1104,6 +1124,7 @@ class TemplateURLService final : public
+   std::unique_ptr<TemplateUrlServiceAndroid> template_url_service_android_;
+ #endif
+ 
++  base::WeakPtrFactory<TemplateURLService> bang_weak_ptr_factory_{this};
+   base::WeakPtrFactory<TemplateURLService> weak_ptr_factory_{this};
+ };
+ 
 --- /dev/null
 +++ b/components/search_engines/template_url_bang_manager.cc
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,213 @@
 +// Copyright 2025 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "components/search_engines/template_url_bang_manager.h"
 +
-+#include <memory>
-+#include <string>
-+#include <vector>
 +#include <map>
++#include <utility>
 +
 +#include "base/functional/bind.h"
-+#include "base/functional/callback.h"
-+#include "base/memory/weak_ptr.h"
-+#include "base/memory/singleton.h"
 +#include "base/json/json_reader.h"
++#include "base/no_destructor.h"
++#include "base/task/thread_pool.h"
 +#include "components/helium_services/helium_services_helpers.h"
 +#include "net/base/load_flags.h"
 +#include "net/http/http_status_code.h"
 +#include "services/network/public/cpp/resource_request.h"
 +#include "services/network/public/cpp/simple_url_loader.h"
-+#include "services/network/public/cpp/shared_url_loader_factory.h"
 +#include "services/network/public/mojom/url_response_head.mojom.h"
 +#include "url/gurl.h"
 +
 +namespace Bangs {
++namespace {
 +
-+const int kMaxFetchRetries = 3;
-+const int kFetchTimeoutSeconds = 30;
++constexpr net::BackoffEntry::Policy kRetryPolicy = {
++    0,       // Don't ignore initial errors.
++    5000,    // Start with a five-second delay.
++    2.0,     // Double the delay after each failure.
++    0.2,     // Jitter retries across clients.
++    300000,  // Cap delays at five minutes.
++    -1,      // Never discard failure history.
++    false,
++};
 +
 +constexpr net::NetworkTrafficAnnotationTag kCustomizationDocumentNetworkTag =
 +    net::DefineNetworkTrafficAnnotation("native_bangs",
@@ -318,180 +497,172 @@
 +            cookies_allowed: NO
 +        })");
 +
++BangManager::Result ParseManifest(const std::string& manifest) {
++  auto parsed = base::JSONReader::ReadAndReturnValueWithError(
++      manifest, base::JSON_ALLOW_COMMENTS | base::JSON_ALLOW_TRAILING_COMMAS);
++  if (!parsed.has_value()) {
++    LOG(ERROR) << parsed.error().message;
++    return nullptr;
++  }
++  if (!parsed->is_list()) {
++    LOG(ERROR) << "received invalid bang data - not an array";
++    return nullptr;
++  }
 +
-+BangManager* BangManager::GetInstance() {
-+    return base::Singleton<
-+        BangManager,
-+        base::DefaultSingletonTraits<BangManager>
-+    >::get();
++  std::vector<Bang> bangs;
++  for (const auto& value : parsed->GetList()) {
++    const auto* dict = value.GetIfDict();
++    if (!dict) {
++      continue;
++    }
++    const auto* name = dict->FindString("s");
++    const auto* triggers = dict->FindList("ts");
++    const auto* url = dict->FindString("u");
++    if (!name || name->empty() || !triggers || !url) {
++      continue;
++    }
++    const GURL parsed_url(*url);
++    if (!parsed_url.is_valid() || !parsed_url.SchemeIsHTTPOrHTTPS()) {
++      continue;
++    }
++    const auto* category = dict->FindString("sc");
++    for (const auto& trigger : *triggers) {
++      if (!trigger.is_string() || trigger.GetString().empty()) {
++        continue;
++      }
++      bangs.push_back({bangs.size(), *name, trigger.GetString(), *url,
++                       category && *category == "ai" ? BANG_CATEGORY_AI
++                                                     : BANG_CATEGORY_OTHER});
++    }
++  }
++  return base::MakeRefCounted<Catalogue>(std::move(bangs));
 +}
 +
-+BangCategory BangManager::GetCategoryForBang(size_t index) const {
-+    if (auto category = category_map_.find(index - 1); category != category_map_.end()) {
-+        return category->second;
++class BangCache {
++ public:
++  using Completion = base::OnceCallback<void(const BangManager::Result&)>;
++
++  static BangCache& GetInstance() {
++    static base::NoDestructor<BangCache> cache;
++    return *cache;
++  }
++
++  void Load(const GURL& url,
++            network::SharedURLLoaderFactory* factory,
++            bool allow_network,
++            Completion callback) {
++    auto& entry = entries_[url];
++    if (entry.bangs) {
++      std::move(callback).Run(entry.bangs);
++      return;
++    }
++    entry.callbacks.push_back(std::move(callback));
++    if (entry.loader) {
++      return;
 +    }
 +
-+    return BANG_CATEGORY_OTHER;
-+}
-+
-+BangCategory BangManager::GetCategoryFromJSONObject(std::string_view sc) const {
-+    if (sc == "ai") {
-+        return BANG_CATEGORY_AI;
-+    }
-+
-+    return BANG_CATEGORY_OTHER;
-+}
-+
-+void BangManager::LoadBangs(
-+    scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory,
-+    PrefService& prefs,
-+    base::OnceClosure callback) {
-+    if (bangs_.empty() && !load_pending_) {
-+        load_pending_ = true;
-+        DoStartFileFetch(url_loader_factory, prefs);
-+    } else if (!load_pending_) {
-+        std::move(callback).Run();
-+        return;
-+    }
-+
-+    callbacks_.push_back(std::move(callback));
-+}
-+
-+void BangManager::DoStartFileFetch(
-+    scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory,
-+    PrefService& prefs
-+) {
 +    auto request = std::make_unique<network::ResourceRequest>();
-+    request->url = helium::GetServicesBaseURL(prefs).Resolve(kBangsPrefix);
-+
-+    request->load_flags = helium::ShouldFetchBangs(prefs)
-+                            ? net::LOAD_NORMAL
-+                            : net::LOAD_ONLY_FROM_CACHE;
-+
++    request->url = url;
++    request->load_flags =
++        allow_network ? net::LOAD_NORMAL : net::LOAD_ONLY_FROM_CACHE;
 +    request->credentials_mode = network::mojom::CredentialsMode::kOmit;
 +    request->headers.SetHeader("Accept", "application/json");
-+
-+    url_loader_ = network::SimpleURLLoader::Create(
++    entry.loader = network::SimpleURLLoader::Create(
 +        std::move(request), kCustomizationDocumentNetworkTag);
++    entry.loader->SetTimeoutDuration(base::Seconds(30));
++    entry.loader->DownloadToString(
++        factory,
++        base::BindOnce(&BangCache::OnComplete, base::Unretained(this), url),
++        5'000'000 /* 5 MB */);
++  }
 +
-+    url_loader_->SetTimeoutDuration(base::Seconds(kFetchTimeoutSeconds));
-+    url_loader_->SetRetryOptions(
-+        kMaxFetchRetries, network::SimpleURLLoader::RETRY_ON_NETWORK_CHANGE);
++ private:
++  struct Entry {
++    BangManager::Result bangs;
++    std::unique_ptr<network::SimpleURLLoader> loader;
++    std::vector<Completion> callbacks;
++  };
 +
-+    url_loader_->DownloadToString(
-+        url_loader_factory.get(),
-+        base::BindOnce(&BangManager::OnSimpleLoaderComplete,
-+                       weak_ptr_factory_.GetWeakPtr()),
-+        5e6 /* 5 MB */
-+    );
-+}
-+
-+void BangManager::OnSimpleLoaderComplete(
-+    std::optional<std::string> response_body) {
++  void OnComplete(const GURL& url, std::optional<std::string> response_body) {
++    auto& entry = entries_.at(url);
 +    int response_code = -1;
 +    std::string mime_type;
-+
-+    if (url_loader_->ResponseInfo() && url_loader_->ResponseInfo()->headers) {
-+        response_code = url_loader_->ResponseInfo()->headers->response_code();
-+        url_loader_->ResponseInfo()->headers->GetMimeType(&mime_type);
++    if (entry.loader->ResponseInfo() && entry.loader->ResponseInfo()->headers) {
++      response_code = entry.loader->ResponseInfo()->headers->response_code();
++      entry.loader->ResponseInfo()->headers->GetMimeType(&mime_type);
 +    }
-+
-+    if (response_body && mime_type == "application/json") {
-+        BangManager::LoadManifestFromString(*response_body);
++    if (response_body && response_code == net::HTTP_OK &&
++        mime_type == "application/json") {
++      base::ThreadPool::PostTaskAndReplyWithResult(
++          FROM_HERE, {base::TaskPriority::USER_VISIBLE},
++          base::BindOnce(&ParseManifest, std::move(*response_body)),
++          base::BindOnce(&BangCache::OnParsed, base::Unretained(this), url));
++      return;
 +    } else {
-+        LOG(ERROR) << "Fetching bangs failed:"
-+                   << " response code = " << response_code;
++      LOG(ERROR) << "Fetching bangs failed: response code = " << response_code;
 +    }
 +
-+    load_pending_ = false;
++    OnParsed(url, nullptr);
++  }
++
++  void OnParsed(const GURL& url, BangManager::Result bangs) {
++    auto& entry = entries_.at(url);
++    entry.bangs = std::move(bangs);
++    entry.loader.reset();
++    auto callbacks = std::move(entry.callbacks);
++    for (auto& callback : callbacks) {
++      std::move(callback).Run(entry.bangs);
++    }
++  }
++
++  std::map<GURL, Entry> entries_;
++};
++
++}  // namespace
++
++Catalogue::Catalogue(std::vector<Bang> entries) : entries(std::move(entries)) {}
++Catalogue::~Catalogue() = default;
++
++BangManager::BangManager(
++    PrefService& prefs,
++    scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory)
++    : prefs_(prefs),
++      url_loader_factory_(std::move(url_loader_factory)),
++      backoff_(&kRetryPolicy) {}
++
++BangManager::~BangManager() = default;
++
++void BangManager::LoadBangs(Callback callback) {
++  retry_timer_.Stop();
++  weak_ptr_factory_.InvalidateWeakPtrs();
++  backoff_.Reset();
++  callback_ = std::move(callback);
++  StartFetch();
 +}
 +
-+std::vector<std::string> FilterTriggers(base::ListValue&& list) {
-+    std::vector<std::string> triggers;
-+    triggers.reserve(list.size());
-+
-+    for (auto& value : list) {
-+        if (!value.is_string()) {
-+            continue;
-+        }
-+
-+        triggers.push_back(std::move(value).TakeString());
-+    }
-+
-+    return triggers;
++void BangManager::StartFetch() {
++  BangCache::GetInstance().Load(
++      helium::GetServicesBaseURL(*prefs_).Resolve("/bangs.json"),
++      url_loader_factory_.get(), helium::ShouldFetchBangs(*prefs_),
++      base::BindOnce(&BangManager::OnBangsLoaded,
++                     weak_ptr_factory_.GetWeakPtr()));
 +}
 +
-+void BangManager::LoadManifestFromString(const std::string& manifest) {
-+    auto parsed = base::JSONReader::ReadAndReturnValueWithError(
-+        manifest,
-+        base::JSON_ALLOW_COMMENTS | base::JSON_ALLOW_TRAILING_COMMAS
-+    );
-+
-+    if (!parsed.has_value()) {
-+        LOG(ERROR) << parsed.error().message;
-+        return;
-+    } else if (!parsed->is_list()) {
-+        LOG(ERROR) << "received invalid bang data - not an array";
-+        return;
-+    }
-+
-+    auto list = std::move(*parsed).TakeList();
-+    bangs_.reserve(list.size());
-+
-+    size_t index = 0;
-+
-+    for (auto& bang : list) {
-+        if (!bang.is_dict()) {
-+            continue;
-+        }
-+
-+        auto dict = std::move(bang).TakeDict();
-+        auto* name = dict.FindString("s");
-+        auto* triggers_ptr = dict.FindList("ts");
-+        auto* url_template = dict.FindString("u");
-+
-+        if (!name || !triggers_ptr || !url_template || triggers_ptr->empty()) {
-+            continue;
-+        }
-+
-+        auto triggers = FilterTriggers(std::move(*triggers_ptr));
-+        auto bang_gurl = GURL(*url_template);
-+
-+        if (!bang_gurl.is_valid() || !bang_gurl.SchemeIsHTTPOrHTTPS()) {
-+            VLOG(2) << "invalid bang url " << *url_template;
-+            continue;
-+        }
-+
-+        auto category = dict.FindString("sc");
-+
-+        for (auto&& trigger : std::move(triggers)) {
-+            if (category) {
-+                category_map_[index] = GetCategoryFromJSONObject(*category);
-+            }
-+
-+            // We need to pass the URL here as-is, because otherwise URLs
-+            // which have the template in the path will have it %-encoded,
-+            // which will break everything.
-+            bangs_.emplace_back(index++, *name, std::move(trigger), *url_template);
-+        }
-+    }
-+
-+    if (!callbacks_.empty()) {
-+        auto callbacks = std::move(callbacks_);
-+        for (auto& cb : callbacks) {
-+            std::move(cb).Run();
-+        }
-+    }
-+}
-+
-+const std::vector<Bang>& BangManager::GetBangs() {
-+    return bangs_;
++void BangManager::OnBangsLoaded(const Result& result) {
++  backoff_.InformOfRequest(!!result);
++  if (!result && helium::ShouldFetchBangs(*prefs_)) {
++    retry_timer_.Start(FROM_HERE, backoff_.GetTimeUntilRelease(), this,
++                       &BangManager::StartFetch);
++  }
++  // Update retry state before notifying callers, which may reload.
++  auto callback = callback_;
++  callback.Run(result);
 +}
 +
 +}  // namespace Bangs
 --- /dev/null
 +++ b/components/search_engines/template_url_bang_manager.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,66 @@
 +// Copyright 2025 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -500,74 +671,64 @@
 +#define COMPONENTS_SEARCH_ENGINES_TEMPLATE_URL_BANG_MANAGER_H_
 +
 +#include <memory>
++#include <optional>
 +#include <string>
 +#include <vector>
-+#include <map>
 +
-+#include "base/memory/weak_ptr.h"
 +#include "base/functional/callback.h"
++#include "base/memory/raw_ref.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
 +#include "components/prefs/pref_service.h"
-+#include "services/network/public/cpp/simple_url_loader.h"
++#include "components/search_engines/template_url_bang.h"
++#include "net/base/backoff_entry.h"
 +#include "services/network/public/cpp/shared_url_loader_factory.h"
-+#include "url/gurl.h"
 +
 +namespace Bangs {
-+    // Template URL where to fetch bangs data from.
-+    static constexpr char kBangsPrefix[] = "/bangs.json";
 +
-+    struct Bang {
-+        size_t id;
-+        std::string name;
-+        std::string bang;
-+        std::string template_url;
-+    };
++class Catalogue : public base::RefCountedThreadSafe<Catalogue> {
++ public:
++  explicit Catalogue(std::vector<Bang> entries);
++  const std::vector<Bang> entries;
 +
-+    enum BangCategory {
-+        BANG_CATEGORY_OTHER = 0,
-+        BANG_CATEGORY_AI,
-+    };
++ private:
++  friend class base::RefCountedThreadSafe<Catalogue>;
++  ~Catalogue();
++};
 +
-+    class BangManager {
-+    public:
-+        static BangManager* GetInstance();
++// Loads shared catalogue data using one profile's settings and retry policy.
++// TemplateURLService owns the installed entries.
++class BangManager {
++ public:
++  using Result = scoped_refptr<const Catalogue>;
++  using Callback = base::RepeatingCallback<void(const Result&)>;
 +
-+        BangManager() = default;
-+        BangManager(const BangManager&) = delete;
-+        BangManager& operator=(const BangManager&) = delete;
++  BangManager(
++      PrefService& prefs,
++      scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory);
++  ~BangManager();
++  BangManager(const BangManager&) = delete;
++  BangManager& operator=(const BangManager&) = delete;
 +
-+        BangCategory GetCategoryForBang(size_t index) const;
++  // Reports the catalogue or nullptr on failure. Retries failed network loads.
++  void LoadBangs(Callback callback);
 +
-+        void LoadBangs(
-+            scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory,
-+            PrefService& prefs,
-+            base::OnceClosure callback
-+        );
-+        const std::vector<Bang>& GetBangs();
++ private:
++  void StartFetch();
++  void OnBangsLoaded(const Result& result);
 +
-+    private:
-+        void DoStartFileFetch(
-+            scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory,
-+            PrefService& prefs
-+        );
-+        void OnSimpleLoaderComplete(std::optional<std::string> response_body);
-+        void LoadManifestFromString(const std::string& manifest);
-+        BangCategory GetCategoryFromJSONObject(std::string_view sc) const;
++  const raw_ref<PrefService> prefs_;
++  scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory_;
++  Callback callback_;
++  net::BackoffEntry backoff_;
++  base::OneShotTimer retry_timer_;
++  base::WeakPtrFactory<BangManager> weak_ptr_factory_{this};
++};
 +
-+        // SimpleURLLoader instance.
-+        std::unique_ptr<network::SimpleURLLoader> url_loader_;
-+
-+        std::vector<Bang> bangs_;
-+        bool load_pending_ = false;
-+        std::vector<base::OnceClosure> callbacks_;
-+        std::map<size_t, BangCategory> category_map_;
-+
-+        // Weak factory for callbacks.
-+        base::WeakPtrFactory<BangManager> weak_ptr_factory_{this};
-+    };
-+}
++}  // namespace Bangs
 +
 +#endif  // COMPONENTS_SEARCH_ENGINES_TEMPLATE_URL_BANG_MANAGER_H_
-+
 --- a/components/omnibox/browser/autocomplete_input.cc
 +++ b/components/omnibox/browser/autocomplete_input.cc
 @@ -753,9 +753,9 @@ bool AutocompleteInput::HasHTTPSScheme(c
@@ -671,12 +832,21 @@
  size_t TemplateURLData::EstimateMemoryUsage() const {
 --- a/components/search_engines/template_url_data.h
 +++ b/components/search_engines/template_url_data.h
-@@ -277,6 +277,9 @@ struct TemplateURLData {
+@@ -13,6 +13,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/time/time.h"
+ #include "base/values.h"
++#include "components/search_engines/template_url_bang.h"
+ #include "components/search_engines/template_url_id.h"
+ #include "components/search_engines/template_url_starter_pack_data.h"
+ #include "third_party/search_engines_data/resources/definitions/prepopulated_engines.h"
+@@ -277,6 +278,10 @@ struct TemplateURLData {
    // starter_pack_id > 0.
    int starter_pack_id{0};
  
 +  // This TemplateURL is a bang if bang_id > 0.
 +  int bang_id{0};
++  Bangs::BangCategory bang_category = Bangs::BANG_CATEGORY_OTHER;
 +
    friend bool operator==(const TemplateURLData&,
                           const TemplateURLData&) = default;
@@ -694,11 +864,12 @@
          // Favor prepopulated engines over other auto-generated engines.
 --- a/components/search_engines/template_url.h
 +++ b/components/search_engines/template_url.h
-@@ -893,6 +893,8 @@ class TemplateURL {
+@@ -893,6 +893,9 @@ class TemplateURL {
             policy_origin() == TemplateURLData::PolicyOrigin::kSearchAggregator;
    }
  
 +  int bang_id() const { return data().bang_id; }
++  Bangs::BangCategory bang_category() const { return data().bang_category; }
 +
    const std::vector<TemplateURLRef>& url_refs() const { return url_refs_; }
    const TemplateURLRef& url_ref() const {
@@ -950,3 +1121,83 @@
          controller()->edit_model()->OpenCurrentSelection(event.time_stamp(),
                                                           disposition,
                                                           /*via_keyboard=*/true);
+--- /dev/null
++++ b/components/search_engines/template_url_bang.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SEARCH_ENGINES_TEMPLATE_URL_BANG_H_
++#define COMPONENTS_SEARCH_ENGINES_TEMPLATE_URL_BANG_H_
++
++#include <stddef.h>
++
++#include <string>
++
++namespace Bangs {
++
++enum BangCategory {
++  BANG_CATEGORY_OTHER = 0,
++  BANG_CATEGORY_AI,
++};
++
++struct Bang {
++  size_t id;
++  std::string name;
++  std::string bang;
++  std::string template_url;
++  BangCategory category = BANG_CATEGORY_OTHER;
++};
++
++}  // namespace Bangs
++
++#endif  // COMPONENTS_SEARCH_ENGINES_TEMPLATE_URL_BANG_H_
+--- a/chrome/browser/ui/search_engines/template_url_table_model.cc
++++ b/chrome/browser/ui/search_engines/template_url_table_model.cc
+@@ -27,6 +27,9 @@ void TemplateURLTableModel::Reload() {
+       extension_entries;
+   // Keywords that can be made the default first.
+   for (TemplateURL* template_url : urls) {
++    if (template_url->bang_id()) {
++      continue;
++    }
+     if (disabled_starter_pack_ids_.Has(template_url->starter_pack_id())) {
+       continue;
+     }
+@@ -70,8 +73,7 @@ void TemplateURLTableModel::Reload() {
+ TemplateURL* TemplateURLTableModel::GetTemplateURL(size_t index) {
+   // Sanity checks for https://crbug.com/40548229.
+   CHECK_LT(index, entries_.size());
+-  CHECK(std::ranges::contains(template_url_service_->GetTemplateURLs(),
+-                              entries_[index]))
++  CHECK(template_url_service_->ContainsTemplateURL(entries_[index]))
+       << "TemplateURLTableModel is returning a pointer to a TemplateURL "
+          "that has already been freed by TemplateURLService.";
+ 
+--- a/components/search_engines/search_host_to_urls_map.cc
++++ b/components/search_engines/search_host_to_urls_map.cc
+@@ -31,11 +31,19 @@ void SearchHostToURLsMap::Add(TemplateUR
+   DCHECK(template_url);
+   DCHECK_NE(TemplateURL::OMNIBOX_API_EXTENSION, template_url->type());
+ 
+-  const GURL url(template_url->GenerateSearchURL(search_terms_data));
+-  if (!url.is_valid() || !url.has_host())
+-    return;
++  std::string host;
++  if (template_url->bang_id()) {
++    host = template_url->url_ref().GetHost(search_terms_data);
++  }
++  if (host.empty()) {
++    const GURL url(template_url->GenerateSearchURL(search_terms_data));
++    if (!url.is_valid() || !url.has_host()) {
++      return;
++    }
++    host = url.GetHost();
++  }
+ 
+-  host_to_urls_map_[url.GetHost()].insert(template_url);
++  host_to_urls_map_[host].insert(template_url);
+ }
+ 
+ void SearchHostToURLsMap::Remove(const TemplateURL* template_url) {
