@@ -1,0 +1,274 @@
+--- a/chrome/browser/sync/BUILD.gn
++++ b/chrome/browser/sync/BUILD.gn
+@@ -37,6 +37,9 @@ source_set("sync") {
+     "private_sync/private_sync_prefs.cc",
+     "private_sync/private_sync_prefs.h",
+     "private_sync/private_sync_provider.h",
++    "private_sync/private_sync_repository.cc",
++    "private_sync/private_sync_repository.h",
++    "private_sync/private_sync_repository_factory.cc",
+     "send_tab_to_self_sync_service_factory.cc",
+     "send_tab_to_self_sync_service_factory.h",
+     "session_sync_service_factory.cc",
+--- /dev/null
++++ b/chrome/browser/sync/private_sync/private_sync_repository.cc
+@@ -0,0 +1,137 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/sync/private_sync/private_sync_repository.h"
++
++#include "base/functional/bind.h"
++#include "components/prefs/pref_service.h"
++
++namespace browser_sync::private_sync {
++namespace {
++
++bool SameConfiguration(const std::optional<Repository::Configuration>& a,
++                       const std::optional<Repository::Configuration>& b) {
++  if (!a || !b) {
++    return a.has_value() == b.has_value();
++  }
++  return a->provider == b->provider && a->vault_uuid == b->vault_uuid &&
++         a->key_mode == b->key_mode &&
++         a->encrypted_vault_key == b->encrypted_vault_key;
++}
++
++}  // namespace
++
++Repository::Repository(PrefService& prefs)
++    : prefs_(prefs),
++      configuration_(private_sync_prefs::ReadConfiguration(prefs)),
++      diagnostics_(private_sync_prefs::ReadDiagnostics(prefs)) {
++  registrar_.Init(&prefs);
++  registrar_.Add(private_sync_prefs::kConfiguration,
++                 base::BindRepeating(&Repository::OnConfigurationPrefChanged,
++                                     base::Unretained(this)));
++  registrar_.Add(private_sync_prefs::kDiagnostics,
++                 base::BindRepeating(&Repository::OnDiagnosticsPrefChanged,
++                                     base::Unretained(this)));
++}
++
++Repository::~Repository() = default;
++
++void Repository::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void Repository::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void Repository::InstallConfiguration(Configuration configuration) {
++  if (!SameConfiguration(configuration_, configuration)) {
++    private_sync_prefs::ClearDiagnostics(&*prefs_);
++  }
++  private_sync_prefs::WriteConfiguration(&*prefs_, configuration);
++}
++
++bool Repository::ClearConfiguration(const Configuration& expected) {
++  if (!configuration_ || !SameConfiguration(configuration_, expected)) {
++    return false;
++  }
++  private_sync_prefs::ClearConfiguration(&*prefs_);
++  private_sync_prefs::ClearDiagnostics(&*prefs_);
++  return true;
++}
++
++void Repository::WriteDiagnostics(const Configuration& expected,
++                                  Diagnostics diagnostics) {
++  if (!configuration_ || !SameConfiguration(configuration_, expected) ||
++      configuration_->vault_uuid != diagnostics.vault_uuid) {
++    return;
++  }
++  private_sync_prefs::WriteDiagnostics(&*prefs_, diagnostics);
++}
++
++bool Repository::RecordReconciliation(const Configuration& expected,
++                                      Diagnostics diagnostics) {
++  if (!configuration_ || !SameConfiguration(configuration_, expected) ||
++      configuration_->vault_uuid != diagnostics.vault_uuid) {
++    return false;
++  }
++  const bool matching_previous =
++      diagnostics_ && diagnostics_->vault_uuid == diagnostics.vault_uuid;
++  const bool was_blocked = private_sync_prefs::HasBlockingReconciliationError(
++      *prefs_, diagnostics.vault_uuid);
++  if (was_blocked) {
++    // An unreadable persisted block requires an explicit diagnostics reset.
++    if (!matching_previous || !diagnostics_->last_error ||
++        !private_sync_prefs::IsBlockingReconciliationError(
++            *diagnostics_->last_error)) {
++      return false;
++    }
++    diagnostics.last_error = diagnostics_->last_error;
++  }
++  if (diagnostics.last_error && matching_previous) {
++    diagnostics.last_success = diagnostics_->last_success;
++    diagnostics.state_statistics_available =
++        diagnostics_->state_statistics_available;
++    diagnostics.entity_count = diagnostics_->entity_count;
++    diagnostics.state_bytes = diagnostics_->state_bytes;
++  }
++  const bool now_blocked = diagnostics.last_error &&
++                           private_sync_prefs::IsBlockingReconciliationError(
++                               *diagnostics.last_error);
++  WriteDiagnostics(expected, std::move(diagnostics));
++  return now_blocked && !was_blocked;
++}
++
++void Repository::ClearDiagnostics() {
++  private_sync_prefs::ClearDiagnostics(&*prefs_);
++}
++
++void Repository::Flush(base::OnceClosure callback) {
++  prefs_->CommitPendingWrite(std::move(callback));
++}
++
++void Repository::OnConfigurationPrefChanged() {
++  auto next = private_sync_prefs::ReadConfiguration(*prefs_);
++  const bool same_identity = SameConfiguration(configuration_, next);
++  const bool same_checkpoint =
++      configuration_ && next &&
++      configuration_->encrypted_checkpoint == next->encrypted_checkpoint;
++  configuration_ = std::move(next);
++  if (!same_identity) {
++    observers_.Notify(&Observer::OnVaultConfigurationChanged);
++  } else if (!same_checkpoint && configuration_) {
++    observers_.Notify(&Observer::OnVaultCheckpointChanged);
++  }
++}
++
++void Repository::OnDiagnosticsPrefChanged() {
++  diagnostics_ = private_sync_prefs::ReadDiagnostics(*prefs_);
++  observers_.Notify(&Observer::OnVaultDiagnosticsChanged);
++}
++
++void Repository::Shutdown() {
++  registrar_.RemoveAll();
++}
++
++}  // namespace browser_sync::private_sync
+--- /dev/null
++++ b/chrome/browser/sync/private_sync/private_sync_repository.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_REPOSITORY_H_
++#define CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_REPOSITORY_H_
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ref.h"
++#include "base/observer_list.h"
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
++
++class Profile;
++class PrefService;
++class ProfileKeyedServiceFactory;
++
++namespace browser_sync::private_sync {
++
++// Profile-owned access to private sync's persisted state. Only changes to
++// provider, vault, key, or key mode are configuration transitions.
++class Repository : public KeyedService {
++ public:
++  using Configuration = private_sync_prefs::Configuration;
++  using Diagnostics = private_sync_prefs::Diagnostics;
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnVaultConfigurationChanged() {}
++    virtual void OnVaultCheckpointChanged() {}
++    virtual void OnVaultDiagnosticsChanged() {}
++  };
++  static Repository* Get(Profile* profile);
++  static ProfileKeyedServiceFactory* GetFactory();
++  explicit Repository(PrefService& prefs);
++  ~Repository() override;
++
++  const std::optional<Configuration>& configuration() const {
++    return configuration_;
++  }
++  const std::optional<Diagnostics>& diagnostics() const { return diagnostics_; }
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++  void InstallConfiguration(Configuration configuration);
++  bool ClearConfiguration(const Configuration& expected);
++  void WriteDiagnostics(const Configuration& expected, Diagnostics diagnostics);
++  // Merge one backend result with retained health state. Returns true only
++  // when this result first latches a blocking reconciliation error.
++  bool RecordReconciliation(const Configuration& expected,
++                            Diagnostics diagnostics);
++  void ClearDiagnostics();
++  void Flush(base::OnceClosure callback);
++  void Shutdown() override;
++
++ private:
++  void OnConfigurationPrefChanged();
++  void OnDiagnosticsPrefChanged();
++  const raw_ref<PrefService> prefs_;
++  std::optional<Configuration> configuration_;
++  std::optional<Diagnostics> diagnostics_;
++  PrefChangeRegistrar registrar_;
++  base::ObserverList<Observer> observers_;
++};
++
++}  // namespace browser_sync::private_sync
++
++#endif  // CHROME_BROWSER_SYNC_PRIVATE_SYNC_PRIVATE_SYNC_REPOSITORY_H_
+--- /dev/null
++++ b/chrome/browser/sync/private_sync/private_sync_repository_factory.cc
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++#include "chrome/browser/profiles/profile_selections.h"
++#include "chrome/browser/sync/private_sync/private_sync_repository.h"
++#include "components/prefs/pref_service.h"
++
++namespace browser_sync::private_sync {
++namespace {
++class RepositoryFactory final : public ProfileKeyedServiceFactory {
++ public:
++  static RepositoryFactory* GetInstance() {
++    static base::NoDestructor<RepositoryFactory> instance;
++    return instance.get();
++  }
++  Repository* Get(Profile* profile) {
++    return static_cast<Repository*>(GetServiceForBrowserContext(profile, true));
++  }
++
++ private:
++  friend class base::NoDestructor<RepositoryFactory>;
++  RepositoryFactory()
++      : ProfileKeyedServiceFactory(
++            "PrivateSyncRepository",
++            ProfileSelections::BuildRedirectedInIncognito()) {}
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override {
++    return std::make_unique<Repository>(
++        *Profile::FromBrowserContext(context)->GetPrefs());
++  }
++};
++
++}  // namespace
++
++Repository* Repository::Get(Profile* profile) {
++  return RepositoryFactory::GetInstance()->Get(profile);
++}
++
++ProfileKeyedServiceFactory* Repository::GetFactory() {
++  return RepositoryFactory::GetInstance();
++}
++
++}  // namespace browser_sync::private_sync

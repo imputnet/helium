@@ -9,6 +9,14 @@ This directory contains the translations for Helium browser UI strings.
                      beyond what is already supported in Chromium.
 - `translations/` - Per-language translation files.
 
+## Submitting translations
+**Do not open pull requests with new translations!** We run translations [in
+batches][pr], if you would like to contribute to the translation of Helium,
+please wait for the next batch.
+
+If you are editing existing strings (e.g. you noticed some string(s) that are
+incorrect), feel free to open a pull request as usual.
+
 ## Translation reviewers
 Your responsibility as a reviewer is to ensure the translation is the
 best it can be. When reviewing translations for a specific language, focus on:
@@ -52,3 +60,5 @@ not by position. Each entry is an object:
 
 The `feminine`/`masculine` fields are only present when the
 translation genuinely differs by grammatical gender.
+
+[pr]: https://github.com/imputnet/helium/pulls?q=i18n+in%3Atitle+is%3Apr+is%3Aopen

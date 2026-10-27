@@ -3,6 +3,10 @@ name: Code Validation
 on:
   pull_request:
   push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
   workflow_dispatch:
 
 concurrency:
@@ -82,11 +86,18 @@ jobs:
           DEPS_PID=$!
 
           if ! ./utils/downloads.py retrieve -i downloads.ini -c chromium_download_cache; then
-            ./utils/clone.py -o chromium_src
-            rm -rf chromium_src/uc_staging
-            find chromium_src -type d -name '.git' -exec rm -rf "{}" \; -prune
-            tar cf "chromium_download_cache/chromium-$(cat chromium_version.txt)-lite.tar.xz" \
-              --transform "s/chromium_src/chromium-$(cat chromium_version.txt)/" chromium_src
+            TARBALL="chromium_download_cache/chromium-$(cat chromium_version.txt)-base.tar.zst"
+            if [[ $(tar --test-label -f "$TARBALL" 2> /dev/null) == "clone" ]]; then
+              echo "INFO: Using cached clone tarball"
+            else
+              ./utils/clone.py -o src
+              mv src chromium_src
+              echo "INFO: Pruning directories for clone tarball"
+              find chromium_src -type d -name '.git' -exec rm -rf "{}" \; -prune
+              echo "INFO: Creating clone tarball"
+              tar --transform "s/chromium_src/chromium-$(cat chromium_version.txt)/" \
+                --label=clone -cf - chromium_src | zstd -T0 --fast - > "$TARBALL"
+            fi
           fi
 
           wait "$DEPS_PID"
@@ -101,13 +112,39 @@ jobs:
       - name: Validate patches
         run: ./devutils/validate_patches.py -l chromium_src -v
 
-      - name: Validate source file lists
+      - name: Restore generated source file lists
+        id: source-file-lists-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            pruning.list.gen
+            domain_substitution.list.gen
+          # Deliberately exclude the checked-in lists so changes to them are
+          # still validated against the previously generated results.
+          key: >-
+            ${{ runner.os }}-source-file-lists-v1-${{
+              hashFiles(
+                '.python-version',
+                'chromium_version.txt',
+                'downloads.ini',
+                'deps.ini',
+                'domain_regex.list',
+                'devutils/update_lists.py',
+                'utils/domain_substitution.py',
+                'utils/prune_binaries.py'
+              )
+            }}
+
+      - name: Generate source file lists
+        if: steps.source-file-lists-cache.outputs.cache-hit != 'true'
         run: |
-          set -e
           ./devutils/update_lists.py \
             --tree chromium_src \
             --pruning pruning.list.gen \
             --domain-substitution domain_substitution.list.gen \
             --no-error-unused
+
+      - name: Validate source file lists
+        run: |
           diff -u pruning.list pruning.list.gen
           diff -u domain_substitution.list domain_substitution.list.gen

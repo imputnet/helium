@@ -1,100 +1,187 @@
 --- a/components/extstore_fixups/BUILD.gn
 +++ b/components/extstore_fixups/BUILD.gn
-@@ -16,6 +16,7 @@ generate_grd("extstore_fixups_grd") {
+@@ -16,6 +16,8 @@ generate_grd("extstore_fixups_grd") {
      input_files_base_dir = rebase_path(".", "//")
      input_files = [
          "manifest.json",
 +        "chrome-webstore.js",
++        "chrome-webstore-main.js",
      ]
  }
  
 --- a/components/extstore_fixups/manifest.json
 +++ b/components/extstore_fixups/manifest.json
-@@ -9,5 +9,10 @@
+@@ -9,5 +9,17 @@
    "version": "0.0.0",
    "manifest_version": 3,
    "content_scripts": [
 +    {
 +      "matches": [ "https://chromewebstore.google.com/*" ],
 +      "run_at": "document_start",
++      "world": "MAIN",
++      "js": [ "chrome-webstore-main.js" ]
++    },
++    {
++      "matches": [ "https://chromewebstore.google.com/*" ],
++      "run_at": "document_start",
++      "world": "ISOLATED",
 +      "js": [ "chrome-webstore.js" ]
 +    }
    ]
  }
 --- /dev/null
 +++ b/components/extstore_fixups/chrome-webstore.js
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,66 @@
 +// Copyright 2025 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +(() => {
 +  const PROMO_POPUP_SELECTOR = 'header > [aria-labelledby=promo-header]';
-+  const SWITCH_NAG_SELECTOR = 'main section [aria-label=Info]';
-+  const SWITCH_BTN_SELECTOR = 'button[aria-label^=\'Switch to Chrome\']';
-+  const removeChromeNags = () => {
-+    const promoPopup = document.querySelector(PROMO_POPUP_SELECTOR);
-+    if (promoPopup) {
-+      promoPopup.remove();
-+    }
++  // 276336 is the store's logging ID for the "Install Chrome" button in the
++  // "Switch to Chrome" banner. It's the same in every locale, but it's an
++  // internal value that the store may change at any time, so update it here
++  // if the Chrome eligibility override in chrome-webstore-main.js fails and
++  // the banner comes back.
++  const SWITCH_NAG_SELECTOR =
++      'main section div:has(> div > div > button[jslog^="276336;"])';
++  const CHROME_NAME_REGEX = /\b(?:Google\s)?Chrome\b/;
 +
-+    const switchNag = document.querySelector(SWITCH_NAG_SELECTOR);
-+    if (switchNag && switchNag.querySelector(SWITCH_BTN_SELECTOR)) {
-+      switchNag.remove();
-+    }
++  const removeChromeNags = () => {
++    document.querySelector(PROMO_POPUP_SELECTOR)?.remove();
++    document.querySelector(SWITCH_NAG_SELECTOR)?.remove();
 +  };
 +
 +  const replaceDownloadButtonText = (el) => {
 +    if (el.nodeType === Node.TEXT_NODE) {
-+      if (!el.nodeValue?.includes('Chrome')) {
++      const replacement = el.nodeValue.replace(CHROME_NAME_REGEX, 'Helium');
++      if (replacement === el.nodeValue) {
 +        return false;
 +      }
-+
-+      el.nodeValue = el.nodeValue.replace(/\b(Google\s)?Chrome\b/, 'Helium');
++      el.nodeValue = replacement;
 +      return true;
-+    } else if (el.childNodes) {
-+      for (const node of el.childNodes) {
-+        if (replaceDownloadButtonText(node)) {
-+          return true;
-+        }
-+      }
 +    }
-+
-+    return false;
++    return Array.from(el.childNodes).some(replaceDownloadButtonText);
 +  };
 +
 +  const getDownloadButton = (section) => {
-+    const buttons = section?.querySelectorAll('button') || [];
-+
-+    for (const button of buttons) {
-+        if (!button.textContent?.includes('Chrome')) {
-+            continue;
-+        }
-+
-+        return button;
-+    }
-+  }
++    return Array.from(section?.querySelectorAll('button') ?? [])
++        .find((button) => button.textContent.includes('Chrome'));
++  };
 +
 +  const changeDownloadButtonText = () => {
 +    const mainTitles = document.querySelectorAll('main section h1');
 +
 +    for (const mainTitleEl of mainTitles) {
-+      const downloadButton = getDownloadButton(mainTitleEl?.parentElement?.parentElement);
-+      if (!downloadButton) {
-+        continue;
-+      }
-+
-+      if (replaceDownloadButtonText(downloadButton)) {
++      const downloadButton =
++          getDownloadButton(mainTitleEl.parentElement?.parentElement);
++      if (downloadButton && replaceDownloadButtonText(downloadButton)) {
 +        break;
 +      }
 +    }
 +  };
 +
 +  const handleChanges = () => {
-+    removeChromeNags();
++    // Removing the nags before the page has fully loaded can happen before
++    // the page's controllers attach to them, so wait until it's complete.
++    if (document.readyState === 'complete') {
++      removeChromeNags();
++    }
 +    changeDownloadButtonText();
 +  };
 +
++  window.addEventListener('load', handleChanges, {once: true});
 +  const observer = new MutationObserver(handleChanges);
-+  observer.observe(document, {childList: true, subtree: true});
++  observer.observe(document, {
++    childList: true,
++    characterData: true,
++    subtree: true,
++  });
++})();
+--- /dev/null
++++ b/components/extstore_fixups/chrome-webstore-main.js
+@@ -0,0 +1,84 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++(() => {
++  // On browsers at or above this version, the store's Chrome eligibility check
++  // returns its first argument (a server-provided flag, false by default)
++  // instead of checking the user agent. The flag is never set for Helium, so
++  // the store shows its Chrome nags unless the argument is forced to true.
++  const ELIGIBILITY_VERSION = '142.0.7430.0';
++  // Matches the minified check, whose version-gated branch must return its
++  // default-false argument:
++  // `function(a=!1){... if(... yield check("142.0.7430.0") ...)return a; ...}`
++  const ELIGIBILITY_CHECK_REGEX = new RegExp(
++      String.raw`^(?:async )?function\(([\w$]+)=!1\)` +
++      String.raw`[^]*?\bif\([^;{}]*\b(?:yield|await) [\w$.]+\("` +
++      ELIGIBILITY_VERSION.replaceAll('.', '\\.') +
++      String.raw`"\)[^;{}]*\)return \1[;}]`);
++
++  // Maps each property whose function source contains ELIGIBILITY_VERSION to
++  // its override, or to null if its structure couldn't be verified. Overrides
++  // only apply while there's exactly one candidate.
++  const eligibilityCandidates = new Map();
++  const page = window.default_ChromeWebStoreConsumerFeUi ??= {};
++  window.default_ChromeWebStoreConsumerFeUi = new Proxy(page, {
++    get(target, key, receiver) {
++      if (eligibilityCandidates.size === 1) {
++        const override = eligibilityCandidates.get(key);
++        if (override) {
++          const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
++          // Non-configurable, non-writable data properties must return their
++          // actual value, not a wrapper.
++          if (descriptor?.configurable || descriptor?.writable) {
++            return override;
++          }
++        }
++      }
++      return Reflect.get(target, key, receiver);
++    },
++    // Ordinary assignments also reach this trap through the proxy receiver.
++    defineProperty(target, key, descriptor) {
++      if (!Reflect.defineProperty(target, key, descriptor)) {
++        return false;
++      }
++
++      const value = Reflect.getOwnPropertyDescriptor(target, key)?.value;
++      // A default first parameter makes the function's length 0, which skips
++      // stringifying most functions defined by the page.
++      const source = typeof value === 'function' && value.length === 0 ?
++          Function.prototype.toString.call(value) : '';
++      if (source.includes(ELIGIBILITY_VERSION)) {
++        let override = null;
++        if (ELIGIBILITY_CHECK_REGEX.test(source)) {
++          override = function(...args) {
++            if (eligibilityCandidates.size === 1 &&
++                eligibilityCandidates.get(key) === override) {
++              args[0] = true;
++            }
++            return Reflect.apply(value, this, args);
++          };
++        } else {
++          console.warn('Helium: unverified Chrome eligibility check: ' +
++              String(key));
++        }
++        eligibilityCandidates.set(key, override);
++        if (eligibilityCandidates.size > 1) {
++          console.warn('Helium: ambiguous Chrome eligibility check: ' +
++              Array.from(eligibilityCandidates.keys(), String).join(', '));
++        }
++      } else {
++        eligibilityCandidates.delete(key);
++      }
++
++      return true;
++    },
++    deleteProperty(target, key) {
++      if (!Reflect.deleteProperty(target, key)) {
++        return false;
++      }
++      eligibilityCandidates.delete(key);
++      return true;
++    },
++  });
 +})();

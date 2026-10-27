@@ -1,0 +1,155 @@
+--- /dev/null
++++ b/components/sync/engine/custom_sync_backend.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SYNC_ENGINE_CUSTOM_SYNC_BACKEND_H_
++#define COMPONENTS_SYNC_ENGINE_CUSTOM_SYNC_BACKEND_H_
++
++#include <memory>
++
++namespace syncer {
++
++class CancelationSignal;
++class ServerConnectionManager;
++
++// Sync-engine factory for an embedder-provided backend.
++class CustomSyncBackend {
++ public:
++  CustomSyncBackend() = default;
++  CustomSyncBackend(const CustomSyncBackend&) = delete;
++  CustomSyncBackend& operator=(const CustomSyncBackend&) = delete;
++  virtual ~CustomSyncBackend() = default;
++
++  virtual std::unique_ptr<ServerConnectionManager> CreateConnectionManager(
++      CancelationSignal* cancelation_signal) = 0;
++};
++
++}  // namespace syncer
++
++#endif  // COMPONENTS_SYNC_ENGINE_CUSTOM_SYNC_BACKEND_H_
+--- a/components/sync/engine/BUILD.gn
++++ b/components/sync/engine/BUILD.gn
+@@ -28,6 +28,7 @@ static_library("engine") {
+     "configure_reason.h",
+     "cryptographer.cc",
+     "cryptographer.h",
++    "custom_sync_backend.h",
+     "cycle/commit_quota.cc",
+     "cycle/commit_quota.h",
+     "cycle/data_type_tracker.cc",
+--- a/components/sync/engine/engine_components_factory_impl.cc
++++ b/components/sync/engine/engine_components_factory_impl.cc
+@@ -11,6 +11,7 @@
+ #include "base/check_op.h"
+ #include "base/memory/ptr_util.h"
+ #include "components/sync/engine/backoff_delay_provider.h"
++#include "components/sync/engine/custom_sync_backend.h"
+ #include "components/sync/engine/cycle/sync_cycle_context.h"
+ #include "components/sync/engine/loopback_server/loopback_connection_manager.h"
+ #include "components/sync/engine/net/http_post_provider_factory.h"
+@@ -69,6 +70,15 @@ EngineComponentsFactoryImpl::CreateForLo
+       local_sync_backend_folder));
+ }
+ 
++// static
++std::unique_ptr<EngineComponentsFactoryImpl>
++EngineComponentsFactoryImpl::CreateForCustomBackend(
++    const Switches& switches,
++    std::unique_ptr<CustomSyncBackend> custom_sync_backend) {
++  return base::WrapUnique(
++      new EngineComponentsFactoryImpl(switches, std::move(custom_sync_backend)));
++}
++
+ EngineComponentsFactoryImpl::EngineComponentsFactoryImpl(
+     const Switches& switches,
+     const GURL& service_url,
+@@ -82,6 +92,14 @@ EngineComponentsFactoryImpl::EngineCompo
+            local_sync_backend_folder_.has_value());
+ }
+ 
++EngineComponentsFactoryImpl::EngineComponentsFactoryImpl(
++    const Switches& switches,
++    std::unique_ptr<CustomSyncBackend> custom_sync_backend)
++    : switches_(switches),
++      custom_sync_backend_(std::move(custom_sync_backend)) {
++  CHECK(custom_sync_backend_);
++}
++
+ EngineComponentsFactoryImpl::~EngineComponentsFactoryImpl() = default;
+ 
+ std::unique_ptr<SyncScheduler> EngineComponentsFactoryImpl::BuildScheduler(
+@@ -97,7 +115,8 @@ std::unique_ptr<SyncScheduler> EngineCom
+       std::make_unique<SyncSchedulerImpl>(
+           name, std::move(delay), context,
+           std::make_unique<Syncer>(cancelation_signal),
+-          /*ignore_auth_credentials=*/local_sync_backend_folder_.has_value());
++          /*ignore_auth_credentials=*/local_sync_backend_folder_.has_value() ||
++              custom_sync_backend_);
+   if (switches_.force_short_nudge_delay_for_test) {
+     scheduler->ForceShortNudgeDelayForTest();
+   }
+@@ -117,6 +136,9 @@ std::unique_ptr<SyncCycleContext> Engine
+     const std::string& account_email,
+     SyncAccessTokenFetcher* sync_access_token_fetcher) {
+   CHECK(!local_sync_backend_folder_.has_value() || !sync_access_token_fetcher);
++  if (custom_sync_backend_) {
++    sync_access_token_fetcher = nullptr;
++  }
+   return std::make_unique<SyncCycleContext>(
+       connection_manager, extensions_activity, listeners, debug_info_getter,
+       data_type_registry, cache_guid, store_birthday, bag_of_chips,
+@@ -127,6 +149,13 @@ std::unique_ptr<ServerConnectionManager>
+ EngineComponentsFactoryImpl::BuildConnectionManager(
+     const std::string& cache_guid,
+     CancelationSignal* cancelation_signal) {
++  if (custom_sync_backend_) {
++    std::unique_ptr<ServerConnectionManager> connection_manager =
++        custom_sync_backend_->CreateConnectionManager(cancelation_signal);
++    CHECK(connection_manager);
++    return connection_manager;
++  }
++
+   if (local_sync_backend_folder_.has_value()) {
+     return std::make_unique<LoopbackConnectionManager>(
+         *local_sync_backend_folder_);
+--- a/components/sync/engine/engine_components_factory_impl.h
++++ b/components/sync/engine/engine_components_factory_impl.h
+@@ -17,6 +17,7 @@
+ 
+ namespace syncer {
+ 
++class CustomSyncBackend;
+ class HttpPostProviderFactory;
+ 
+ // An EngineComponentsFactory implementation designed for real production /
+@@ -37,6 +38,11 @@ class EngineComponentsFactoryImpl : publ
+       const Switches& switches,
+       const base::FilePath& local_sync_backend_folder);
+ 
++  // Factory method for an embedder-provided backend.
++  static std::unique_ptr<EngineComponentsFactoryImpl> CreateForCustomBackend(
++      const Switches& switches,
++      std::unique_ptr<CustomSyncBackend> custom_sync_backend);
++
+   EngineComponentsFactoryImpl(const EngineComponentsFactoryImpl&) = delete;
+   EngineComponentsFactoryImpl& operator=(const EngineComponentsFactoryImpl&) =
+       delete;
+@@ -70,11 +76,15 @@ class EngineComponentsFactoryImpl : publ
+       const GURL& service_url,
+       HttpPostProviderFactoryGetter http_factory_getter,
+       const std::optional<base::FilePath>& local_sync_backend_folder);
++  EngineComponentsFactoryImpl(
++      const Switches& switches,
++      std::unique_ptr<CustomSyncBackend> custom_sync_backend);
+ 
+   const Switches switches_;
+   const GURL service_url_;
+   HttpPostProviderFactoryGetter http_factory_getter_;
+   const std::optional<base::FilePath> local_sync_backend_folder_;
++  std::unique_ptr<CustomSyncBackend> custom_sync_backend_;
+ };
+ 
+ }  // namespace syncer

@@ -1,16 +1,3 @@
---- a/chrome/browser/ui/views/frame/multi_contents_resize_area.cc
-+++ b/chrome/browser/ui/views/frame/multi_contents_resize_area.cc
-@@ -28,8 +28,8 @@
- namespace {
- constexpr int kHandleCornerRadius = 2;
- constexpr int kHandleOffAxisSize = 24;
--constexpr int kHandleResizeAxisPadding = 6;
--constexpr int kHandleResizeAxisSize = 4;
-+constexpr int kHandleResizeAxisPadding = 4;
-+constexpr int kHandleResizeAxisSize = 2;
- constexpr int kResizeIncrement = 50;
- }  // namespace
- 
 --- a/chrome/browser/resources/tab_search/split_view/app.css
 +++ b/chrome/browser/resources/tab_search/split_view/app.css
 @@ -50,7 +50,7 @@ picture {
@@ -24,43 +11,45 @@
    line-height: 20px;
 --- a/chrome/browser/ui/tabs/split_tab_menu_model.h
 +++ b/chrome/browser/ui/tabs/split_tab_menu_model.h
-@@ -47,8 +47,7 @@ class SplitTabMenuModel : public ui::Sim
+@@ -52,8 +52,7 @@ class SplitTabMenuModel : public ui::Sim
      kCloseStartTab,
      kCloseEndTab,
      kExitSplit,
 -    kSendFeedback,
--    kMaxValue = kSendFeedback,
-+    kMaxValue = kExitSplit,
+-    kToggleOrientation,
++    kToggleOrientation = 6,
+     kMaxValue = kToggleOrientation,
    };
    // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/enums.xml:SplitViewMenuEntry)
- 
-@@ -78,7 +77,6 @@ class SplitTabMenuModel : public ui::Sim
+@@ -84,7 +83,6 @@ class SplitTabMenuModel : public ui::Sim
        split_tabs::SplitTabActiveLocation active_split_tab_location) const;
    split_tabs::SplitTabLayout GetSplitLayout() const;
-   void CloseTabAtIndex(int index);
+   void CloseWebContents(content::WebContents* contents);
 -  void SendFeedback();
  
    raw_ptr<TabStripModel> tab_strip_model_ = nullptr;
  
 --- a/chrome/browser/ui/tabs/split_tab_menu_model.cc
 +++ b/chrome/browser/ui/tabs/split_tab_menu_model.cc
-@@ -15,10 +15,6 @@
+@@ -15,10 +15,7 @@
  #include "base/notreached.h"
  #include "base/strings/strcat.h"
  #include "chrome/app/vector_icons/vector_icons.h"
 -#include "chrome/browser/feedback/show_feedback_page.h"
 -#include "chrome/browser/profiles/profile.h"
--#include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 -#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
  #include "chrome/browser/ui/tabs/split_tab_util.h"
- #include "chrome/browser/ui/tabs/tab_enums.h"
- #include "chrome/browser/ui/tabs/tab_model.h"
-@@ -77,24 +73,9 @@ std::string_view GetMetricsSuffixForComm
+@@ -80,26 +77,11 @@ std::string_view GetMetricsSuffixForComm
        return "CloseEndTab";
      case SplitTabMenuModel::CommandId::kExitSplit:
        return "ExitSplit";
 -    case SplitTabMenuModel::CommandId::kSendFeedback:
 -      return "SendFeedback";
+     case SplitTabMenuModel::CommandId::kToggleOrientation:
+       return "ToggleOrientation";
    }
  }
  
@@ -80,10 +69,11 @@
  }  // namespace
  
  DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(SplitTabMenuModel,
-@@ -158,16 +139,6 @@ SplitTabMenuModel::SplitTabMenuModel(Tab
+@@ -172,17 +154,6 @@ SplitTabMenuModel::SplitTabMenuModel(Tab
+   SetElementIdentifierAt(
        GetIndexOfCommandId(GetCommandIdInt(CommandId::kExitSplit)).value(),
        kExitSplitMenuItem);
- 
+-
 -  // Only render feedback in the toolbar button menu.
 -  if (menu_source == MenuSource::kToolbarButton &&
 -      chrome::CanShowFeedback(tab_strip_model->profile())) {
@@ -97,19 +87,43 @@
  }
  
  SplitTabMenuModel::~SplitTabMenuModel() = default;
-@@ -256,9 +227,6 @@ void SplitTabMenuModel::ExecuteCommand(i
+@@ -260,6 +231,9 @@ void SplitTabMenuModel::ExecuteCommand(i
+   std::vector<tabs::TabInterface*> tabs_in_split = split_tab_data->ListTabs();
+   CHECK_EQ(tabs_in_split.size(), 2U);
+   CommandId split_command_id = GetCommandIdEnum(command_id);
++  const bool reverse_close_indices =
++      base::i18n::IsRTL() &&
++      GetSplitLayout() == split_tabs::SplitTabLayout::kSideBySide;
+   switch (split_command_id) {
+     case CommandId::kReversePosition:
+       tab_strip_model_->ReverseTabsInSplit(split_id);
+@@ -269,21 +243,18 @@ void SplitTabMenuModel::ExecuteCommand(i
+           tab_strip_model_->GetWebContentsAt(split_tab_index_.value()));
+       break;
+     case CommandId::kCloseStartTab: {
+-      int startIndex = base::i18n::IsRTL() ? 1 : 0;
++      int startIndex = reverse_close_indices ? 1 : 0;
+       CloseWebContents(tabs_in_split[startIndex]->GetContents());
+       break;
+     }
+     case CommandId::kCloseEndTab: {
+-      int endIndex = base::i18n::IsRTL() ? 0 : 1;
++      int endIndex = reverse_close_indices ? 0 : 1;
+       CloseWebContents(tabs_in_split[endIndex]->GetContents());
+       break;
+     }
      case CommandId::kExitSplit:
        tab_strip_model_->RemoveSplit(split_id);
        break;
 -    case CommandId::kSendFeedback:
 -      SendFeedback();
 -      break;
-   }
- 
-   base::UmaHistogramEnumeration(
-@@ -310,11 +278,3 @@ void SplitTabMenuModel::CloseTabAtIndex(
-       index, TabCloseTypes::CLOSE_USER_GESTURE |
-                  TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+     case CommandId::kToggleOrientation: {
+       split_tabs::SplitTabLayout new_layout =
+           GetSplitLayout() == split_tabs::SplitTabLayout::kSideBySide
+@@ -355,11 +326,3 @@ void SplitTabMenuModel::CloseWebContents
+       contents, TabCloseTypes::CLOSE_USER_GESTURE |
+                     TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
  }
 -
 -void SplitTabMenuModel::SendFeedback() {
@@ -119,3 +133,220 @@
 -  chrome::ShowFeedbackPage(browser, feedback::kFeedbackSourceSplitView, "", "",
 -                           "split_view", "");
 -}
+--- a/chrome/browser/ui/views/frame/multi_contents_resize_area.h
++++ b/chrome/browser/ui/views/frame/multi_contents_resize_area.h
+@@ -5,15 +5,21 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_RESIZE_AREA_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_RESIZE_AREA_H_
+ 
++#include <memory>
++
+ #include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/views/context_menu_controller.h"
+ #include "ui/views/controls/resize_area.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/view.h"
+ 
+ class MultiContentsView;
++class SplitTabMenuModel;
++class TabStripModel;
+ 
+ namespace split_tabs {
+ enum class SplitTabLayout;
+@@ -21,6 +27,8 @@ enum class SplitTabLayout;
+ 
+ namespace views {
+ class FlexLayout;
++class MenuModelAdapter;
++class MenuRunner;
+ }
+ 
+ // Keyboard-accessible drag handle icon intended to be drawn on top of a
+@@ -46,19 +54,30 @@ class MultiContentsResizeHandle : public
+ 
+ // ResizeArea meant to draw in between WebContents within a MultiContentsView,
+ // and responsiveness to key events via a focusable MultiContentsResizeHandle.
+-class MultiContentsResizeArea : public views::ResizeArea {
++class MultiContentsResizeArea : public views::ResizeArea,
++                                public views::ContextMenuController,
++                                public TabStripModelObserver {
+   METADATA_HEADER(MultiContentsResizeArea, ResizeArea)
+ 
+  public:
+-  static constexpr int kHandleResizeAxisPadding = 6;
+-  static constexpr int kHandleResizeAxisSize = 4;
++  static constexpr int kHandleResizeAxisPadding = 4;
++  static constexpr int kHandleResizeAxisSize = 2;
+ 
+   DECLARE_CLASS_ELEMENT_IDENTIFIER_VALUE(kMultiContentsResizeAreaElementId);
+ 
+-  explicit MultiContentsResizeArea(MultiContentsView* multi_contents_view);
++  MultiContentsResizeArea(MultiContentsView* multi_contents_view,
++                          TabStripModel* tab_strip_model);
++  ~MultiContentsResizeArea() override;
+ 
+   void SetLayout(split_tabs::SplitTabLayout layout);
+ 
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnSplitTabChanged(const SplitTabChange& change) override;
++
+   // views::ResizeArea:
+   void OnGestureEvent(ui::GestureEvent* event) override;
+   void OnMouseReleased(const ui::MouseEvent& event) override;
+@@ -67,7 +86,15 @@ class MultiContentsResizeArea : public v
+   void OnMouseExited(const ui::MouseEvent& event) override;
+   void SetVisible(bool visible) override;
+ 
++  // views::ContextMenuController:
++  void ShowContextMenuForViewImpl(
++      views::View* source,
++      const gfx::Point& point,
++      ui::mojom::MenuSourceType source_type) override;
++
+  private:
++  void CancelMenu();
++
+   // Sets the layout manager orientation and preferred size according to the
+   // split view layout.
+   void OnLayoutUpdated();
+@@ -81,6 +108,10 @@ class MultiContentsResizeArea : public v
+   raw_ptr<MultiContentsResizeHandle> resize_handle_;
+ 
+   raw_ptr<views::FlexLayout> flex_layout_manager_;
++
++  std::unique_ptr<SplitTabMenuModel> split_tab_menu_;
++  std::unique_ptr<views::MenuModelAdapter> menu_model_adapter_;
++  std::unique_ptr<views::MenuRunner> menu_runner_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_RESIZE_AREA_H_
+--- a/chrome/browser/ui/views/frame/multi_contents_resize_area.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_resize_area.cc
+@@ -8,6 +8,8 @@
+ #include "base/i18n/rtl.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/tabs/split_tab_menu_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+@@ -15,11 +17,15 @@
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/compositor/layer_type.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/background.h"
+ #include "ui/views/controls/focus_ring.h"
+ #include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/menu/menu_item_view.h"
++#include "ui/views/controls/menu/menu_model_adapter.h"
++#include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/layout/flex_layout.h"
+ 
+ namespace {
+@@ -75,18 +81,42 @@ BEGIN_METADATA(MultiContentsResizeHandle
+ END_METADATA
+ 
+ MultiContentsResizeArea::MultiContentsResizeArea(
+-    MultiContentsView* multi_contents_view)
++    MultiContentsView* multi_contents_view,
++    TabStripModel* tab_strip_model)
+     : ResizeArea(multi_contents_view),
+-      multi_contents_view_(multi_contents_view) {
++      multi_contents_view_(multi_contents_view),
++      split_tab_menu_(std::make_unique<SplitTabMenuModel>(
++          tab_strip_model,
++          SplitTabMenuModel::MenuSource::kToolbarButton)) {
++  set_context_menu_controller(this);
+   flex_layout_manager_ =
+       SetLayoutManager(std::make_unique<views::FlexLayout>());
+   flex_layout_manager_->SetMainAxisAlignment(views::LayoutAlignment::kCenter)
+       .SetCrossAxisAlignment(views::LayoutAlignment::kCenter);
+ 
+   resize_handle_ = AddChildView(std::make_unique<MultiContentsResizeHandle>());
++  resize_handle_->set_context_menu_controller(this);
+ 
+   SetProperty(views::kElementIdentifierKey, kMultiContentsResizeAreaElementId);
+   OnLayoutUpdated();
++  tab_strip_model->AddObserver(this);
++}
++
++MultiContentsResizeArea::~MultiContentsResizeArea() {
++  TabStripModelObserver::StopObservingAll(this);
++}
++
++void MultiContentsResizeArea::OnTabStripModelChanged(
++    TabStripModel*,
++    const TabStripModelChange&,
++    const TabStripSelectionChange& selection) {
++  if (selection.active_tab_changed()) {
++    CancelMenu();
++  }
++}
++
++void MultiContentsResizeArea::OnSplitTabChanged(const SplitTabChange&) {
++  CancelMenu();
+ }
+ 
+ void MultiContentsResizeArea::SetLayout(split_tabs::SplitTabLayout layout) {
+@@ -161,10 +191,37 @@ void MultiContentsResizeArea::OnMouseExi
+ }
+ 
+ void MultiContentsResizeArea::SetVisible(bool visible) {
++  if (!visible) {
++    CancelMenu();
++  }
+   views::View::SetVisible(visible);
+   resize_handle_->UpdateVisibility();
+ }
+ 
++void MultiContentsResizeArea::ShowContextMenuForViewImpl(
++    views::View* source,
++    const gfx::Point& point,
++    ui::mojom::MenuSourceType source_type) {
++  if (menu_runner_ && menu_runner_->IsRunning()) {
++    return;
++  }
++  menu_runner_.reset();
++  menu_model_adapter_ =
++      std::make_unique<views::MenuModelAdapter>(split_tab_menu_.get());
++  menu_runner_ = std::make_unique<views::MenuRunner>(
++      menu_model_adapter_->CreateMenu(),
++      views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU);
++  menu_runner_->RunMenuAt(source->GetWidget(), nullptr,
++                          gfx::Rect(point, gfx::Size()),
++                          views::MenuAnchorPosition::kTopLeft, source_type);
++}
++
++void MultiContentsResizeArea::CancelMenu() {
++  if (menu_runner_ && menu_runner_->IsRunning()) {
++    menu_runner_->Cancel();
++  }
++}
++
+ void MultiContentsResizeArea::OnLayoutUpdated() {
+   flex_layout_manager_->SetOrientation(
+       axis() == Axis::kHorizontal ? views::LayoutOrientation::kVertical
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -83,7 +83,8 @@ MultiContentsView::MultiContentsView(
+       ->contents_view()
+       ->set_is_primary_web_contents_for_window(true);
+ 
+-  resize_area_ = AddChildView(std::make_unique<MultiContentsResizeArea>(this));
++  resize_area_ = AddChildView(std::make_unique<MultiContentsResizeArea>(
++      this, browser_view_->browser()->tab_strip_model()));
+   resize_area_->SetVisible(false);
+ 
+   contents_container_views_.push_back(

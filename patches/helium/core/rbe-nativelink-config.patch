@@ -1,0 +1,132 @@
+--- /dev/null
++++ b/build/config/siso/backend_config/nativelink.star
+@@ -0,0 +1,26 @@
++# -*- bazel-starlark -*-
++# Copyright 2026 The Helium Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++load("@builtin//struct.star", "module")
++
++def __platform_properties(ctx):
++    properties = {
++        "cpu_count": "1",
++    }
++    return {
++        "default": properties,
++        "large": properties,
++    }
++
++def __configs(ctx):
++    return ["remote-generators"]
++
++backend = module(
++    "backend",
++    platform_properties = __platform_properties,
++    configs = __configs,
++    minimum_remote_timeout = "7m",
++    remote_python_bin = "/usr/bin/python3",
++)
+--- a/build/config/siso/config.star
++++ b/build/config/siso/config.star
+@@ -8,6 +8,8 @@ load("@builtin//struct.star", "module")
+ load("./backend_config/backend.star", "backend")
+ 
+ __KNOWN_CONFIG_OPTIONS = [
++    # Enable remote execution of TypeScript/WebUI and Mojo generator rules.
++    "remote-generators",
+     # Indicates that it is for Google Chromium/Chrome build using Google RBE
+     # as REAPI backend and all remote exeuctions are tested/maintained by
+     # Chrome build infra team.
+--- a/build/config/siso/mojo.star
++++ b/build/config/siso/mojo.star
+@@ -10,7 +10,7 @@ load("./config.star", "config")
+ load("./platform.star", "platform")
+ 
+ def __step_config(ctx, step_config):
+-    remote_run = config.get(ctx, "googlechrome")
++    remote_run = config.get(ctx, "googlechrome") or config.get(ctx, "remote-generators")
+ 
+     # mojom_bindings_generator.py will run faster on n2-highmem-8 than
+     # n2-custom-2-3840
+--- a/build/config/siso/typescript_all.star
++++ b/build/config/siso/typescript_all.star
+@@ -21,7 +21,7 @@ __input_deps = {
+ }
+ 
+ def __step_config(ctx, step_config):
+-    remote_run = config.get(ctx, "googlechrome")
++    remote_run = config.get(ctx, "googlechrome") or config.get(ctx, "remote-generators")
+     step_config["input_deps"].update(typescript_all.input_deps)
+ 
+     use_input_root_absolute_path = False
+--- a/build/config/siso/mac.star
++++ b/build/config/siso/mac.star
+@@ -8,11 +8,13 @@ load("@builtin//path.star", "path")
+ load("@builtin//struct.star", "module")
+ load("./clang_mac.star", "clang")
+ load("./config.star", "config")
++load("./devtools_frontend.star", "devtools_frontend")
+ load("./platform.star", "platform")
+ 
+ def __filegroups(ctx):
+     fg = {}
+     fg.update(clang.filegroups(ctx))
++    fg.update(devtools_frontend.filegroups(ctx))
+     return fg
+ 
+ def __codesign(ctx, cmd):
+@@ -61,6 +63,7 @@ __handlers.update(clang.handlers)
+ def __step_config(ctx, step_config):
+     config.check(ctx)
+     step_config = clang.step_config(ctx, step_config)
++    step_config = devtools_frontend.step_config(ctx, step_config)
+     step_config["rules"].extend([
+         {
+             "name": "codesign",
+--- a/build/config/siso/main.star
++++ b/build/config/siso/main.star
+@@ -28,6 +28,10 @@ load("./windows.star", chromium_windows
+ def __setup_python(ctx, step_config):
+     for rule in step_config["rules"]:
+         if rule.get("remote_command") == platform.remote_python_bin:
++            remote_python = getattr(backend, "remote_python_bin", None)
++            if remote_python:
++                rule["remote_command"] = remote_python
++                continue
+             inputs = rule.get("inputs", [])
+             if "third_party/cpython3/linux-amd64:cpython3" not in inputs:
+                 inputs.append("third_party/cpython3/linux-amd64:cpython3")
+@@ -43,16 +47,23 @@ def __disable_remote(ctx, step_config):
+     return step_config
+ 
+ def __unset_timeout(ctx, step_config):
+-    if not config.get(ctx, "no-remote-timeout"):
++    if config.get(ctx, "no-remote-timeout"):
++        for rule in step_config["rules"]:
++            # if no timeout, default is 60m timeout.
++            # better to keep longer timeout instead of using shorter timeout.
++            timeout = rule.get("timeout")
++            if timeout and \
++               time.parse_duration(timeout) > time.parse_duration("60m"):
++                continue
++            rule.pop("timeout", None)
+         return step_config
+-    for rule in step_config["rules"]:
+-        # if no timeout, default is 60m timeout.
+-        # better to keep longer timeout instead of using shorter timeout.
+-        timeout = rule.get("timeout")
+-        if timeout and \
+-           time.parse_duration(timeout) > time.parse_duration("60m"):
+-            continue
+-        rule.pop("timeout", None)
++    minimum_timeout = getattr(backend, "minimum_remote_timeout", None)
++    if minimum_timeout:
++        minimum_duration = time.parse_duration(minimum_timeout)
++        for rule in step_config["rules"]:
++            timeout = rule.get("timeout")
++            if rule.get("remote") and timeout and time.parse_duration(timeout) < minimum_duration:
++                rule["timeout"] = minimum_timeout
+     return step_config
+ 
+ def init(ctx):

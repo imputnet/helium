@@ -1,0 +1,398 @@
+--- a/components/sync/engine/BUILD.gn
++++ b/components/sync/engine/BUILD.gn
+@@ -95,6 +95,10 @@ static_library("engine") {
+     "events/protocol_event_buffer.cc",
+     "events/protocol_event_buffer.h",
+     "events/protocol_event_observer.h",
++    "sync_vault/sync_vault_backend.cc",
++    "sync_vault/sync_vault_backend.h",
++    "sync_vault/sync_vault_connection_manager.cc",
++    "sync_vault/sync_vault_connection_manager.h",
+     "forwarding_data_type_processor.cc",
+     "forwarding_data_type_processor.h",
+     "get_updates_delegate.cc",
+@@ -181,6 +185,7 @@ static_library("engine") {
+     "//base",
+     "//components/signin/public/identity_manager",
+     "//components/sync/base",
++    "//components/sync/engine/sync_vault",
+     "//components/sync/protocol",
+     "//components/sync/protocol:util",
+     "//net",
+--- /dev/null
++++ b/components/sync/engine/sync_vault/sync_vault_backend.cc
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/sync/engine/sync_vault/sync_vault_backend.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/check.h"
++#include "components/sync/engine/sync_vault/sync_vault_connection_manager.h"
++#include "components/sync/engine/sync_vault/sync_vault_store.h"
++
++namespace syncer {
++
++SyncVaultBackend::SyncVaultBackend(
++    std::unique_ptr<SyncVaultStore> vault_store,
++    SyncVaultDiagnosticsCallback diagnostics_callback)
++    : vault_store_(std::move(vault_store)),
++      diagnostics_callback_(std::move(diagnostics_callback)) {
++  CHECK(vault_store_);
++}
++
++SyncVaultBackend::~SyncVaultBackend() = default;
++
++std::unique_ptr<ServerConnectionManager>
++SyncVaultBackend::CreateConnectionManager(
++    CancelationSignal* cancelation_signal) {
++  CHECK(vault_store_);
++  CHECK(cancelation_signal);
++  vault_store_->SetCancelationSignal(cancelation_signal);
++  return std::make_unique<SyncVaultConnectionManager>(
++      std::move(vault_store_), std::move(diagnostics_callback_));
++}
++
++}  // namespace syncer
+--- /dev/null
++++ b/components/sync/engine/sync_vault/sync_vault_backend.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_BACKEND_H_
++#define COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_BACKEND_H_
++
++#include <memory>
++
++#include "components/sync/engine/custom_sync_backend.h"
++#include "components/sync/engine/sync_vault/sync_vault_connection_manager.h"
++
++namespace syncer {
++
++class CancelationSignal;
++class SyncVaultStore;
++
++// Adapts the private vault journal to the generic custom backend boundary.
++class SyncVaultBackend final : public CustomSyncBackend {
++ public:
++  explicit SyncVaultBackend(
++      std::unique_ptr<SyncVaultStore> vault_store,
++      SyncVaultDiagnosticsCallback diagnostics_callback = {});
++  ~SyncVaultBackend() override;
++
++  SyncVaultBackend(const SyncVaultBackend&) = delete;
++  SyncVaultBackend& operator=(const SyncVaultBackend&) = delete;
++
++  std::unique_ptr<ServerConnectionManager> CreateConnectionManager(
++      CancelationSignal* cancelation_signal) override;
++
++ private:
++  std::unique_ptr<SyncVaultStore> vault_store_;
++  SyncVaultDiagnosticsCallback diagnostics_callback_;
++};
++
++}  // namespace syncer
++
++#endif  // COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_BACKEND_H_
+--- /dev/null
++++ b/components/sync/engine/sync_vault/sync_vault_connection_manager.cc
+@@ -0,0 +1,221 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/sync/engine/sync_vault/sync_vault_connection_manager.h"
++
++#include <memory>
++#include <optional>
++#include <string_view>
++#include <utility>
++
++#include "base/check.h"
++#include "base/containers/span.h"
++#include "base/notreached.h"
++#include "base/time/time.h"
++#include "components/history/core/common/history_expiration.h"
++#include "components/sync/engine/loopback_server/loopback_server.h"
++#include "components/sync/engine/loopback_server/loopback_server_state_delta.h"
++#include "components/sync/protocol/sync.pb.h"
++#include "net/base/net_errors.h"
++#include "net/http/http_status_code.h"
++
++namespace syncer {
++
++namespace {
++
++constexpr int kMaximumTransactionAttempts = 5;
++
++}  // namespace
++
++SyncVaultConnectionManager::SyncVaultConnectionManager(
++    std::unique_ptr<SyncVaultStore> vault_store,
++    SyncVaultDiagnosticsCallback diagnostics_callback)
++    : vault_store_(std::move(vault_store)),
++      diagnostics_callback_(std::move(diagnostics_callback)) {
++  CHECK(vault_store_);
++}
++
++SyncVaultConnectionManager::~SyncVaultConnectionManager() = default;
++
++HttpResponse SyncVaultConnectionManager::PostBuffer(
++    const std::string& buffer_in,
++    std::string* buffer_out,
++    const signin::AccessTokenInfo& /*access_token_info*/) {
++  CHECK(buffer_out);
++  buffer_out->clear();
++
++  sync_pb::ClientToServerMessage message;
++  if (!message.ParseFromString(buffer_in) || !message.IsInitialized()) {
++    return HttpResponse::ForHttpStatusCode(net::HTTP_BAD_REQUEST);
++  }
++
++  for (int attempt = 0; attempt < kMaximumTransactionAttempts; ++attempt) {
++    // A successful commit conditionally replaces the head using the cached
++    // revision, so the preliminary read would only duplicate that concurrency
++    // check. On conflict, reload the current state and replay the command.
++    const bool defer_head_refresh =
++        loaded_state_ &&
++        message.message_contents() == sync_pb::ClientToServerMessage::COMMIT;
++    if (!loaded_state_) {
++      SyncVaultStore::ReadResult read_result = vault_store_->ReadState();
++      if (!read_result.has_value()) {
++        return ResponseForVaultError(read_result.error());
++      }
++      loaded_state_ = std::move(read_result.value());
++    } else if (!defer_head_refresh) {
++      auto refreshed = RefreshLoadedState();
++      if (!refreshed.has_value()) {
++        return ResponseForVaultError(refreshed.error());
++      }
++    }
++    SyncVaultState& vault_state = *loaded_state_;
++
++    if (!loopback_server_) {
++      auto server = std::make_unique<LoopbackServer>();
++      if (vault_state.generation() > 0 &&
++          !server->LoadStateFromBytes(vault_state.data())) {
++        return ResponseForVaultError(SyncVaultStoreError::kMalformedObject);
++      }
++      server->EnableStrongConsistencyWithConflictDetectionModel();
++      loopback_server_ = std::move(server);
++    }
++
++    const bool history_was_collected =
++        loopback_server_->GarbageCollectHistoryBefore(
++            base::Time::Now() - history::kHistoryExpirationThreshold);
++
++    sync_pb::ClientToServerResponse response;
++    const LoopbackServer::CommandResult command_result =
++        loopback_server_->HandleCommandWithResult(message, &response);
++    if (command_result.status != net::HTTP_OK) {
++      if (command_result.state_changed || history_was_collected) {
++        loopback_server_.reset();
++      }
++      if (defer_head_refresh) {
++        auto refreshed = RefreshLoadedState();
++        if (!refreshed.has_value()) {
++          return ResponseForVaultError(refreshed.error());
++        }
++        if (refreshed.value() == SyncVaultStore::RefreshOutcome::kChanged) {
++          continue;
++        }
++      }
++      return HttpResponse::ForHttpStatusCode(command_result.status);
++    }
++
++    // A new LoopbackServer creates its permanent entities before handling the
++    // first command. Persist that initial state even if the command itself was
++    // read-only.
++    const bool must_persist = history_was_collected ||
++                              command_result.state_changed ||
++                              vault_state.generation() == 0;
++    if (must_persist) {
++      auto snapshot = loopback_server_->SerializeStateToBytes();
++      if (!snapshot) {
++        loopback_server_.reset();
++        return HttpResponse::ForHttpStatusCode(net::HTTP_INTERNAL_SERVER_ERROR);
++      }
++      auto delta = vault_state.generation() > 0
++                       ? LoopbackServerStateCodec::CreateDelta(
++                             vault_state.data(), *snapshot)
++                       : std::nullopt;
++      SyncVaultStore::CommitResult write_result = vault_store_->CommitMutation(
++          vault_state, std::move(delta), std::move(*snapshot));
++      if (!write_result.has_value()) {
++        // The cached server may contain a mutation that was not committed.
++        loopback_server_.reset();
++        if (write_result.error() == SyncVaultStoreError::kConflict) {
++          auto refreshed = RefreshLoadedState();
++          if (!refreshed.has_value()) {
++            return ResponseForVaultError(refreshed.error());
++          }
++          continue;
++        }
++        return ResponseForVaultError(write_result.error());
++      }
++      // Keep the authenticated state and revision returned by the successful
++      // commit. The next request only needs to check whether the remote head
++      // has changed in the meantime.
++      loaded_state_ = std::move(write_result.value());
++    } else if (defer_head_refresh) {
++      // A no-op commit does not perform a conditional head write. Verify that
++      // its response was produced from the current state before returning it.
++      auto refreshed = RefreshLoadedState();
++      if (!refreshed.has_value()) {
++        return ResponseForVaultError(refreshed.error());
++      }
++      if (refreshed.value() == SyncVaultStore::RefreshOutcome::kChanged) {
++        continue;
++      }
++    }
++
++    if (!response.SerializeToString(buffer_out)) {
++      buffer_out->clear();
++      return HttpResponse::ForHttpStatusCode(net::HTTP_INTERNAL_SERVER_ERROR);
++    }
++    ReportDiagnostics(std::nullopt, SyncVaultStateDiagnostics{
++                                        loopback_server_->GetEntityCount(),
++                                        loaded_state_->state_size()});
++    return HttpResponse::ForHttpStatusCode(net::HTTP_OK);
++  }
++
++  return ResponseForVaultError(SyncVaultStoreError::kConflict);
++}
++
++SyncVaultStore::RefreshResult SyncVaultConnectionManager::RefreshLoadedState() {
++  CHECK(loaded_state_);
++  SyncVaultStore::RefreshResult refresh_result =
++      vault_store_->RefreshState(&*loaded_state_);
++  if (!refresh_result.has_value()) {
++    return base::unexpected(refresh_result.error());
++  }
++  if (refresh_result.value() == SyncVaultStore::RefreshOutcome::kChanged) {
++    loopback_server_.reset();
++  }
++  return refresh_result.value();
++}
++
++HttpResponse SyncVaultConnectionManager::ResponseForVaultError(
++    SyncVaultStoreError error) {
++  ReportDiagnostics(error);
++  switch (error) {
++    case SyncVaultStoreError::kAuthenticationRequired:
++      return HttpResponse::ForHttpStatusCode(net::HTTP_UNAUTHORIZED);
++    case SyncVaultStoreError::kConflict:
++      return HttpResponse::ForHttpStatusCode(net::HTTP_CONFLICT);
++    case SyncVaultStoreError::kNetworkError:
++    case SyncVaultStoreError::kTemporaryError:
++    case SyncVaultStoreError::kIncompleteHistory:
++      return HttpResponse::ForNetError(net::ERR_FAILED);
++    case SyncVaultStoreError::kQuotaExceeded:
++      return HttpResponse::ForHttpStatusCode(net::HTTP_INSUFFICIENT_STORAGE);
++    case SyncVaultStoreError::kAccessDenied:
++      return HttpResponse::ForHttpStatusCode(net::HTTP_FORBIDDEN);
++    case SyncVaultStoreError::kAborted:
++      return HttpResponse::ForNetError(net::ERR_ABORTED);
++    case SyncVaultStoreError::kRollback:
++    case SyncVaultStoreError::kFork:
++      return HttpResponse::ForHttpStatusCode(net::HTTP_PRECONDITION_FAILED);
++    case SyncVaultStoreError::kInvalidData:
++    case SyncVaultStoreError::kUnsupported:
++    case SyncVaultStoreError::kInvalidVaultKey:
++    case SyncVaultStoreError::kAuthenticationFailed:
++    case SyncVaultStoreError::kMalformedObject:
++    case SyncVaultStoreError::kUnsupportedVersion:
++    case SyncVaultStoreError::kObjectTooLarge:
++    case SyncVaultStoreError::kCheckpointPersistenceFailed:
++      return HttpResponse::ForHttpStatusCode(net::HTTP_UNPROCESSABLE_CONTENT);
++  }
++  NOTREACHED();
++}
++
++void SyncVaultConnectionManager::ReportDiagnostics(
++    std::optional<SyncVaultStoreError> error,
++    std::optional<SyncVaultStateDiagnostics> state) {
++  if (diagnostics_callback_) {
++    diagnostics_callback_.Run(error, vault_store_->checkpoint(), state);
++  }
++}
++
++}  // namespace syncer
+--- /dev/null
++++ b/components/sync/engine/sync_vault/sync_vault_connection_manager.h
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_CONNECTION_MANAGER_H_
++#define COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_CONNECTION_MANAGER_H_
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/types/expected.h"
++#include "components/sync/engine/net/server_connection_manager.h"
++#include "components/sync/engine/sync_vault/sync_vault_store.h"
++
++namespace syncer {
++
++class LoopbackServer;
++
++struct SyncVaultStateDiagnostics {
++  uint64_t entity_count = 0;
++  uint64_t state_bytes = 0;
++
++  bool operator==(const SyncVaultStateDiagnostics&) const = default;
++};
++
++using SyncVaultDiagnosticsCallback =
++    base::RepeatingCallback<void(std::optional<SyncVaultStoreError>,
++                                 const SyncVaultCheckpoint&,
++                                 std::optional<SyncVaultStateDiagnostics>)>;
++
++// Runs Chromium's LoopbackServer against the authenticated private-vault
++// journal. Losing CAS writers reload the winning head and replay the command.
++class SyncVaultConnectionManager : public ServerConnectionManager {
++ public:
++  explicit SyncVaultConnectionManager(
++      std::unique_ptr<SyncVaultStore> vault_store,
++      SyncVaultDiagnosticsCallback diagnostics_callback = {});
++
++  SyncVaultConnectionManager(const SyncVaultConnectionManager&) =
++      delete;
++  SyncVaultConnectionManager& operator=(
++      const SyncVaultConnectionManager&) = delete;
++
++  ~SyncVaultConnectionManager() override;
++
++ private:
++  HttpResponse PostBuffer(
++      const std::string& buffer_in,
++      std::string* buffer_out,
++      const signin::AccessTokenInfo& access_token_info) override;
++
++  HttpResponse ResponseForVaultError(SyncVaultStoreError error);
++  SyncVaultStore::RefreshResult RefreshLoadedState();
++  void ReportDiagnostics(
++      std::optional<SyncVaultStoreError> error,
++      std::optional<SyncVaultStateDiagnostics> state = std::nullopt);
++
++  std::unique_ptr<SyncVaultStore> vault_store_;
++  std::optional<SyncVaultState> loaded_state_;
++  std::unique_ptr<LoopbackServer> loopback_server_;
++  SyncVaultDiagnosticsCallback diagnostics_callback_;
++};
++
++}  // namespace syncer
++
++#endif  // COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_CONNECTION_MANAGER_H_

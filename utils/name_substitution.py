@@ -15,7 +15,7 @@ import io
 
 import name_substitution_utils as util
 
-IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'android', 'ios', 'testdata']
+IGNORE_DIRS = ['.pc', 'chromeos', 'remoting', 'ash', 'testdata']
 
 
 def replacement_sanity():
