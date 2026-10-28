@@ -137,6 +137,7 @@ DOMAIN_EXCLUDE_PREFIXES = [
     'build/linux/sysroot_scripts/sysroots.json',
     # Exclusion to allow download of libclang with gsutil
     'third_party/depot_tools/gsutil.py',
+    'third_party/depot_tools/win_toolchain/get_toolchain_if_necessary.py',
     # Licenses and credits
     'tools/licenses/licenses.py',
     # Google Web Store extension stuff

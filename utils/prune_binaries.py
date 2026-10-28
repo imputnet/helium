@@ -31,6 +31,9 @@ CONTINGENT_PATHS = (
     'third_party/cpython3/',
     'third_party/dawn/third_party/ninja/',
     'third_party/dawn/tools/golang/',
+    'third_party/depot_tools/.cipd_bin/',
+    'third_party/depot_tools/.cipd_client',
+    'third_party/depot_tools/.cipd_client_cache/',
     'third_party/devtools-frontend/src/third_party/esbuild/',
     'third_party/devtools-frontend/src/third_party/rollup_libs/',
     'third_party/enterprise_companion/chromium_linux64/cipd/',
@@ -106,6 +109,7 @@ CONTINGENT_PATHS = (
     'third_party/catapult/tracing/test_data/',
     'third_party/dawn/test/',
     'third_party/devtools-frontend/src/front_end/panels/timeline/fixtures/',
+    'third_party/dom_distiller_js/dist/test/data/out/',
     'third_party/expat/src/testdata/',
     'third_party/glslang/src/Test/',
     'third_party/harfbuzz-ng/src/test/',
@@ -123,6 +127,7 @@ CONTINGENT_PATHS = (
     'third_party/swiftshader/tests/regres/',
     'third_party/test_fonts/test_fonts/',
     'tools/perf/testdata/',
+    'tools/binary_size/libsupersize/testdata/mock_source_directory/out/',
     # lite tarball paths:
     # https://source.chromium.org/chromium/chromium/tools/build/+/main:recipes/recipes/publish_tarball.py
     'android_webview/',
@@ -215,10 +220,15 @@ def _prune_path(path, unpack_root=None):
     """
     Delete files and directories in path.
 
-    path is a pathlib.Path to the directory to be pruned
+    path is a pathlib.Path to the file or directory to be pruned
     unpack_root is a pathlib.Path to the source tree
     """
-    for node in sorted(path.rglob('*'), key=lambda l: len(str(l)), reverse=True):
+    if path.is_file() or path.is_symlink():
+        nodes = [path]
+    else:
+        nodes = sorted(path.rglob('*'), key=lambda l: len(str(l)), reverse=True)
+
+    for node in nodes:
         if unpack_root is not None and (node.suffix in KEEP_SUFFIXES
                                         or node.relative_to(unpack_root).as_posix() in KEEP_FILES):
             continue
