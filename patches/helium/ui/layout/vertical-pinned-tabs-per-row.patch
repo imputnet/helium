@@ -1,0 +1,282 @@
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -624,6 +624,11 @@ inline constexpr char kHeliumLayout[] =
+ inline constexpr char kHeliumVerticalRightAligned[] =
+     "helium.browser.vertical_right_aligned";
+ 
++// An integer pref that controls how many pinned tabs are shown per row in the
++// vertical tab strip. 0 lets the tab strip fit as many as possible.
++inline constexpr char kHeliumVerticalPinnedTabsPerRow[] =
++    "helium.browser.vertical_pinned_tabs_per_row";
++
+ // A boolean pref set to true if zen mode is enabled.
+ inline constexpr char kHeliumZenMode[] = "helium.browser.zen_mode";
+ 
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+@@ -35,6 +35,7 @@ void RegisterProfilePrefs(user_prefs::Pr
+   registry->RegisterIntegerPref(prefs::kHeliumLayout,
+                                 std::to_underlying(HeliumLayoutType::kClassic));
+   registry->RegisterBooleanPref(prefs::kHeliumVerticalRightAligned, false);
++  registry->RegisterIntegerPref(prefs::kHeliumVerticalPinnedTabsPerRow, 0);
+   registry->RegisterBooleanPref(prefs::kHeliumZenMode, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenModeSidebarPinned, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenModeTopChromePinned, false);
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
+@@ -63,6 +63,10 @@ class VerticalTabStripStateController {
+   virtual bool IsTabStripRightAligned() const = 0;
+   virtual void SetTabStripRightAligned(bool right_aligned) = 0;
+ 
++  // Returns the number of pinned tabs to show per row, or 0 to fit as many as
++  // the tab strip width allows.
++  virtual int GetPinnedTabsPerRow() const = 0;
++
+   virtual std::unique_ptr<ScopedEnableStateLock> GetEnableStateLock() = 0;
+ 
+   virtual bool IsCollapsed() const = 0;
+@@ -97,6 +101,9 @@ class VerticalTabStripStateController {
+   base::CallbackListSubscription RegisterOnExpandOnHoverEnabledChanged(
+       base::RepeatingCallback<void(bool)> callback);
+ 
++  base::CallbackListSubscription RegisterOnPinnedTabsPerRowChanged(
++      base::RepeatingClosure callback);
++
+   using StateChangedCallback =
+       base::RepeatingCallback<void(VerticalTabStripStateController*)>;
+   base::CallbackListSubscription RegisterOnModeWillChange(
+@@ -114,6 +121,7 @@ class VerticalTabStripStateController {
+   void NotifyResizingChanged(bool is_resizing);
+   void NotifyCollapseChanged(VerticalTabStripCollapseState new_state);
+   void NotifyExpandOnHoverEnabledChanged(bool expand_on_hover_enabled);
++  void NotifyPinnedTabsPerRowChanged();
+   void NotifyModeWillChange();
+   void NotifyModeChanged();
+ 
+@@ -123,6 +131,7 @@ class VerticalTabStripStateController {
+   base::RepeatingCallbackList<void(bool)> on_resizing_changed_callback_list_;
+   base::RepeatingCallbackList<void(bool)>
+       on_expand_on_hover_enabled_changed_callback_list_;
++  base::RepeatingClosureList on_pinned_tabs_per_row_changed_callback_list_;
+   base::RepeatingCallbackList<void(VerticalTabStripStateController*)>
+       on_mode_will_change_callback_list_;
+   base::RepeatingCallbackList<void(VerticalTabStripStateController*)>
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -48,6 +48,12 @@ VerticalTabStripStateController::Registe
+ }
+ 
+ base::CallbackListSubscription
++VerticalTabStripStateController::RegisterOnPinnedTabsPerRowChanged(
++    base::RepeatingClosure callback) {
++  return on_pinned_tabs_per_row_changed_callback_list_.Add(std::move(callback));
++}
++
++base::CallbackListSubscription
+ VerticalTabStripStateController::RegisterOnModeWillChange(
+     StateChangedCallback callback) {
+   return on_mode_will_change_callback_list_.Add(std::move(callback));
+@@ -74,6 +80,10 @@ void VerticalTabStripStateController::No
+       expand_on_hover_enabled);
+ }
+ 
++void VerticalTabStripStateController::NotifyPinnedTabsPerRowChanged() {
++  on_pinned_tabs_per_row_changed_callback_list_.Notify();
++}
++
+ void VerticalTabStripStateController::NotifyModeWillChange() {
+   on_mode_will_change_callback_list_.Notify(this);
+ }
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.h
+@@ -49,6 +49,7 @@ class VerticalTabStripStateControllerImp
+   void SetVerticalTabsEnabled(bool enabled) override;
+   bool IsTabStripRightAligned() const override;
+   void SetTabStripRightAligned(bool right_aligned) override;
++  int GetPinnedTabsPerRow() const override;
+ 
+   std::unique_ptr<ScopedEnableStateLock> GetEnableStateLock() override;
+ 
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.cc
+@@ -68,6 +68,12 @@ VerticalTabStripStateControllerImpl::Ver
+       base::BindRepeating(&VerticalTabStripStateControllerImpl::OnModeChanged,
+                           base::Unretained(this)));
+ 
++  pref_change_registrar_.Add(
++      prefs::kHeliumVerticalPinnedTabsPerRow,
++      base::BindRepeating(
++          &VerticalTabStripStateControllerImpl::NotifyPinnedTabsPerRowChanged,
++          base::Unretained(this)));
++
+   if (IsVerticalTabsExpandOnHoverFeatureEnabled()) {
+     is_expand_on_hover_enabled_ =
+         pref_service_->GetBoolean(prefs::kVerticalTabsExpandOnHoverEnabled);
+@@ -193,6 +199,10 @@ void VerticalTabStripStateControllerImpl
+   pref_service_->SetBoolean(prefs::kHeliumVerticalRightAligned, right_aligned);
+ }
+ 
++int VerticalTabStripStateControllerImpl::GetPinnedTabsPerRow() const {
++  return pref_service_->GetInteger(prefs::kHeliumVerticalPinnedTabsPerRow);
++}
++
+ bool VerticalTabStripStateControllerImpl::IsCollapsed() const {
+   return state_.collapsed;
+ }
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
+@@ -85,6 +85,7 @@ class PinnedTabContainerView
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
+   base::CallbackListSubscription collapsed_state_changed_subscription_;
++  base::CallbackListSubscription pinned_tabs_per_row_changed_subscription_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_H_
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -72,6 +72,11 @@ PinnedTabContainerView::PinnedTabContain
+           state_controller->RegisterOnCollapseChanged(base::BindRepeating(
+               &PinnedTabContainerView::OnCollapseStateChanged,
+               base::Unretained(this)));
++      pinned_tabs_per_row_changed_subscription_ =
++          state_controller->RegisterOnPinnedTabsPerRowChanged(
++              base::BindRepeating(&PinnedTabContainerView::InvalidateLayout,
++                                  base::Unretained(this),
++                                  /*avoid_propagate_during_layout=*/false));
+     }
+   }
+ }
+@@ -412,17 +417,27 @@ views::ProposedLayout PinnedTabContainer
+         GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
+ 
+     // When we are in collapsed state, only one child should be shown per row.
+-    // During collapse animation and other cases, fit as many as possible.
++    // During collapse animation and other cases, fit as many as possible, up
++    // to the user's preferred number of pinned tabs per row.
++    int max_children_on_row =
++        static_cast<int>(std::floor((available_width - child_width) /
++                                    (child_width + kTabPadding))) +
++        1;
++    const auto* controller =
++        collection_node_ ? collection_node_->GetController() : nullptr;
++    const auto* state_controller =
++        controller ? controller->GetStateController() : nullptr;
++    const int pinned_tabs_per_row =
++        state_controller ? state_controller->GetPinnedTabsPerRow() : 0;
++    if (pinned_tabs_per_row > 0) {
++      max_children_on_row = std::min(max_children_on_row, pinned_tabs_per_row);
++    }
+     children_on_row =
+         tabs::IsVerticalTabsExpandOnHoverFeatureEnabled() &&
+                 collapse_state ==
+                     tabs::VerticalTabStripCollapseState::kCollapsed
+             ? 1
+-            : std::min(
+-                  children_on_row,
+-                  static_cast<int>(std::floor((available_width - child_width) /
+-                                              (child_width + kTabPadding)) +
+-                                   1));
++            : std::min(children_on_row, max_children_on_row);
+ 
+     // Allocate extra space to the tabs.
+     available_width -=
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -222,6 +222,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+   (*s_allowlist)[::prefs::kHeliumLayout] = settings_api::PrefType::kNumber;
+   (*s_allowlist)[::prefs::kHeliumVerticalRightAligned] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumVerticalPinnedTabsPerRow] =
++      settings_api::PrefType::kNumber;
+   (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumMinimalLocationBar] =
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -298,6 +298,12 @@
+     <message name="IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN" desc="Label for the toggle that displays vertical tabs on the right side of the browser window.">
+       Show vertical tabs on right side
+     </message>
++    <message name="IDS_SETTINGS_VERTICAL_PINNED_TABS_PER_ROW" desc="Label for the dropdown that controls how many pinned tabs are shown per row in the vertical tab strip.">
++      Pinned tabs per row
++    </message>
++    <message name="IDS_SETTINGS_VERTICAL_PINNED_TABS_PER_ROW_AUTOMATIC" desc="Option in the pinned tabs per row dropdown that fits as many pinned tabs per row as the vertical tab strip width allows.">
++      Automatic
++    </message>
+     <message name="IDS_SETTINGS_CENTERED_LOCATION_BAR" desc="Label for the toggle to use a centered address bar.">
+       Centered address bar
+     </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -614,6 +614,9 @@ void AddAppearanceStrings(content::WebUI
+       {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
+       {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
+       {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
++      {"verticalPinnedTabsPerRow", IDS_SETTINGS_VERTICAL_PINNED_TABS_PER_ROW},
++      {"verticalPinnedTabsPerRowAutomatic",
++       IDS_SETTINGS_VERTICAL_PINNED_TABS_PER_ROW_AUTOMATIC},
+       {"browserZenMode", IDS_SETTINGS_BROWSER_ZEN_MODE},
+       {"browserZenModeDescription", IDS_SETTINGS_BROWSER_ZEN_MODE_DESCRIPTION},
+       {"zenModePinSidebar", IDS_SETTINGS_ZEN_PIN_SIDEBAR},
+--- a/chrome/browser/resources/settings/appearance_page/appearance_layout_page.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_layout_page.ts
+@@ -3,6 +3,7 @@
+ // the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
+ import '../controls/controlled_radio_button.js';
++import '../controls/settings_dropdown_menu.js';
+ import '../controls/settings_radio_group.js';
+ import '../controls/settings_toggle_button.js';
+ import '../settings_page/settings_section.js';
+@@ -10,6 +11,7 @@ import '../settings_page/settings_sectio
+ import {PrefServiceObserverMixinLit} from '/shared/settings/prefs2/pref_service_observer_mixin_lit.js';
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
++import type {DropdownMenuOptionList} from '../controls/settings_dropdown_menu.js';
+ import {loadTimeData} from '../i18n_setup.js';
+ 
+ import {getCss} from './appearance_layout_page.css.js';
+@@ -53,6 +55,7 @@ export class SettingsAppearanceLayoutPag
+     return {
+       browserLayoutPref_: {type: Object},
+       browserLayoutOptions_: {type: Array},
++      pinnedTabsPerRowOptions_: {type: Array},
+       showVerticalTabsExpandOnHoverEnabled_: {type: Boolean},
+       zenModePref_: {type: Object},
+       zenModeSidebarPinnedPref_: {type: Object},
+@@ -94,6 +97,15 @@ export class SettingsAppearanceLayoutPag
+     },
+   ];
+ 
++  // 0 lets the vertical tab strip fit as many pinned tabs per row as possible.
++  protected accessor pinnedTabsPerRowOptions_: DropdownMenuOptionList = [
++    {
++      value: 0,
++      name: loadTimeData.getString('verticalPinnedTabsPerRowAutomatic'),
++    },
++    ...[1, 2, 3, 4, 5, 6].map(value => ({value, name: value.toLocaleString()})),
++  ];
++
+   protected accessor showVerticalTabsExpandOnHoverEnabled_: boolean =
+       loadTimeData.getBoolean('showVerticalTabsExpandOnHoverEnabled');
+ 
+--- a/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
+@@ -32,6 +32,16 @@ export function getHtml(this: SettingsAp
+       pref-key="helium.browser.vertical_right_aligned"
+       label="$i18n{tabStripRightAlign}">
+   </settings-toggle-button>
++  <div class="cr-row hr" ?hidden="${!this.showVerticalSettings_()}">
++    <div class="flex cr-padded-text" aria-hidden="true">
++      $i18n{verticalPinnedTabsPerRow}
++    </div>
++    <settings-dropdown-menu id="verticalPinnedTabsPerRow"
++        label="$i18n{verticalPinnedTabsPerRow}"
++        pref-key="helium.browser.vertical_pinned_tabs_per_row"
++        .menuOptions="${this.pinnedTabsPerRowOptions_}">
++    </settings-dropdown-menu>
++  </div>
+   <settings-toggle-button class="hr" disabled
+       ?hidden="${!this.showVerticalTabsExpandOnHoverSetting_() ||
+                  !this.isExpandOnHoverForcedByZenMode_()}"
