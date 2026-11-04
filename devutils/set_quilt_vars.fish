@@ -8,7 +8,8 @@ set REPO_ROOT (dirname (dirname (readlink -f (status current-filename))))
 
 set -gx QUILT_PATCHES "$REPO_ROOT/patches"
 
-set -gx QUILT_PUSH_ARGS "--color=auto"
+set -gx QUILT_PUSH_ARGS "--color=auto -q"
+set -gx QUILT_POP_ARGS "-q"
 set -gx QUILT_DIFF_OPTS "--show-c-function"
 set -gx QUILT_PATCH_OPTS "--unified --reject-format=unified"
 set -gx QUILT_DIFF_ARGS "-p ab --no-timestamps --no-index --color=auto"

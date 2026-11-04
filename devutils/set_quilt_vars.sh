@@ -14,7 +14,8 @@ export QUILT_PATCHES="$REPO_ROOT/patches"
 #export QUILT_SERIES=$(readlink -f "$REPO_ROOT/patches/series")
 
 # Options below borrowed from Debian and default quilt options (from /etc/quilt.quiltrc on Debian)
-export QUILT_PUSH_ARGS="--color=auto"
+export QUILT_PUSH_ARGS="--color=auto -q"
+export QUILT_POP_ARGS="-q"
 export QUILT_DIFF_OPTS="--show-c-function"
 export QUILT_PATCH_OPTS="--unified --reject-format=unified"
 export QUILT_DIFF_ARGS="-p ab --no-timestamps --no-index --color=auto"
