@@ -1,0 +1,293 @@
+--- a/components/translate/core/browser/BUILD.gn
++++ b/components/translate/core/browser/BUILD.gn
+@@ -54,6 +54,8 @@ static_library("browser") {
+     "translate_url_fetcher.h",
+     "translate_url_util.cc",
+     "translate_url_util.h",
++    "translation_provider.cc",
++    "translation_provider.h",
+   ]
+ 
+   deps = [
+--- /dev/null
++++ b/components/translate/core/browser/translation_provider.cc
+@@ -0,0 +1,123 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/translate/core/browser/translation_provider.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/feature_list.h"
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "components/translate/core/common/translate_features.h"
++
++namespace translate {
++
++namespace {
++
++std::vector<std::unique_ptr<TranslationProvider>>& GetProviders() {
++  static base::NoDestructor<std::vector<std::unique_ptr<TranslationProvider>>>
++      providers;
++  return *providers;
++}
++
++// Spreads the flat |translations| back over the runs in |shape|.
++void OnTextsTranslated(
++    std::vector<std::vector<bool>> shape,
++    TranslationSession::TranslateCallback callback,
++    const std::optional<std::vector<std::u16string>>& translations,
++    const std::string& source_lang,
++    TranslateErrors error) {
++  if (!translations) {
++    std::move(callback).Run(std::nullopt, source_lang, error);
++    return;
++  }
++
++  TranslationResult result;
++  result.reserve(shape.size());
++  auto translation = translations->begin();
++  for (const std::vector<bool>& runs : shape) {
++    std::vector<std::u16string>& segment = result.emplace_back();
++    segment.reserve(runs.size());
++    for (bool translate : runs) {
++      if (!translate) {
++        segment.emplace_back();
++        continue;
++      }
++
++      if (translation == translations->end()) {
++        std::move(callback).Run(std::nullopt, source_lang,
++                                TranslateErrors::TRANSLATION_ERROR);
++        return;
++      }
++
++      segment.push_back(*translation++);
++    }
++  }
++
++  if (translation != translations->end()) {
++    std::move(callback).Run(std::nullopt, source_lang,
++                            TranslateErrors::TRANSLATION_ERROR);
++    return;
++  }
++
++  std::move(callback).Run(result, source_lang, error);
++}
++
++}  // namespace
++
++TranslationSegment::TranslationSegment() = default;
++TranslationSegment::TranslationSegment(TranslationSegment&&) = default;
++TranslationSegment& TranslationSegment::operator=(TranslationSegment&&) =
++    default;
++TranslationSegment::~TranslationSegment() = default;
++
++TranslationRequest::TranslationRequest() = default;
++TranslationRequest::TranslationRequest(TranslationRequest&&) = default;
++TranslationRequest& TranslationRequest::operator=(TranslationRequest&&) =
++    default;
++TranslationRequest::~TranslationRequest() = default;
++
++void PlainTextTranslationSession::Translate(const TranslationRequest& request,
++                                            TranslateCallback callback) {
++  std::vector<std::u16string> texts;
++  std::vector<std::vector<bool>> shape;
++  shape.reserve(request.segments.size());
++  for (const TranslationSegment& segment : request.segments) {
++    std::vector<bool>& runs = shape.emplace_back();
++    for (const TranslationRun& run : segment.runs) {
++      runs.push_back(run.translate);
++      if (run.translate) {
++        texts.push_back(run.text);
++      }
++    }
++  }
++
++  TranslateTexts(request.source_lang, request.target_lang, std::move(texts),
++                 base::BindOnce(&OnTextsTranslated, std::move(shape),
++                                std::move(callback)));
++}
++
++void RegisterTranslationProvider(
++    std::unique_ptr<TranslationProvider> provider) {
++  GetProviders().push_back(std::move(provider));
++}
++
++bool HasTranslationProvider() {
++  return base::FeatureList::IsEnabled(kHeliumTranslate) &&
++         !GetProviders().empty();
++}
++
++TranslationProvider* GetTranslationProvider() {
++  if (!HasTranslationProvider()) {
++    return nullptr;
++  }
++
++  const auto& providers = GetProviders();
++  const auto it = std::ranges::find_if(
++      providers, [](const auto& provider) { return provider->IsAvailable(); });
++  return it == providers.end() ? nullptr : it->get();
++}
++
++}  // namespace translate
+--- /dev/null
++++ b/components/translate/core/browser/translation_provider.h
+@@ -0,0 +1,132 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_TRANSLATE_CORE_BROWSER_TRANSLATION_PROVIDER_H_
++#define COMPONENTS_TRANSLATE_CORE_BROWSER_TRANSLATION_PROVIDER_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "components/translate/core/common/translate_errors.h"
++
++class GURL;
++
++namespace translate {
++
++// Part of a sentence, split where inline elements such as links start and
++// end. Runs that aren't translated, like code, are still sent so that the
++// provider sees the whole sentence.
++struct TranslationRun {
++  std::u16string text;
++  bool translate = true;
++};
++
++// A sentence or paragraph of a page, or the value of an attribute.
++struct TranslationSegment {
++  TranslationSegment();
++  TranslationSegment(TranslationSegment&&);
++  TranslationSegment& operator=(TranslationSegment&&);
++  ~TranslationSegment();
++
++  std::vector<TranslationRun> runs;
++  // The lowercase tag of the element the text belongs to, e.g. "p", "h1",
++  // "button" or "title", or empty if unknown.
++  std::string element;
++  // The attribute the text comes from, e.g. "alt", or empty for element text.
++  std::string attribute;
++};
++
++struct TranslationRequest {
++  TranslationRequest();
++  TranslationRequest(TranslationRequest&&);
++  TranslationRequest& operator=(TranslationRequest&&);
++  ~TranslationRequest();
++
++  // Translate language codes. |source_lang| is "auto" when the page language
++  // is unknown, in which case the provider detects it.
++  std::string source_lang;
++  std::string target_lang;
++  // In page order, so that neighboring segments give each other context.
++  std::vector<TranslationSegment> segments;
++};
++
++// The translation of each run of each segment of a request. Strings for runs
++// that aren't translated are ignored, and empty strings keep the original.
++using TranslationResult = std::vector<std::vector<std::u16string>>;
++
++// Translates one document. Lives as long as the document, so it can keep state
++// across batches.
++class TranslationSession {
++ public:
++  // |translations| is nullopt on failure. |source_lang| is the language that
++  // was translated from.
++  using TranslateCallback = base::OnceCallback<void(
++      const std::optional<TranslationResult>& translations,
++      const std::string& source_lang,
++      TranslateErrors error)>;
++
++  virtual ~TranslationSession() = default;
++
++  // Can do its work elsewhere, e.g. in a utility process, but replies on the
++  // calling sequence. Runs |callback| unless the session is destroyed first.
++  virtual void Translate(const TranslationRequest& request,
++                         TranslateCallback callback) = 0;
++};
++
++// For providers that translate plain strings. Each translated run is sent on
++// its own, so these never deal with segments.
++class PlainTextTranslationSession : public TranslationSession {
++ public:
++  // |translations| matches the requested texts in order, or is nullopt on
++  // failure.
++  using TextsCallback = base::OnceCallback<void(
++      const std::optional<std::vector<std::u16string>>& translations,
++      const std::string& source_lang,
++      TranslateErrors error)>;
++
++  // TranslationSession:
++  void Translate(const TranslationRequest& request,
++                 TranslateCallback callback) final;
++
++ protected:
++  virtual void TranslateTexts(const std::string& source_lang,
++                              const std::string& target_lang,
++                              std::vector<std::u16string> texts,
++                              TextsCallback callback) = 0;
++};
++
++// Translates pages in place of the Google Translate Element. Only used on the
++// UI thread.
++class TranslationProvider {
++ public:
++  virtual ~TranslationProvider() = default;
++
++  // Whether the provider can translate right now.
++  virtual bool IsAvailable() const = 0;
++
++  // Whether page text stays on the device. Translation is offered offline and
++  // by default only for on-device providers.
++  virtual bool IsOnDevice() const = 0;
++
++  virtual std::unique_ptr<TranslationSession> StartSession(const GURL& url) = 0;
++};
++
++// Adds |provider| after the ones registered before it. Must be called before
++// profiles are created, as their default translate prefs depend on it.
++void RegisterTranslationProvider(std::unique_ptr<TranslationProvider> provider);
++
++// Whether a provider is registered and kHeliumTranslate is enabled, even if
++// none is available right now. For UI that is built once, like browser actions.
++bool HasTranslationProvider();
++
++// Returns the first available provider, or nullptr if there is none or
++// kHeliumTranslate is disabled.
++TranslationProvider* GetTranslationProvider();
++
++}  // namespace translate
++
++#endif  // COMPONENTS_TRANSLATE_CORE_BROWSER_TRANSLATION_PROVIDER_H_
+--- a/components/translate/core/common/translate_features.cc
++++ b/components/translate/core/common/translate_features.cc
+@@ -40,4 +40,6 @@ bool IsTranslateTriggerEnabled() {
+       kTranslateTrigger.name, base::FeatureList::OVERRIDE_ENABLE_FEATURE);
+ }
+ 
++BASE_FEATURE(kHeliumTranslate, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ }  // namespace translate
+--- a/components/translate/core/common/translate_features.h
++++ b/components/translate/core/common/translate_features.h
+@@ -40,6 +40,9 @@ BASE_DECLARE_FEATURE(kPartialTranslateUs
+ BASE_DECLARE_FEATURE(kTranslateTrigger);
+ bool IsTranslateTriggerEnabled();
+ 
++// Enables translation through registered TranslationProviders.
++BASE_DECLARE_FEATURE(kHeliumTranslate);
++
+ }  // namespace translate
+ 
+ #endif  // COMPONENTS_TRANSLATE_CORE_COMMON_TRANSLATE_FEATURES_H_
