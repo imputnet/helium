@@ -1,0 +1,292 @@
+--- a/chrome/browser/sync/BUILD.gn
++++ b/chrome/browser/sync/BUILD.gn
+@@ -79,6 +79,7 @@ source_set("sync") {
+     "//components/sync_tab_context",
+     "//components/translate/core/browser",
+     "//content/public/browser",
++    "//extensions/buildflags",
+ 
+     # TODO: Use //chrome/browser/ui instead after fixing cyclic dependency.
+     "//components/paint_preview/buildflags",
+@@ -95,6 +96,7 @@ source_set("sync") {
+     "//chrome/browser/consent_auditor",
+     "//chrome/browser/data_sharing",
+     "//chrome/browser/trusted_vault",
++    "//components/sync/engine",
+ 
+     # TODO(crbug.com/483063966) Investigate why putting contextual_tasks
+     # dependency behind !is_android leads to failures on android-binary-size.
+@@ -164,6 +166,7 @@ source_set("sync") {
+     "//components/spellcheck:buildflags",
+     "//components/spellcheck/browser",
+     "//components/strings:components_strings_grit",
++    "//components/sync/engine/sync_vault",
+     "//components/sync_bookmarks",
+     "//components/sync_preferences:features",
+     "//components/sync_preferences/cross_device_pref_tracker",
+@@ -240,7 +243,6 @@ source_set("sync") {
+       "glue/extension_setting_data_type_controller.cc",
+       "glue/extension_setting_data_type_controller.h",
+     ]
+-    public_deps += [ "//extensions/buildflags" ]
+     deps += [
+       "//extensions/browser",
+       "//extensions/browser/api/storage",
+@@ -248,7 +250,15 @@ source_set("sync") {
+     ]
+   }
+   if (enable_extensions) {
+-    deps += [ "//chrome/browser/web_applications" ]
++    sources += [
++      "extension_sync/extension_sync_vault_transport.cc",
++      "extension_sync/extension_sync_vault_transport.h",
++    ]
++
++    deps += [
++      "//chrome/browser/extensions/api/sync_vault_provider",
++      "//chrome/browser/web_applications",
++    ]
+   }
+   if (is_chromeos) {
+     sources += [
+--- /dev/null
++++ b/chrome/browser/sync/extension_sync/extension_sync_vault_transport.cc
+@@ -0,0 +1,184 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/sync/extension_sync/extension_sync_vault_transport.h"
++
++#include <limits>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/memory/ptr_util.h"
++#include "base/notreached.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/uuid.h"
++#include "content/public/browser/browser_thread.h"
++#include "extensions/common/extension.h"
++
++namespace browser_sync {
++namespace {
++namespace api = extensions::api::sync_vault_provider;
++using Service = extensions::SyncVaultProviderService;
++using Error = syncer::SyncVaultTransportError;
++
++Error MapFailure(const Service::ProviderFailure& failure) {
++  switch (failure.error) {
++    case api::SyncVaultProviderError::kAuthRequired:
++      return Error::kAuthenticationRequired;
++    case api::SyncVaultProviderError::kConflict:
++      return Error::kConflict;
++    case api::SyncVaultProviderError::kNetworkError:
++      return Error::kNetworkError;
++    case api::SyncVaultProviderError::kTemporaryError:
++      return Error::kTemporaryError;
++    case api::SyncVaultProviderError::kQuotaExceeded:
++      return Error::kQuotaExceeded;
++    case api::SyncVaultProviderError::kAccessDenied:
++      return Error::kAccessDenied;
++    case api::SyncVaultProviderError::kUnsupported:
++      return Error::kUnsupported;
++    case api::SyncVaultProviderError::kAborted:
++      return Error::kAborted;
++    case api::SyncVaultProviderError::kNotFound:
++    case api::SyncVaultProviderError::kInvalidData:
++    case api::SyncVaultProviderError::kNone:
++      return Error::kInvalidData;
++  }
++  NOTREACHED();
++}
++}  // namespace
++
++std::unique_ptr<syncer::SyncVaultTransport> ExtensionSyncVaultTransport::Create(
++    Service* service,
++    std::string uuid) {
++  auto provider = Open(service, std::move(uuid));
++  return provider ? syncer::MakeSynchronousVaultTransport(std::move(provider))
++                  : nullptr;
++}
++
++std::unique_ptr<syncer::SyncVaultAsyncTransport>
++ExtensionSyncVaultTransport::Open(Service* service, std::string uuid) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!service || !base::Uuid::ParseLowercase(uuid).is_valid() ||
++      !service->GetSelectedProvider()) {
++    return nullptr;
++  }
++  return base::WrapUnique(new ExtensionSyncVaultTransport(
++      service->GetWeakPtr(), service->GetSelectedProvider()->id(),
++      std::move(uuid)));
++}
++
++ExtensionSyncVaultTransport::ExtensionSyncVaultTransport(
++    base::WeakPtr<Service> service,
++    std::string provider_id,
++    std::string uuid)
++    : service_(std::move(service)),
++      provider_id_(std::move(provider_id)),
++      vault_uuid_(std::move(uuid)) {}
++
++bool ExtensionSyncVaultTransport::IsAvailable() const {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  return service_ && service_->GetSelectedProvider() &&
++         service_->GetSelectedProvider()->id() == provider_id_;
++}
++
++ExtensionSyncVaultTransport::Request ExtensionSyncVaultTransport::OwnRequest(
++    int id) {
++  return Request(base::BindOnce(
++      [](base::WeakPtr<Service> service, int id) {
++        if (service && id) {
++          service->CancelRequest(id);
++        }
++      },
++      service_, id));
++}
++
++ExtensionSyncVaultTransport::Request ExtensionSyncVaultTransport::ReadObject(
++    std::string id,
++    size_t maximum,
++    ReadCallback callback) {
++  if (!IsAvailable()) {
++    std::move(callback).Run(base::unexpected(Error::kAborted));
++    return {};
++  }
++  if (maximum > std::numeric_limits<int>::max()) {
++    std::move(callback).Run(base::unexpected(Error::kInvalidData));
++    return {};
++  }
++  return OwnRequest(service_->ReadObject(
++      vault_uuid_, id, base::checked_cast<int>(maximum),
++      base::BindOnce(
++          [](ReadCallback callback, Service::Response response) {
++            if (!response.has_value()) {
++              if (response.error().error ==
++                  api::SyncVaultProviderError::kNotFound) {
++                std::move(callback).Run(std::nullopt);
++              } else {
++                std::move(callback).Run(
++                    base::unexpected(MapFailure(response.error())));
++              }
++              return;
++            }
++            std::move(callback).Run(syncer::OpaqueSyncVaultObject{
++                std::move(*response->success->data),
++                std::move(*response->success->revision)});
++          },
++          std::move(callback))));
++}
++
++ExtensionSyncVaultTransport::Request ExtensionSyncVaultTransport::WriteObject(
++    std::string id,
++    std::optional<std::string> revision,
++    std::vector<uint8_t> data,
++    std::optional<uint32_t> epoch,
++    WriteCallback callback) {
++  if (!IsAvailable()) {
++    std::move(callback).Run(base::unexpected(Error::kAborted));
++    return {};
++  }
++  if (epoch && *epoch > std::numeric_limits<int>::max()) {
++    std::move(callback).Run(base::unexpected(Error::kInvalidData));
++    return {};
++  }
++  return OwnRequest(service_->WriteObject(
++      vault_uuid_, id, std::move(data), std::move(revision),
++      epoch ? std::make_optional(base::checked_cast<int>(*epoch))
++            : std::nullopt,
++      base::BindOnce(
++          [](WriteCallback callback, Service::Response response) {
++            if (!response.has_value()) {
++              std::move(callback).Run(
++                  base::unexpected(MapFailure(response.error())));
++              return;
++            }
++            std::move(callback).Run(std::move(*response->success->revision));
++          },
++          std::move(callback))));
++}
++
++ExtensionSyncVaultTransport::Request
++ExtensionSyncVaultTransport::CollectEpochsBefore(uint32_t epoch,
++                                                 CollectCallback callback) {
++  if (!IsAvailable()) {
++    std::move(callback).Run(base::unexpected(Error::kAborted));
++    return {};
++  }
++  if (epoch == 0 || epoch > std::numeric_limits<int>::max()) {
++    std::move(callback).Run(base::unexpected(Error::kInvalidData));
++    return {};
++  }
++  return OwnRequest(service_->CollectEpochs(
++      vault_uuid_, base::checked_cast<int>(epoch),
++      base::BindOnce(
++          [](CollectCallback callback, Service::Response response) {
++            if (!response.has_value()) {
++              std::move(callback).Run(
++                  base::unexpected(MapFailure(response.error())));
++              return;
++            }
++            std::move(callback).Run(base::ok());
++          },
++          std::move(callback))));
++}
++
++}  // namespace browser_sync
+--- /dev/null
++++ b/chrome/browser/sync/extension_sync/extension_sync_vault_transport.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_SYNC_EXTENSION_SYNC_EXTENSION_SYNC_VAULT_TRANSPORT_H_
++#define CHROME_BROWSER_SYNC_EXTENSION_SYNC_EXTENSION_SYNC_VAULT_TRANSPORT_H_
++
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/extensions/api/sync_vault_provider/sync_vault_provider_service.h"
++#include "components/sync/engine/sync_vault/sync_vault_async_transport.h"
++
++namespace browser_sync {
++
++// Converts extension broker messages into the provider-neutral asynchronous
++// vault contract. Request IDs never cross this boundary.
++class ExtensionSyncVaultTransport final
++    : public syncer::SyncVaultAsyncTransport {
++ public:
++  static std::unique_ptr<syncer::SyncVaultTransport> Create(
++      extensions::SyncVaultProviderService* service,
++      std::string vault_uuid);
++  static std::unique_ptr<syncer::SyncVaultAsyncTransport> Open(
++      extensions::SyncVaultProviderService* service,
++      std::string vault_uuid);
++
++  Request ReadObject(std::string id,
++                     size_t maximum,
++                     ReadCallback callback) override;
++  Request WriteObject(std::string id,
++                      std::optional<std::string> revision,
++                      std::vector<uint8_t> data,
++                      std::optional<uint32_t> epoch,
++                      WriteCallback callback) override;
++  Request CollectEpochsBefore(uint32_t epoch,
++                              CollectCallback callback) override;
++
++ private:
++  ExtensionSyncVaultTransport(
++      base::WeakPtr<extensions::SyncVaultProviderService> service,
++      std::string provider_id,
++      std::string vault_uuid);
++  bool IsAvailable() const;
++  Request OwnRequest(int request_id);
++  base::WeakPtr<extensions::SyncVaultProviderService> service_;
++  const std::string provider_id_;
++  const std::string vault_uuid_;
++};
++
++}  // namespace browser_sync
++
++#endif  // CHROME_BROWSER_SYNC_EXTENSION_SYNC_EXTENSION_SYNC_VAULT_TRANSPORT_H_

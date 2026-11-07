@@ -1,17 +1,18 @@
 --- a/components/sync/engine/BUILD.gn
 +++ b/components/sync/engine/BUILD.gn
-@@ -95,6 +95,10 @@ static_library("engine") {
-     "events/protocol_event_buffer.cc",
-     "events/protocol_event_buffer.h",
-     "events/protocol_event_observer.h",
+@@ -161,6 +161,11 @@ static_library("engine") {
+     "sync_status_tracker.h",
+     "sync_string_conversions.cc",
+     "sync_string_conversions.h",
++    "sync_vault/sync_vault_async_transport.cc",
 +    "sync_vault/sync_vault_backend.cc",
 +    "sync_vault/sync_vault_backend.h",
 +    "sync_vault/sync_vault_connection_manager.cc",
 +    "sync_vault/sync_vault_connection_manager.h",
-     "forwarding_data_type_processor.cc",
-     "forwarding_data_type_processor.h",
-     "get_updates_delegate.cc",
-@@ -183,6 +187,7 @@ static_library("engine") {
+     "syncer.cc",
+     "syncer.h",
+     "syncer_error.cc",
+@@ -183,6 +188,7 @@ static_library("engine") {
      "//base",
      "//components/signin/public/identity_manager",
      "//components/sync/base",
@@ -396,3 +397,332 @@
 +}  // namespace syncer
 +
 +#endif  // COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_CONNECTION_MANAGER_H_
+--- a/base/threading/thread_restrictions.h
++++ b/base/threading/thread_restrictions.h
+@@ -437,6 +437,7 @@ class ObfuscatedFileUtil;
+ namespace syncer {
+ class GetLocalChangesRequest;
+ class HttpBridge;
++class SyncVaultTransportScopedAllowBaseSyncPrimitives;
+ }  // namespace syncer
+ namespace tracing {
+ class EmergencyTraceFinalisationCoordinator;
+@@ -812,6 +813,7 @@ class BASE_EXPORT ScopedAllowBaseSyncPri
+   friend class storage::ObfuscatedFileUtil;
+   friend class syncer::HttpBridge;
+   friend class syncer::GetLocalChangesRequest;
++  friend class syncer::SyncVaultTransportScopedAllowBaseSyncPrimitives;
+   friend class updater::SystemctlLauncherScopedAllowBaseSyncPrimitives;
+   friend class webnn::WebNNTensorImpl;
+ 
+--- a/components/sync/engine/sync_vault/BUILD.gn
++++ b/components/sync/engine/sync_vault/BUILD.gn
+@@ -12,6 +12,7 @@ proto_library("sync_vault_proto") {
+ 
+ source_set("sync_vault") {
+   sources = [
++    "sync_vault_async_transport.h",
+     "sync_vault_cryptographer.cc",
+     "sync_vault_cryptographer.h",
+     "sync_vault_format.cc",
+--- /dev/null
++++ b/components/sync/engine/sync_vault/sync_vault_async_transport.cc
+@@ -0,0 +1,246 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/sync/engine/sync_vault/sync_vault_async_transport.h"
++
++#include <utility>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/ref_counted_delete_on_sequence.h"
++#include "base/memory/weak_ptr.h"
++#include "base/synchronization/lock.h"
++#include "base/synchronization/waitable_event.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/threading/thread_restrictions.h"
++#include "base/time/time.h"
++#include "components/sync/engine/cancelation_signal.h"
++
++namespace syncer {
++
++class [[maybe_unused,
++        nodiscard]] SyncVaultTransportScopedAllowBaseSyncPrimitives
++    : public base::ScopedAllowBaseSyncPrimitives {};
++
++namespace {
++
++class Connection : public base::RefCountedDeleteOnSequence<Connection> {
++ public:
++  explicit Connection(std::unique_ptr<SyncVaultAsyncTransport> provider)
++      : base::RefCountedDeleteOnSequence<Connection>(
++            base::SequencedTaskRunner::GetCurrentDefault()),
++        provider(std::move(provider)),
++        runner(base::SequencedTaskRunner::GetCurrentDefault()) {}
++  std::unique_ptr<SyncVaultAsyncTransport> provider;
++  const scoped_refptr<base::SequencedTaskRunner> runner;
++
++ private:
++  friend class base::RefCountedDeleteOnSequence<Connection>;
++  friend class base::DeleteHelper<Connection>;
++  ~Connection() = default;
++};
++
++template <typename Result>
++class PendingCall : public base::RefCountedThreadSafe<PendingCall<Result>>,
++                    public CancelationSignal::Observer {
++ public:
++  explicit PendingCall(scoped_refptr<base::SequencedTaskRunner> runner)
++      : request_(nullptr, base::OnTaskRunnerDeleter(std::move(runner))) {}
++
++  void Complete(Result result) {
++    base::AutoLock lock(lock_);
++    if (!result_) {
++      result_ = std::move(result);
++      completed_.Signal();
++    }
++  }
++  void InstallRequest(SyncVaultAsyncTransport::Request request) {
++    request_.reset(new SyncVaultAsyncTransport::Request(std::move(request)));
++  }
++  bool HasResult() {
++    base::AutoLock lock(lock_);
++    return result_.has_value();
++  }
++  void ReleaseRequest() { request_.reset(); }
++
++  Result Wait(CancelationSignal* signal) {
++    bool registered = signal && signal->TryRegisterHandler(this);
++    if (signal && !registered) {
++      OnCancelationSignalReceived();
++    }
++    {
++      SyncVaultTransportScopedAllowBaseSyncPrimitives allow_wait;
++      if (!completed_.TimedWait(base::Minutes(2) + base::Seconds(5),
++                                FROM_HERE)) {
++        Complete(base::unexpected(SyncVaultTransportError::kTemporaryError));
++      }
++    }
++    if (registered) {
++      signal->UnregisterHandler(this);
++    }
++    base::AutoLock lock(lock_);
++    return std::move(*result_);
++  }
++  void OnCancelationSignalReceived() override {
++    Complete(base::unexpected(SyncVaultTransportError::kAborted));
++  }
++
++ private:
++  friend class base::RefCountedThreadSafe<PendingCall<Result>>;
++  ~PendingCall() override = default;
++  base::Lock lock_;
++  base::WaitableEvent completed_;
++  std::optional<Result> result_ GUARDED_BY(lock_);
++  std::unique_ptr<SyncVaultAsyncTransport::Request, base::OnTaskRunnerDeleter>
++      request_;
++};
++
++class CollectionCall : public base::RefCountedDeleteOnSequence<CollectionCall> {
++ public:
++  CollectionCall(scoped_refptr<Connection> connection,
++                 SyncVaultTransport::CollectCallback callback)
++      : base::RefCountedDeleteOnSequence<CollectionCall>(connection->runner),
++        connection_(std::move(connection)),
++        callback_(std::move(callback)) {}
++  void Start(uint32_t epoch) {
++    if (finished_) {
++      return;
++    }
++    auto request = connection_->provider->CollectEpochsBefore(
++        epoch,
++        base::BindOnce(&CollectionCall::Complete, base::WrapRefCounted(this)));
++    if (!finished_) {
++      request_ = std::move(request);
++    }
++  }
++  void Cancel() {
++    Complete(base::unexpected(SyncVaultTransportError::kAborted));
++  }
++
++ private:
++  friend class base::RefCountedDeleteOnSequence<CollectionCall>;
++  friend class base::DeleteHelper<CollectionCall>;
++  ~CollectionCall() = default;
++  void Complete(SyncVaultTransport::CollectResult result) {
++    if (finished_) {
++      return;
++    }
++    finished_ = true;
++    request_.RunAndReset();
++    std::move(callback_).Run(std::move(result));
++  }
++  scoped_refptr<Connection> connection_;
++  SyncVaultTransport::CollectCallback callback_;
++  SyncVaultAsyncTransport::Request request_;
++  bool finished_ = false;
++};
++
++class SynchronousVaultTransport final : public SyncVaultTransport {
++ public:
++  explicit SynchronousVaultTransport(scoped_refptr<Connection> connection)
++      : connection_(std::move(connection)) {}
++  ~SynchronousVaultTransport() override {
++    if (collection_) {
++      connection_->runner->PostTask(
++          FROM_HERE, base::BindOnce(&CollectionCall::Cancel, collection_));
++    }
++  }
++  void SetCancelationSignal(CancelationSignal* signal) override {
++    CHECK(signal);
++    CHECK(!signal_);
++    signal_ = signal;
++  }
++  ReadResult ReadObject(const std::string& id, size_t maximum) override {
++    return Run<ReadResult>(base::BindOnce(
++        [](std::string id, size_t maximum, SyncVaultAsyncTransport* provider,
++           SyncVaultAsyncTransport::ReadCallback callback) {
++          return provider->ReadObject(std::move(id), maximum,
++                                      std::move(callback));
++        },
++        id, maximum));
++  }
++  WriteResult WriteObject(const std::string& id,
++                          std::optional<std::string> revision,
++                          std::vector<uint8_t> data,
++                          std::optional<uint32_t> epoch) override {
++    return Run<WriteResult>(base::BindOnce(
++        [](std::string id, std::optional<std::string> revision,
++           std::vector<uint8_t> data, std::optional<uint32_t> epoch,
++           SyncVaultAsyncTransport* provider,
++           SyncVaultAsyncTransport::WriteCallback callback) {
++          return provider->WriteObject(std::move(id), std::move(revision),
++                                       std::move(data), epoch,
++                                       std::move(callback));
++        },
++        id, std::move(revision), std::move(data), epoch));
++  }
++  void CollectEpochsBefore(uint32_t epoch, CollectCallback callback) override {
++    if (!base::SequencedTaskRunner::HasCurrentDefault()) {
++      // Setup verification may use a one-off ThreadPool task. Collection
++      // belongs to the long-lived engine sequence, where replies can return.
++      std::move(callback).Run(
++          base::unexpected(SyncVaultTransportError::kUnsupported));
++      return;
++    }
++    if (collection_) {
++      connection_->runner->PostTask(
++          FROM_HERE, base::BindOnce(&CollectionCall::Cancel, collection_));
++    }
++    collection_ = base::MakeRefCounted<CollectionCall>(
++        connection_,
++        base::BindPostTask(base::SequencedTaskRunner::GetCurrentDefault(),
++                           std::move(callback)));
++    connection_->runner->PostTask(
++        FROM_HERE, base::BindOnce(&CollectionCall::Start, collection_, epoch));
++  }
++
++ private:
++  template <typename Result>
++  Result Run(base::OnceCallback<SyncVaultAsyncTransport::Request(
++                 SyncVaultAsyncTransport*,
++                 base::OnceCallback<void(Result)>)> start) {
++    CHECK(!connection_->runner->RunsTasksInCurrentSequence());
++    if (signal_ && signal_->IsSignalled()) {
++      return base::unexpected(SyncVaultTransportError::kAborted);
++    }
++    auto call = base::MakeRefCounted<PendingCall<Result>>(connection_->runner);
++    if (!connection_->runner->PostTask(
++            FROM_HERE,
++            base::BindOnce(
++                [](scoped_refptr<Connection> connection,
++                   scoped_refptr<PendingCall<Result>> call,
++                   decltype(start) start) {
++                  if (call->HasResult()) {
++                    return;
++                  }
++                  call->InstallRequest(std::move(start).Run(
++                      connection->provider.get(),
++                      base::BindOnce(&PendingCall<Result>::Complete, call)));
++                },
++                connection_, call, std::move(start)))) {
++      call->Complete(base::unexpected(SyncVaultTransportError::kAborted));
++    }
++    Result result = call->Wait(signal_);
++    connection_->runner->PostTask(
++        FROM_HERE, base::BindOnce(&PendingCall<Result>::ReleaseRequest, call));
++    return result;
++  }
++  scoped_refptr<Connection> connection_;
++  scoped_refptr<CollectionCall> collection_;
++  raw_ptr<CancelationSignal> signal_ = nullptr;
++};
++
++}  // namespace
++
++std::unique_ptr<SyncVaultTransport> MakeSynchronousVaultTransport(
++    std::unique_ptr<SyncVaultAsyncTransport> provider) {
++  CHECK(provider);
++  return std::make_unique<SynchronousVaultTransport>(
++      base::MakeRefCounted<Connection>(std::move(provider)));
++}
++
++}  // namespace syncer
+--- /dev/null
++++ b/components/sync/engine/sync_vault/sync_vault_async_transport.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_ASYNC_TRANSPORT_H_
++#define COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_ASYNC_TRANSPORT_H_
++
++#include <memory>
++
++#include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
++#include "components/sync/engine/sync_vault/sync_vault_transport.h"
++
++namespace syncer {
++
++// One vault connection, used and destroyed on its owning sequence. Callbacks
++// may run synchronously. Destroying a request cancels it; destroying a
++// completed request is harmless. The provider must never invoke a callback
++// twice.
++class SyncVaultAsyncTransport {
++ public:
++  using Request = base::ScopedClosureRunner;
++  using ReadCallback = base::OnceCallback<void(SyncVaultTransport::ReadResult)>;
++  using WriteCallback =
++      base::OnceCallback<void(SyncVaultTransport::WriteResult)>;
++  using CollectCallback =
++      base::OnceCallback<void(SyncVaultTransport::CollectResult)>;
++  virtual ~SyncVaultAsyncTransport() = default;
++
++  virtual Request ReadObject(std::string object_id,
++                             size_t maximum_bytes,
++                             ReadCallback callback) = 0;
++  virtual Request WriteObject(std::string object_id,
++                              std::optional<std::string> expected_revision,
++                              std::vector<uint8_t> data,
++                              std::optional<uint32_t> retention_epoch,
++                              WriteCallback callback) = 0;
++  virtual Request CollectEpochsBefore(uint32_t minimum_retained_epoch,
++                                      CollectCallback callback) = 0;
++};
++
++// Construct on the provider sequence, then transfer to the Sync sequence.
++// Only this compatibility adapter waits for asynchronous provider operations.
++std::unique_ptr<SyncVaultTransport> MakeSynchronousVaultTransport(
++    std::unique_ptr<SyncVaultAsyncTransport> provider);
++
++}  // namespace syncer
++
++#endif  // COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_ASYNC_TRANSPORT_H_
