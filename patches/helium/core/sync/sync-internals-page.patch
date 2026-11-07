@@ -1,0 +1,611 @@
+--- a/components/browser_sync/sync_internals_message_handler.cc
++++ b/components/browser_sync/sync_internals_message_handler.cc
+@@ -70,8 +70,12 @@ SyncInternalsMessageHandler::SyncInterna
+     const std::string& channel)
+     : SyncInternalsMessageHandler(
+           delegate,
+-          base::BindRepeating(&syncer::sync_ui_util::ConstructAboutInformation,
+-                              syncer::sync_ui_util::IncludeSensitiveData(true)),
++          base::BindRepeating(
++              [](syncer::SyncService* service, const std::string& channel) {
++                return syncer::sync_ui_util::ConstructAboutInformation(
++                    syncer::sync_ui_util::IncludeSensitiveData(true), service,
++                    channel);
++              }),
+           identity_manager,
+           sync_service,
+           sync_invalidations_service,
+@@ -111,6 +115,10 @@ void SyncInternalsMessageHandler::Disabl
+   invalidations_observation_.Reset();
+ }
+ 
++void SyncInternalsMessageHandler::RefreshAboutInfo() {
++  SendAboutInfoAndEntityCounts();
++}
++
+ base::flat_map<std::string, SyncInternalsMessageHandler::PageMessageHandler>
+ SyncInternalsMessageHandler::GetMessageHandlerMap() {
+   return {
+--- a/components/browser_sync/sync_internals_message_handler.h
++++ b/components/browser_sync/sync_internals_message_handler.h
+@@ -101,6 +101,9 @@ class SyncInternalsMessageHandler : publ
+   // SendEventToPage() or ResolvePageCallback().
+   void DisableMessagesToPage();
+ 
++  // Recomputes the About page data after an embedder-owned dependency changes.
++  void RefreshAboutInfo();
++
+  private:
+   // Synchronously fetches updated aboutInfo and sends it to the page in the
+   // form of an onAboutInfoUpdated event. The entity counts for each data type
+--- a/components/sync/service/sync_internals_util.cc
++++ b/components/sync/service/sync_internals_util.cc
+@@ -81,6 +81,8 @@ base::ListValue TypeStatusMapToValueList
+ // 'stat_status'.
+ class StatBase {
+  public:
++  void Hide() { visible_ = false; }
++  bool visible() const { return visible_; }
+   base::DictValue ToValue() const {
+     return base::DictValue()
+         .Set("stat_name", base::Value(key_))
+@@ -98,6 +100,7 @@ class StatBase {
+   }
+ 
+  private:
++  bool visible_ = true;
+   std::string key_;
+   base::Value value_;
+   std::string status_ = kUninitializedCSSClass;
+@@ -118,6 +121,9 @@ class Stat : public StatBase {
+ // list of fields.
+ class Section {
+  public:
++  void Hide() { visible_ = false; }
++  bool visible() const { return visible_; }
++  void SetTitle(std::string title) { title_ = std::move(title); }
+   Section(const std::string& title, bool is_sensitive)
+       : title_(title), is_sensitive_(is_sensitive) {}
+ 
+@@ -132,7 +138,9 @@ class Section {
+   base::DictValue ToValue() const {
+     base::ListValue stats;
+     for (const std::unique_ptr<StatBase>& stat : stats_) {
+-      stats.Append(stat->ToValue());
++      if (stat->visible()) {
++        stats.Append(stat->ToValue());
++      }
+     }
+     return base::DictValue()
+         .Set("title", base::Value(title_))
+@@ -154,6 +162,7 @@ class Section {
+   std::string title_;
+   std::vector<std::unique_ptr<StatBase>> stats_;
+   bool is_sensitive_ = false;
++  bool visible_ = true;
+ };
+ 
+ class SectionList {
+@@ -172,7 +181,8 @@ class SectionList {
+   base::ListValue ToValue(IncludeSensitiveData include_sensitive_data) const {
+     base::ListValue result;
+     for (const std::unique_ptr<Section>& section : sections_) {
+-      if (include_sensitive_data || !section->is_sensitive()) {
++      if (section->visible() &&
++          (include_sensitive_data || !section->is_sensitive())) {
+         result.Append(section->ToValue());
+       }
+     }
+@@ -357,7 +367,8 @@ std::string TransportStateStringToDebugS
+ base::DictValue ConstructAboutInformation(
+     IncludeSensitiveData include_sensitive_data,
+     SyncService* service,
+-    const std::string& channel) {
++    const std::string& channel,
++    bool include_account_details) {
+   base::DictValue about_info;
+ 
+   SectionList section_list;
+@@ -487,6 +498,19 @@ base::DictValue ConstructAboutInformatio
+       section_that_cycle->AddIntStat("Committed Count");
+ 
+   // Populate all the fields we declared above.
++  if (!include_account_details) {
++    section_identity->Hide();
++    section_credentials->Hide();
++    section_encryption->Hide();
++    feature_enabled->Hide();
++    auth_error->Hide();
++    server_url->Hide();
++    server_connection->Hide();
++    is_local_sync_enabled->Hide();
++    local_backend_path->Hide();
++    are_notifications_enabled->Hide();
++    section_local->SetTitle("Engine State");
++  }
+   client_version->Set(GetVersionString(channel));
+ 
+   if (!service) {
+@@ -709,7 +733,7 @@ base::DictValue ConstructAboutInformatio
+   // Sync-the-feature should not be enabled on mobile platforms, where the
+   // sync-to-signin migration is completed.
+   const bool allow_enabling_sync_the_feature =
+-      !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_IOS);
++      include_account_details && !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_IOS);
+ 
+   about_info.Set("allow_enabling_sync_the_feature",
+                  base::Value(allow_enabling_sync_the_feature));
+--- a/components/sync/service/sync_internals_util.h
++++ b/components/sync/service/sync_internals_util.h
+@@ -85,7 +85,8 @@ std::string TransportStateStringToDebugS
+ base::DictValue ConstructAboutInformation(
+     IncludeSensitiveData include_sensitive_data,
+     SyncService* service,
+-    const std::string& channel);
++    const std::string& channel,
++    bool include_account_details = true);
+ 
+ }  // namespace sync_ui_util
+ 
+--- a/components/sync/service/resources/about.ts
++++ b/components/sync/service/resources/about.ts
+@@ -267,14 +267,14 @@ function initStatusDumpButton() {
+   const dumpStatusButton = document.querySelector<HTMLElement>('#dump-status');
+   assert(dumpStatusButton);
+   dumpStatusButton.addEventListener('click', () => {
+-    const aboutInfoCopy = aboutInfo;
+     const includeIds = document.querySelector<HTMLInputElement>('#include-ids');
+     assert(includeIds);
+-    if (!includeIds.checked) {
+-      aboutInfoCopy.details = aboutInfo.details.filter(function(el) {
+-        return !el.is_sensitive;
+-      });
+-    }
++    const aboutInfoCopy: AboutInfo = {
++      ...aboutInfo,
++      details: includeIds.checked ?
++          aboutInfo.details :
++          aboutInfo.details.filter(detail => !detail.is_sensitive),
++    };
+     const dataToDump = {
+       aboutInfo: aboutInfoCopy,
+       protocolEvents: protocolEvents,
+--- a/chrome/browser/ui/webui/sync_internals/BUILD.gn
++++ b/chrome/browser/ui/webui/sync_internals/BUILD.gn
+@@ -5,6 +5,8 @@
+ source_set("sync_internals") {
+   sources = [
+     "chrome_sync_internals_message_handler.cc",
++    "private_sync_internals_util.cc",
++    "private_sync_internals_util.h",
+     "sync_internals_ui.cc",
+   ]
+   public = [
+@@ -17,12 +19,16 @@ source_set("sync_internals") {
+   ]
+   deps = [
+     "//base",
++    "//chrome/browser/extensions/api/sync_vault_provider",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/signin",
+     "//chrome/browser/sync",
++    "//chrome/common/extensions/api",
+     "//components/browser_sync",
++    "//components/prefs",
+     "//components/sync/service",
+     "//components/sync/service/resources",
++    "//extensions/common",
+     "//services/network/public/mojom",
+     "//ui/webui",
+   ]
+--- a/chrome/browser/ui/webui/sync_internals/chrome_sync_internals_message_handler.cc
++++ b/chrome/browser/ui/webui/sync_internals/chrome_sync_internals_message_handler.cc
+@@ -5,24 +5,72 @@
+ #include "chrome/browser/ui/webui/sync_internals/chrome_sync_internals_message_handler.h"
+ 
+ #include <algorithm>
++#include <optional>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
+ #include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
++#include "chrome/browser/ui/webui/sync_internals/private_sync_internals_util.h"
++#include "components/prefs/pref_service.h"
+ 
+ ChromeSyncInternalsMessageHandler::ChromeSyncInternalsMessageHandler(
++    Profile* profile,
+     signin::IdentityManager* identity_manager,
+     syncer::SyncService* sync_service,
+     syncer::SyncInvalidationsService* sync_invalidations_service,
+     syncer::UserEventService* user_event_service,
+     const std::string& channel)
+-    : message_handler_(this,
+-                       identity_manager,
+-                       sync_service,
+-                       sync_invalidations_service,
+-                       user_event_service,
+-                       channel) {}
++    : message_handler_(
++          this,
++          base::BindRepeating(&ConstructHeliumSyncInternalsAboutInformation,
++                              profile),
++          identity_manager,
++          sync_service,
++          sync_invalidations_service,
++          user_event_service,
++          channel) {
++  pref_change_registrar_.Init(profile->GetPrefs());
++  pref_change_registrar_.Add(
++      browser_sync::private_sync_prefs::kConfiguration,
++      base::BindRepeating(
++          &ChromeSyncInternalsMessageHandler::RefreshPrivateSyncInfo,
++          base::Unretained(this)));
++  pref_change_registrar_.Add(
++      browser_sync::private_sync_prefs::kDiagnostics,
++      base::BindRepeating(
++          &ChromeSyncInternalsMessageHandler::RefreshPrivateSyncInfo,
++          base::Unretained(this)));
++  if (extensions::SyncVaultProviderService* provider_service =
++          extensions::SyncVaultProviderServiceFactory::GetForBrowserContext(
++              profile)) {
++    provider_service_observation_.Observe(provider_service);
++  }
++}
++
++void ChromeSyncInternalsMessageHandler::OnSyncVaultProviderStateChanged(
++    extensions::api::sync_vault_provider::ProviderState) {
++  RefreshPrivateSyncInfo();
++}
++
++void ChromeSyncInternalsMessageHandler::OnSyncVaultProviderSelectionChanged(
++    const std::optional<extensions::ExtensionId>&) {
++  RefreshPrivateSyncInfo();
++}
++
++void ChromeSyncInternalsMessageHandler::OnSyncVaultProviderAvailabilityChanged(
++    bool) {
++  RefreshPrivateSyncInfo();
++}
++
++void ChromeSyncInternalsMessageHandler::RefreshPrivateSyncInfo() {
++  if (IsJavascriptAllowed()) {
++    message_handler_.RefreshAboutInfo();
++  }
++}
+ 
+ void ChromeSyncInternalsMessageHandler::SendEventToPage(
+     std::string_view event_name,
+--- a/chrome/browser/ui/webui/sync_internals/chrome_sync_internals_message_handler.h
++++ b/chrome/browser/ui/webui/sync_internals/chrome_sync_internals_message_handler.h
+@@ -5,11 +5,17 @@
+ #ifndef CHROME_BROWSER_UI_WEBUI_SYNC_INTERNALS_CHROME_SYNC_INTERNALS_MESSAGE_HANDLER_H_
+ #define CHROME_BROWSER_UI_WEBUI_SYNC_INTERNALS_CHROME_SYNC_INTERNALS_MESSAGE_HANDLER_H_
+ 
++#include <optional>
+ #include <string>
+ 
++#include "base/scoped_observation.h"
++#include "chrome/browser/extensions/api/sync_vault_provider/sync_vault_provider_service.h"
+ #include "components/browser_sync/sync_internals_message_handler.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "content/public/browser/web_ui_message_handler.h"
+ 
++class Profile;
++
+ namespace signin {
+ class IdentityManager;
+ }  // namespace signin
+@@ -23,9 +29,11 @@ class UserEventService;
+ // Chrome-specific implementation of SyncInternalsMessageHandler.
+ class ChromeSyncInternalsMessageHandler
+     : public browser_sync::SyncInternalsMessageHandler::Delegate,
++      public extensions::SyncVaultProviderService::Observer,
+       public content::WebUIMessageHandler {
+  public:
+   ChromeSyncInternalsMessageHandler(
++      Profile* profile,
+       signin::IdentityManager* identity_manager,
+       syncer::SyncService* sync_service,
+       syncer::SyncInvalidationsService* sync_invalidations_service,
+@@ -50,14 +58,26 @@ class ChromeSyncInternalsMessageHandler
+   void OnJavascriptDisallowed() override;
+ 
+  private:
++  // extensions::SyncVaultProviderService::Observer overrides.
++  void OnSyncVaultProviderStateChanged(
++      extensions::api::sync_vault_provider::ProviderState state) override;
++  void OnSyncVaultProviderSelectionChanged(
++      const std::optional<extensions::ExtensionId>& extension_id) override;
++  void OnSyncVaultProviderAvailabilityChanged(bool available) override;
++
+   // When handling a message page from the page, this class might want to reply
+   // back, which requires javascript to be enabled. This wrapper ensures it.
+   void AllowJavascriptAndHandleMessage(
+       const browser_sync::SyncInternalsMessageHandler::PageMessageHandler&
+           handler,
+       const base::ListValue& args);
++  void RefreshPrivateSyncInfo();
+ 
+   browser_sync::SyncInternalsMessageHandler message_handler_;
++  PrefChangeRegistrar pref_change_registrar_;
++  base::ScopedObservation<extensions::SyncVaultProviderService,
++                          extensions::SyncVaultProviderService::Observer>
++      provider_service_observation_{this};
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_WEBUI_SYNC_INTERNALS_CHROME_SYNC_INTERNALS_MESSAGE_HANDLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/webui/sync_internals/private_sync_internals_util.cc
+@@ -0,0 +1,228 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/sync_internals/private_sync_internals_util.h"
++
++#include <algorithm>
++#include <initializer_list>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/time/time.h"
++#include "chrome/browser/extensions/api/sync_vault_provider/sync_vault_provider_service.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sync/private_sync/private_sync_prefs.h"
++#include "components/prefs/pref_service.h"
++#include "components/sync/base/time.h"
++#include "components/sync/engine/sync_status.h"
++#include "components/sync/service/sync_backend_type.h"
++#include "components/sync/service/sync_internals_util.h"
++#include "components/sync/service/sync_service.h"
++#include "extensions/common/extension.h"
++
++namespace {
++
++namespace provider_api = extensions::api::sync_vault_provider;
++
++base::DictValue MakeStat(std::string name,
++                         std::string value,
++                         bool is_good = true) {
++  return base::DictValue()
++      .Set("stat_name", std::move(name))
++      .Set("stat_value", std::move(value))
++      .Set("stat_status", is_good ? "" : "in_bad_state");
++}
++
++base::DictValue MakeSection(std::string title,
++                            bool is_sensitive,
++                            base::ListValue data) {
++  return base::DictValue()
++      .Set("title", std::move(title))
++      .Set("data", std::move(data))
++      .Set("is_sensitive", is_sensitive);
++}
++
++std::string ProviderStateName(
++    std::optional<provider_api::ProviderState> state) {
++  if (!state || *state == provider_api::ProviderState::kNone) {
++    return "UNKNOWN";
++  }
++  return provider_api::ToString(*state);
++}
++
++std::string ReconciliationErrorName(
++    std::optional<browser_sync::private_sync_prefs::ReconciliationError>
++        error) {
++  using Error = browser_sync::private_sync_prefs::ReconciliationError;
++  if (!error) {
++    return "NONE";
++  }
++  switch (*error) {
++    case Error::kAuthenticationRequired:
++      return "AUTHENTICATION_REQUIRED";
++    case Error::kConflict:
++      return "CONFLICT";
++    case Error::kNetwork:
++      return "NETWORK";
++    case Error::kTemporary:
++      return "TEMPORARY";
++    case Error::kQuotaExceeded:
++      return "QUOTA_EXCEEDED";
++    case Error::kAccessDenied:
++      return "ACCESS_DENIED";
++    case Error::kInvalidData:
++      return "INVALID_DATA";
++    case Error::kUnsupported:
++      return "UNSUPPORTED";
++    case Error::kAborted:
++      return "ABORTED";
++    case Error::kRollback:
++      return "ROLLBACK";
++    case Error::kFork:
++      return "FORK";
++    case Error::kIncompleteHistory:
++      return "INCOMPLETE_HISTORY";
++    case Error::kCheckpointPersistence:
++      return "CHECKPOINT_PERSISTENCE";
++  }
++}
++
++std::string DiagnosticTime(base::Time time) {
++  return time.is_null() ? "Never" : syncer::GetTimeDebugString(time);
++}
++
++}  // namespace
++
++base::DictValue ConstructHeliumSyncInternalsAboutInformation(
++    Profile* profile,
++    syncer::SyncService* service,
++    const std::string& channel) {
++  base::DictValue about_info = syncer::sync_ui_util::ConstructAboutInformation(
++      syncer::sync_ui_util::IncludeSensitiveData(true), service, channel,
++      /*include_account_details=*/false);
++
++  base::ListValue* details = about_info.FindList("details");
++  if (!details) {
++    return about_info;
++  }
++
++  PrefService* prefs = profile->GetPrefs();
++  std::optional<browser_sync::private_sync_prefs::Configuration> configuration =
++      browser_sync::private_sync_prefs::ReadConfiguration(*prefs);
++  std::optional<browser_sync::private_sync_prefs::Diagnostics> diagnostics =
++      browser_sync::private_sync_prefs::ReadDiagnostics(*prefs);
++  if (diagnostics && (!configuration ||
++                      diagnostics->vault_uuid != configuration->vault_uuid)) {
++    diagnostics.reset();
++  }
++
++  extensions::SyncVaultProviderService* provider_service =
++      extensions::SyncVaultProviderServiceFactory::GetForBrowserContext(
++          profile);
++  const extensions::Extension* provider =
++      provider_service ? provider_service->GetSelectedProvider() : nullptr;
++  const bool selected_provider_matches =
++      configuration &&
++      configuration->provider.kind ==
++          browser_sync::private_sync::ProviderKind::kExtension &&
++      provider_service &&
++      provider_service->selected_provider_id() == configuration->provider.id;
++  std::optional<provider_api::ProviderState> provider_state;
++  if (selected_provider_matches) {
++    provider_state = provider_service->selected_provider_state();
++  }
++
++  const bool custom_backend_active =
++      service &&
++      service->GetSyncBackendType() == syncer::SyncBackendType::kCustom;
++  base::ListValue private_sync;
++  private_sync.Append(
++      MakeStat("Backend", configuration ? "Extension provider" : "None"));
++  private_sync.Append(MakeStat(
++      "Status",
++      custom_backend_active
++          ? "Active"
++          : (configuration ? "Configured, inactive" : "Not configured"),
++      !configuration || custom_backend_active));
++  if (configuration) {
++    private_sync.Append(MakeStat("Provider",
++                                 provider && selected_provider_matches
++                                     ? provider->name()
++                                     : "Unavailable",
++                                 provider && selected_provider_matches));
++    private_sync.Append(
++        MakeStat("Provider state", ProviderStateName(provider_state),
++                 provider_state == provider_api::ProviderState::kReady));
++    private_sync.Append(MakeStat(
++        "Key recovery",
++        configuration->key_mode ==
++                browser_sync::private_sync_prefs::KeyMode::kAccountBoundEnvelope
++            ? "Provider account"
++            : "Recovery key"));
++  }
++
++  if (diagnostics) {
++    private_sync.Append(
++        MakeStat("Accepted generation",
++                 base::NumberToString(diagnostics->accepted_generation)));
++    private_sync.Append(MakeStat("Commit digest prefix",
++                                 diagnostics->head_digest_prefix.empty()
++                                     ? "Not available"
++                                     : diagnostics->head_digest_prefix));
++    private_sync.Append(MakeStat(
++        "Entities", diagnostics->state_statistics_available
++                        ? base::NumberToString(diagnostics->entity_count)
++                        : "Not available"));
++    private_sync.Append(
++        MakeStat("State size",
++                 diagnostics->state_statistics_available
++                     ? base::NumberToString(diagnostics->state_bytes) + " bytes"
++                     : "Not available"));
++    private_sync.Append(
++        MakeStat("Last attempt", DiagnosticTime(diagnostics->last_attempt)));
++    private_sync.Append(
++        MakeStat("Last success", DiagnosticTime(diagnostics->last_success)));
++    private_sync.Append(
++        MakeStat("Last error", ReconciliationErrorName(diagnostics->last_error),
++                 !diagnostics->last_error));
++  } else if (configuration) {
++    private_sync.Append(MakeStat("Accepted generation", "Not available"));
++    private_sync.Append(MakeStat("Last attempt", "Never"));
++    private_sync.Append(MakeStat("Last success", "Never"));
++    private_sync.Append(MakeStat("Last error", "NONE"));
++  }
++
++  if (service) {
++    syncer::SyncStatus status;
++    if (service->QueryDetailedSyncStatusForDebugging(&status) &&
++        status.retry_time > base::Time::Now()) {
++      private_sync.Append(
++          MakeStat("Retry delay",
++                   base::NumberToString(
++                       (status.retry_time - base::Time::Now()).InSeconds()) +
++                       " seconds"));
++    } else {
++      private_sync.Append(MakeStat("Retry delay", "None"));
++    }
++  }
++
++  details->Insert(details->begin(),
++                  base::Value(MakeSection("Private Sync",
++                                          /*is_sensitive=*/false,
++                                          std::move(private_sync))));
++  if (configuration) {
++    base::ListValue identifiers;
++    identifiers.Append(MakeStat("Provider kind", "extension"));
++    identifiers.Append(MakeStat("Provider ID", configuration->provider.id));
++    identifiers.Append(MakeStat("Vault UUID", configuration->vault_uuid));
++    details->Insert(details->begin() + 1,
++                    base::Value(MakeSection("Private Sync Identifiers",
++                                            /*is_sensitive=*/true,
++                                            std::move(identifiers))));
++  }
++  return about_info;
++}
+--- /dev/null
++++ b/chrome/browser/ui/webui/sync_internals/private_sync_internals_util.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SYNC_INTERNALS_PRIVATE_SYNC_INTERNALS_UTIL_H_
++#define CHROME_BROWSER_UI_WEBUI_SYNC_INTERNALS_PRIVATE_SYNC_INTERNALS_UTIL_H_
++
++#include <string>
++
++#include "base/values.h"
++
++class Profile;
++
++namespace syncer {
++class SyncService;
++}  // namespace syncer
++
++// Builds the chrome://sync-internals About payload for Helium. It adds the
++// private-vault transport state and removes account-sync fields that Helium
++// does not support.
++base::DictValue ConstructHeliumSyncInternalsAboutInformation(
++    Profile* profile,
++    syncer::SyncService* service,
++    const std::string& channel);
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SYNC_INTERNALS_PRIVATE_SYNC_INTERNALS_UTIL_H_
+--- a/chrome/browser/ui/webui/sync_internals/sync_internals_ui.cc
++++ b/chrome/browser/ui/webui/sync_internals/sync_internals_ui.cc
+@@ -48,7 +48,7 @@ SyncInternalsUI::SyncInternalsUI(content
+ 
+   auto* profile = Profile::FromWebUI(web_ui)->GetOriginalProfile();
+   web_ui->AddMessageHandler(std::make_unique<ChromeSyncInternalsMessageHandler>(
+-      IdentityManagerFactory::GetForProfile(profile),
++      profile, IdentityManagerFactory::GetForProfile(profile),
+       SyncServiceFactory::GetForProfile(profile),
+       SyncInvalidationsServiceFactory::GetForProfile(profile),
+       browser_sync::UserEventServiceFactory::GetForProfile(profile),
