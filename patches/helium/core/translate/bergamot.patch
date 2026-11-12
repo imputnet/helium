@@ -1,0 +1,1688 @@
+--- a/chrome/browser/chrome_browser_main_linux.cc
++++ b/chrome/browser/chrome_browser_main_linux.cc
+@@ -13,17 +13,25 @@
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
++#include "base/path_service.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/lifetime/application_lifetime_desktop.h"
+ #include "chrome/common/chrome_features.h"
++#include "chrome/common/chrome_paths.h"
++#include "components/on_device_translation/buildflags/buildflags.h"
+ #include "components/password_manager/core/browser/password_manager_switches.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "device/bluetooth/dbus/bluez_dbus_manager.h"
+ #include "ui/base/l10n/l10n_util.h"
+ 
++#if BUILDFLAG(ENABLE_ON_DEVICE_TRANSLATION)
++#include "components/on_device_translation/bergamot_translation_provider.h"
++#include "components/translate/core/browser/translation_provider.h"
++#endif
++
+ #if BUILDFLAG(IS_LINUX)
+ #include "ui/ozone/public/ozone_platform.h"
+ #if BUILDFLAG(USE_DBUS)
+@@ -108,6 +116,15 @@ void ChromeBrowserMainPartsLinux::PrePro
+       base::BindOnce(base::IgnoreResult(&base::GetLinuxDistro)));
+ #endif
+ 
++#if BUILDFLAG(ENABLE_ON_DEVICE_TRANSLATION)
++  base::FilePath user_data_dir;
++  if (base::PathService::Get(chrome::DIR_USER_DATA, &user_data_dir)) {
++    translate::RegisterTranslationProvider(
++        std::make_unique<on_device_translation::BergamotTranslationProvider>(
++            user_data_dir.AppendASCII("TranslationModels")));
++  }
++#endif
++
+   ChromeBrowserMainPartsPosix::PreProfileInit();
+ }
+ 
+--- a/components/on_device_translation/BUILD.gn
++++ b/components/on_device_translation/BUILD.gn
+@@ -42,6 +42,8 @@ source_set("translation_installer") {
+ 
+ source_set("on_device_translation") {
+   sources = [
++    "bergamot_translation_provider.cc",
++    "bergamot_translation_provider.h",
+     "component_manager.cc",
+     "component_manager.h",
+     "service_controller.cc",
+@@ -68,6 +70,9 @@ source_set("on_device_translation") {
+     "//components/component_updater",
+     "//components/language/core/browser",
+     "//components/on_device_translation/public/mojom",
++    "//components/on_device_translation/service:file_operation_proxy",
++    "//components/translate/core/browser",
++    "//components/translate/core/common",
+     "//components/user_prefs",
+     "//mojo/public/cpp/bindings",
+     "//mojo/public/cpp/system",
+--- /dev/null
++++ b/components/on_device_translation/bergamot_translation_provider.cc
+@@ -0,0 +1,236 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/on_device_translation/bergamot_translation_provider.h"
++
++#include <memory>
++#include <optional>
++
++#include "base/files/file_enumerator.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "components/on_device_translation/service/file_operation_proxy_impl.h"
++#include "components/translate/core/common/translate_errors.h"
++#include "content/public/browser/service_process_host.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++namespace on_device_translation {
++
++namespace {
++
++using Packages =
++    std::vector<std::pair<std::pair<std::string, std::string>, base::FilePath>>;
++
++// Must match kAutoDetectionLanguage in translate_agent.cc.
++constexpr char kAutoLanguage[] = "auto";
++
++std::vector<base::FilePath> GetSubdirectories(const base::FilePath& dir) {
++  std::vector<base::FilePath> subdirectories;
++  base::FileEnumerator enumerator(dir, /*recursive=*/false,
++                                  base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath path = enumerator.Next(); !path.empty();
++       path = enumerator.Next()) {
++    subdirectories.push_back(std::move(path));
++  }
++
++  return subdirectories;
++}
++
++Packages FindPackages(const base::FilePath& models_dir) {
++  Packages packages;
++  for (const base::FilePath& source_dir : GetSubdirectories(models_dir)) {
++    for (const base::FilePath& target_dir : GetSubdirectories(source_dir)) {
++      packages.emplace_back(
++          std::make_pair(source_dir.BaseName().AsUTF8Unsafe(),
++                         target_dir.BaseName().AsUTF8Unsafe()),
++          target_dir);
++    }
++  }
++
++  return packages;
++}
++
++void OnTranslated(
++    size_t text_count,
++    const std::string& source_lang,
++    translate::PlainTextTranslationSession::TextsCallback callback,
++    const std::optional<std::vector<std::string>>& outputs) {
++  if (!outputs || outputs->size() != text_count) {
++    std::move(callback).Run(std::nullopt, source_lang,
++                            translate::TranslateErrors::TRANSLATION_ERROR);
++    return;
++  }
++
++  std::vector<std::u16string> translations;
++  translations.reserve(outputs->size());
++  for (const std::string& output : *outputs) {
++    translations.push_back(base::UTF8ToUTF16(output));
++  }
++
++  std::move(callback).Run(std::move(translations), source_lang,
++                          translate::TranslateErrors::NONE);
++}
++
++}  // namespace
++
++// Lets each page's session share the provider's service.
++class BergamotTranslationProvider::Session
++    : public translate::PlainTextTranslationSession {
++ public:
++  explicit Session(base::WeakPtr<BergamotTranslationProvider> provider)
++      : provider_(std::move(provider)) {}
++
++ protected:
++  // translate::PlainTextTranslationSession:
++  void TranslateTexts(const std::string& source_lang,
++                      const std::string& target_lang,
++                      std::vector<std::u16string> texts,
++                      TextsCallback callback) override {
++    if (!provider_) {
++      std::move(callback).Run(std::nullopt, source_lang,
++                              translate::TranslateErrors::TRANSLATION_ERROR);
++      return;
++    }
++
++    provider_->Translate(source_lang, target_lang, std::move(texts),
++                         std::move(callback));
++  }
++
++ private:
++  base::WeakPtr<BergamotTranslationProvider> provider_;
++};
++
++BergamotTranslationProvider::BergamotTranslationProvider(
++    base::FilePath models_dir)
++    : models_dir_(std::move(models_dir)) {}
++
++BergamotTranslationProvider::~BergamotTranslationProvider() = default;
++
++std::string BergamotTranslationProvider::GetId() const {
++  return "bergamot";
++}
++
++std::u16string BergamotTranslationProvider::GetName() const {
++  return u"Bergamot";
++}
++
++bool BergamotTranslationProvider::IsAvailable() const {
++  return true;
++}
++
++bool BergamotTranslationProvider::SendsTextOffDevice() const {
++  return false;
++}
++
++std::unique_ptr<translate::TranslationSession>
++BergamotTranslationProvider::StartSession(const GURL& url) {
++  return std::make_unique<Session>(weak_ptr_factory_.GetWeakPtr());
++}
++
++void BergamotTranslationProvider::Translate(const std::string& source_lang,
++                                            const std::string& target_lang,
++                                            std::vector<std::u16string> texts,
++                                            TextsCallback callback) {
++  // TODO: detect the language, since models only exist for specific ones.
++  if (source_lang == kAutoLanguage) {
++    std::move(callback).Run(std::nullopt, source_lang,
++                            translate::TranslateErrors::UNKNOWN_LANGUAGE);
++    return;
++  }
++
++  if (!service_) {
++    pending_requests_.push_back(base::BindOnce(
++        &BergamotTranslationProvider::Translate, weak_ptr_factory_.GetWeakPtr(),
++        source_lang, target_lang, std::move(texts), std::move(callback)));
++    if (!launching_) {
++      launching_ = true;
++      base::ThreadPool::PostTaskAndReplyWithResult(
++          FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++          base::BindOnce(&FindPackages, models_dir_),
++          base::BindOnce(&BergamotTranslationProvider::LaunchService,
++                         weak_ptr_factory_.GetWeakPtr()));
++    }
++
++    return;
++  }
++
++  const LanguagePair languages(source_lang, target_lang);
++  mojo::Remote<mojom::OnDeviceTranslator>& translator = translators_[languages];
++  if (!translator) {
++    // Requests are queued until the translator is created. If that fails,
++    // the translator disconnects, and they fail with it.
++    service_->CreateTranslator(
++        source_lang, target_lang, translator.BindNewPipeAndPassReceiver(),
++        base::DoNothingAs<void(mojom::CreateTranslatorResult)>());
++    translator.reset_on_disconnect();
++  }
++
++  std::vector<std::string> inputs;
++  inputs.reserve(texts.size());
++  for (const std::u16string& text : texts) {
++    inputs.push_back(base::UTF16ToUTF8(text));
++  }
++
++  translator->TranslateBatch(
++      std::move(inputs), mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++                             base::BindOnce(&OnTranslated, texts.size(),
++                                            source_lang, std::move(callback)),
++                             std::optional<std::vector<std::string>>()));
++}
++
++void BergamotTranslationProvider::LaunchService(Packages packages) {
++  launching_ = false;
++  content::ServiceProcessHost::Launch(
++      service_.BindNewPipeAndPassReceiver(),
++      content::ServiceProcessHost::Options()
++          .WithDisplayName("Helium Translation Service")
++          .Pass());
++  service_.set_disconnect_handler(
++      base::BindOnce(&BergamotTranslationProvider::OnServiceDisconnected,
++                     base::Unretained(this)));
++
++  auto config = mojom::OnDeviceTranslationServiceConfig::New();
++  std::vector<base::FilePath> package_paths;
++  for (auto& [languages, path] : packages) {
++    config->packages.push_back(mojom::OnDeviceTranslationLanguagePackage::New(
++        languages.first, languages.second));
++    package_paths.push_back(std::move(path));
++  }
++
++  // The proxy opens files from |package_paths| for the sandboxed service, on
++  // a sequence that can block.
++  scoped_refptr<base::SequencedTaskRunner> task_runner =
++      base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE});
++  task_runner->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](mojo::PendingReceiver<mojom::FileOperationProxy> receiver,
++             scoped_refptr<base::SequencedTaskRunner> task_runner,
++             std::vector<base::FilePath> package_paths) {
++            mojo::MakeSelfOwnedReceiver(
++                std::make_unique<FileOperationProxyImpl>(
++                    std::move(task_runner), std::move(package_paths)),
++                std::move(receiver));
++          },
++          config->file_operation_proxy.InitWithNewPipeAndPassReceiver(),
++          task_runner, std::move(package_paths)));
++  service_->SetServiceConfig(std::move(config));
++
++  for (base::OnceClosure& request : std::exchange(pending_requests_, {})) {
++    std::move(request).Run();
++  }
++}
++
++void BergamotTranslationProvider::OnServiceDisconnected() {
++  // Models may have been added since, so they're found again on relaunch.
++  service_.reset();
++  translators_.clear();
++}
++
++}  // namespace on_device_translation
+--- /dev/null
++++ b/components/on_device_translation/bergamot_translation_provider.h
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_ON_DEVICE_TRANSLATION_BERGAMOT_TRANSLATION_PROVIDER_H_
++#define COMPONENTS_ON_DEVICE_TRANSLATION_BERGAMOT_TRANSLATION_PROVIDER_H_
++
++#include <map>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback_forward.h"
++#include "base/memory/weak_ptr.h"
++#include "components/on_device_translation/public/mojom/on_device_translation_service.mojom.h"
++#include "components/on_device_translation/public/mojom/translator.mojom.h"
++#include "components/translate/core/browser/translation_provider.h"
++#include "mojo/public/cpp/bindings/remote.h"
++
++namespace on_device_translation {
++
++// Translates pages with bergamot in the on-device translation service, using
++// Firefox's models from |models_dir|. The model that translates from one
++// language to another is in |models_dir|/<from>/<to>, named like Firefox's
++// without their languages: model.bin, lex.bin, and vocab.spm or
++// srcvocab.spm and trgvocab.spm.
++class BergamotTranslationProvider : public translate::TranslationProvider {
++ public:
++  explicit BergamotTranslationProvider(base::FilePath models_dir);
++  ~BergamotTranslationProvider() override;
++
++  BergamotTranslationProvider(const BergamotTranslationProvider&) = delete;
++  BergamotTranslationProvider& operator=(const BergamotTranslationProvider&) =
++      delete;
++
++  // translate::TranslationProvider:
++  std::string GetId() const override;
++  std::u16string GetName() const override;
++  bool IsAvailable() const override;
++  bool SendsTextOffDevice() const override;
++  std::unique_ptr<translate::TranslationSession> StartSession(
++      const GURL& url) override;
++
++ private:
++  class Session;
++
++  using LanguagePair = std::pair<std::string, std::string>;
++  using TextsCallback = translate::PlainTextTranslationSession::TextsCallback;
++
++  // Translates for all sessions, which share the service and its translators.
++  void Translate(const std::string& source_lang,
++                 const std::string& target_lang,
++                 std::vector<std::u16string> texts,
++                 TextsCallback callback);
++
++  void LaunchService(
++      std::vector<std::pair<LanguagePair, base::FilePath>> packages);
++  void OnServiceDisconnected();
++
++  const base::FilePath models_dir_;
++
++  mojo::Remote<mojom::OnDeviceTranslationService> service_;
++  std::map<LanguagePair, mojo::Remote<mojom::OnDeviceTranslator>> translators_;
++  // Requests that wait for the service to launch, if it is launching.
++  std::vector<base::OnceClosure> pending_requests_;
++  bool launching_ = false;
++
++  base::WeakPtrFactory<BergamotTranslationProvider> weak_ptr_factory_{this};
++};
++
++}  // namespace on_device_translation
++
++#endif  // COMPONENTS_ON_DEVICE_TRANSLATION_BERGAMOT_TRANSLATION_PROVIDER_H_
+--- /dev/null
++++ b/third_party/bergamot/BUILD.gn
+@@ -0,0 +1,239 @@
++# Copyright 2026 The Helium Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# Builds the parts of bergamot-translator and its marian fork that are needed
++# to translate text with Firefox's models on the cpu.
++
++config("bergamot_config") {
++  include_dirs = [
++    "src",
++    "marian-fork/src",
++    "marian-fork/src/3rd_party",
++    "marian-fork/src/3rd_party/intgemm",
++    "marian-fork/src/3rd_party/pathie-cpp/include",
++    "shims/include",
++    "shims/ssplit",
++
++    # bergamot includes some of marian's headers from the top.
++    ".",
++  ]
++
++  # The same reduced feature set that Firefox builds as wasm, without threads.
++  defines = [
++    "COMPILE_CPU=1",
++    "USE_RUY_SGEMM=1",
++    "USE_SENTENCEPIECE",
++    "WASM_COMPATIBLE_SOURCE",
++    "WITHOUT_EXCEPTIONS",
++
++    # For std::result_of, which marian and CLI11 still use.
++    "_LIBCPP_ENABLE_CXX20_REMOVED_TYPE_TRAITS",
++  ]
++
++  if (current_cpu == "x64" || current_cpu == "x86") {
++    defines += [
++      "USE_INTGEMM=1",
++      "USE_SSE2",
++    ]
++  }
++}
++
++config("bergamot_warnings") {
++  if (is_clang) {
++    cflags = [
++      "-Wno-delete-non-abstract-non-virtual-dtor",
++      "-Wno-deprecated-declarations",
++      "-Wno-deprecated-this-capture",
++      "-Wno-mismatched-tags",
++      "-Wno-pessimizing-move",
++      "-Wno-reorder-ctor",
++      "-Wno-unknown-pragmas",
++      "-Wno-unused-function",
++      "-Wno-unused-lambda-capture",
++      "-Wno-unused-private-field",
++      "-Wno-unused-result",
++      "-Wno-unused-value",
++    ]
++  }
++}
++
++# Separate from bergamot, which has a parser.cpp too.
++source_set("yaml_cpp") {
++  visibility = [ ":bergamot" ]
++  sources = [
++    "marian-fork/src/3rd_party/yaml-cpp/binary_renamed.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/contrib/graphbuilder.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/contrib/graphbuilderadapter.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/convert.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/directives.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/emit.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/emitfromevents.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/emitter.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/emitterstate.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/emitterutils.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/exceptions.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/exp.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/memory.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/node_data.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/nodebuilder.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/nodeevents.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/null.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/ostream_wrapper.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/parse.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/parser.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/regex_yaml.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/scanner.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/scanscalar.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/scantag.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/scantoken.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/simplekey.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/singledocparser.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/stream.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/tag.cpp",
++    "marian-fork/src/3rd_party/yaml-cpp/yaml-node.cpp",
++  ]
++
++  configs -= [
++    "//build/config/compiler:chromium_code",
++    "//build/config/compiler:no_exceptions",
++    "//build/config/compiler:no_rtti",
++  ]
++  configs += [
++    "//build/config/compiler:exceptions",
++    "//build/config/compiler:no_chromium_code",
++    "//build/config/compiler:rtti",
++    ":bergamot_config",
++    ":bergamot_warnings",
++  ]
++}
++
++source_set("bergamot") {
++  sources = [
++    # bergamot-translator
++    "src/translator/aggregate_batching_pool.cpp",
++    "src/translator/annotation.cpp",
++    "src/translator/batch.cpp",
++    "src/translator/batching_pool.cpp",
++    "src/translator/byte_array_util.cpp",
++    "src/translator/html.cpp",
++    "src/translator/parser.cpp",
++    "src/translator/quality_estimator.cpp",
++    "src/translator/request.cpp",
++    "src/translator/response.cpp",
++    "src/translator/response_builder.cpp",
++    "src/translator/service.cpp",
++    "src/translator/text_processor.cpp",
++    "src/translator/translation_model.cpp",
++    "src/translator/xh_scanner.cpp",
++
++    # marian
++    "marian-fork/src/common/aliases.cpp",
++    "marian-fork/src/common/binary.cpp",
++    "marian-fork/src/common/cli_helper.cpp",
++    "marian-fork/src/common/cli_wrapper.cpp",
++    "marian-fork/src/common/config.cpp",
++    "marian-fork/src/common/config_parser.cpp",
++    "marian-fork/src/common/config_validator.cpp",
++    "marian-fork/src/common/fastopt.cpp",
++    "marian-fork/src/common/file_stream.cpp",
++    "marian-fork/src/common/file_utils.cpp",
++    "marian-fork/src/common/filesystem.cpp",
++    "marian-fork/src/common/io.cpp",
++    "marian-fork/src/common/logging.cpp",
++    "marian-fork/src/common/options.cpp",
++    "marian-fork/src/common/signal_handling.cpp",
++    "marian-fork/src/common/types.cpp",
++    "marian-fork/src/common/utils.cpp",
++    "marian-fork/src/common/version.cpp",
++    "marian-fork/src/data/alignment.cpp",
++    "marian-fork/src/data/corpus.cpp",
++    "marian-fork/src/data/corpus_base.cpp",
++    "marian-fork/src/data/corpus_nbest.cpp",
++    "marian-fork/src/data/default_vocab.cpp",
++    "marian-fork/src/data/factored_vocab.cpp",
++    "marian-fork/src/data/sentencepiece_vocab.cpp",
++    "marian-fork/src/data/shortlist.cpp",
++    "marian-fork/src/data/text_input.cpp",
++    "marian-fork/src/data/vocab.cpp",
++    "marian-fork/src/embedder/vector_collector.cpp",
++    "marian-fork/src/graph/expression_graph.cpp",
++    "marian-fork/src/graph/expression_operators.cpp",
++    "marian-fork/src/graph/node.cpp",
++    "marian-fork/src/graph/node_initializers.cpp",
++    "marian-fork/src/graph/node_operators.cpp",
++    "marian-fork/src/layers/convolution.cpp",
++    "marian-fork/src/layers/generic.cpp",
++    "marian-fork/src/layers/loss.cpp",
++    "marian-fork/src/layers/weight.cpp",
++    "marian-fork/src/models/encoder_decoder.cpp",
++    "marian-fork/src/models/model_factory.cpp",
++    "marian-fork/src/models/transformer_stub.cpp",
++    "marian-fork/src/optimizers/clippers.cpp",
++    "marian-fork/src/optimizers/optimizers.cpp",
++    "marian-fork/src/rescorer/score_collector.cpp",
++    "marian-fork/src/rnn/attention.cpp",
++    "marian-fork/src/rnn/cells.cpp",
++    "marian-fork/src/tensors/backend.cpp",
++    "marian-fork/src/tensors/cpu/device.cpp",
++    "marian-fork/src/tensors/cpu/integer_common.cpp",
++    "marian-fork/src/tensors/cpu/prod.cpp",
++    "marian-fork/src/tensors/cpu/tensor_operators.cpp",
++    "marian-fork/src/tensors/cpu/topk.cpp",
++    "marian-fork/src/tensors/cpu/wasm_intgemm_fallback.cpp",
++    "marian-fork/src/tensors/rand.cpp",
++    "marian-fork/src/tensors/tensor.cpp",
++    "marian-fork/src/translator/beam_search.cpp",
++    "marian-fork/src/translator/helpers.cpp",
++    "marian-fork/src/translator/history.cpp",
++    "marian-fork/src/translator/nth_element.cpp",
++    "marian-fork/src/translator/output_collector.cpp",
++    "marian-fork/src/translator/output_printer.cpp",
++    "marian-fork/src/translator/scorers.cpp",
++
++    # marian's vendored dependencies
++    "marian-fork/src/3rd_party/cnpy/cnpy.cpp",
++    "marian-fork/src/3rd_party/pathie-cpp/src/entry_iterator.cpp",
++    "marian-fork/src/3rd_party/pathie-cpp/src/errors.cpp",
++    "marian-fork/src/3rd_party/pathie-cpp/src/path.cpp",
++    "marian-fork/src/3rd_party/pathie-cpp/src/pathie.cpp",
++    "marian-fork/src/3rd_party/pathie-cpp/src/pathie_ifstream.cpp",
++    "marian-fork/src/3rd_party/pathie-cpp/src/pathie_ofstream.cpp",
++    "marian-fork/src/3rd_party/pathie-cpp/src/temp.cpp",
++    "marian-fork/src/3rd_party/phf/phf.cc",
++
++    # Replacements for generated files and dependencies.
++    "helium/bergamot_engine.cc",
++    "helium/bergamot_engine.h",
++    "shims/build_info.cc",
++    "shims/ssplit/ssplit.cc",
++  ]
++
++  if (current_cpu == "x64" || current_cpu == "x86") {
++    sources += [ "marian-fork/src/3rd_party/intgemm/intgemm/intgemm.cc" ]
++  }
++
++  configs -= [
++    "//build/config/compiler:chromium_code",
++    "//build/config/compiler:no_exceptions",
++    "//build/config/compiler:no_rtti",
++  ]
++  configs += [
++    "//build/config/compiler:exceptions",
++    "//build/config/compiler:no_chromium_code",
++    "//build/config/compiler:rtti",
++    ":bergamot_config",
++    ":bergamot_warnings",
++  ]
++
++  deps = [
++    ":yaml_cpp",
++    "//third_party/abseil-cpp:absl",
++    "//third_party/icu",
++    "//third_party/ruy",
++    "//third_party/ruy:ruy_platform",
++    "//third_party/ruy:ruy_system_aligned_alloc",
++    "//third_party/sentencepiece",
++    "//third_party/sentencepiece:sentencepiece_proto",
++  ]
++}
+--- /dev/null
++++ b/third_party/bergamot/README.chromium
+@@ -0,0 +1,21 @@
++Name: bergamot-translator
++URL: https://github.com/mozilla/translations/tree/main/inference
++Version: 0.6.0
++Revision: 8eada038fd45bbf6fa58a412b22f80c79887fabc
++License: MPL-2.0, MIT
++License File: //third_party/eigen3/src/COPYING.MPL2, marian-fork/LICENSE.md
++Security Critical: yes
++Shipped: yes
++
++Description:
++The inference engine that Firefox uses for on-device translation, with its
++fork of marian. Downloaded through deps.ini, together with intgemm.
++
++Local Modifications:
++- BUILD.gn builds the parts that are needed to translate on the cpu.
++- shims/ replaces cmake generated files, ssplit-cpp with ICU, and marian's
++  copy of sentencepiece with chromium's.
++- helium/ wraps the engine in an interface that doesn't throw.
++- src/translator/html.{h,cpp}: drop an overload that is a duplicate with
++  chromium's absl, and rename a format() helper that clashes with
++  std::format.
+--- a/components/on_device_translation/service/BUILD.gn
++++ b/components/on_device_translation/service/BUILD.gn
+@@ -46,16 +46,15 @@ source_set("service_launcher") {
+ 
+ source_set("on_device_translation_service") {
+   sources = [
++    "bergamot_client.cc",
++    "bergamot_client.h",
+     "on_device_translation_service.cc",
+     "on_device_translation_service.h",
+-    "translate_kit_client.cc",
+-    "translate_kit_client.h",
+-    "translate_kit_structs.h",
+   ]
+   deps = [
+-    ":translate_kit_api_proto",
+     "//components/on_device_translation:features",
+     "//components/on_device_translation:metrics",
++    "//third_party/bergamot",
+   ]
+ 
+   public_deps = [
+--- /dev/null
++++ b/components/on_device_translation/service/bergamot_client.cc
+@@ -0,0 +1,168 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/on_device_translation/service/bergamot_client.h"
++
++#include <string_view>
++
++#include "base/containers/span.h"
++#include "base/files/file.h"
++#include "base/files/file_path.h"
++#include "base/files/memory_mapped_file.h"
++#include "base/strings/string_view_util.h"
++
++namespace on_device_translation {
++
++namespace {
++
++// Models are only available to and from English.
++constexpr char kPivotLanguage[] = "en";
++
++// The files in each package, as Firefox calls them without their languages.
++constexpr char kModelFile[] = "model.bin";
++constexpr char kShortlistFile[] = "lex.bin";
++constexpr char kVocabFile[] = "vocab.spm";
++constexpr char kSourceVocabFile[] = "srcvocab.spm";
++constexpr char kTargetVocabFile[] = "trgvocab.spm";
++
++std::string_view AsStringView(const base::MemoryMappedFile* file) {
++  return file ? base::as_string_view(file->bytes()) : std::string_view();
++}
++
++}  // namespace
++
++BergamotClient::Translator::Translator(
++    bergamot::Engine& engine,
++    std::shared_ptr<bergamot::Model> model,
++    std::shared_ptr<bergamot::Model> pivot_model)
++    : engine_(engine),
++      model_(std::move(model)),
++      pivot_model_(std::move(pivot_model)) {}
++
++BergamotClient::Translator::~Translator() = default;
++
++std::optional<std::vector<std::string>> BergamotClient::Translator::Translate(
++    std::vector<std::string> texts) {
++  return engine_->Translate(model_, pivot_model_, std::move(texts));
++}
++
++BergamotClient::BergamotClient() = default;
++
++BergamotClient::~BergamotClient() = default;
++
++void BergamotClient::SetConfig(
++    mojom::OnDeviceTranslationServiceConfigPtr config) {
++  translators_.clear();
++  models_.clear();
++  package_indices_.clear();
++
++  file_operation_proxy_.reset();
++  file_operation_proxy_.Bind(std::move(config->file_operation_proxy));
++  for (uint32_t i = 0; i < config->packages.size(); ++i) {
++    const auto& package = config->packages[i];
++    package_indices_.emplace(
++        LanguagePair(package->language1, package->language2), i);
++  }
++}
++
++bool BergamotClient::CanTranslate(const std::string& source_lang,
++                                  const std::string& target_lang) const {
++  return !GetRoute(source_lang, target_lang).empty();
++}
++
++base::expected<BergamotClient::Translator*, mojom::CreateTranslatorResult>
++BergamotClient::GetTranslator(const std::string& source_lang,
++                              const std::string& target_lang) {
++  const LanguagePair languages(source_lang, target_lang);
++  if (auto it = translators_.find(languages); it != translators_.end()) {
++    return it->second.get();
++  }
++
++  const std::vector<LanguagePair> route = GetRoute(source_lang, target_lang);
++  if (route.empty()) {
++    return base::unexpected(
++        mojom::CreateTranslatorResult::kErrorFailedToCreateTranslator);
++  }
++
++  std::shared_ptr<bergamot::Model> model = GetModel(route[0]);
++  std::shared_ptr<bergamot::Model> pivot_model;
++  if (route.size() > 1) {
++    pivot_model = GetModel(route[1]);
++  }
++
++  if (!model || (route.size() > 1 && !pivot_model)) {
++    return base::unexpected(
++        mojom::CreateTranslatorResult::kErrorFailedToInitialize);
++  }
++
++  auto translator = std::make_unique<Translator>(engine_, std::move(model),
++                                                 std::move(pivot_model));
++  Translator* translator_ptr = translator.get();
++  translators_.emplace(languages, std::move(translator));
++  return translator_ptr;
++}
++
++std::vector<BergamotClient::LanguagePair> BergamotClient::GetRoute(
++    const std::string& source_lang,
++    const std::string& target_lang) const {
++  const LanguagePair direct(source_lang, target_lang);
++  if (package_indices_.contains(direct)) {
++    return {direct};
++  }
++
++  const LanguagePair to_pivot(source_lang, kPivotLanguage);
++  const LanguagePair from_pivot(kPivotLanguage, target_lang);
++  if (package_indices_.contains(to_pivot) &&
++      package_indices_.contains(from_pivot)) {
++    return {to_pivot, from_pivot};
++  }
++
++  return {};
++}
++
++std::shared_ptr<bergamot::Model> BergamotClient::GetModel(
++    const LanguagePair& languages) {
++  if (auto it = models_.find(languages); it != models_.end()) {
++    return it->second;
++  }
++
++  const uint32_t package_index = package_indices_.at(languages);
++  auto map_file =
++      [&](const char* name) -> std::unique_ptr<base::MemoryMappedFile> {
++    base::File file;
++    file_operation_proxy_->Open(package_index, base::FilePath::FromASCII(name),
++                                &file);
++    auto mapped_file = std::make_unique<base::MemoryMappedFile>();
++    if (!file.IsValid() || !mapped_file->Initialize(std::move(file))) {
++      return nullptr;
++    }
++
++    return mapped_file;
++  };
++
++  // The vocabulary is either shared by both languages, or split in two.
++  std::unique_ptr<base::MemoryMappedFile> source_vocab = map_file(kVocabFile);
++  std::unique_ptr<base::MemoryMappedFile> target_vocab;
++  if (!source_vocab) {
++    source_vocab = map_file(kSourceVocabFile);
++    target_vocab = map_file(kTargetVocabFile);
++    if (!target_vocab) {
++      return nullptr;
++    }
++  }
++
++  // The engine copies what it needs, so the files can be unmapped after.
++  std::unique_ptr<base::MemoryMappedFile> model = map_file(kModelFile);
++  std::unique_ptr<base::MemoryMappedFile> shortlist = map_file(kShortlistFile);
++  std::shared_ptr<bergamot::Model> loaded_model = bergamot::Engine::LoadModel(
++      AsStringView(model.get()), AsStringView(shortlist.get()),
++      AsStringView(source_vocab.get()), AsStringView(target_vocab.get()));
++  if (loaded_model) {
++    models_.emplace(languages, loaded_model);
++  }
++
++  return loaded_model;
++}
++
++}  // namespace on_device_translation
+--- /dev/null
++++ b/components/on_device_translation/service/bergamot_client.h
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_ON_DEVICE_TRANSLATION_SERVICE_BERGAMOT_CLIENT_H_
++#define COMPONENTS_ON_DEVICE_TRANSLATION_SERVICE_BERGAMOT_CLIENT_H_
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/memory/raw_ref.h"
++#include "base/types/expected.h"
++#include "components/on_device_translation/public/mojom/on_device_translation_service.mojom.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "third_party/bergamot/helium/bergamot_engine.h"
++
++namespace on_device_translation {
++
++// Translates with bergamot-translator and Firefox's models. Each package
++// holds the model that translates from its first language to its second.
++// Languages without a model between them are translated through English.
++class BergamotClient {
++ public:
++  class Translator {
++   public:
++    Translator(bergamot::Engine& engine,
++               std::shared_ptr<bergamot::Model> model,
++               std::shared_ptr<bergamot::Model> pivot_model);
++    ~Translator();
++
++    Translator(const Translator&) = delete;
++    Translator& operator=(const Translator&) = delete;
++
++    std::optional<std::vector<std::string>> Translate(
++        std::vector<std::string> texts);
++
++   private:
++    const raw_ref<bergamot::Engine> engine_;
++    const std::shared_ptr<bergamot::Model> model_;
++    const std::shared_ptr<bergamot::Model> pivot_model_;
++  };
++
++  BergamotClient();
++  ~BergamotClient();
++
++  BergamotClient(const BergamotClient&) = delete;
++  BergamotClient& operator=(const BergamotClient&) = delete;
++
++  void SetConfig(mojom::OnDeviceTranslationServiceConfigPtr config);
++
++  bool CanTranslate(const std::string& source_lang,
++                    const std::string& target_lang) const;
++
++  // The translator is owned by this client.
++  base::expected<Translator*, mojom::CreateTranslatorResult> GetTranslator(
++      const std::string& source_lang,
++      const std::string& target_lang);
++
++ private:
++  using LanguagePair = std::pair<std::string, std::string>;
++
++  // Returns the packages to translate with in order, which is empty if there
++  // are none.
++  std::vector<LanguagePair> GetRoute(const std::string& source_lang,
++                                     const std::string& target_lang) const;
++
++  std::shared_ptr<bergamot::Model> GetModel(const LanguagePair& languages);
++
++  bergamot::Engine engine_;
++  mojo::Remote<mojom::FileOperationProxy> file_operation_proxy_;
++  std::map<LanguagePair, uint32_t> package_indices_;
++  std::map<LanguagePair, std::shared_ptr<bergamot::Model>> models_;
++  std::map<LanguagePair, std::unique_ptr<Translator>> translators_;
++};
++
++}  // namespace on_device_translation
++
++#endif  // COMPONENTS_ON_DEVICE_TRANSLATION_SERVICE_BERGAMOT_CLIENT_H_
+--- a/components/on_device_translation/service/on_device_translation_service.cc
++++ b/components/on_device_translation/service/on_device_translation_service.cc
+@@ -11,48 +11,58 @@
+ #include "components/on_device_translation/metrics.h"
+ #include "components/on_device_translation/public/mojom/on_device_translation_service.mojom.h"
+ #include "components/on_device_translation/public/mojom/translator.mojom.h"
+-#include "components/on_device_translation/service/translate_kit_client.h"
++#include "components/on_device_translation/service/bergamot_client.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
+ namespace on_device_translation {
+ namespace {
+-// TranslateKitTranslator provides translation functionalities based on the
+-// Translator from TranslateKitClient.
+-class TranslateKitTranslator : public mojom::OnDeviceTranslator {
++// BergamotTranslator provides translation functionalities based on the
++// Translator from BergamotClient.
++class BergamotTranslator : public mojom::OnDeviceTranslator {
+  public:
+-  explicit TranslateKitTranslator(std::string source_lang,
+-                                  std::string target_lang,
+-                                  TranslateKitClient::Translator* translator)
++  explicit BergamotTranslator(std::string source_lang,
++                              std::string target_lang,
++                              BergamotClient::Translator* translator)
+       : source_lang_(std::move(source_lang)),
+         target_lang_(std::move(target_lang)),
+         translator_(translator) {
+     CHECK(translator_);
+   }
+-  ~TranslateKitTranslator() override = default;
++  ~BergamotTranslator() override = default;
+   // Not copyable.
+-  TranslateKitTranslator(const TranslateKitTranslator&) = delete;
+-  TranslateKitTranslator& operator=(const TranslateKitTranslator&) = delete;
++  BergamotTranslator(const BergamotTranslator&) = delete;
++  BergamotTranslator& operator=(const BergamotTranslator&) = delete;
+ 
+   // `mojom::OnDeviceTranslator` overrides:
+   void Translate(const std::string& input,
+                  TranslateCallback translate_callback) override {
+     RecordOnDeviceTranslationLength(source_lang_, target_lang_, input.size());
+     CHECK(translator_);
+-    std::move(translate_callback).Run(translator_->Translate(input));
++    std::optional<std::vector<std::string>> outputs =
++        translator_->Translate({input});
++    std::move(translate_callback)
++        .Run(outputs ? std::make_optional(std::move(outputs->front()))
++                     : std::nullopt);
+   }
+ 
++  void TranslateBatch(const std::vector<std::string>& inputs,
++                      TranslateBatchCallback callback) override {
++    CHECK(translator_);
++    std::move(callback).Run(translator_->Translate(inputs));
++  }
++
++  // Bergamot splits sentences by itself, so this only helps streaming.
+   void SplitSentences(const std::string& input,
+                       SplitSentencesCallback callback) override {
+-    CHECK(translator_);
+-    std::move(callback).Run(translator_->SplitSentences(input));
++    std::move(callback).Run({input});
+   }
+ 
+  private:
+   std::string source_lang_;
+   std::string target_lang_;
+-  // Owned by the TranslateKitClient managed by OnDeviceTranslationService.
++  // Owned by the BergamotClient managed by OnDeviceTranslationService.
+   // The lifetime must be longer than this instance.
+-  raw_ptr<TranslateKitClient::Translator> translator_;
++  raw_ptr<BergamotClient::Translator> translator_;
+ };
+ }  // namespace
+ 
+@@ -60,7 +70,7 @@ class TranslateKitTranslator : public mo
+ std::unique_ptr<OnDeviceTranslationService>
+ OnDeviceTranslationService::CreateForTesting(
+     mojo::PendingReceiver<mojom::OnDeviceTranslationService> receiver,
+-    std::unique_ptr<TranslateKitClient> client) {
++    std::unique_ptr<BergamotClient> client) {
+   return std::make_unique<OnDeviceTranslationService>(
+       std::move(receiver), std::move(client),
+       base::PassKey<OnDeviceTranslationService>());
+@@ -74,18 +84,17 @@ void OnDeviceTranslationService::OnDisco
+ 
+ OnDeviceTranslationService::OnDeviceTranslationService(
+     mojo::PendingReceiver<mojom::OnDeviceTranslationService> receiver)
+-    : receiver_(this, std::move(receiver)), client_(TranslateKitClient::Get()) {
++    : receiver_(this, std::move(receiver)),
++      client_(std::make_unique<BergamotClient>()) {
+   translators_.set_disconnect_handler(base::BindRepeating(
+       &OnDeviceTranslationService::OnDisconnect, base::Unretained(this)));
+ }
+ 
+ OnDeviceTranslationService::OnDeviceTranslationService(
+     mojo::PendingReceiver<mojom::OnDeviceTranslationService> receiver,
+-    std::unique_ptr<TranslateKitClient> client,
++    std::unique_ptr<BergamotClient> client,
+     base::PassKey<OnDeviceTranslationService>)
+-    : receiver_(this, std::move(receiver)),
+-      owning_client_for_testing_(std::move(client)),
+-      client_(owning_client_for_testing_.get()) {
++    : receiver_(this, std::move(receiver)), client_(std::move(client)) {
+   translators_.set_disconnect_handler(base::BindRepeating(
+       &OnDeviceTranslationService::OnDisconnect, base::Unretained(this)));
+ }
+@@ -108,7 +117,7 @@ void OnDeviceTranslationService::CreateT
+     std::move(create_translator_callback).Run(maybe_translator.error());
+     return;
+   }
+-  translators_.Add(std::make_unique<TranslateKitTranslator>(
++  translators_.Add(std::make_unique<BergamotTranslator>(
+                        source_lang, target_lang, maybe_translator.value()),
+                    std::move(receiver));
+   std::move(create_translator_callback)
+--- a/components/on_device_translation/service/on_device_translation_service.h
++++ b/components/on_device_translation/service/on_device_translation_service.h
+@@ -16,19 +16,19 @@
+ 
+ namespace on_device_translation {
+ 
+-class TranslateKitClient;
++class BergamotClient;
+ 
+ class OnDeviceTranslationService : public mojom::OnDeviceTranslationService {
+  public:
+   static std::unique_ptr<OnDeviceTranslationService> CreateForTesting(
+       mojo::PendingReceiver<mojom::OnDeviceTranslationService> receiver,
+-      std::unique_ptr<TranslateKitClient> client);
++      std::unique_ptr<BergamotClient> client);
+ 
+   explicit OnDeviceTranslationService(
+       mojo::PendingReceiver<mojom::OnDeviceTranslationService> receiver);
+   OnDeviceTranslationService(
+       mojo::PendingReceiver<mojom::OnDeviceTranslationService> receiver,
+-      std::unique_ptr<TranslateKitClient> client,
++      std::unique_ptr<BergamotClient> client,
+       base::PassKey<OnDeviceTranslationService>);
+ 
+   ~OnDeviceTranslationService() override;
+@@ -56,8 +56,7 @@ class OnDeviceTranslationService : publi
+   void OnDisconnect();
+ 
+   mojo::Receiver<mojom::OnDeviceTranslationService> receiver_;
+-  std::unique_ptr<TranslateKitClient> owning_client_for_testing_;
+-  raw_ptr<TranslateKitClient> client_;
++  std::unique_ptr<BergamotClient> client_;
+ 
+   mojo::UniqueReceiverSet<on_device_translation::mojom::OnDeviceTranslator>
+       translators_;
+--- a/components/on_device_translation/service/sandbox_hook.cc
++++ b/components/on_device_translation/service/sandbox_hook.cc
+@@ -4,7 +4,6 @@
+ 
+ #include "components/on_device_translation/service/sandbox_hook.h"
+ 
+-#include "components/on_device_translation/service/translate_kit_client.h"
+ #include "sandbox/linux/syscall_broker/broker_command.h"
+ 
+ using sandbox::syscall_broker::BrokerFilePermission;
+@@ -13,7 +12,7 @@ using sandbox::syscall_broker::MakeBroke
+ namespace on_device_translation {
+ namespace {
+ 
+-// Gets the file permissions required by the TranslateKit
++// Gets the file permissions required by bergamot.
+ std::vector<BrokerFilePermission> GetOnDeviceTranslationFilePermissions() {
+   std::vector<BrokerFilePermission> permissions{
+       // Opened for checking the CPU numbers.
+@@ -26,9 +25,6 @@ std::vector<BrokerFilePermission> GetOnD
+ 
+ bool OnDeviceTranslationSandboxHook(
+     sandbox::policy::SandboxLinux::Options options) {
+-  // Call `TranslateKitClient::Get()` to load libtranslatekit.so
+-  TranslateKitClient::Get();
+-
+   auto* instance = sandbox::policy::SandboxLinux::GetInstance();
+   instance->StartBrokerProcess(MakeBrokerCommandSet({
+                                    sandbox::syscall_broker::COMMAND_OPEN,
+--- /dev/null
++++ b/third_party/bergamot/helium/bergamot_engine.cc
+@@ -0,0 +1,141 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "third_party/bergamot/helium/bergamot_engine.h"
++
++#include <cstring>
++#include <exception>
++#include <utility>
++
++#include "common/logging.h"
++#include "translator/parser.h"
++#include "translator/response_options.h"
++#include "translator/service.h"
++#include "translator/translation_model.h"
++
++namespace bergamot {
++
++namespace {
++
++using marian::bergamot::AlignedMemory;
++using marian::bergamot::BlockingService;
++using marian::bergamot::MemoryBundle;
++using marian::bergamot::Response;
++using marian::bergamot::ResponseOptions;
++using marian::bergamot::TranslationModel;
++
++// Matches what Firefox uses for its models, with sentences on their own lines
++// split by ICU, and without the alignments that are only needed for HTML.
++// The vocabularies are loaded from memory, but marian looks at their names to
++// tell whether they're factored.
++constexpr char kModelConfig[] = R"(
++vocabs:
++  - source.spm
++  - target.spm
++beam-size: 1
++normalize: 1.0
++word-penalty: 0
++max-length-break: 128
++mini-batch-words: 1024
++workspaces: 128
++max-length-factor: 2.0
++skip-cost: true
++cpu-threads: 0
++quiet: true
++quiet-translation: true
++gemm-precision: int8shiftAlphaAll
++check-bytearray: true
++ssplit-mode: paragraph
++)";
++
++AlignedMemory CopyToAlignedMemory(std::string_view bytes, size_t alignment) {
++  AlignedMemory memory(bytes.size(), alignment);
++  std::memcpy(memory.begin(), bytes.data(), bytes.size());
++  return memory;
++}
++
++}  // namespace
++
++class Model {
++ public:
++  explicit Model(std::shared_ptr<TranslationModel> model)
++      : model_(std::move(model)) {}
++
++  const std::shared_ptr<TranslationModel>& get() const { return model_; }
++
++ private:
++  std::shared_ptr<TranslationModel> model_;
++};
++
++Engine::Engine() {
++  // Marian calls std::abort() on errors otherwise.
++  marian::setThrowExceptionOnAbort(true);
++  try {
++    service_ = std::make_unique<BlockingService>(BlockingService::Config());
++  } catch (const std::exception&) {
++  }
++}
++
++Engine::~Engine() = default;
++
++// static
++std::shared_ptr<Model> Engine::LoadModel(std::string_view model,
++                                         std::string_view shortlist,
++                                         std::string_view source_vocab,
++                                         std::string_view target_vocab) {
++  if (model.empty() || shortlist.empty() || source_vocab.empty()) {
++    return nullptr;
++  }
++
++  try {
++    MemoryBundle memory;
++    // intgemm needs the model to be aligned to 256 bytes, and the rest to 64.
++    memory.models.push_back(CopyToAlignedMemory(model, 256));
++    memory.shortlist = CopyToAlignedMemory(shortlist, 64);
++    auto source = std::make_shared<AlignedMemory>(
++        CopyToAlignedMemory(source_vocab, 64));
++    auto target = target_vocab.empty()
++                      ? source
++                      : std::make_shared<AlignedMemory>(
++                            CopyToAlignedMemory(target_vocab, 64));
++    memory.vocabs = {std::move(source), std::move(target)};
++
++    return std::make_shared<Model>(std::make_shared<TranslationModel>(
++        marian::bergamot::parseOptionsFromString(kModelConfig,
++                                                 /*validate=*/false),
++        std::move(memory)));
++  } catch (const std::exception&) {
++    return nullptr;
++  }
++}
++
++std::optional<std::vector<std::string>> Engine::Translate(
++    const std::shared_ptr<Model>& model,
++    const std::shared_ptr<Model>& pivot_model,
++    std::vector<std::string> texts) {
++  if (!service_ || !model) {
++    return std::nullopt;
++  }
++
++  try {
++    const std::vector<ResponseOptions> options(texts.size());
++    std::vector<Response> responses =
++        pivot_model ? service_->pivotMultiple(model->get(), pivot_model->get(),
++                                              std::move(texts), options)
++                    : service_->translateMultiple(model->get(),
++                                                  std::move(texts), options);
++
++    std::vector<std::string> translations;
++    translations.reserve(responses.size());
++    for (Response& response : responses) {
++      translations.push_back(std::move(response.target.text));
++    }
++
++    return translations;
++  } catch (const std::exception&) {
++    return std::nullopt;
++  }
++}
++
++}  // namespace bergamot
+--- /dev/null
++++ b/third_party/bergamot/helium/bergamot_engine.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BERGAMOT_HELIUM_BERGAMOT_ENGINE_H_
++#define THIRD_PARTY_BERGAMOT_HELIUM_BERGAMOT_ENGINE_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace marian::bergamot {
++class BlockingService;
++}
++
++namespace bergamot {
++
++// A model for translating in one direction.
++class Model;
++
++// Wraps bergamot-translator behind an interface that doesn't throw, so that
++// only this file has to be built with exceptions. Errors are reported as
++// nullptr or nullopt.
++class Engine {
++ public:
++  Engine();
++  ~Engine();
++
++  Engine(const Engine&) = delete;
++  Engine& operator=(const Engine&) = delete;
++
++  // Loads an int8 quantized model with its lexical shortlist and vocabulary.
++  // |target_vocab| is empty when both languages share |source_vocab|.
++  static std::shared_ptr<Model> LoadModel(std::string_view model,
++                                          std::string_view shortlist,
++                                          std::string_view source_vocab,
++                                          std::string_view target_vocab);
++
++  // Translates each of |texts| with |model|, or with |model| and then
++  // |pivot_model| if the latter is set.
++  std::optional<std::vector<std::string>> Translate(
++      const std::shared_ptr<Model>& model,
++      const std::shared_ptr<Model>& pivot_model,
++      std::vector<std::string> texts);
++
++ private:
++  std::unique_ptr<marian::bergamot::BlockingService> service_;
++};
++
++}  // namespace bergamot
++
++#endif  // THIRD_PARTY_BERGAMOT_HELIUM_BERGAMOT_ENGINE_H_
+--- /dev/null
++++ b/third_party/bergamot/shims/build_info.cc
+@@ -0,0 +1,15 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Stands in for the file that marian generates with cmake.
++
++#include "common/build_info.h"
++
++std::string marian::cmakeBuildOptions() {
++  return "";
++}
++
++std::string marian::cmakeBuildOptionsAdvanced() {
++  return "";
++}
+--- a/components/on_device_translation/public/mojom/translator.mojom
++++ b/components/on_device_translation/public/mojom/translator.mojom
+@@ -11,6 +11,10 @@ interface OnDeviceTranslator {
+   // initialized. `output` is nullopt if the translation fails.
+   Translate(string input) => (string? output);
+ 
++  // Translates each of the inputs, which is faster than translating them one
++  // by one. `outputs` is nullopt if the translation fails.
++  TranslateBatch(array<string> inputs) => (array<string>? outputs);
++
+   // Splits the translation source language input into sentences
+   // for chunk-by-chunk streaming of translation outputs.
+   SplitSentences(string input) => (array<string> sentences);
+--- /dev/null
++++ b/third_party/bergamot/shims/ssplit/ssplit.cc
+@@ -0,0 +1,79 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "ssplit.h"
++
++#include "third_party/icu/source/common/unicode/locid.h"
++#include "third_party/icu/source/common/unicode/utext.h"
++
++namespace ug::ssplit {
++
++namespace {
++
++std::string_view TrimWhitespace(std::string_view text) {
++  constexpr std::string_view kWhitespace = " \t\n\v\f\r";
++  const size_t start = text.find_first_not_of(kWhitespace);
++  if (start == std::string_view::npos) {
++    return {};
++  }
++
++  return text.substr(start, text.find_last_not_of(kWhitespace) - start + 1);
++}
++
++}  // namespace
++
++SentenceStream::SentenceStream(std::string_view text,
++                               const SentenceSplitter&,
++                               splitmode mode)
++    : text_(text) {
++  // ICU always breaks at newlines, so it handles paragraphs on their own
++  // lines. Wrapped text is split at its newlines too.
++  if (mode == splitmode::one_sentence_per_line) {
++    return;
++  }
++
++  UErrorCode status = U_ZERO_ERROR;
++  iterator_.reset(
++      icu::BreakIterator::createSentenceInstance(icu::Locale::getRoot(), status));
++  // The iterator keeps a shallow copy of |utext|, and indexes |text_| in
++  // bytes.
++  UText* utext = utext_openUTF8(nullptr, text_.data(), text_.size(), &status);
++  if (U_SUCCESS(status)) {
++    iterator_->setText(utext, status);
++  }
++
++  utext_close(utext);
++  if (U_FAILURE(status)) {
++    iterator_.reset();
++  }
++}
++
++SentenceStream::~SentenceStream() = default;
++
++size_t SentenceStream::NextBreak() {
++  if (!iterator_) {
++    const size_t newline = text_.find('\n', position_);
++    return newline == std::string_view::npos ? text_.size() : newline + 1;
++  }
++
++  const int32_t next = iterator_->following(position_);
++  return next == icu::BreakIterator::DONE ? text_.size() : next;
++}
++
++bool SentenceStream::operator>>(std::string_view& sentence) {
++  while (position_ < text_.size()) {
++    const size_t end = NextBreak();
++    const std::string_view piece =
++        TrimWhitespace(text_.substr(position_, end - position_));
++    position_ = end;
++    if (!piece.empty()) {
++      sentence = piece;
++      return true;
++    }
++  }
++
++  return false;
++}
++
++}  // namespace ug::ssplit
+--- /dev/null
++++ b/third_party/bergamot/shims/ssplit/ssplit.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Replaces ssplit-cpp, which needs pcre2, with ICU's sentence breaking. This
++// is also what Firefox does, through Intl.Segmenter.
++
++#pragma once
++
++#include <memory>
++#include <string>
++#include <string_view>
++
++#include "third_party/icu/source/common/unicode/brkiter.h"
++
++namespace ug::ssplit {
++
++// ICU has no use for the moses prefix lists that ssplit loads.
++class SentenceSplitter {
++ public:
++  void load(const std::string&) {}
++  void loadFromSerialized(std::string_view) {}
++};
++
++class SentenceStream {
++ public:
++  enum class splitmode {
++    one_sentence_per_line,
++    one_paragraph_per_line,
++    wrapped_text,
++  };
++
++  SentenceStream(std::string_view text,
++                 const SentenceSplitter& splitter,
++                 splitmode mode);
++  ~SentenceStream();
++
++  // Sets |sentence| to the next non-empty sentence, without surrounding
++  // whitespace. Returns false once there are none left.
++  bool operator>>(std::string_view& sentence);
++
++ private:
++  size_t NextBreak();
++
++  std::string_view text_;
++  size_t position_ = 0;
++  // Unset when every line is a sentence.
++  std::unique_ptr<icu::BreakIterator> iterator_;
++};
++
++}  // namespace ug::ssplit
+--- /dev/null
++++ b/third_party/bergamot/shims/include/common/git_revision.h
+@@ -0,0 +1,9 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Stands in for the file that marian generates with cmake.
++
++#pragma once
++
++#define GIT_REVISION "bergamot"
+--- /dev/null
++++ b/third_party/bergamot/shims/include/common/project_version.h
+@@ -0,0 +1,13 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Stands in for the file that marian generates with cmake.
++
++#pragma once
++
++#define PROJECT_VERSION_FULL "v1.12.14-helium"
++#define PROJECT_VERSION "v1.12.14"
++#define PROJECT_VERSION_MAJOR 1
++#define PROJECT_VERSION_MINOR 12
++#define PROJECT_VERSION_PATCH 14
+--- /dev/null
++++ b/third_party/bergamot/shims/include/intgemm/intgemm_config.h
+@@ -0,0 +1,12 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Stands in for the file that intgemm generates with cmake. clang supports
++// all of these, and intgemm picks a kernel based on the cpu at runtime.
++
++#pragma once
++
++#define INTGEMM_COMPILER_SUPPORTS_AVX2
++#define INTGEMM_COMPILER_SUPPORTS_AVX512BW
++#define INTGEMM_COMPILER_SUPPORTS_AVX512VNNI
+--- /dev/null
++++ b/third_party/bergamot/shims/include/sentencepiece/src/sentencepiece_processor.h
+@@ -0,0 +1,9 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Marian expects its own copy of sentencepiece, use chromium's instead.
++
++#pragma once
++
++#include "src/sentencepiece_processor.h"
+--- /dev/null
++++ b/third_party/bergamot/shims/include/sentencepiece/src/sentencepiece_trainer.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Chromium's sentencepiece doesn't include the trainer, which marian only
++// uses to create new vocabularies.
++
++#pragma once
++
++#include <string_view>
++
++#include "src/sentencepiece_processor.h"
++
++namespace sentencepiece {
++
++class SentencePieceTrainer {
++ public:
++  static absl::Status Train(std::string_view) {
++    return absl::UnimplementedError("training is not supported");
++  }
++};
++
++}  // namespace sentencepiece
+--- /dev/null
++++ b/third_party/bergamot/shims/include/sentencepiece/src/builtin_pb/sentencepiece.pb.h
+@@ -0,0 +1,7 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#pragma once
++
++#include "src/sentencepiece.pb.h"
+--- /dev/null
++++ b/third_party/bergamot/shims/include/sentencepiece/third_party/absl/strings/string_view.h
+@@ -0,0 +1,7 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#pragma once
++
++#include "third_party/abseil-cpp/absl/strings/string_view.h"
+--- a/third_party/bergamot/src/translator/html.cpp
++++ b/third_party/bergamot/src/translator/html.cpp
+@@ -62,10 +62,10 @@ std::string toLowerCase(std::string_view
+ /// Very simple replacement for std::format introduced in C++20. Only supports
+ /// replacing `{}` in the template string with whatever `operator<<` for that
+ /// type turns it into.
+-std::string format(std::string const &formatTemplate) { return formatTemplate; }
++std::string formatString(std::string const &formatTemplate) { return formatTemplate; }
+ 
+ template <typename Arg>
+-std::string format(std::string const &formatTemplate, Arg arg) {
++std::string formatString(std::string const &formatTemplate, Arg arg) {
+   std::ostringstream os;
+   auto index = formatTemplate.find("{}");
+   assert(index != std::string::npos);
+@@ -74,11 +74,11 @@ std::string format(std::string const &fo
+ }
+ 
+ template <typename Arg, typename... Args>
+-std::string format(std::string const &formatTemplate, Arg arg, Args... args) {
++std::string formatString(std::string const &formatTemplate, Arg arg, Args... args) {
+   std::ostringstream os;
+   auto index = formatTemplate.find("{}");
+   assert(index != std::string::npos);
+-  os << formatTemplate.substr(0, index) << arg << format(formatTemplate.substr(index + 2), std::forward<Args>(args)...);
++  os << formatTemplate.substr(0, index) << arg << formatString(formatTemplate.substr(index + 2), std::forward<Args>(args)...);
+   return os.str();
+ }
+ 
+@@ -179,7 +179,7 @@ class TokenFormatter {
+ 
+     for (HTML::Tag const *tag : Reversed(closing)) {
+       assert(tag->type == HTML::Tag::ELEMENT);
+-      std::string closeTag = format("</{}>", tag->name);
++      std::string closeTag = formatString("</{}>", tag->name);
+       html_.insert(offset_ + (closeLeft_ ? 0 : whitespaceSize_), closeTag);
+       offset_ += closeTag.size();
+       if (closeLeft_) whitespaceOffset_ += closeTag.size();
+@@ -190,13 +190,13 @@ class TokenFormatter {
+       switch (tag->type) {
+         case HTML::Tag::ELEMENT:
+         case HTML::Tag::VOID_ELEMENT:
+-          openTag = format("<{}{}>{}", tag->name, tag->attributes, tag->data);
++          openTag = formatString("<{}{}>{}", tag->name, tag->attributes, tag->data);
+           break;
+         case HTML::Tag::COMMENT:
+-          openTag = format("<!--{}-->", tag->data);
++          openTag = formatString("<!--{}-->", tag->data);
+           break;
+         case HTML::Tag::PROCESSING_INSTRUCTION:
+-          openTag = format("<?{}?>", tag->data);
++          openTag = formatString("<?{}?>", tag->data);
+           break;
+         case HTML::Tag::WHITESPACE: {
+           // Try to eat two newlines (paragraph break) from our segment
+@@ -262,7 +262,7 @@ void consumeIgnoredTag(markup::Scanner &
+       case markup::Scanner::TT_EOF:
+         ABORT("Did not find closing tag </{}>", name);
+       case markup::Scanner::TT_ATTRIBUTE:
+-        tag.attributes += format(" {}=\"{}\"", scanner.attribute(), scanner.value());
++        tag.attributes += formatString(" {}=\"{}\"", scanner.attribute(), scanner.value());
+         break;
+       default:
+         // Not an attribute! Must be something inside the body or the closing
+@@ -468,7 +468,7 @@ HTML::HTML(std::string &&source, bool pr
+ 
+       case markup::Scanner::TT_ATTRIBUTE:
+         assert(tag != nullptr);
+-        tag->attributes += format(" {}=\"{}\"", scanner.attribute(), scanner.value());
++        tag->attributes += formatString(" {}=\"{}\"", scanner.attribute(), scanner.value());
+         break;
+ 
+       case markup::Scanner::TT_COMMENT_START:
+@@ -702,7 +702,7 @@ void HTML::annotateTagStack(Response con
+       auto const &sentenceQuality = response.qualityScores[sentenceIdx];
+       // Create a single <font> tag for this sentence with sentence level info
+       Tag *sentenceTag = makeTag({Tag::ELEMENT, "font"});
+-      sentenceTag->attributes += format(" x-bergamot-sentence-index=\"{}\" x-bergamot-sentence-score=\"{}\"",
++      sentenceTag->attributes += formatString(" x-bergamot-sentence-index=\"{}\" x-bergamot-sentence-score=\"{}\"",
+                                         sentenceIdx, sentenceQuality.sentenceScore);
+ 
+       // Add that tag to all tokens in this sentence.
+@@ -713,7 +713,7 @@ void HTML::annotateTagStack(Response con
+       // Add word level <font> tags as well to all tokens that make up a word.
+       for (size_t wordIdx = 0; wordIdx < sentenceQuality.wordRanges.size(); ++wordIdx) {
+         Tag *wordTag = makeTag({Tag::ELEMENT, "font"});
+-        wordTag->attributes += format(" x-bergamot-word-index=\"{}\" x-bergamot-word-score=\"{}\"", wordIdx,
++        wordTag->attributes += formatString(" x-bergamot-word-index=\"{}\" x-bergamot-word-score=\"{}\"", wordIdx,
+                                       sentenceQuality.wordScores[wordIdx]);
+         auto const &range = sentenceQuality.wordRanges[wordIdx];
+         for (size_t tokenIdx = range.begin; tokenIdx < range.end; ++tokenIdx) {
+@@ -741,10 +741,6 @@ bool HTML::isContinuation(std::string_vi
+          options_.continuationDelimiters.find(prev.back()) == std::string::npos;
+ }
+ 
+-bool HTML::isContinuation(marian::string_view prev, marian::string_view str) const {
+-  return isContinuation(std::string_view(prev.data(), prev.size()), std::string_view(str.data(), str.size()));
+-}
+-
+ /// Selects for each token in `response.target` a best source token from
+ /// `response.source` and writes this selection to `alignments`. The source
+ /// token spans are used to also look at the markup applied to each token to
+--- a/third_party/bergamot/src/translator/html.h
++++ b/third_party/bergamot/src/translator/html.h
+@@ -181,7 +181,6 @@ class HTML {
+   /// Utilities to test whether subword `str` is part of a word together with
+   /// the subword `prev`, or a separate word. Basically *does `str` start with
+   /// a space, but bit more complex to deal with punctuation.
+-  bool isContinuation(marian::string_view prev, marian::string_view str) const;
+   bool isContinuation(std::string_view prev, std::string_view str) const;
+ 
+   /// Copies span pointers from the subwords/tokens from the source text to the
