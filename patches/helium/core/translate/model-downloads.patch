@@ -1,0 +1,1056 @@
+--- a/chrome/browser/chrome_browser_main_linux.cc
++++ b/chrome/browser/chrome_browser_main_linux.cc
+@@ -13,14 +13,12 @@
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+-#include "base/path_service.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/lifetime/application_lifetime_desktop.h"
+ #include "chrome/common/chrome_features.h"
+-#include "chrome/common/chrome_paths.h"
+ #include "components/on_device_translation/buildflags/buildflags.h"
+ #include "components/password_manager/core/browser/password_manager_switches.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -117,12 +115,10 @@ void ChromeBrowserMainPartsLinux::PrePro
+ #endif
+ 
+ #if BUILDFLAG(ENABLE_ON_DEVICE_TRANSLATION)
+-  base::FilePath user_data_dir;
+-  if (base::PathService::Get(chrome::DIR_USER_DATA, &user_data_dir)) {
+-    translate::RegisterTranslationProvider(
+-        std::make_unique<on_device_translation::BergamotTranslationProvider>(
+-            user_data_dir.AppendASCII("TranslationModels")));
+-  }
++  translate::RegisterTranslationProvider(
++      std::make_unique<on_device_translation::BergamotTranslationProvider>(
++          g_browser_process->component_updater(),
++          g_browser_process->local_state()));
+ #endif
+ 
+   ChromeBrowserMainPartsPosix::PreProfileInit();
+--- a/components/component_updater/BUILD.gn
++++ b/components/component_updater/BUILD.gn
+@@ -54,6 +54,7 @@ static_library("component_updater") {
+     "//base",
+     "//build:branding_buildflags",
+     "//components/crx_file",
++    "//components/helium_services",
+     "//components/prefs",
+     "//components/update_client",
+     "//components/version_info",
+--- a/components/component_updater/component_installer.cc
++++ b/components/component_updater/component_installer.cc
+@@ -31,6 +31,7 @@
+ #include "components/component_updater/component_updater_paths.h"
+ #include "components/component_updater/component_updater_service.h"
+ #include "components/crx_file/crx_verifier.h"
++#include "components/helium_services/translation_packs.h"
+ #include "components/update_client/update_client.h"
+ #include "components/update_client/update_client_errors.h"
+ #include "components/update_client/update_query_params.h"
+@@ -120,7 +121,8 @@ void ComponentInstaller::Register(Compon
+   registration_info->crx_id = update_client::GetCrxIdFromPublicKeyHash(
+       registration_info->public_key_hash);
+ 
+-  if (!kAllowedComponents.contains(registration_info->crx_id)) {
++  if (!kAllowedComponents.contains(registration_info->crx_id) &&
++      !helium::IsTranslationPack(registration_info->public_key_hash)) {
+     return;
+   }
+ 
+--- a/components/component_updater/component_updater_service.h
++++ b/components/component_updater/component_updater_service.h
+@@ -238,6 +238,7 @@ class OnDemandUpdater {
+   friend class SodaLanguagePackComponentInstallerPolicy;
+   friend class TranslateKitComponentInstallerPolicy;
+   friend class TranslateKitLanguagePackComponentInstallerPolicy;
++  friend class BergamotPackInstallerPolicy;
+   friend class ::extensions::AutotestPrivateLoadSmartDimComponentFunction;
+ #if BUILDFLAG(IS_CHROMEOS)
+   friend class ash::SmartDimComponentIntegrationTest;
+--- a/components/helium_services/BUILD.gn
++++ b/components/helium_services/BUILD.gn
+@@ -9,13 +9,15 @@ component("helium_services") {
+     "pref_names.h",
+     "schema.cc",
+     "schema.h",
++    "translation_packs.cc",
++    "translation_packs.h",
+   ]
+ 
+   public_deps = [
+     "//base",
+     "//components/prefs",
+-    "//url",
+     "//net",
++    "//url",
+   ]
+ 
+   defines = [ "IS_HELIUM_IMPL" ]
+--- /dev/null
++++ b/components/helium_services/translation_packs.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/helium_services/translation_packs.h"
++
++#include <algorithm>
++
++namespace helium {
++
++namespace {
++
++// TODO: these are test keys, replace them with the ones Helium services sign
++// the packs with.
++constexpr TranslationPack kTranslationPacks[] = {
++    {"de", "en", {0xb6, 0xaf, 0x82, 0x02, 0xcb, 0x77, 0x68, 0x67,
++                  0x07, 0xbb, 0x85, 0xfe, 0xc4, 0x7d, 0x00, 0x3e,
++                  0xd5, 0x75, 0x83, 0xdb, 0x08, 0x52, 0x00, 0x2c,
++                  0xa0, 0xd8, 0x43, 0x6d, 0xf0, 0x61, 0x43, 0xa7}},
++    {"en", "de", {0x95, 0xc1, 0xc5, 0x07, 0xea, 0x86, 0x09, 0x26,
++                  0xf5, 0xc2, 0x9b, 0x1e, 0xfa, 0x28, 0xa6, 0x17,
++                  0x31, 0x08, 0x64, 0x32, 0x85, 0x0a, 0xbf, 0xc1,
++                  0x4e, 0x27, 0x89, 0x84, 0x5c, 0xe2, 0xb4, 0xac}},
++    {"en", "fr", {0x13, 0xfc, 0x21, 0x7f, 0x86, 0x3a, 0xca, 0x79,
++                  0x24, 0x04, 0x91, 0x23, 0xd9, 0x93, 0x8c, 0xc7,
++                  0x25, 0x07, 0x1f, 0x08, 0x83, 0x28, 0xb8, 0x41,
++                  0x2a, 0x27, 0xdf, 0x24, 0xbe, 0x0a, 0x15, 0x1e}},
++    {"fr", "en", {0xbe, 0x4a, 0x27, 0xf1, 0x0c, 0x21, 0x6c, 0xb9,
++                  0xd6, 0xeb, 0x7f, 0x07, 0xbd, 0x44, 0xcc, 0xbe,
++                  0xb4, 0xa2, 0x31, 0xd2, 0x4a, 0x74, 0x38, 0x39,
++                  0xae, 0x9b, 0xf1, 0x73, 0x1b, 0xcf, 0x78, 0x60}},
++};
++
++}  // namespace
++
++base::span<const TranslationPack> GetTranslationPacks() {
++  return kTranslationPacks;
++}
++
++bool IsTranslationPack(base::span<const uint8_t> public_key_sha) {
++  return std::ranges::any_of(kTranslationPacks, [&](const auto& pack) {
++    return std::ranges::equal(pack.public_key_sha, public_key_sha);
++  });
++}
++
++}  // namespace helium
+--- /dev/null
++++ b/components/helium_services/translation_packs.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_HELIUM_SERVICES_TRANSLATION_PACKS_H_
++#define COMPONENTS_HELIUM_SERVICES_TRANSLATION_PACKS_H_
++
++#include <array>
++#include <cstdint>
++#include <string_view>
++
++#include "base/component_export.h"
++#include "base/containers/span.h"
++
++namespace helium {
++
++// A model that translates from one language to another, which Helium services
++// serve as a component. Languages are translate language codes.
++struct TranslationPack {
++  std::string_view source_lang;
++  std::string_view target_lang;
++  // SHA-256 of the public key that the component is signed with.
++  std::array<uint8_t, 32> public_key_sha;
++};
++
++COMPONENT_EXPORT(HELIUM)
++base::span<const TranslationPack> GetTranslationPacks();
++
++// Whether a component with |public_key_sha| is a translation pack.
++COMPONENT_EXPORT(HELIUM)
++bool IsTranslationPack(base::span<const uint8_t> public_key_sha);
++
++}  // namespace helium
++
++#endif  // COMPONENTS_HELIUM_SERVICES_TRANSLATION_PACKS_H_
+--- a/components/on_device_translation/BUILD.gn
++++ b/components/on_device_translation/BUILD.gn
+@@ -68,11 +68,14 @@ source_set("on_device_translation") {
+     "//base",
+     "//base/i18n:language_tag",
+     "//components/component_updater",
++    "//components/crx_file",
++    "//components/helium_services",
+     "//components/language/core/browser",
+     "//components/on_device_translation/public/mojom",
+     "//components/on_device_translation/service:file_operation_proxy",
+     "//components/translate/core/browser",
+     "//components/translate/core/common",
++    "//components/update_client",
+     "//components/user_prefs",
+     "//mojo/public/cpp/bindings",
+     "//mojo/public/cpp/system",
+--- a/components/on_device_translation/bergamot_translation_provider.cc
++++ b/components/on_device_translation/bergamot_translation_provider.cc
+@@ -4,55 +4,205 @@
+ 
+ #include "components/on_device_translation/bergamot_translation_provider.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ 
+-#include "base/files/file_enumerator.h"
++#include "base/barrier_callback.h"
++#include "base/byte_size.h"
++#include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/json/values_util.h"
++#include "base/memory/raw_ref.h"
++#include "base/path_service.h"
++#include "base/strings/strcat.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
++#include "base/values.h"
++#include "components/component_updater/component_installer.h"
++#include "components/component_updater/component_updater_paths.h"
++#include "components/component_updater/component_updater_service.h"
++#include "components/crx_file/id_util.h"
++#include "components/helium_services/helium_services_helpers.h"
++#include "components/helium_services/translation_packs.h"
++#include "components/on_device_translation/public/pref_names.h"
+ #include "components/on_device_translation/service/file_operation_proxy_impl.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
+ #include "components/translate/core/common/translate_errors.h"
++#include "components/update_client/crx_update_item.h"
+ #include "content/public/browser/service_process_host.h"
+ #include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
++namespace component_updater {
++
++// Installs one of the translation packs from Helium services.
++class BergamotPackInstallerPolicy : public ComponentInstallerPolicy {
++ public:
++  using ReadyCallback = base::RepeatingCallback<void(const base::FilePath&)>;
++
++  BergamotPackInstallerPolicy(const helium::TranslationPack& pack,
++                              ReadyCallback ready_callback)
++      : pack_(pack), ready_callback_(std::move(ready_callback)) {}
++  ~BergamotPackInstallerPolicy() override = default;
++
++  static base::FilePath GetInstallDir(const helium::TranslationPack& pack) {
++    return base::FilePath(FILE_PATH_LITERAL("TranslationModels"))
++        .AppendASCII(base::StrCat({pack.source_lang, "-", pack.target_lang}));
++  }
++
++  static void UpdateOnDemand(ComponentUpdateService* component_updater,
++                             const helium::TranslationPack& pack,
++                             base::OnceCallback<void(bool)> callback) {
++    component_updater->GetOnDemandUpdater().OnDemandUpdate(
++        crx_file::id_util::GenerateIdFromHash(pack.public_key_sha),
++        OnDemandUpdater::Priority::FOREGROUND,
++        base::BindOnce(
++            [](base::OnceCallback<void(bool)> callback,
++               update_client::Error error) {
++              std::move(callback).Run(error == update_client::Error::NONE);
++            },
++            std::move(callback)));
++  }
++
++  // ComponentInstallerPolicy:
++  bool SupportsGroupPolicyEnabledComponentUpdates() const override {
++    return false;
++  }
++
++  bool RequiresNetworkEncryption() const override { return false; }
++
++  update_client::CrxInstaller::Result OnCustomInstall(
++      const base::DictValue& manifest,
++      const base::FilePath& install_dir) override {
++    return update_client::CrxInstaller::Result(0);
++  }
++
++  void OnCustomUninstall() override {}
++
++  // Matches what BergamotClient loads.
++  bool VerifyInstallation(const base::DictValue& manifest,
++                          const base::FilePath& install_dir) const override {
++    auto exists = [&](const char* name) {
++      return base::PathExists(install_dir.AppendASCII(name));
++    };
++
++    return exists("model.bin") && exists("lex.bin") &&
++           (exists("vocab.spm") ||
++            (exists("srcvocab.spm") && exists("trgvocab.spm")));
++  }
++
++  void ComponentReady(const base::Version& version,
++                      const base::FilePath& install_dir,
++                      base::DictValue manifest) override {
++    ready_callback_.Run(install_dir);
++  }
++
++  base::FilePath GetRelativeInstallDir() const override {
++    return GetInstallDir(*pack_);
++  }
++
++  void GetHash(std::vector<uint8_t>* hash) const override {
++    hash->assign(pack_->public_key_sha.begin(), pack_->public_key_sha.end());
++  }
++
++  std::string GetName() const override {
++    return base::StrCat({"Translation Model (", pack_->source_lang, "-",
++                         pack_->target_lang, ")"});
++  }
++
++  update_client::InstallerAttributes GetInstallerAttributes() const override {
++    return {};
++  }
++
++ private:
++  const raw_ref<const helium::TranslationPack> pack_;
++  const ReadyCallback ready_callback_;
++};
++
++}  // namespace component_updater
++
+ namespace on_device_translation {
+ 
+ namespace {
+ 
+-using Packages =
+-    std::vector<std::pair<std::pair<std::string, std::string>, base::FilePath>>;
++using component_updater::BergamotPackInstallerPolicy;
+ 
+ // Must match kAutoDetectionLanguage in translate_agent.cc.
+ constexpr char kAutoLanguage[] = "auto";
+ 
+-std::vector<base::FilePath> GetSubdirectories(const base::FilePath& dir) {
+-  std::vector<base::FilePath> subdirectories;
+-  base::FileEnumerator enumerator(dir, /*recursive=*/false,
+-                                  base::FileEnumerator::DIRECTORIES);
+-  for (base::FilePath path = enumerator.Next(); !path.empty();
+-       path = enumerator.Next()) {
+-    subdirectories.push_back(std::move(path));
++// Models are only available to and from English.
++constexpr char kPivotLanguage[] = "en";
++
++// Roughly what a model with its vocabulary takes to download.
++constexpr base::ByteSize kPackDownloadSize = base::MiB(25);
++
++// Packs that aren't used for this long are removed.
++constexpr base::TimeDelta kUnusedPackLifetime = base::Days(30);
++
++// Identifies a pack in prefs::kTranslationModelsLastUsed.
++std::string GetPackKey(std::string_view source_lang,
++                       std::string_view target_lang) {
++  return base::StrCat({source_lang, "-", target_lang});
++}
++
++const helium::TranslationPack* FindPack(std::string_view source_lang,
++                                        std::string_view target_lang) {
++  const auto packs = helium::GetTranslationPacks();
++  const auto it = std::ranges::find_if(packs, [&](const auto& pack) {
++    return pack.source_lang == source_lang && pack.target_lang == target_lang;
++  });
++  return it == packs.end() ? nullptr : &*it;
++}
++
++// Returns the packs that the user agreed to download before, after deleting
++// the ones that were last used before |unused_since|.
++std::vector<const helium::TranslationPack*> FindDownloadedPacks(
++    std::map<std::string, base::Time> last_used,
++    base::Time unused_since) {
++  std::vector<const helium::TranslationPack*> packs;
++  base::FilePath components_dir;
++  if (!base::PathService::Get(component_updater::DIR_COMPONENT_USER,
++                              &components_dir)) {
++    return packs;
++  }
++
++  // A failed download can leave an empty directory behind.
++  for (const helium::TranslationPack& pack : helium::GetTranslationPacks()) {
++    const base::FilePath install_dir =
++        components_dir.Append(BergamotPackInstallerPolicy::GetInstallDir(pack));
++    if (!base::DirectoryExists(install_dir) ||
++        base::IsDirectoryEmpty(install_dir)) {
++      continue;
++    }
++
++    const auto it =
++        last_used.find(GetPackKey(pack.source_lang, pack.target_lang));
++    if (it != last_used.end() && it->second < unused_since) {
++      base::DeletePathRecursively(install_dir);
++      continue;
++    }
++
++    packs.push_back(&pack);
+   }
+ 
+-  return subdirectories;
++  return packs;
+ }
+ 
+-Packages FindPackages(const base::FilePath& models_dir) {
+-  Packages packages;
+-  for (const base::FilePath& source_dir : GetSubdirectories(models_dir)) {
+-    for (const base::FilePath& target_dir : GetSubdirectories(source_dir)) {
+-      packages.emplace_back(
+-          std::make_pair(source_dir.BaseName().AsUTF8Unsafe(),
+-                         target_dir.BaseName().AsUTF8Unsafe()),
+-          target_dir);
+-    }
++std::vector<translate::TranslationProvider::DownloadedModel> ComputeModelSizes(
++    std::vector<std::pair<translate::TranslationProvider::DownloadedModel,
++                          base::FilePath>> models) {
++  std::vector<translate::TranslationProvider::DownloadedModel> sized_models;
++  for (auto& [model, install_dir] : models) {
++    model.size = base::ByteSize(static_cast<uint64_t>(
++        std::max<int64_t>(base::ComputeDirectorySize(install_dir), 0)));
++    sized_models.push_back(std::move(model));
+   }
+ 
+-  return packages;
++  return sized_models;
+ }
+ 
+ void OnTranslated(
+@@ -106,10 +256,36 @@ class BergamotTranslationProvider::Sessi
+ };
+ 
+ BergamotTranslationProvider::BergamotTranslationProvider(
+-    base::FilePath models_dir)
+-    : models_dir_(std::move(models_dir)) {}
++    component_updater::ComponentUpdateService* component_updater,
++    PrefService* local_state)
++    : component_updater_(component_updater), local_state_(local_state) {
++  component_updater_->AddObserver(this);
++
++  std::map<std::string, base::Time> last_used;
++  for (const auto [key, value] :
++       local_state_->GetDict(prefs::kTranslationModelsLastUsed)) {
++    if (std::optional<base::Time> time = base::ValueToTime(value)) {
++      last_used.emplace(key, *time);
++    }
++  }
+ 
+-BergamotTranslationProvider::~BergamotTranslationProvider() = default;
++  // Downloaded packs are registered again to keep them up to date. Others
++  // are only registered once the user agrees to download them.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&FindDownloadedPacks, std::move(last_used),
++                     base::Time::Now() - kUnusedPackLifetime),
++      base::BindOnce(&BergamotTranslationProvider::OnDownloadedPacksFound,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++BergamotTranslationProvider::~BergamotTranslationProvider() {
++  component_updater_->RemoveObserver(this);
++}
++
++BergamotTranslationProvider::Download::Download() = default;
++
++BergamotTranslationProvider::Download::~Download() = default;
+ 
+ std::string BergamotTranslationProvider::GetId() const {
+   return "bergamot";
+@@ -132,6 +308,63 @@ BergamotTranslationProvider::StartSessio
+   return std::make_unique<Session>(weak_ptr_factory_.GetWeakPtr());
+ }
+ 
++translate::TranslationProvider::PairState
++BergamotTranslationProvider::GetPairState(
++    const std::string& source_lang,
++    const std::string& target_lang) const {
++  const std::vector<const helium::TranslationPack*> route =
++      GetRoute(source_lang, target_lang);
++  if (route.empty()) {
++    return PairState::kUnsupported;
++  }
++
++  const bool installed =
++      std::ranges::all_of(route, [&](const helium::TranslationPack* pack) {
++        return installed_packs_.contains(
++            LanguagePair(pack->source_lang, pack->target_lang));
++      });
++  return installed ? PairState::kReady : PairState::kNeedsSetup;
++}
++
++void BergamotTranslationProvider::PrepareTranslation(
++    const std::string& source_lang,
++    const std::string& target_lang,
++    const PrefService& prefs,
++    ConfirmSetupCallback confirm_setup,
++    PrepareCallback callback) {
++  std::vector<const helium::TranslationPack*> missing_packs =
++      GetRoute(source_lang, target_lang);
++  if (missing_packs.empty()) {
++    std::move(callback).Run(PrepareResult::kUnsupported);
++    return;
++  }
++
++  MarkPacksUsed(missing_packs);
++  std::erase_if(missing_packs, [&](const helium::TranslationPack* pack) {
++    return installed_packs_.contains(
++        LanguagePair(pack->source_lang, pack->target_lang));
++  });
++  if (missing_packs.empty()) {
++    std::move(callback).Run(PrepareResult::kReady);
++    return;
++  }
++
++  // The packs come from Helium services, which the user has to allow.
++  if (!helium::ShouldAccessComponentUpdateService(prefs)) {
++    std::move(callback).Run(PrepareResult::kFailed);
++    return;
++  }
++
++  Setup setup;
++  setup.download_size = kPackDownloadSize * missing_packs.size();
++  std::move(confirm_setup)
++      .Run(setup,
++           base::BindOnce(&BergamotTranslationProvider::InstallPacks,
++                          weak_ptr_factory_.GetWeakPtr(),
++                          std::move(missing_packs)),
++           std::move(callback));
++}
++
+ void BergamotTranslationProvider::Translate(const std::string& source_lang,
+                                             const std::string& target_lang,
+                                             std::vector<std::u16string> texts,
+@@ -144,19 +377,7 @@ void BergamotTranslationProvider::Transl
+   }
+ 
+   if (!service_) {
+-    pending_requests_.push_back(base::BindOnce(
+-        &BergamotTranslationProvider::Translate, weak_ptr_factory_.GetWeakPtr(),
+-        source_lang, target_lang, std::move(texts), std::move(callback)));
+-    if (!launching_) {
+-      launching_ = true;
+-      base::ThreadPool::PostTaskAndReplyWithResult(
+-          FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-          base::BindOnce(&FindPackages, models_dir_),
+-          base::BindOnce(&BergamotTranslationProvider::LaunchService,
+-                         weak_ptr_factory_.GetWeakPtr()));
+-    }
+-
+-    return;
++    LaunchService();
+   }
+ 
+   const LanguagePair languages(source_lang, target_lang);
+@@ -183,8 +404,225 @@ void BergamotTranslationProvider::Transl
+                              std::optional<std::vector<std::string>>()));
+ }
+ 
+-void BergamotTranslationProvider::LaunchService(Packages packages) {
+-  launching_ = false;
++void BergamotTranslationProvider::GetDownloadedModels(
++    base::OnceCallback<void(std::vector<DownloadedModel>)> callback) {
++  const base::DictValue& last_used =
++      local_state_->GetDict(prefs::kTranslationModelsLastUsed);
++  std::vector<std::pair<DownloadedModel, base::FilePath>> models;
++  for (const auto& [languages, install_dir] : installed_packs_) {
++    DownloadedModel model;
++    model.source_lang = languages.first;
++    model.target_lang = languages.second;
++    if (const base::Value* time =
++            last_used.Find(GetPackKey(languages.first, languages.second))) {
++      model.last_used = base::ValueToTime(time).value_or(base::Time());
++    }
++
++    models.emplace_back(std::move(model), install_dir);
++  }
++
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ComputeModelSizes, std::move(models)),
++      std::move(callback));
++}
++
++void BergamotTranslationProvider::RemoveDownloadedModel(
++    const std::string& source_lang,
++    const std::string& target_lang,
++    base::OnceClosure callback) {
++  if (const helium::TranslationPack* pack =
++          FindPack(source_lang, target_lang)) {
++    const LanguagePair languages(source_lang, target_lang);
++    // Unregistering the component deletes its files.
++    if (registered_packs_.erase(languages)) {
++      component_updater_->UnregisterComponent(
++          crx_file::id_util::GenerateIdFromHash(pack->public_key_sha));
++    }
++
++    installed_packs_.erase(languages);
++    ScopedDictPrefUpdate(local_state_, prefs::kTranslationModelsLastUsed)
++        ->Remove(GetPackKey(source_lang, target_lang));
++
++    // The service is launched again without the pack when it's next needed.
++    OnServiceDisconnected();
++  }
++
++  std::move(callback).Run();
++}
++
++std::vector<const helium::TranslationPack*>
++BergamotTranslationProvider::GetRoute(const std::string& source_lang,
++                                      const std::string& target_lang) const {
++  if (const helium::TranslationPack* pack =
++          FindPack(source_lang, target_lang)) {
++    return {pack};
++  }
++
++  const helium::TranslationPack* to_pivot =
++      FindPack(source_lang, kPivotLanguage);
++  const helium::TranslationPack* from_pivot =
++      FindPack(kPivotLanguage, target_lang);
++  if (to_pivot && from_pivot) {
++    return {to_pivot, from_pivot};
++  }
++
++  return {};
++}
++
++void BergamotTranslationProvider::OnDownloadedPacksFound(
++    std::vector<const helium::TranslationPack*> packs) {
++  // Packs that were deleted, or downloaded before their use was recorded, get
++  // a fresh start.
++  base::DictValue last_used;
++  const base::DictValue& old_last_used =
++      local_state_->GetDict(prefs::kTranslationModelsLastUsed);
++  for (const helium::TranslationPack* pack : packs) {
++    const std::string key = GetPackKey(pack->source_lang, pack->target_lang);
++    const base::Value* time = old_last_used.Find(key);
++    last_used.Set(key,
++                  time ? time->Clone() : base::TimeToValue(base::Time::Now()));
++  }
++
++  local_state_->SetDict(prefs::kTranslationModelsLastUsed,
++                        std::move(last_used));
++  RegisterPacks(std::move(packs));
++}
++
++void BergamotTranslationProvider::MarkPacksUsed(
++    const std::vector<const helium::TranslationPack*>& packs) {
++  ScopedDictPrefUpdate update(local_state_, prefs::kTranslationModelsLastUsed);
++  for (const helium::TranslationPack* pack : packs) {
++    update->Set(GetPackKey(pack->source_lang, pack->target_lang),
++                base::TimeToValue(base::Time::Now()));
++  }
++}
++
++void BergamotTranslationProvider::RegisterPacks(
++    std::vector<const helium::TranslationPack*> packs) {
++  for (const helium::TranslationPack* pack : packs) {
++    if (!registered_packs_.emplace(pack->source_lang, pack->target_lang)
++             .second) {
++      OnPackRegistered(pack);
++      continue;
++    }
++
++    base::MakeRefCounted<component_updater::ComponentInstaller>(
++        std::make_unique<BergamotPackInstallerPolicy>(
++            *pack, base::BindRepeating(
++                       &BergamotTranslationProvider::OnPackReady,
++                       weak_ptr_factory_.GetWeakPtr(),
++                       LanguagePair(pack->source_lang, pack->target_lang))))
++        ->Register(
++            component_updater_,
++            base::BindOnce(&BergamotTranslationProvider::OnPackRegistered,
++                           weak_ptr_factory_.GetWeakPtr(), pack));
++  }
++}
++
++void BergamotTranslationProvider::InstallPacks(
++    std::vector<const helium::TranslationPack*> packs,
++    SetupProgressCallback progress_callback,
++    InstallCallback callback) {
++  const int download_id = next_download_id_++;
++  Download& download = downloads_[download_id];
++  download.progress_callback = std::move(progress_callback);
++  for (const helium::TranslationPack* pack : packs) {
++    download
++        .bytes[crx_file::id_util::GenerateIdFromHash(pack->public_key_sha)] = {
++        base::ByteSize(), kPackDownloadSize};
++  }
++
++  auto barrier = base::BarrierCallback<bool>(
++      packs.size(),
++      base::BindOnce(
++          [](base::WeakPtr<BergamotTranslationProvider> provider,
++             int download_id, InstallCallback callback,
++             const std::vector<bool>& results) {
++            if (provider) {
++              provider->downloads_.erase(download_id);
++            }
++
++            std::move(callback).Run(std::ranges::all_of(
++                results, [](bool installed) { return installed; }));
++          },
++          weak_ptr_factory_.GetWeakPtr(), download_id, std::move(callback)));
++
++  for (const helium::TranslationPack* pack : packs) {
++    installing_.emplace(LanguagePair(pack->source_lang, pack->target_lang),
++                        barrier);
++  }
++
++  RegisterPacks(std::move(packs));
++}
++
++void BergamotTranslationProvider::OnPackRegistered(
++    const helium::TranslationPack* pack) {
++  // Only packs that are being installed need to be downloaded right away.
++  if (!installing_.contains(
++          LanguagePair(pack->source_lang, pack->target_lang))) {
++    return;
++  }
++
++  BergamotPackInstallerPolicy::UpdateOnDemand(
++      component_updater_, *pack,
++      base::BindOnce(&BergamotTranslationProvider::OnPackUpdated,
++                     weak_ptr_factory_.GetWeakPtr(), pack));
++}
++
++void BergamotTranslationProvider::OnPackUpdated(
++    const helium::TranslationPack* pack,
++    bool success) {
++  // The pack is ready by now if it was installed.
++  const LanguagePair languages(pack->source_lang, pack->target_lang);
++  const bool installed = success && installed_packs_.contains(languages);
++  auto [begin, end] = installing_.equal_range(languages);
++  std::vector<InstallCallback> callbacks;
++  for (auto it = begin; it != end; ++it) {
++    callbacks.push_back(std::move(it->second));
++  }
++
++  installing_.erase(begin, end);
++  for (InstallCallback& callback : callbacks) {
++    std::move(callback).Run(installed);
++  }
++}
++
++void BergamotTranslationProvider::OnEvent(
++    const update_client::CrxUpdateItem& item) {
++  if (item.downloaded_bytes < 0 || item.total_bytes <= 0) {
++    return;
++  }
++
++  for (auto& [id, download] : downloads_) {
++    auto it = download.bytes.find(item.id);
++    if (it == download.bytes.end()) {
++      continue;
++    }
++
++    it->second = {base::ByteSize(static_cast<uint64_t>(item.downloaded_bytes)),
++                  base::ByteSize(static_cast<uint64_t>(item.total_bytes))};
++    base::ByteSize downloaded;
++    base::ByteSize total;
++    for (const auto& [pack_id, bytes] : download.bytes) {
++      downloaded += bytes.first;
++      total += bytes.second;
++    }
++
++    download.progress_callback.Run(downloaded, total);
++  }
++}
++
++void BergamotTranslationProvider::OnPackReady(
++    LanguagePair languages,
++    const base::FilePath& install_dir) {
++  installed_packs_[std::move(languages)] = install_dir;
++
++  // The service is launched again with the new pack when it's next needed.
++  OnServiceDisconnected();
++}
++
++void BergamotTranslationProvider::LaunchService() {
+   content::ServiceProcessHost::Launch(
+       service_.BindNewPipeAndPassReceiver(),
+       content::ServiceProcessHost::Options()
+@@ -196,10 +634,10 @@ void BergamotTranslationProvider::Launch
+ 
+   auto config = mojom::OnDeviceTranslationServiceConfig::New();
+   std::vector<base::FilePath> package_paths;
+-  for (auto& [languages, path] : packages) {
++  for (const auto& [languages, path] : installed_packs_) {
+     config->packages.push_back(mojom::OnDeviceTranslationLanguagePackage::New(
+         languages.first, languages.second));
+-    package_paths.push_back(std::move(path));
++    package_paths.push_back(path);
+   }
+ 
+   // The proxy opens files from |package_paths| for the sandboxed service, on
+@@ -221,14 +659,9 @@ void BergamotTranslationProvider::Launch
+           config->file_operation_proxy.InitWithNewPipeAndPassReceiver(),
+           task_runner, std::move(package_paths)));
+   service_->SetServiceConfig(std::move(config));
+-
+-  for (base::OnceClosure& request : std::exchange(pending_requests_, {})) {
+-    std::move(request).Run();
+-  }
+ }
+ 
+ void BergamotTranslationProvider::OnServiceDisconnected() {
+-  // Models may have been added since, so they're found again on relaunch.
+   service_.reset();
+   translators_.clear();
+ }
+--- a/components/on_device_translation/bergamot_translation_provider.h
++++ b/components/on_device_translation/bergamot_translation_provider.h
+@@ -7,28 +7,45 @@
+ 
+ #include <map>
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
++#include "base/byte_size.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/callback_forward.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "components/on_device_translation/public/mojom/on_device_translation_service.mojom.h"
+ #include "components/on_device_translation/public/mojom/translator.mojom.h"
+ #include "components/translate/core/browser/translation_provider.h"
++#include "components/update_client/update_client.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ 
++class PrefService;
++
++namespace component_updater {
++class ComponentUpdateService;
++}
++
++namespace helium {
++struct TranslationPack;
++}
++
+ namespace on_device_translation {
+ 
+ // Translates pages with bergamot in the on-device translation service, using
+-// Firefox's models from |models_dir|. The model that translates from one
+-// language to another is in |models_dir|/<from>/<to>, named like Firefox's
+-// without their languages: model.bin, lex.bin, and vocab.spm or
+-// srcvocab.spm and trgvocab.spm.
+-class BergamotTranslationProvider : public translate::TranslationProvider {
++// Firefox's models. Each model is a component that is only downloaded once
++// the user agrees to it, when they first translate between its languages, and
++// removed again when it isn't used for a while.
++class BergamotTranslationProvider
++    : public translate::TranslationProvider,
++      public update_client::UpdateClient::Observer {
+  public:
+-  explicit BergamotTranslationProvider(base::FilePath models_dir);
++  BergamotTranslationProvider(
++      component_updater::ComponentUpdateService* component_updater,
++      PrefService* local_state);
+   ~BergamotTranslationProvider() override;
+ 
+   BergamotTranslationProvider(const BergamotTranslationProvider&) = delete;
+@@ -40,14 +57,30 @@ class BergamotTranslationProvider : publ
+   std::u16string GetName() const override;
+   bool IsAvailable() const override;
+   bool SendsTextOffDevice() const override;
++  PairState GetPairState(const std::string& source_lang,
++                         const std::string& target_lang) const override;
++  void PrepareTranslation(const std::string& source_lang,
++                          const std::string& target_lang,
++                          const PrefService& prefs,
++                          ConfirmSetupCallback confirm_setup,
++                          PrepareCallback callback) override;
+   std::unique_ptr<translate::TranslationSession> StartSession(
+       const GURL& url) override;
++  void GetDownloadedModels(
++      base::OnceCallback<void(std::vector<DownloadedModel>)> callback) override;
++  void RemoveDownloadedModel(const std::string& source_lang,
++                             const std::string& target_lang,
++                             base::OnceClosure callback) override;
++
++  // update_client::UpdateClient::Observer:
++  void OnEvent(const update_client::CrxUpdateItem& item) override;
+ 
+  private:
+   class Session;
+ 
+   using LanguagePair = std::pair<std::string, std::string>;
+   using TextsCallback = translate::PlainTextTranslationSession::TextsCallback;
++  using InstallCallback = base::OnceCallback<void(bool)>;
+ 
+   // Translates for all sessions, which share the service and its translators.
+   void Translate(const std::string& source_lang,
+@@ -55,17 +88,48 @@ class BergamotTranslationProvider : publ
+                  std::vector<std::u16string> texts,
+                  TextsCallback callback);
+ 
+-  void LaunchService(
+-      std::vector<std::pair<LanguagePair, base::FilePath>> packages);
++  // Returns the packs to translate with in order, which is empty if there are
++  // none.
++  std::vector<const helium::TranslationPack*> GetRoute(
++      const std::string& source_lang,
++      const std::string& target_lang) const;
++
++  // Registers the packs that are still in use, and forgets the others.
++  void OnDownloadedPacksFound(
++      std::vector<const helium::TranslationPack*> packs);
++  void MarkPacksUsed(const std::vector<const helium::TranslationPack*>& packs);
++
++  void RegisterPacks(std::vector<const helium::TranslationPack*> packs);
++  void InstallPacks(std::vector<const helium::TranslationPack*> packs,
++                    SetupProgressCallback progress_callback,
++                    InstallCallback callback);
++  void OnPackRegistered(const helium::TranslationPack* pack);
++  void OnPackUpdated(const helium::TranslationPack* pack, bool success);
++  void OnPackReady(LanguagePair languages, const base::FilePath& install_dir);
++
++  void LaunchService();
+   void OnServiceDisconnected();
+ 
+-  const base::FilePath models_dir_;
++  const raw_ptr<component_updater::ComponentUpdateService> component_updater_;
++  const raw_ptr<PrefService> local_state_;
++  std::set<LanguagePair> registered_packs_;
++  std::map<LanguagePair, base::FilePath> installed_packs_;
++  // Callbacks for packs that are being installed.
++  std::multimap<LanguagePair, InstallCallback> installing_;
++
++  // How far the packs of each InstallPacks() call are downloaded, by their
++  // component IDs.
++  struct Download {
++    Download();
++    ~Download();
++    std::map<std::string, std::pair<base::ByteSize, base::ByteSize>> bytes;
++    SetupProgressCallback progress_callback;
++  };
++  std::map<int, Download> downloads_;
++  int next_download_id_ = 0;
+ 
+   mojo::Remote<mojom::OnDeviceTranslationService> service_;
+   std::map<LanguagePair, mojo::Remote<mojom::OnDeviceTranslator>> translators_;
+-  // Requests that wait for the service to launch, if it is launching.
+-  std::vector<base::OnceClosure> pending_requests_;
+-  bool launching_ = false;
+ 
+   base::WeakPtrFactory<BergamotTranslationProvider> weak_ptr_factory_{this};
+ };
+--- a/components/component_updater/component_updater_service.cc
++++ b/components/component_updater/component_updater_service.cc
+@@ -33,6 +33,7 @@
+ #include "components/component_updater/component_updater_utils.h"
+ #include "components/component_updater/pref_names.h"
+ #include "components/component_updater/required_components_controller.h"
++#include "components/helium_services/translation_packs.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/update_client/configurator.h"
+@@ -339,8 +340,11 @@ update_client::CrxComponent CrxUpdateSer
+       component.allow_updates_on_metered_connection;
+ 
+   crx.brand = brand_;
++  // Helium signs translation packs itself, without Google's publisher proof.
+   crx.crx_format_requirement =
+-      crx_file::VerifierFormat::CRX3_WITH_PUBLISHER_PROOF;
++      helium::IsTranslationPack(component.public_key_hash)
++          ? crx_file::VerifierFormat::CRX3
++          : crx_file::VerifierFormat::CRX3_WITH_PUBLISHER_PROOF;
+ 
+   bool component_updates_enabled =
+       config_->GetPrefService()->GetBoolean(prefs::kComponentUpdatesEnabled);
+--- a/components/on_device_translation/public/pref_names.cc
++++ b/components/on_device_translation/public/pref_names.cc
+@@ -19,6 +19,9 @@ const char kTranslateKitPreviouslyRegist
+ const char kTranslatorAPIAllowed[] =
+     "on_device_translation.translator_api_allowed";
+ 
++const char kTranslationModelsLastUsed[] =
++    "on_device_translation.models_last_used";
++
+ }  // namespace prefs
+ 
+ namespace on_device_translation {
+@@ -28,6 +31,7 @@ void RegisterLocalStatePrefs(PrefRegistr
+                                  base::FilePath());
+   registry->RegisterBooleanPref(prefs::kTranslateKitPreviouslyRegistered,
+                                 false);
++  registry->RegisterDictionaryPref(prefs::kTranslationModelsLastUsed);
+ 
+   // Register language pack config path preferences.
+   for (const auto& it : kLanguagePackComponentConfigMap) {
+--- a/components/on_device_translation/public/pref_names.h
++++ b/components/on_device_translation/public/pref_names.h
+@@ -26,6 +26,9 @@ extern const char kTranslateKitPreviousl
+ // Enterprise policy.
+ extern const char kTranslatorAPIAllowed[];
+ 
++// When each downloaded translation model was last used, by languages.
++extern const char kTranslationModelsLastUsed[];
++
+ }  // namespace prefs
+ 
+ namespace on_device_translation {
+--- a/components/translate/core/browser/translation_provider.cc
++++ b/components/translate/core/browser/translation_provider.cc
+@@ -119,6 +119,17 @@ TranslationBatchLimits TranslationProvid
+   return {};
+ }
+ 
++void TranslationProvider::GetDownloadedModels(
++    base::OnceCallback<void(std::vector<DownloadedModel>)> callback) {
++  std::move(callback).Run({});
++}
++
++void TranslationProvider::RemoveDownloadedModel(const std::string& source_lang,
++                                                const std::string& target_lang,
++                                                base::OnceClosure callback) {
++  std::move(callback).Run();
++}
++
+ void RegisterTranslationProvider(
+     std::unique_ptr<TranslationProvider> provider) {
+   GetProviders().push_back(std::move(provider));
+--- a/components/translate/core/browser/translation_provider.h
++++ b/components/translate/core/browser/translation_provider.h
+@@ -12,6 +12,7 @@
+ 
+ #include "base/byte_size.h"
+ #include "base/functional/callback.h"
++#include "base/time/time.h"
+ #include "components/translate/core/common/translate_errors.h"
+ 
+ class GURL;
+@@ -189,6 +190,23 @@ class TranslationProvider {
+   virtual TranslationBatchLimits GetBatchLimits() const;
+ 
+   virtual std::unique_ptr<TranslationSession> StartSession(const GURL& url) = 0;
++
++  // A model that the provider downloaded to translate on the device.
++  struct DownloadedModel {
++    std::string source_lang;
++    std::string target_lang;
++    base::ByteSize size;
++    base::Time last_used;
++  };
++
++  // Lists the models that the provider downloaded, if it downloads any.
++  virtual void GetDownloadedModels(
++      base::OnceCallback<void(std::vector<DownloadedModel>)> callback);
++
++  // Deletes a downloaded model, which is downloaded again if it's needed.
++  virtual void RemoveDownloadedModel(const std::string& source_lang,
++                                     const std::string& target_lang,
++                                     base::OnceClosure callback);
+ };
+ 
+ // Adds |provider| after the ones registered before it. Must be called before
