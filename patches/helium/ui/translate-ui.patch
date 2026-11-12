@@ -1,0 +1,281 @@
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -225,10 +225,10 @@
+ #include "components/strings/grit/components_strings.h"
+ #include "components/supervised_user/core/browser/supervised_user_preferences.h"
+ #include "components/supervised_user/core/browser/supervised_user_url_filtering_service.h"
+-#include "components/translate/core/common/translate_switches.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
+ #include "components/translate/core/browser/translate_manager.h"
+ #include "components/translate/core/browser/translate_prefs.h"
++#include "components/translate/core/browser/translation_provider.h"
+ #include "components/translate/core/common/translate_util.h"
+ #include "components/url_formatter/url_formatter.h"
+ #include "components/user_prefs/user_prefs.h"
+@@ -2673,7 +2673,6 @@ void RenderViewContextMenu::AppendPageIt
+   }
+ 
+   if (CanTranslate(/*menu_logging=*/true)) {
+-   if (base::CommandLine::ForCurrentProcess()->HasSwitch(translate::switches::kTranslateScriptURL))
+     AppendTranslateItem();
+   }
+ }
+@@ -5989,6 +5988,11 @@ ToastController* RenderViewContextMenu::
+ }
+ 
+ bool RenderViewContextMenu::CanTranslate(bool menu_logging) {
++  // Selected text can't be translated with a TranslationProvider yet.
++  if (!translate::GetTranslationProvider() || !params_.selection_text.empty()) {
++    return false;
++  }
++
+   ChromeTranslateClient* chrome_translate_client =
+       ChromeTranslateClient::FromWebContents(embedder_web_contents_);
+   return chrome_translate_client &&
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1051,6 +1051,7 @@ source_set("browser_ui_prefs") {
+     "//components/pref_registry",
+     "//components/prefs",
+     "//components/sharing_message",
++    "//components/translate/core/browser",
+     "//components/translate/core/browser:translate_pref_names",
+   ]
+   if (is_win && is_chrome_branded) {
+--- a/chrome/browser/ui/browser_actions.cc
++++ b/chrome/browser/ui/browser_actions.cc
+@@ -226,6 +226,7 @@
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/strings/grit/components_strings.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "components/translate/core/browser/translation_provider.h"
+ #include "content/public/browser/page_navigator.h"
+ #include "extensions/common/extension_urls.h"
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -1313,17 +1314,19 @@ void BrowserActions::InitializeChromeMen
+           .SetAccelerator(GetAcceleratorForCommandId(IDC_DEV_TOOLS))
+           .Build());
+ 
+-  root_action_item_->AddChild(
+-      ChromeMenuAction(
+-          base::BindRepeating(
+-              [](BrowserWindowInterface* bwi, actions::ActionItem* item,
+-                 actions::ActionInvocationContext context) {
+-                chrome::ShowTranslateBubble(bwi);
+-              },
+-              bwi),
+-          kActionShowTranslate, IDS_SHOW_TRANSLATE, IDS_TOOLTIP_TRANSLATE,
+-          vector_icons::kGTranslateIcon)
+-          .Build());
++  if (translate::HasTranslationProvider()) {
++    root_action_item_->AddChild(
++        ChromeMenuAction(
++            base::BindRepeating(
++                [](BrowserWindowInterface* bwi, actions::ActionItem* item,
++                   actions::ActionInvocationContext context) {
++                  chrome::ShowTranslateBubble(bwi);
++                },
++                bwi),
++            kActionShowTranslate, IDS_SHOW_TRANSLATE, IDS_TOOLTIP_TRANSLATE,
++            vector_icons::kGTranslateIcon)
++            .Build());
++  }
+ 
+   root_action_item_->AddChild(
+       actions::ActionItem::Builder(
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -22,6 +22,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/prefs/scoped_user_pref_update.h"
+ #include "components/translate/core/browser/translate_pref_names.h"
++#include "components/translate/core/browser/translation_provider.h"
+ #include "media/media_buildflags.h"
+ #include "third_party/blink/public/common/peerconnection/webrtc_ip_handling_policy.h"
+ 
+@@ -162,8 +163,12 @@ void RegisterBrowserUserPrefs(user_prefs
+   registry->RegisterBooleanPref(prefs::kWebAppCreateOnDesktop, true);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInAppsMenu, true);
+   registry->RegisterBooleanPref(prefs::kWebAppCreateInQuickLaunchBar, true);
++  // Translation is only offered by default when it stays on-device.
++  const translate::TranslationProvider* translation_provider =
++      translate::GetTranslationProvider();
+   registry->RegisterBooleanPref(
+-      translate::prefs::kOfferTranslateEnabled, false,
++      translate::prefs::kOfferTranslateEnabled,
++      translation_provider && translation_provider->IsOnDevice(),
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   registry->RegisterDictionaryPref(prefs::kBrowserWindowPlacement);
+   registry->RegisterDictionaryPref(prefs::kBrowserWindowPlacementPopup);
+--- a/chrome/browser/ui/toolbar/app_menu_model.cc
++++ b/chrome/browser/ui/toolbar/app_menu_model.cc
+@@ -143,6 +143,7 @@
+ #include "components/skills/features.h"
+ #include "components/strings/grit/components_strings.h"
+ #include "components/sync/service/sync_service.h"
++#include "components/translate/core/browser/translation_provider.h"
+ #include "components/user_education/common/feature_promo/feature_promo_controller.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "components/webapps/browser/banners/app_banner_manager.h"
+@@ -2090,8 +2091,11 @@ void AppMenuModel::Build() {
+     }
+   }
+ 
+-  AddItemWithStringIdAndVectorIcon(this, IDC_SHOW_TRANSLATE, IDS_SHOW_TRANSLATE,
+-                                   vector_icons::kGTranslateIcon);
++  if (translate::HasTranslationProvider()) {
++    AddItemWithStringIdAndVectorIcon(this, IDC_SHOW_TRANSLATE,
++                                     IDS_SHOW_TRANSLATE,
++                                     vector_icons::kGTranslateIcon);
++  }
+ 
+   CreateFindAndEditSubMenu();
+ 
+--- a/chrome/browser/resources/settings/languages_page/languages_page.html.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_page.html.ts
+@@ -4,6 +4,8 @@
+ 
+ import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
++import {loadTimeData} from '../i18n_setup.js';
++
+ import type {SettingsLanguagesPageElement} from './languages_page.js';
+ 
+ export function getHtml(this: SettingsLanguagesPageElement) {
+@@ -30,9 +32,11 @@ export function getHtml(this: SettingsLa
+           <div title="${item.language.nativeDisplayName}" role="none">
+             ${this.formatIndex_(index)}. ${item.language.displayName}
+           </div>
++          ${loadTimeData.getBoolean('enableHeliumTranslate') ? html`
+           <div class="target-info secondary">
+             $i18n{translateTargetLabel}
+           </div>
++          ` : ''}
+ <if expr="is_win">
+           <div class="explain-selected"
+               ?hidden="${!this.isProspectiveUiLanguage_(
+--- a/chrome/browser/resources/settings/languages_page/translate_page.html.ts
++++ b/chrome/browser/resources/settings/languages_page/translate_page.html.ts
+@@ -4,10 +4,13 @@
+ 
+ import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
++import {loadTimeData} from '../i18n_setup.js';
++
+ import type {SettingsTranslatePageElement} from './translate_page.js';
+ 
+ export function getHtml(this: SettingsTranslatePageElement) {
+   return html`<!--_html_template_start_-->
++${loadTimeData.getBoolean('enableHeliumTranslate') ? html`
+ <settings-section page-title="$i18n{translatePageTitle}">
+ <settings-toggle-button id="offerTranslateOtherLanguages"
+     pref-key="translate.enabled"
+@@ -107,5 +110,6 @@ ${this.showAddNeverTranslateDialog_ ? ht
+   </settings-add-languages-dialog>
+ ` : ''}
+ </settings-section>
++` : ''}
+ <!--_html_template_end_-->`;
+ }
+--- a/chrome/browser/ui/views/translate/translate_bubble_controller.cc
++++ b/chrome/browser/ui/views/translate/translate_bubble_controller.cc
+@@ -50,10 +50,10 @@ const char kTranslatePartialTranslationS
+ 
+ actions::ActionItem* GetTranslateActionItem(
+     actions::ActionItem* root_action_item) {
++  // Null without a TranslationProvider.
+   actions::ActionItem* translate_action_item =
+       actions::ActionManager::Get().FindAction(kActionShowTranslate,
+                                                root_action_item);
+-  CHECK(translate_action_item);
+   return translate_action_item;
+ }
+ 
+@@ -142,7 +142,9 @@ views::Widget* TranslateBubbleController
+ 
+   translate_bubble_view_->model()->ReportUIChange(true);
+ 
+-  action_item_->SetIsShowingBubble(true);
++  if (action_item_) {
++    action_item_->SetIsShowingBubble(true);
++  }
+ 
+   // Trigger PDF translate IPH
+   if (web_contents &&
+@@ -345,7 +347,9 @@ void TranslateBubbleController::CreatePa
+       std::move(partial_translate_bubble_view));
+   partial_translate_bubble_view_->SetViewState(view_state, error_type);
+ 
+-  action_item_->SetIsShowingBubble(true);
++  if (action_item_) {
++    action_item_->SetIsShowingBubble(true);
++  }
+ }
+ 
+ void TranslateBubbleController::CloseBubble() {
+@@ -396,12 +400,16 @@ TranslateBubbleController::GetOnPartialT
+ 
+ void TranslateBubbleController::OnTranslateBubbleClosed() {
+   translate_bubble_view_ = nullptr;
+-  action_item_->SetIsShowingBubble(false);
++  if (action_item_) {
++    action_item_->SetIsShowingBubble(false);
++  }
+ }
+ 
+ void TranslateBubbleController::OnPartialTranslateBubbleClosed() {
+   partial_translate_bubble_view_ = nullptr;
+-  action_item_->SetIsShowingBubble(false);
++  if (action_item_) {
++    action_item_->SetIsShowingBubble(false);
++  }
+ }
+ 
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(TranslateBubbleController);
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -116,6 +116,7 @@
+ #include "components/sync/service/sync_service.h"
+ #include "components/sync/service/sync_service_utils.h"
+ #include "components/sync/service/sync_user_settings.h"
++#include "components/translate/core/browser/translation_provider.h"
+ #include "components/translate/core/common/translate_features.h"
+ #include "components/wallet/core/browser/walletable_permission_utils.h"
+ #include "components/wallet/core/common/wallet_features.h"
+@@ -1531,6 +1532,8 @@ void AddLanguagesStrings(content::WebUID
+       base::FeatureList::IsEnabled(translate::kEnableTranslatePdf)
+           ? IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL_WITH_PDF
+           : IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL);
++  html_source->AddBoolean("enableHeliumTranslate",
++                          translate::HasTranslationProvider());
+ #endif  // !BUILDFLAG(IS_CHROMEOS)
+ #if BUILDFLAG(IS_CHROMEOS)
+   html_source->AddString("osSettingsLanguagesPageUrl",
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -1259,13 +1259,13 @@
+         Let websites know the languages you speak. They'll show content in those languages, when possible.
+       </message>
+       <message name="IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE" desc="The label of the check-box that enables the prompt to translate a page.">
+-        Use Google Translate
++        Offer to translate pages
+       </message>
+       <message name="IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL" desc="The sublabel of the check-box that enables the prompt to translate a page.">
+-        When on, Google Translate will offer to translate sites into your preferred language. It can also automatically translate sites.
++        When on, Helium will offer to translate sites into your preferred language. It can also automatically translate sites.
+       </message>
+       <message name="IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL_WITH_PDF" desc="The sublabel of the check-box that enables the prompt to translate a page or PDF.">
+-  When on, Google Translate will offer to translate sites and PDFs into your preferred language. It can also automatically translate sites.
++  When on, Helium will offer to translate sites and PDFs into your preferred language. It can also automatically translate sites.
+ </message>
+       <message name="IDS_SETTINGS_LANGUAGES_TRANSLATE_TARGET" desc="The label under a language's name in a list of enabled languages indicating that pages will be translated to this language.">
+         This language is used when translating pages
+@@ -1286,7 +1286,7 @@
+         Remove <ph name="LANGUAGE_NAME">$1<ex>Swahili</ex></ph> from never offer translation languages
+       </message>
+       <message name="IDS_SETTINGS_TRANSLATE_PAGE_TITLE" desc="Name of the settings page which displays translate preferences.">
+-        Google Translate
++        Translate
+       </message>
+       <message name="IDS_SETTINGS_TARGET_TRANSLATE_LABEL" desc="Label for the element to select the target language">
+         Translate into this language

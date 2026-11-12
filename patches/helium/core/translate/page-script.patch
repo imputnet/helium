@@ -1,0 +1,986 @@
+--- a/components/resources/translate_resources.grdp
++++ b/components/resources/translate_resources.grdp
+@@ -1,4 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <grit-part>
+   <include name="IDR_TRANSLATE_JS" file="../translate/core/browser/resources/translate.js" type="BINDATA" />
++  <include name="IDR_HELIUM_TRANSLATE_JS" file="../translate/core/browser/resources/helium_translate.js" type="BINDATA" />
+ </grit-part>
+--- /dev/null
++++ b/components/translate/core/browser/resources/helium_translate.js
+@@ -0,0 +1,975 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Replaces the Google Translate Element behind its cr.googleTranslate API.
++// Injected with WebString::FromAscii, so keep this file ASCII-only.
++
++// eslint-disable-next-line no-var
++var cr = cr || {};
++
++cr.googleTranslate = (function() {
++  'use strict';
++
++  // Mirrors translate::TranslateErrors.
++  const ERROR = {
++    'NONE': 0,
++    'INITIALIZATION_ERROR': 2,
++    'UNKNOWN_LANGUAGE': 3,
++    'UNSUPPORTED_LANGUAGE': 4,
++    'IDENTICAL_LANGUAGES': 5,
++    'TRANSLATION_ERROR': 6,
++    'UNEXPECTED_SCRIPT_ERROR': 8,
++  };
++
++  // Errors that retrying can't fix.
++  const FATAL_ERRORS = new Set([
++    ERROR['INITIALIZATION_ERROR'],
++    ERROR['UNKNOWN_LANGUAGE'],
++    ERROR['UNSUPPORTED_LANGUAGE'],
++  ]);
++
++  const SKIPPED_TAGS = new Set([
++    'SCRIPT',
++    'STYLE',
++    'NOSCRIPT',
++    'TEMPLATE',
++    'CODE',
++    'KBD',
++    'SAMP',
++    'PRE',
++    'SVG',
++    'MATH',
++    'IFRAME',
++    'OBJECT',
++    'EMBED',
++    'CANVAS',
++    'VIDEO',
++    'AUDIO',
++  ]);
++
++  const COLLECTED_NODE_TYPES = new Set([
++    Node.TEXT_NODE,
++    Node.ELEMENT_NODE,
++    Node.DOCUMENT_FRAGMENT_NODE,
++  ]);
++
++  const TRANSLATED_ATTRIBUTES = [
++    'title',
++    'alt',
++    'placeholder',
++    'aria-label',
++    'aria-placeholder',
++    'aria-roledescription',
++    'aria-valuetext',
++  ];
++
++  const OBSERVER_OPTIONS = {
++    childList: true,
++    characterData: true,
++    attributes: true,
++    // A button's name and type decide whether its value can be translated.
++    attributeFilter: [...TRANSLATED_ATTRIBUTES, 'value', 'name', 'type'],
++    subtree: true,
++  };
++
++  // |batchLimits| is set by the browser ahead of this script.
++  const MAX_PIECES_PER_REQUEST = batchLimits.maxSegments;
++  const MAX_CHARS_PER_REQUEST = batchLimits.maxCharacters;
++  const MAX_PIECE_CHARS = Math.min(1000, MAX_CHARS_PER_REQUEST);
++  // Text past a split point that Intl.Segmenter sees, so it doesn't end a word
++  // or sentence at the cut.
++  const SPLIT_LOOKAHEAD_CHARS = 100;
++
++  const MAX_SEGMENT_RETRIES = 2;
++  const MAX_CONSECUTIVE_FAILURES = 3;
++
++  // In takeTextRequest() calls.
++  const PRUNE_INTERVAL = 20;
++
++  const SPLIT_WHITESPACE = /^(\s*)([\s\S]*?)(\s*)$/;
++  const TRAILING_WHITESPACE = /\s*$/;
++  const HAS_LETTER = /\p{L}/u;
++
++  let finished = false;
++  let error = false;
++  let errorCode = ERROR['NONE'];
++  let sourceLang = '';
++  let targetLang = '';
++  let startTime = 0;
++  let translationTime = 0;
++  let consecutiveFailures = 0;
++  let detectSource = false;
++  let pollsSincePrune = 0;
++
++  // {segment, index} of each untranslated piece.
++  let pending = [];
++  // Keys of segments that are queued or partially translated.
++  let queued = new Set();
++  let inFlight = null;
++  // Key -> {segment, value} of applied translations.
++  let translated = new Map();
++  let observer = null;
++  const attributeKeys = new WeakMap();
++  // The page's own lang attribute while the translation is shown.
++  let savedLang = null;
++  // Whether elements with queued text are within a viewport height of it.
++  let nearViewport = new WeakMap();
++  let visibilityObserver = null;
++
++  // The last |granularity| boundary in |text| at or before |limit|, or 0.
++  function lastBoundary(text, limit, granularity) {
++    const segmenter =
++        new Intl.Segmenter(sourceLang || undefined, {granularity});
++    const window = text.slice(0, limit + SPLIT_LOOKAHEAD_CHARS);
++    let boundary = 0;
++    for (const segment of segmenter.segment(window)) {
++      if (segment.index > limit) {
++        break;
++      }
++
++      if (granularity === 'sentence' || segment.isWordLike) {
++        boundary = segment.index;
++      }
++    }
++
++    return boundary;
++  }
++
++  function splitText(text) {
++    const pieces = [];
++    const separators = [];
++    let rest = text;
++    while (rest.length > MAX_PIECE_CHARS) {
++      // Split before the sentence or word that the limit cuts through.
++      let cut = lastBoundary(rest, MAX_PIECE_CHARS, 'sentence') ||
++          lastBoundary(rest, MAX_PIECE_CHARS, 'word');
++      if (!cut) {
++        cut = MAX_PIECE_CHARS;
++        // Don't split a surrogate pair.
++        if (/[\udc00-\udfff]/.test(rest[cut])) {
++          --cut;
++        }
++      }
++
++      const piece = rest.slice(0, cut);
++      const whitespace = TRAILING_WHITESPACE.exec(piece);
++      pieces.push(piece.slice(0, whitespace.index));
++      separators.push(whitespace[0]);
++      rest = rest.slice(cut);
++    }
++
++    pieces.push(rest);
++    separators.push('');
++    return {pieces, separators};
++  }
++
++  // Text of a text node or attribute. |element| and |attribute| are context for
++  // the provider, |eligible| rechecks whether it may be translated where it is
++  // now, and |requeue| queues its location again once the page changed it.
++  function Segment(
++      key, element, attribute, get, set, connected, eligible, requeue) {
++    this.key = key;
++    this.element = element;
++    this.attribute = attribute;
++    this.get = get;
++    this.set = set;
++    this.connected = connected;
++    this.eligible = eligible;
++    this.requeue = requeue;
++    this.original = get();
++    const parts = SPLIT_WHITESPACE.exec(this.original);
++    this.leading = parts[1];
++    this.core = parts[2];
++    this.trailing = parts[3];
++    const split = splitText(this.core);
++    this.pieces = split.pieces;
++    this.separators = split.separators;
++    this.results = this.pieces.map(piece => piece ? null : '');
++    this.remaining = this.pieces.filter(piece => piece).length;
++    this.retries = 0;
++    this.dropped = false;
++  }
++
++  function isTranslatableText(text) {
++    return !!text && HAS_LETTER.test(text);
++  }
++
++  function isSkippedElement(element) {
++    return SKIPPED_TAGS.has(element.tagName.toUpperCase()) ||
++        element.isContentEditable;
++  }
++
++  // Whether the text inside |element| is page content. A textarea holds its
++  // value, and an option without a value attribute submits its text.
++  function hasTranslatableText(element) {
++    const tag = element.tagName.toUpperCase();
++    if (tag === 'TEXTAREA') {
++      return false;
++    }
++
++    return tag !== 'OPTION' || element.hasAttribute('value');
++  }
++
++  // Whether |element| opts in or out of translation through the translate
++  // attribute or the classes Google Translate honors, or null if it inherits.
++  function explicitTranslate(element) {
++    // Invalid values inherit, like a missing attribute.
++    const value =
++        (element.getAttribute('translate') ?? 'inherit').toLowerCase();
++    const classes = element.classList;
++    if (value === 'no' || classes.contains('notranslate') ||
++        classes.contains('skiptranslate')) {
++      return false;
++    }
++
++    if (value === '' || value === 'yes' || classes.contains('translate')) {
++      return true;
++    }
++
++    return null;
++  }
++
++  // The parent element of |node|, continuing from shadow roots to their host.
++  function parentOf(node) {
++    const parent = node.parentNode;
++    if (!parent) {
++      return null;
++    }
++
++    if (parent.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
++      return parent.host || null;
++    }
++
++    return parent.nodeType === Node.ELEMENT_NODE ? parent : null;
++  }
++
++  // Whether content inside |element| is translated, or null if it never is.
++  function translateState(element) {
++    let state = null;
++    for (; element; element = parentOf(element)) {
++      if (isSkippedElement(element) || !hasTranslatableText(element)) {
++        return null;
++      }
++
++      if (state === null) {
++        state = explicitTranslate(element);
++      }
++    }
++
++    return state !== false;
++  }
++
++  function hasTranslatableAttributes(element) {
++    if (isSkippedElement(element)) {
++      return false;
++    }
++
++    const parent = parentOf(element);
++    const inherited = parent ? translateState(parent) : true;
++    if (inherited === null) {
++      return false;
++    }
++
++    const explicit = explicitTranslate(element);
++    return explicit === null ? inherited : explicit;
++  }
++
++  // Whether the value of |element| is a button label. Submit buttons with a
++  // name send their value with the form, so it has to stay as is.
++  function hasTranslatableValue(element) {
++    if (element.tagName.toUpperCase() !== 'INPUT') {
++      return false;
++    }
++
++    const type = (element.getAttribute('type') || '').toLowerCase();
++    if (type === 'button' || type === 'reset') {
++      return true;
++    }
++
++    return type === 'submit' && !element.hasAttribute('name');
++  }
++
++  function attributeKey(element, name) {
++    let keys = attributeKeys.get(element);
++    if (!keys) {
++      keys = {};
++      attributeKeys.set(element, keys);
++    }
++
++    if (!keys[name]) {
++      keys[name] = {element: element, name: name};
++    }
++
++    return keys[name];
++  }
++
++  // The element whose position decides how soon |segment| is translated.
++  function elementOf(segment) {
++    return segment.key instanceof Node ? parentOf(segment.key) :
++                                         segment.key.element;
++  }
++
++  function isNearViewport(element) {
++    if (!nearViewport.has(element)) {
++      // Not reported by |visibilityObserver| yet.
++      const rect = element.getBoundingClientRect();
++      const height = window.innerHeight;
++      const isRendered = rect.width > 0 || rect.height > 0;
++      const isNear = rect.bottom >= -height && rect.top <= 2 * height;
++      nearViewport.set(element, isRendered && isNear);
++    }
++
++    return nearViewport.get(element);
++  }
++
++  function watchVisibility(element) {
++    if (!visibilityObserver) {
++      visibilityObserver = new IntersectionObserver((entries) => {
++        for (const entry of entries) {
++          nearViewport.set(entry.target, entry.isIntersecting);
++        }
++      }, {rootMargin: '100% 0px'});
++    }
++
++    visibilityObserver.observe(element);
++  }
++
++  function stopWatchingVisibility() {
++    if (visibilityObserver) {
++      visibilityObserver.disconnect();
++      visibilityObserver = null;
++      nearViewport = new WeakMap();
++    }
++  }
++
++  function queueSegment(segment) {
++    if (queued.has(segment.key) || !isTranslatableText(segment.core)) {
++      return;
++    }
++
++    queued.add(segment.key);
++    const element = elementOf(segment);
++    if (element) {
++      watchVisibility(element);
++    }
++
++    segment.pieces.forEach((piece, index) => {
++      if (piece) {
++        pending.push({segment, index});
++      }
++    });
++  }
++
++  function dropSegment(segment) {
++    segment.dropped = true;
++    queued.delete(segment.key);
++  }
++
++  // Whether |key| still shows its translation. If not, the page changed it,
++  // possibly while detached and unobserved, and |value| is the new original.
++  function isStillTranslated(key, value) {
++    const entry = translated.get(key);
++    if (entry && entry.value === value) {
++      return true;
++    }
++
++    translated.delete(key);
++    return false;
++  }
++
++  function queueTextNode(node) {
++    if (isStillTranslated(node, node.nodeValue)) {
++      return;
++    }
++
++    const parent = parentOf(node);
++    queueSegment(new Segment(
++        node, parent ? parent.localName : '', '', () => node.nodeValue,
++        (value) => {
++          node.nodeValue = value;
++        },
++        () => node.isConnected,
++        () => {
++          const parent = parentOf(node);
++          return !!parent && translateState(parent) === true;
++        },
++        () => {
++          if (node.isConnected) {
++            collect(node);
++          }
++        }));
++  }
++
++  function queueAttributes(element) {
++    const names =
++        TRANSLATED_ATTRIBUTES.filter(name => element.hasAttribute(name));
++    if (hasTranslatableValue(element) && element.hasAttribute('value')) {
++      names.push('value');
++    }
++
++    for (const name of names) {
++      const key = attributeKey(element, name);
++      if (isStillTranslated(key, element.getAttribute(name) || '')) {
++        continue;
++      }
++
++      queueSegment(new Segment(
++          key, element.localName, name, () => element.getAttribute(name) || '',
++          (value) => {
++            element.setAttribute(name, value);
++          },
++          () => element.isConnected,
++          () => hasTranslatableAttributes(element) &&
++              (name !== 'value' || hasTranslatableValue(element)),
++          () => {
++            if (element.isConnected && hasTranslatableAttributes(element)) {
++              queueAttributes(element);
++            }
++          }));
++    }
++  }
++
++  function collect(root) {
++    if (!COLLECTED_NODE_TYPES.has(root.nodeType)) {
++      return;
++    }
++
++    const parent = root.nodeType === Node.DOCUMENT_FRAGMENT_NODE ?
++        root.host :
++        parentOf(root);
++    const inherited = parent ? translateState(parent) : true;
++    if (inherited === null) {
++      return;
++    }
++
++    // Iterative, carrying the inherited translate state down.
++    const stack = [[root, inherited]];
++    while (stack.length) {
++      const [node, parentTranslates] = stack.pop();
++      if (node.nodeType === Node.TEXT_NODE) {
++        if (parentTranslates) {
++          queueTextNode(node);
++        }
++
++        continue;
++      }
++
++      let translates = parentTranslates;
++      if (node.nodeType === Node.ELEMENT_NODE) {
++        if (isSkippedElement(node)) {
++          continue;
++        }
++
++        const explicit = explicitTranslate(node);
++        if (explicit !== null) {
++          translates = explicit;
++        }
++
++        if (translates) {
++          queueAttributes(node);
++        }
++
++        if (!hasTranslatableText(node)) {
++          continue;
++        }
++
++        if (node.shadowRoot) {
++          // Observers don't see into shadow trees from the document.
++          if (observer) {
++            observer.observe(node.shadowRoot, OBSERVER_OPTIONS);
++          }
++
++          stack.push([node.shadowRoot, translates]);
++        }
++      }
++
++      // Pushed in reverse, so text is queued in document order.
++      for (let child = node.lastChild; child; child = child.previousSibling) {
++        stack.push([child, translates]);
++      }
++    }
++  }
++
++  function collectDocument() {
++    const title = document.querySelector('head > title');
++    if (title && translateState(title)) {
++      for (const child of title.childNodes) {
++        if (child.nodeType === Node.TEXT_NODE) {
++          queueTextNode(child);
++        }
++      }
++    }
++
++    if (document.body) {
++      collect(document.body);
++    }
++  }
++
++  function handleMutations(records) {
++    for (const record of records) {
++      if (record.type === 'childList') {
++        for (const node of record.addedNodes) {
++          collect(node);
++        }
++      } else if (record.type === 'characterData') {
++        // The page replaced translated text, so its value is the new original.
++        const entry = translated.get(record.target);
++        if (entry && record.target.nodeValue !== entry.value) {
++          translated.delete(record.target);
++        }
++
++        collect(record.target);
++      } else if (record.type === 'attributes') {
++        const name = record.attributeName;
++        if (name === 'name' || name === 'type') {
++          // A button that now submits its value has to send the original.
++          const entry = translated.get(attributeKey(record.target, 'value'));
++          if (entry && !entry.segment.eligible()) {
++            restoreOriginal(entry);
++            translated.delete(entry.segment.key);
++          }
++        } else if (
++            name === 'value' &&
++            record.target.tagName.toUpperCase() === 'OPTION') {
++          // An option without a value attribute submits its text, which has to
++          // be the original then.
++          if (hasTranslatableText(record.target)) {
++            collect(record.target);
++          } else {
++            restoreTextIn(record.target);
++          }
++        } else {
++          const key = attributeKey(record.target, name);
++          const entry = translated.get(key);
++          if (entry && record.target.getAttribute(name) !== entry.value) {
++            translated.delete(key);
++          }
++        }
++
++        if (hasTranslatableAttributes(record.target)) {
++          queueAttributes(record.target);
++        }
++      }
++    }
++  }
++
++  function restoreTextIn(element) {
++    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
++    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
++      const entry = translated.get(node);
++      if (entry) {
++        restoreOriginal(entry);
++        translated.delete(node);
++      }
++    }
++  }
++
++  // Puts the original text back, unless the page changed it since.
++  function restoreOriginal(entry) {
++    const segment = entry.segment;
++    if (segment.get() === entry.value) {
++      segment.set(segment.original);
++    }
++  }
++
++  function restoreAll() {
++    for (const entry of translated.values()) {
++      restoreOriginal(entry);
++    }
++
++    translated = new Map();
++    restorePageLang();
++  }
++
++  // Keeps the page's own lang for reverting.
++  function setPageLang(lang) {
++    const root = document.documentElement;
++    if (savedLang === null) {
++      savedLang = {value: root.getAttribute('lang')};
++    }
++
++    root.setAttribute('lang', lang);
++  }
++
++  // Puts the page's own lang back, unless the page changed it since.
++  function restorePageLang() {
++    if (savedLang === null) {
++      return;
++    }
++
++    const root = document.documentElement;
++    if (root.getAttribute('lang') === targetLang) {
++      if (savedLang.value === null) {
++        root.removeAttribute('lang');
++      } else {
++        root.setAttribute('lang', savedLang.value);
++      }
++    }
++
++    savedLang = null;
++  }
++
++  function pruneDetached() {
++    if (++pollsSincePrune < PRUNE_INTERVAL) {
++      return;
++    }
++
++    pollsSincePrune = 0;
++    for (const [key, entry] of translated) {
++      if (!entry.segment.connected()) {
++        // Restore the original in case the page reattaches the node.
++        restoreOriginal(entry);
++        translated.delete(key);
++      }
++    }
++  }
++
++  function startObserving() {
++    if (observer) {
++      return;
++    }
++
++    observer = new MutationObserver(handleMutations);
++    observer.observe(document.documentElement, OBSERVER_OPTIONS);
++  }
++
++  function stopObserving() {
++    if (observer) {
++      observer.disconnect();
++      observer = null;
++    }
++  }
++
++  function reset() {
++    stopObserving();
++    stopWatchingVisibility();
++    pending = [];
++    queued = new Set();
++    inFlight = null;
++    finished = false;
++    error = false;
++    errorCode = ERROR['NONE'];
++    consecutiveFailures = 0;
++    pollsSincePrune = 0;
++    translationTime = 0;
++  }
++
++  // Whether the page is known to be in a language other than the target.
++  function hasForeignSource() {
++    return !!sourceLang && sourceLang !== targetLang;
++  }
++
++  function markFinished() {
++    if (finished) {
++      return;
++    }
++
++    // The browser fails the translation when the detected language is unknown
++    // or the target, and can't revert it then, so stop translating here.
++    if (detectSource && !hasForeignSource()) {
++      fail(
++          sourceLang ? ERROR['IDENTICAL_LANGUAGES'] :
++                       ERROR['UNKNOWN_LANGUAGE']);
++      return;
++    }
++
++    finished = true;
++    translationTime = performance.now() - startTime;
++  }
++
++  function fail(code) {
++    error = true;
++    errorCode = code;
++    stopObserving();
++    stopWatchingVisibility();
++    pending = [];
++    queued = new Set();
++    inFlight = null;
++    // The browser can't revert a failed translation.
++    restoreAll();
++  }
++
++  function applySegment(segment) {
++    queued.delete(segment.key);
++    if (segment.get() !== segment.original) {
++      segment.requeue();
++      return;
++    }
++
++    // The page may have made it untranslatable while it was being translated.
++    if (!segment.eligible()) {
++      return;
++    }
++
++    const text = segment.pieces
++                     .map(
++                         (piece, index) => (segment.results[index] || piece) +
++                             segment.separators[index])
++                     .join('');
++    const value = segment.leading + text + segment.trailing;
++    if (value === segment.original) {
++      return;
++    }
++
++    segment.set(value);
++    if (!translated.has(segment.key)) {
++      translated.set(segment.key, {segment: segment, value: value});
++    }
++  }
++
++  // Requeues a failed batch, dropping segments that failed too often.
++  function retryPieces(pieces) {
++    const retried = new Set();
++    for (const piece of pieces) {
++      const segment = piece.segment;
++      if (segment.dropped) {
++        continue;
++      }
++
++      if (!retried.has(segment)) {
++        retried.add(segment);
++        if (++segment.retries > MAX_SEGMENT_RETRIES) {
++          dropSegment(segment);
++          continue;
++        }
++      }
++
++      pending.push(piece);
++    }
++  }
++
++  // A page restored from the back-forward cache counts as untranslated again,
++  // so restore the original before it's cached, like translate.js does.
++  window.addEventListener('pagehide', (event) => {
++    if (event.persisted) {
++      reset();
++      restoreAll();
++    }
++  });
++
++  return {
++    get libReady() {
++      return true;
++    },
++
++    get finished() {
++      return finished;
++    },
++
++    get error() {
++      return error;
++    },
++
++    get errorCode() {
++      return errorCode;
++    },
++
++    get sourceLang() {
++      return sourceLang;
++    },
++
++    get loadTime() {
++      return 0;
++    },
++
++    get readyTime() {
++      return 0;
++    },
++
++    get translationTime() {
++      return translationTime;
++    },
++
++    get textActive() {
++      return !error && (!!observer || !!inFlight || pending.length > 0);
++    },
++
++    translate(originalLang, target) {
++      try {
++        if (translated.size) {
++          this.revert();
++        }
++
++        reset();
++        detectSource = originalLang === 'auto';
++        sourceLang = detectSource ? '' : originalLang;
++        targetLang = target;
++        setPageLang(target);
++        startTime = performance.now();
++        startObserving();
++        collectDocument();
++        if (!pending.length) {
++          markFinished();
++        }
++
++        return true;
++      } catch (e) {
++        fail(ERROR['UNEXPECTED_SCRIPT_ERROR']);
++        return false;
++      }
++    },
++
++    revert() {
++      reset();
++      restoreAll();
++    },
++
++    // The next segments to translate, or null if there are none right now.
++    takeTextRequest() {
++      if (error || inFlight) {
++        return null;
++      }
++
++      if (observer) {
++        handleMutations(observer.takeRecords());
++      }
++
++      pruneDetached();
++      if (!pending.length) {
++        stopWatchingVisibility();
++        if (!finished) {
++          markFinished();
++        }
++
++        return null;
++      }
++
++      // Text near the viewport goes first, the rest in page order.
++      const near = [];
++      const rest = [];
++      for (const piece of pending) {
++        const element = elementOf(piece.segment);
++        (element && isNearViewport(element) ? near : rest).push(piece);
++      }
++
++      pending = near.concat(rest);
++      const pieces = [];
++      let length = 0;
++      while (pending.length && pieces.length < MAX_PIECES_PER_REQUEST) {
++        const piece = pending[0];
++        const segment = piece.segment;
++        const text = segment.pieces[piece.index];
++        if (pieces.length && length + text.length > MAX_CHARS_PER_REQUEST) {
++          break;
++        }
++
++        pending.shift();
++        if (segment.dropped) {
++          continue;
++        }
++
++        if (!segment.connected()) {
++          dropSegment(segment);
++          continue;
++        }
++
++        if (segment.get() !== segment.original) {
++          dropSegment(segment);
++          segment.requeue();
++          continue;
++        }
++
++        if (!segment.eligible()) {
++          dropSegment(segment);
++          continue;
++        }
++
++        pieces.push(piece);
++        length += text.length;
++      }
++
++      if (!pieces.length) {
++        return null;
++      }
++
++      inFlight = pieces;
++      return pieces.map(piece => {
++        const segment = piece.segment;
++        return {
++          runs: [{text: segment.pieces[piece.index], translate: true}],
++          element: segment.element,
++          attribute: segment.attribute,
++        };
++      });
++    },
++
++    // |source| is the language the browser translated from.
++    onTextResponse(translations, code, source) {
++      const pieces = inFlight;
++      inFlight = null;
++      if (!pieces) {
++        return;
++      }
++
++      // Each piece is sent as a segment with a single run.
++      const isWellFormed = Array.isArray(translations) &&
++          translations.length === pieces.length &&
++          translations.every(runs => Array.isArray(runs) && runs.length === 1);
++      if (code !== ERROR['NONE'] || !isWellFormed) {
++        if (code === ERROR['NONE']) {
++          code = ERROR['TRANSLATION_ERROR'];
++        }
++
++        const tooManyFailures =
++            ++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
++        if (tooManyFailures || (!finished && FATAL_ERRORS.has(code))) {
++          if (finished) {
++            // The page was already reported as translated, so stop
++            // translating new content instead.
++            stopObserving();
++            pending = [];
++            queued = new Set();
++          } else {
++            fail(code);
++          }
++
++          return;
++        }
++
++        retryPieces(pieces);
++        return;
++      }
++
++      consecutiveFailures = 0;
++      // Prefer a source that needed translating, so a mixed-language page
++      // isn't reported as already being in the target language.
++      if (source && !hasForeignSource()) {
++        sourceLang = source;
++      }
++
++      if (observer) {
++        handleMutations(observer.takeRecords());
++      }
++
++      for (let i = 0; i < pieces.length; ++i) {
++        const segment = pieces[i].segment;
++        if (segment.dropped) {
++          continue;
++        }
++
++        const translation = translations[i][0];
++        segment.results[pieces[i].index] =
++            typeof translation === 'string' ? translation : '';
++        if (--segment.remaining === 0) {
++          applySegment(segment);
++        }
++      }
++
++      if (observer) {
++        // Our own writes are ignored through |translated|, but the page may
++        // react to them, like custom elements rerendering on attribute changes.
++        handleMutations(observer.takeRecords());
++      }
++
++      // The initial translation is done once its queued text has drained.
++      if (!pending.length) {
++        markFinished();
++      }
++    },
++
++    onTranslateElementError(e) {
++      fail(ERROR['UNEXPECTED_SCRIPT_ERROR']);
++    },
++  };
++})();

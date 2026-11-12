@@ -1,0 +1,581 @@
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -57,6 +57,7 @@
+ #include "components/security_state/core/security_state.h"
+ #include "components/signin/public/identity_manager/identity_manager.h"
+ #include "components/spellcheck/spellcheck_buildflags.h"
++#include "components/translate/content/browser/text_translator_host.h"
+ #include "components/translate/content/common/translate.mojom.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -468,6 +469,8 @@ void PopulateChromeFrameBinders(
+ 
+   map->Add<translate::mojom::ContentTranslateDriver>(
+       &translate::BindContentTranslateDriver);
++  map->Add<translate::mojom::TextTranslator>(
++      &translate::TextTranslatorHost::Create);
+ 
+   map->Add<optimization_guide::mojom::ModelBroker>(&BindModelBroker);
+ 
+--- a/components/translate/content/browser/BUILD.gn
++++ b/components/translate/content/browser/BUILD.gn
+@@ -16,6 +16,8 @@ static_library("browser") {
+     "contextual_translate_delegate.h",
+     "partial_translate_manager.cc",
+     "partial_translate_manager.h",
++    "text_translator_host.cc",
++    "text_translator_host.h",
+   ]
+ 
+   public_deps = [
+--- /dev/null
++++ b/components/translate/content/browser/text_translator_host.cc
+@@ -0,0 +1,121 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/translate/content/browser/text_translator_host.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/check.h"
++#include "components/translate/core/browser/translation_provider.h"
++#include "components/translate/core/common/translate_errors.h"
++#include "content/public/browser/render_frame_host.h"
++#include "url/gurl.h"
++
++namespace translate {
++
++namespace {
++
++// The page script only sends segments with something to translate.
++bool IsValidSegment(const mojom::TextSegmentPtr& segment) {
++  return std::ranges::any_of(segment->runs, [](const mojom::TextRunPtr& run) {
++    return run->translate;
++  });
++}
++
++TranslationSegment ToTranslationSegment(mojom::TextSegment& segment) {
++  TranslationSegment result;
++  result.runs.reserve(segment.runs.size());
++  for (mojom::TextRunPtr& run : segment.runs) {
++    result.runs.push_back({std::move(run->text), run->translate});
++  }
++
++  result.element = std::move(segment.element);
++  result.attribute = std::move(segment.attribute);
++  return result;
++}
++
++}  // namespace
++
++// static
++void TextTranslatorHost::Create(
++    content::RenderFrameHost* render_frame_host,
++    mojo::PendingReceiver<mojom::TextTranslator> receiver) {
++  CHECK(render_frame_host);
++  TranslationProvider* provider = GetTranslationProvider();
++  if (!render_frame_host->IsInPrimaryMainFrame() || !provider) {
++    return;
++  }
++
++  // Owned by the document. See DocumentService.
++  new TextTranslatorHost(*render_frame_host, std::move(receiver), *provider);
++}
++
++TextTranslatorHost::TextTranslatorHost(
++    content::RenderFrameHost& render_frame_host,
++    mojo::PendingReceiver<mojom::TextTranslator> receiver,
++    TranslationProvider& provider)
++    : DocumentService(render_frame_host, std::move(receiver)),
++      provider_(provider) {}
++
++TextTranslatorHost::~TextTranslatorHost() = default;
++
++void TextTranslatorHost::TranslateText(
++    const std::string& source_lang,
++    const std::string& target_lang,
++    std::vector<mojom::TextSegmentPtr> segments,
++    TranslateTextCallback callback) {
++  const TranslationBatchLimits limits = provider_->GetBatchLimits();
++  size_t characters = 0;
++  for (const mojom::TextSegmentPtr& segment : segments) {
++    for (const mojom::TextRunPtr& run : segment->runs) {
++      characters += run->text.size();
++    }
++  }
++
++  // The page script is given the provider's limits and keeps to them.
++  const bool within_limits = segments.size() <= limits.max_segments &&
++                             characters <= limits.max_characters;
++  if (segments.empty() || !within_limits ||
++      !std::ranges::all_of(segments, IsValidSegment)) {
++    ReportBadMessageAndDeleteThis("Invalid text translation batch");
++    return;
++  }
++
++  if (target_lang.empty()) {
++    std::move(callback).Run(std::nullopt, std::string(),
++                            TranslateErrors::UNSUPPORTED_LANGUAGE);
++    return;
++  }
++
++  if (source_lang == target_lang) {
++    std::move(callback).Run(std::nullopt, std::string(),
++                            TranslateErrors::IDENTICAL_LANGUAGES);
++    return;
++  }
++
++  // Fail rather than fall back to another provider if it became unavailable.
++  if (!provider_->IsAvailable()) {
++    std::move(callback).Run(std::nullopt, std::string(),
++                            TranslateErrors::INITIALIZATION_ERROR);
++    return;
++  }
++
++  if (!session_) {
++    session_ =
++        provider_->StartSession(render_frame_host().GetLastCommittedURL());
++  }
++
++  TranslationRequest request;
++  request.source_lang = source_lang;
++  request.target_lang = target_lang;
++  request.segments.reserve(segments.size());
++  for (mojom::TextSegmentPtr& segment : segments) {
++    request.segments.push_back(ToTranslationSegment(*segment));
++  }
++
++  session_->Translate(request, std::move(callback));
++}
++
++}  // namespace translate
+--- /dev/null
++++ b/components/translate/content/browser/text_translator_host.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_TRANSLATE_CONTENT_BROWSER_TEXT_TRANSLATOR_HOST_H_
++#define COMPONENTS_TRANSLATE_CONTENT_BROWSER_TEXT_TRANSLATOR_HOST_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ref.h"
++#include "components/translate/content/common/translate.mojom.h"
++#include "content/public/browser/document_service.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++
++namespace content {
++class RenderFrameHost;
++}  // namespace content
++
++namespace translate {
++
++class TranslationProvider;
++class TranslationSession;
++
++// Passes page text from TranslateAgent to the TranslationProvider.
++class TextTranslatorHost final
++    : public content::DocumentService<mojom::TextTranslator> {
++ public:
++  // Binds |receiver| for the primary main frame if a provider is available.
++  static void Create(content::RenderFrameHost* render_frame_host,
++                     mojo::PendingReceiver<mojom::TextTranslator> receiver);
++
++  TextTranslatorHost(const TextTranslatorHost&) = delete;
++  TextTranslatorHost& operator=(const TextTranslatorHost&) = delete;
++
++  // mojom::TextTranslator:
++  void TranslateText(const std::string& source_lang,
++                     const std::string& target_lang,
++                     std::vector<mojom::TextSegmentPtr> segments,
++                     TranslateTextCallback callback) override;
++
++ private:
++  TextTranslatorHost(content::RenderFrameHost& render_frame_host,
++                     mojo::PendingReceiver<mojom::TextTranslator> receiver,
++                     TranslationProvider& provider);
++  ~TextTranslatorHost() override;
++
++  // The provider chosen when the page connected. The page keeps using it, so
++  // its text can't move to another provider, e.g. off the device, unnoticed.
++  const raw_ref<TranslationProvider> provider_;
++
++  // Started with the first batch of the document.
++  std::unique_ptr<TranslationSession> session_;
++};
++
++}  // namespace translate
++
++#endif  // COMPONENTS_TRANSLATE_CONTENT_BROWSER_TEXT_TRANSLATOR_HOST_H_
+--- a/components/translate/content/common/translate.mojom
++++ b/components/translate/content/common/translate.mojom
+@@ -123,3 +123,30 @@ interface ContentTranslateDriver {
+                LanguageDetectionDetails details,
+                bool translation_critiera_met);
+ };
++
++// Part of a sentence. See translate::TranslationRun.
++struct TextRun {
++  mojo_base.mojom.String16 text;
++  bool translate;
++};
++
++// A sentence or paragraph, or an attribute value. See
++// translate::TranslationSegment.
++struct TextSegment {
++  array<TextRun> runs;
++  string element;
++  string attribute;
++};
++
++// Translates page text with the browser's TranslationProvider. Bound for the
++// primary main frame while a provider is available.
++interface TextTranslator {
++  // |translations| holds a string for each run of each segment, or is null on
++  // failure. Empty strings keep the original text. |source_lang| is the
++  // language translated from.
++  TranslateText(
++      string source_lang, string target_lang, array<TextSegment> segments)
++      => (array<array<mojo_base.mojom.String16>>? translations,
++          string source_lang,
++          TranslateError error);
++};
+--- a/components/translate/content/renderer/translate_agent.cc
++++ b/components/translate/content/renderer/translate_agent.cc
+@@ -14,6 +14,7 @@
+ #include "base/compiler_specific.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "base/json/json_writer.h"
+ #include "base/json/string_escape.h"
+ #include "base/location.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -21,10 +22,13 @@
+ #include "base/metrics/histogram_macros_local.h"
+ #include "base/no_destructor.h"
+ #include "base/notreached.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/values.h"
+ #include "components/language_detection/content/renderer/language_detection_agent.h"
+ #include "components/language_detection/core/constants.h"
+ #include "components/language_detection/core/language_detection_provider.h"
+@@ -40,6 +44,9 @@
+ #include "content/public/common/url_constants.h"
+ #include "content/public/renderer/render_frame.h"
+ #include "content/public/renderer/render_thread.h"
++#include "gin/converter.h"
++#include "gin/dictionary.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/scheduler/web_agent_group_scheduler.h"
+ #include "third_party/blink/public/web/web_document.h"
+@@ -56,6 +63,47 @@ using blink::WebLocalFrame;
+ using blink::WebScriptSource;
+ using blink::WebString;
+ 
++namespace gin {
++
++template <>
++struct Converter<translate::mojom::TextRunPtr> {
++  static bool FromV8(v8::Isolate* isolate,
++                     v8::Local<v8::Value> value,
++                     translate::mojom::TextRunPtr* out) {
++    Dictionary dictionary(isolate);
++    auto run = translate::mojom::TextRun::New();
++    if (!ConvertFromV8(isolate, value, &dictionary) ||
++        !dictionary.Get("text", &run->text) ||
++        !dictionary.Get("translate", &run->translate)) {
++      return false;
++    }
++
++    *out = std::move(run);
++    return true;
++  }
++};
++
++template <>
++struct Converter<translate::mojom::TextSegmentPtr> {
++  static bool FromV8(v8::Isolate* isolate,
++                     v8::Local<v8::Value> value,
++                     translate::mojom::TextSegmentPtr* out) {
++    Dictionary dictionary(isolate);
++    auto segment = translate::mojom::TextSegment::New();
++    if (!ConvertFromV8(isolate, value, &dictionary) ||
++        !dictionary.Get("runs", &segment->runs) ||
++        !dictionary.Get("element", &segment->element) ||
++        !dictionary.Get("attribute", &segment->attribute)) {
++      return false;
++    }
++
++    *out = std::move(segment);
++    return true;
++  }
++};
++
++}  // namespace gin
++
+ namespace {
+ 
+ // The delay in milliseconds that we'll wait before checking to see if the
+@@ -73,6 +121,9 @@ const int kTranslateStatusCheckDelayMs =
+ // Language name passed to the Translate element for it to detect the language.
+ const char kAutoDetectionLanguage[] = "auto";
+ 
++const int kTextTranslatePollDelayMs = 500;
++const int kTextTranslateTimeoutMs = 60000;
++
+ // The current CLD model version.
+ constexpr char kCLDModelVersion[] = "CLD3";
+ 
+@@ -217,6 +268,7 @@ void TranslateAgent::PdfPageCaptured(con
+ 
+ void TranslateAgent::CancelPendingTranslation() {
+   weak_method_factory_.InvalidateWeakPtrs();
++  text_request_in_flight_ = false;
+   // Make sure to send the cancelled response back.
+   if (translate_callback_pending_) {
+     std::move(translate_callback_pending_)
+@@ -686,6 +738,8 @@ void TranslateAgent::TranslatePageImpl(i
+   if (!weak_this) {
+     return;
+   }
++
++  ScheduleTextTranslationPump(0);
+   // Check the status of the translation.
+   translate_task_runner_->PostDelayedTask(
+       FROM_HERE,
+@@ -718,6 +772,156 @@ TranslateAgent::GetTranslateHandler() {
+   return translate_handler_;
+ }
+ 
++void TranslateAgent::PumpTextTranslation() {
++  if (text_request_in_flight_) {
++    return;
++  }
++
++  WebLocalFrame* main_frame = render_frame()->GetWebFrame();
++  if (!main_frame) {
++    return;
++  }
++
++  // Executing script may spin a nested run loop that detaches the frame and
++  // deletes |this|.
++  auto weak_this = weak_pointer_factory_.GetWeakPtr();
++  v8::Isolate* isolate = main_frame->GetAgentGroupScheduler()->Isolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Value> request =
++      main_frame->ExecuteScriptInIsolatedWorldAndReturnValue(
++          world_id_,
++          WebScriptSource(
++              WebString::FromAscii("cr.googleTranslate.takeTextRequest()")),
++          blink::BackForwardCacheAware::kAllow);
++  if (!weak_this) {
++    return;
++  }
++
++  // Null means there is nothing to translate right now. The Google Translate
++  // Element has no takeTextRequest(), so its pump stops here too.
++  if (request.IsEmpty() || request->IsNullOrUndefined()) {
++    const bool active =
++        ExecuteScriptAndGetBoolResult("cr.googleTranslate.textActive", false);
++    if (weak_this && active) {
++      ScheduleTextTranslationPump(kTextTranslatePollDelayMs);
++    }
++
++    return;
++  }
++
++  v8::Local<v8::Context> context =
++      main_frame->GetScriptContextFromWorldId(isolate, world_id_);
++  std::vector<mojom::TextSegmentPtr> segments;
++  bool valid = !context.IsEmpty();
++  if (valid) {
++    v8::Context::Scope context_scope(context);
++    valid =
++        gin::ConvertFromV8(isolate, request, &segments) && !segments.empty();
++  }
++
++  if (!valid) {
++    SendTextTranslateResponse(std::nullopt, std::string(),
++                              TranslateErrors::UNEXPECTED_SCRIPT_ERROR);
++    if (weak_this) {
++      ScheduleTextTranslationPump(kTextTranslatePollDelayMs);
++    }
++
++    return;
++  }
++
++  text_request_in_flight_ = true;
++  const int request_id = ++text_request_id_;
++  // Fail the batch if the browser drops the request or doesn't reply.
++  GetTextTranslator()->TranslateText(
++      source_lang_, target_lang_, std::move(segments),
++      mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++          base::BindOnce(&TranslateAgent::OnTextTranslateResponse,
++                         weak_method_factory_.GetWeakPtr(), request_id),
++          std::nullopt, std::string(), TranslateErrors::TRANSLATION_ERROR));
++  translate_task_runner_->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&TranslateAgent::OnTextTranslateResponse,
++                     weak_method_factory_.GetWeakPtr(), request_id,
++                     std::optional<TextTranslations>(), std::string(),
++                     TranslateErrors::TRANSLATION_TIMEOUT),
++      AdjustDelay(kTextTranslateTimeoutMs));
++}
++
++void TranslateAgent::ScheduleTextTranslationPump(int delay_in_milliseconds) {
++  translate_task_runner_->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&TranslateAgent::PumpTextTranslation,
++                     weak_method_factory_.GetWeakPtr()),
++      AdjustDelay(delay_in_milliseconds));
++}
++
++void TranslateAgent::OnTextTranslateResponse(
++    int request_id,
++    const std::optional<TextTranslations>& translations,
++    const std::string& source_lang,
++    TranslateErrors error) {
++  if (!text_request_in_flight_ || request_id != text_request_id_) {
++    return;
++  }
++
++  text_request_in_flight_ = false;
++
++  auto weak_this = weak_pointer_factory_.GetWeakPtr();
++  SendTextTranslateResponse(translations, source_lang, error);
++  if (!weak_this) {
++    return;
++  }
++
++  ScheduleTextTranslationPump(0);
++}
++
++void TranslateAgent::SendTextTranslateResponse(
++    const std::optional<TextTranslations>& translations,
++    const std::string& source_lang,
++    TranslateErrors error) {
++  WebLocalFrame* main_frame = render_frame()->GetWebFrame();
++  if (!main_frame) {
++    return;
++  }
++
++  std::string translations_json = "null";
++  if (translations && error == TranslateErrors::NONE) {
++    base::ListValue list;
++    for (const std::vector<std::u16string>& segment : *translations) {
++      base::ListValue runs;
++      for (const std::u16string& run : segment) {
++        runs.Append(run);
++      }
++
++      list.Append(std::move(runs));
++    }
++
++    translations_json = base::WriteJson(list).value_or("null");
++  }
++
++  // Not ASCII-only, so ExecuteScript() can't be used.
++  const std::string script =
++      base::StrCat({"cr.googleTranslate.onTextResponse(", translations_json,
++                    ",", base::NumberToString(static_cast<int>(error)), ",",
++                    base::GetQuotedJSONString(source_lang), ")"});
++  main_frame->ExecuteScriptInIsolatedWorld(
++      world_id_, WebScriptSource(WebString::FromUtf8(script)),
++      blink::BackForwardCacheAware::kAllow);
++}
++
++const mojo::Remote<mojom::TextTranslator>& TranslateAgent::GetTextTranslator() {
++  if (text_translator_ && !text_translator_.is_connected()) {
++    text_translator_.reset();
++  }
++
++  if (!text_translator_) {
++    render_frame()->GetBrowserInterfaceBroker().GetInterface(
++        text_translator_.BindNewPipeAndPassReceiver(translate_task_runner_));
++  }
++
++  return text_translator_;
++}
++
+ void TranslateAgent::ResetPage() {
+   last_details_ = {};
+   receiver_.reset();
+--- a/components/translate/content/renderer/translate_agent.h
++++ b/components/translate/content/renderer/translate_agent.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <vector>
+ 
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/ref_counted_memory.h"
+@@ -138,6 +139,24 @@ class TranslateAgent : public content::R
+ 
+   const mojo::Remote<mojom::ContentTranslateDriver>& GetTranslateHandler();
+ 
++  // Per segment, the translation of each run.
++  using TextTranslations = std::vector<std::vector<std::u16string>>;
++
++  // Sends batches from the injected script to the browser's TextTranslator
++  // until the translation is cancelled or reverted.
++  void PumpTextTranslation();
++  void ScheduleTextTranslationPump(int delay_in_milliseconds);
++  void OnTextTranslateResponse(
++      int request_id,
++      const std::optional<TextTranslations>& translations,
++      const std::string& source_lang,
++      TranslateErrors error);
++  void SendTextTranslateResponse(
++      const std::optional<TextTranslations>& translations,
++      const std::string& source_lang,
++      TranslateErrors error);
++  const mojo::Remote<mojom::TextTranslator>& GetTextTranslator();
++
+   // Helper to send the page registration Mojo call to the browser.
+   void RegisterPageInternal(LanguageDetectionDetails details,
+                             bool page_level_translation_criteria_met);
+@@ -199,6 +218,10 @@ class TranslateAgent : public content::R
+   // Mojo interface).
+   mojo::Remote<mojom::ContentTranslateDriver> translate_handler_;
+ 
++  mojo::Remote<mojom::TextTranslator> text_translator_;
++  bool text_request_in_flight_ = false;
++  int text_request_id_ = 0;
++
+   const raw_ref<translate::LanguageDetectionModel>
+       translate_language_detection_model_;
+ 
+--- a/components/translate/content/renderer/BUILD.gn
++++ b/components/translate/content/renderer/BUILD.gn
+@@ -19,6 +19,7 @@ static_library("renderer") {
+     "//components/translate/core/language_detection",
+     "//content/public/common",
+     "//content/public/renderer",
++    "//gin",
+     "//pdf:buildflags",
+     "//services/service_manager/public/cpp",
+     "//third_party/blink/public:blink",
+--- a/components/translate/content/renderer/DEPS
++++ b/components/translate/content/renderer/DEPS
+@@ -1,5 +1,7 @@
+ include_rules = [
+   "+content/public/renderer",
++  "+gin/converter.h",
++  "+gin/dictionary.h",
+   "+components/language_detection/core",
+   "+components/language_detection/content/renderer/language_detection_agent.h",
+   "+services/service_manager/public",
