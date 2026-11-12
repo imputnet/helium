@@ -1,0 +1,194 @@
+--- a/chrome/browser/download/download_commands.h
++++ b/chrome/browser/download/download_commands.h
+@@ -48,8 +48,9 @@ class DownloadCommands {
+     EDIT_WITH_MEDIA_APP = 22,  // Open file using the ChromeOS media app with
+                                // an editing hint.
+     OPEN_HELIUM_SERVICES = 23,  // Open the Services page in settings.
++    COPY_DOWNLOAD_LINK = 24,  // Copy the download source URL to the clipboard.
+ 
+-    kMaxValue = OPEN_HELIUM_SERVICES,  // Keep last.
++    kMaxValue = COPY_DOWNLOAD_LINK,  // Keep last.
+   };
+ 
+   // |model| must outlive DownloadCommands.
+--- a/chrome/browser/download/download_ui_model.cc
++++ b/chrome/browser/download/download_ui_model.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/download/offline_item_utils.h"
+ #include "chrome/browser/download/status_text_builder_utils.h"
+ #include "chrome/browser/enterprise/connectors/common.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/safe_browsing/advanced_protection_status_manager.h"
+ #include "chrome/browser/safe_browsing/advanced_protection_status_manager_factory.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+@@ -38,6 +39,7 @@
+ #include "components/url_formatter/elide_url.h"
+ #include "net/base/mime_util.h"
+ #include "third_party/blink/public/common/mime_util/mime_util.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/l10n/time_format.h"
+ #include "ui/base/page_transition_types.h"
+@@ -672,6 +674,8 @@ bool DownloadUIModel::IsCommandEnabled(
+     case DownloadCommands::CANCEL_DEEP_SCAN:
+     case DownloadCommands::OPEN_HELIUM_SERVICES:
+       return true;
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
++      return GetURL().is_valid();
+     case DownloadCommands::REVIEW:
+ #if BUILDFLAG(ENTERPRISE_CONTENT_ANALYSIS)
+       return true;
+@@ -714,6 +718,7 @@ bool DownloadUIModel::IsCommandChecked(
+     case DownloadCommands::OPEN_WITH_MEDIA_APP:
+     case DownloadCommands::EDIT_WITH_MEDIA_APP:
+     case DownloadCommands::OPEN_HELIUM_SERVICES:
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
+       return false;
+   }
+   return false;
+@@ -772,6 +777,14 @@ void DownloadUIModel::ExecuteCommand(Dow
+                                  ui::PAGE_TRANSITION_LINK, false),
+           /*navigation_handle_callback=*/{});
+       break;
++    case DownloadCommands::COPY_DOWNLOAD_LINK: {
++      ui::ScopedClipboardWriter scw(ui::ClipboardBuffer::kCopyPaste);
++      if (profile()->IsOffTheRecord()) {
++        scw.MarkAsOffTheRecord();
++      }
++      scw.WriteText(base::UTF8ToUTF16(GetURL().spec()));
++      break;
++    }
+     case DownloadCommands::OPEN_SAFE_BROWSING_SETTING:
+       chrome::ShowSafeBrowsingEnhancedProtectionWithIph(
+           download_commands->GetBrowser(),
+--- a/chrome/browser/download/download_item_model.cc
++++ b/chrome/browser/download/download_item_model.cc
+@@ -689,6 +689,9 @@ bool DownloadItemModel::IsCommandEnabled
+     case DownloadCommands::PAUSE:
+       return !download_->IsSavePackageDownload() &&
+              DownloadUIModel::IsCommandEnabled(download_commands, command);
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
++      return !download_->IsUrlTruncated() &&
++             DownloadUIModel::IsCommandEnabled(download_commands, command);
+     case DownloadCommands::OPEN_WITH_MEDIA_APP:
+     case DownloadCommands::EDIT_WITH_MEDIA_APP: {
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -761,6 +764,7 @@ bool DownloadItemModel::IsCommandChecked
+     case DownloadCommands::OPEN_WITH_MEDIA_APP:
+     case DownloadCommands::EDIT_WITH_MEDIA_APP:
+     case DownloadCommands::OPEN_HELIUM_SERVICES:
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
+       return false;
+   }
+   return false;
+@@ -869,6 +873,7 @@ void DownloadItemModel::ExecuteCommand(D
+     case DownloadCommands::OPEN_WITH_MEDIA_APP:
+     case DownloadCommands::EDIT_WITH_MEDIA_APP:
+     case DownloadCommands::OPEN_HELIUM_SERVICES:
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
+       DownloadUIModel::ExecuteCommand(download_commands, command);
+       break;
+     case DownloadCommands::DEEP_SCAN: {
+--- a/chrome/browser/download/offline_item_model.cc
++++ b/chrome/browser/download/offline_item_model.cc
+@@ -355,6 +355,7 @@ bool OfflineItemModel::IsCommandEnabled(
+     case DownloadCommands::RETRY:
+     case DownloadCommands::CANCEL_DEEP_SCAN:
+     case DownloadCommands::OPEN_HELIUM_SERVICES:
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
+       return DownloadUIModel::IsCommandEnabled(download_commands, command);
+   }
+   NOTREACHED();
+@@ -391,6 +392,7 @@ bool OfflineItemModel::IsCommandChecked(
+     case DownloadCommands::OPEN_WITH_MEDIA_APP:
+     case DownloadCommands::EDIT_WITH_MEDIA_APP:
+     case DownloadCommands::OPEN_HELIUM_SERVICES:
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
+       return false;
+   }
+   return false;
+@@ -425,6 +427,7 @@ void OfflineItemModel::ExecuteCommand(Do
+     case DownloadCommands::OPEN_WITH_MEDIA_APP:
+     case DownloadCommands::EDIT_WITH_MEDIA_APP:
+     case DownloadCommands::OPEN_HELIUM_SERVICES:
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
+       DownloadUIModel::ExecuteCommand(download_commands, command);
+       break;
+   }
+--- a/chrome/browser/download/download_stats.h
++++ b/chrome/browser/download/download_stats.h
+@@ -196,7 +196,9 @@ enum class DownloadUiContextMenuAction {
+   // kReviewEnabled = 34,
+   // kReviewClicked = 35,
+   kNotReached = 36,  // Should not be possible to hit
+-  kMaxValue = kNotReached
++  kCopyDownloadLinkEnabled = 37,
++  kCopyDownloadLinkClicked = 38,
++  kMaxValue = kCopyDownloadLinkClicked
+ };
+ 
+ DownloadUiContextMenuAction DownloadCommandToContextMenuAction(
+--- a/chrome/browser/download/download_stats.cc
++++ b/chrome/browser/download/download_stats.cc
+@@ -156,6 +156,9 @@ DownloadUiContextMenuAction DownloadComm
+     case DownloadCommands::BYPASS_DEEP_SCANNING_AND_OPEN:
+       return clicked ? DownloadUiContextMenuAction::kBypassDeepScanningClicked
+                      : DownloadUiContextMenuAction::kBypassDeepScanningEnabled;
++    case DownloadCommands::Command::COPY_DOWNLOAD_LINK:
++      return clicked ? DownloadUiContextMenuAction::kCopyDownloadLinkClicked
++                     : DownloadUiContextMenuAction::kCopyDownloadLinkEnabled;
+ 
+     // The following are not actually visible in the context menu so should
+     // never be logged.
+--- a/chrome/browser/download/download_ui_context_menu.cc
++++ b/chrome/browser/download/download_ui_context_menu.cc
+@@ -193,6 +193,9 @@ std::u16string DownloadUiContextMenu::Ge
+     case DownloadCommands::BYPASS_DEEP_SCANNING_AND_OPEN:
+       id = IDS_OPEN_DOWNLOAD_NOW;
+       break;
++    case DownloadCommands::COPY_DOWNLOAD_LINK:
++      id = IDS_DOWNLOAD_COPY_DOWNLOAD_LINK;
++      break;
+     // These commands are not supported on the context menu.
+     case DownloadCommands::REVIEW:
+     case DownloadCommands::RETRY:
+@@ -246,6 +249,9 @@ ui::SimpleMenuModel* DownloadUiContextMe
+     in_progress_download_menu_model_->AddItem(
+         DownloadCommands::SHOW_IN_FOLDER,
+         GetLabelForCommandId(DownloadCommands::SHOW_IN_FOLDER));
++    in_progress_download_menu_model_->AddItem(
++        DownloadCommands::COPY_DOWNLOAD_LINK,
++        GetLabelForCommandId(DownloadCommands::COPY_DOWNLOAD_LINK));
+   }
+ 
+   in_progress_download_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+@@ -279,6 +285,9 @@ ui::SimpleMenuModel* DownloadUiContextMe
+     in_progress_download_paused_menu_model_->AddItem(
+         DownloadCommands::SHOW_IN_FOLDER,
+         GetLabelForCommandId(DownloadCommands::SHOW_IN_FOLDER));
++    in_progress_download_paused_menu_model_->AddItem(
++        DownloadCommands::COPY_DOWNLOAD_LINK,
++        GetLabelForCommandId(DownloadCommands::COPY_DOWNLOAD_LINK));
+   }
+ 
+   in_progress_download_paused_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+@@ -315,6 +324,9 @@ ui::SimpleMenuModel* DownloadUiContextMe
+     finished_download_menu_model_->AddItem(
+         DownloadCommands::SHOW_IN_FOLDER,
+         GetLabelForCommandId(DownloadCommands::SHOW_IN_FOLDER));
++    finished_download_menu_model_->AddItem(
++        DownloadCommands::COPY_DOWNLOAD_LINK,
++        GetLabelForCommandId(DownloadCommands::COPY_DOWNLOAD_LINK));
+     finished_download_menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   }
+ 
+@@ -335,6 +347,9 @@ ui::SimpleMenuModel* DownloadUiContextMe
+ 
+   interrupted_download_menu_model_->AddItem(
+       DownloadCommands::RESUME, GetLabelForCommandId(DownloadCommands::RESUME));
++  interrupted_download_menu_model_->AddItem(
++      DownloadCommands::COPY_DOWNLOAD_LINK,
++      GetLabelForCommandId(DownloadCommands::COPY_DOWNLOAD_LINK));
+ #if BUILDFLAG(IS_WIN)
+   // The Help Center article is currently Windows specific.
+   // TODO(asanka): Enable this for other platforms when the article is expanded
