@@ -27,28 +27,37 @@
  
  namespace translate {
  namespace {
-@@ -76,6 +80,11 @@ TranslateManager::TranslateInitCallbackL
+@@ -76,6 +80,16 @@ TranslateManager::TranslateInitCallbackL
  TranslateManager::LanguageDetectedCallbackList* g_detection_callback_list_ =
      nullptr;
  
-+bool TranslationNeedsNetwork() {
++// Whether translating from |source_lang| to |target_lang| needs the network,
++// as far as the provider knows.
++bool TranslationNeedsNetwork(const std::string& source_lang,
++                             const std::string& target_lang) {
 +  const TranslationProvider* provider = GetTranslationProvider();
-+  return !provider || !provider->IsOnDevice();
++  return !provider || provider->SendsTextOffDevice() ||
++         provider->GetPairState(source_lang, target_lang) ==
++             TranslationProvider::PairState::kNeedsSetup;
 +}
 +
  std::string GetForcedTranslateLanguage() {
    return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
        switches::kForcedTranslateLanguage);
-@@ -200,7 +209,7 @@ bool TranslateManager::CanManuallyTransl
+@@ -200,7 +214,11 @@ bool TranslateManager::CanManuallyTransl
                                                      bool is_partial_translate) {
    bool can_translate = true;
  
 -  if (net::NetworkChangeNotifier::IsOffline()) {
-+  if (TranslationNeedsNetwork() && net::NetworkChangeNotifier::IsOffline()) {
++  const std::string display_target_lang = GetTargetLanguageForDisplay(
++      translate_client_->GetTranslatePrefs().get(), language_model_);
++  if (TranslationNeedsNetwork(language_state_.source_language(),
++                              display_target_lang) &&
++      net::NetworkChangeNotifier::IsOffline()) {
      if (!menu_logging) {
        return false;
      }
-@@ -210,7 +219,7 @@ bool TranslateManager::CanManuallyTransl
+@@ -210,7 +228,7 @@ bool TranslateManager::CanManuallyTransl
      can_translate = false;
    }
  
@@ -57,26 +66,81 @@
        !::google_apis::HasAPIKeyConfigured()) {
      if (!menu_logging) {
        return false;
-@@ -464,6 +473,18 @@ void TranslateManager::TranslatePage(std
+@@ -464,6 +482,16 @@ void TranslateManager::TranslatePage(std
  
    GetActiveTranslateMetricsLogger()->LogTranslationStarted(translation_type);
  
-+  if (const TranslationProvider* provider = GetTranslationProvider()) {
-+    const TranslationBatchLimits limits = provider->GetBatchLimits();
-+    std::string script = base::StringPrintf(
-+        "var batchLimits = {maxSegments: %zu, maxCharacters: %zu};\n",
-+        limits.max_segments, limits.max_characters);
-+    script.append(
-+        ui::ResourceBundle::GetSharedInstance().LoadDataResourceString(
-+            IDR_HELIUM_TRANSLATE_JS));
-+    DoTranslatePage(script, source_lang, target_lang);
++  if (TranslationProvider* provider = GetTranslationProvider()) {
++    provider->PrepareTranslation(
++        source_lang, std::string(target_lang), *translate_client_->GetPrefs(),
++        base::BindOnce(&TranslateManager::ConfirmTranslationSetup, GetWeakPtr(),
++                       source_lang, std::string(target_lang)),
++        base::BindOnce(&TranslateManager::OnTranslationPrepared, GetWeakPtr(),
++                       source_lang, std::string(target_lang)));
 +    return;
 +  }
 +
    TranslateScript* script = TranslateDownloadManager::GetInstance()->script();
    DCHECK(script != nullptr);
  
-@@ -786,7 +807,7 @@ void TranslateManager::SetIgnoreMissingK
+@@ -502,6 +530,56 @@ void TranslateManager::RevertTranslation
+   translate_client_->RevertPdfTranslation();
+ }
+ 
++void TranslateManager::ConfirmTranslationSetup(
++    std::string source_lang,
++    std::string target_lang,
++    const TranslationProvider::Setup& setup,
++    TranslationProvider::StartSetupCallback start_setup,
++    TranslationProvider::PrepareCallback callback) {
++  translate_client_->ConfirmTranslationSetup(source_lang, target_lang, setup,
++                                             std::move(start_setup),
++                                             std::move(callback));
++}
++
++void TranslateManager::OnTranslationPrepared(
++    std::string source_lang,
++    std::string target_lang,
++    TranslationProvider::PrepareResult result) {
++  if (!translate_driver_->HasCurrentPage()) {
++    return;
++  }
++
++  if (result == TranslationProvider::PrepareResult::kDeclined) {
++    // Back to offering the translation, rather than showing it in progress.
++    translate_client_->ShowTranslateUI(
++        translate::TRANSLATE_STEP_BEFORE_TRANSLATE, source_lang, target_lang,
++        TranslateErrors::NONE, false);
++    return;
++  }
++
++  const TranslationProvider* provider = GetTranslationProvider();
++  if (result != TranslationProvider::PrepareResult::kReady || !provider) {
++    const TranslateErrors error =
++        result == TranslationProvider::PrepareResult::kUnsupported
++            ? TranslateErrors::UNSUPPORTED_LANGUAGE
++            : TranslateErrors::NETWORK;
++    translate_client_->ShowTranslateUI(
++        translate::TRANSLATE_STEP_TRANSLATE_ERROR, source_lang, target_lang,
++        error, false);
++    NotifyTranslateError(error);
++    GetActiveTranslateMetricsLogger()->LogTranslationFinished(false, error);
++    return;
++  }
++
++  const TranslationBatchLimits limits = provider->GetBatchLimits();
++  std::string script = base::StringPrintf(
++      "var batchLimits = {maxSegments: %zu, maxCharacters: %zu};\n",
++      limits.max_segments, limits.max_characters);
++  script.append(ui::ResourceBundle::GetSharedInstance().LoadDataResourceString(
++      IDR_HELIUM_TRANSLATE_JS));
++  DoTranslatePage(script, source_lang, target_lang);
++}
++
+ void TranslateManager::DoTranslatePage(std::string_view translate_script,
+                                        std::string_view source_lang,
+                                        std::string_view target_lang) {
+@@ -786,7 +864,7 @@ void TranslateManager::SetIgnoreMissingK
  // static
  bool TranslateManager::IsAvailable(const TranslatePrefs* prefs) {
    // These conditions mirror the conditions in InitiateTranslation.
@@ -85,12 +149,14 @@
            ::google_apis::HasAPIKeyConfigured()) &&
           prefs->IsOfferTranslateEnabled();
  }
-@@ -961,15 +982,17 @@ void TranslateManager::FilterIsTranslate
+@@ -961,15 +1039,19 @@ void TranslateManager::FilterIsTranslate
  
    // Also, skip if the connection is currently offline - initiation doesn't make
    // sense there, either.
 -  if (net::NetworkChangeNotifier::IsOffline()) {
-+  if (TranslationNeedsNetwork() && net::NetworkChangeNotifier::IsOffline()) {
++  if (TranslationNeedsNetwork(std::string(page_language_code),
++                              std::string(target_lang)) &&
++      net::NetworkChangeNotifier::IsOffline()) {
      decision->PreventAllTriggering();
      GetActiveTranslateMetricsLogger()->LogTriggerDecision(
          TriggerDecision::kDisabledOffline);
@@ -106,3 +172,34 @@
      // Without an API key, translate won't work, so don't offer to translate in
      // the first place. Leave kOfferTranslateEnabled on, though, because that
      // settings syncs and we don't want to turn off translate everywhere else.
+--- a/components/translate/core/browser/translate_manager.h
++++ b/components/translate/core/browser/translate_manager.h
+@@ -17,6 +17,7 @@
+ #include "components/language_detection/core/constants.h"
+ #include "components/translate/core/browser/language_state.h"
+ #include "components/translate/core/browser/translate_metrics_logger.h"
++#include "components/translate/core/browser/translation_provider.h"
+ #include "components/translate/core/common/translate_errors.h"
+ 
+ namespace language {
+@@ -255,6 +256,20 @@ class TranslateManager {
+   bool CanManuallyTranslateInternal(bool menu_logging,
+                                     bool is_partial_translate);
+ 
++  // Asks the user to agree to the setup that the TranslationProvider needs.
++  void ConfirmTranslationSetup(
++      std::string source_lang,
++      std::string target_lang,
++      const TranslationProvider::Setup& setup,
++      TranslationProvider::StartSetupCallback start_setup,
++      TranslationProvider::PrepareCallback callback);
++
++  // Translates the page once the TranslationProvider is ready for it, or
++  // reports why it couldn't get ready.
++  void OnTranslationPrepared(std::string source_lang,
++                             std::string target_lang,
++                             TranslationProvider::PrepareResult result);
++
+   // Sends a translation request to the TranslateDriver.
+   void DoTranslatePage(std::string_view translate_script,
+                        std::string_view source_lang,

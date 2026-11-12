@@ -11,7 +11,7 @@
    deps = [
 --- /dev/null
 +++ b/components/translate/core/browser/translation_provider.cc
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,141 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -113,6 +113,20 @@
 +                                std::move(callback)));
 +}
 +
++TranslationProvider::PairState TranslationProvider::GetPairState(
++    const std::string& source_lang,
++    const std::string& target_lang) const {
++  return PairState::kReady;
++}
++
++void TranslationProvider::PrepareTranslation(const std::string& source_lang,
++                                             const std::string& target_lang,
++                                             const PrefService& prefs,
++                                             ConfirmSetupCallback confirm_setup,
++                                             PrepareCallback callback) {
++  std::move(callback).Run(PrepareResult::kReady);
++}
++
 +TranslationBatchLimits TranslationProvider::GetBatchLimits() const {
 +  return {};
 +}
@@ -141,7 +155,7 @@
 +}  // namespace translate
 --- /dev/null
 +++ b/components/translate/core/browser/translation_provider.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,202 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -154,10 +168,12 @@
 +#include <string>
 +#include <vector>
 +
++#include "base/byte_size.h"
 +#include "base/functional/callback.h"
 +#include "components/translate/core/common/translate_errors.h"
 +
 +class GURL;
++class PrefService;
 +
 +namespace translate {
 +
@@ -260,9 +276,67 @@
 +  // Whether the provider can translate right now.
 +  virtual bool IsAvailable() const = 0;
 +
-+  // Whether page text stays on the device. Translation is offered offline and
-+  // by default only for on-device providers.
-+  virtual bool IsOnDevice() const = 0;
++  // Whether page text is sent off the device. Translation is only offered by
++  // default for providers that keep it local.
++  virtual bool SendsTextOffDevice() const = 0;
++
++  enum class PairState {
++    kUnknown,
++    kReady,
++    // Needs something first, e.g. downloading models.
++    kNeedsSetup,
++    kUnsupported,
++  };
++
++  // Best guess from what the provider already knows, for deciding what to
++  // offer, e.g. while offline. PrepareTranslation() is what actually checks.
++  virtual PairState GetPairState(const std::string& source_lang,
++                                 const std::string& target_lang) const;
++
++  enum class PrepareResult {
++    kReady,
++    // The user didn't want the setup the pair needs.
++    kDeclined,
++    kFailed,
++    kUnsupported,
++  };
++  using PrepareCallback = base::OnceCallback<void(PrepareResult)>;
++
++  // What a language pair needs before the provider can translate it.
++  struct Setup {
++    enum class Kind {
++      // Models that the provider downloads once the user agrees.
++      kDownload,
++      // Languages that the user installs in the system settings.
++      kSystemSettings,
++    };
++
++    Kind kind = Kind::kDownload;
++    // Roughly how much is downloaded for kDownload.
++    base::ByteSize download_size;
++  };
++
++  // Reports how far setup is, e.g. how much of a download is done.
++  using SetupProgressCallback =
++      base::RepeatingCallback<void(base::ByteSize done, base::ByteSize total)>;
++  // Starts setup, which reports its progress and then whether it succeeded.
++  using StartSetupCallback =
++      base::OnceCallback<void(SetupProgressCallback,
++                              base::OnceCallback<void(bool)>)>;
++  // Asks the user to agree to |setup|. If they do, runs the StartSetupCallback
++  // and shows its progress, then runs the PrepareCallback with the outcome.
++  using ConfirmSetupCallback = base::OnceCallback<
++      void(const Setup& setup, StartSetupCallback, PrepareCallback)>;
++
++  // Called before every page translation, with |source_lang| "und" if the
++  // page language is unknown. Sets the pair up if needed, asking the user
++  // through |confirm_setup|. |prefs| are the profile's, and only valid during
++  // the call.
++  virtual void PrepareTranslation(const std::string& source_lang,
++                                  const std::string& target_lang,
++                                  const PrefService& prefs,
++                                  ConfirmSetupCallback confirm_setup,
++                                  PrepareCallback callback);
 +
 +  virtual TranslationBatchLimits GetBatchLimits() const;
 +
@@ -305,3 +379,38 @@
  }  // namespace translate
  
  #endif  // COMPONENTS_TRANSLATE_CORE_COMMON_TRANSLATE_FEATURES_H_
+--- a/components/translate/core/browser/translate_client.h
++++ b/components/translate/core/browser/translate_client.h
+@@ -8,11 +8,13 @@
+ #include <memory>
+ #include <string>
+ 
++#include "base/functional/callback.h"
+ #include "base/functional/callback_forward.h"
+ #include "build/build_config.h"
+ #include "components/language/core/browser/accept_languages_service.h"
+ #include "components/translate/core/browser/translate_prefs.h"
+ #include "components/translate/core/browser/translate_step.h"
++#include "components/translate/core/browser/translation_provider.h"
+ #include "components/translate/core/common/translate_errors.h"
+ 
+ class GURL;
+@@ -77,6 +79,18 @@ class TranslateClient {
+   // Reverts PDF translation.
+   virtual void RevertPdfTranslation() {}
+ 
++  // Asks the user whether to set up translating from |source_lang| to
++  // |target_lang| as |setup| describes. If they agree, runs |start_setup| and
++  // shows its progress until it's done.
++  virtual void ConfirmTranslationSetup(
++      const std::string& source_lang,
++      const std::string& target_lang,
++      const TranslationProvider::Setup& setup,
++      TranslationProvider::StartSetupCallback start_setup,
++      TranslationProvider::PrepareCallback callback) {
++    std::move(callback).Run(TranslationProvider::PrepareResult::kDeclined);
++  }
++
+   // Returns true if Reading Mode is open.
+   virtual bool IsReadingModeOpen() const = 0;
+ };
