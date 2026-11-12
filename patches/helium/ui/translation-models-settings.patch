@@ -1,0 +1,371 @@
+--- a/components/translate_strings.grdp
++++ b/components/translate_strings.grdp
+@@ -101,4 +101,24 @@
+     Waiting for languages…
+   </message>
+ 
++  <!-- Translation models in settings -->
++  <message name="IDS_TRANSLATE_MODELS_TITLE" desc="Title of the list of translation models that were downloaded to translate pages on the device.">
++    Translation models
++  </message>
++  <message name="IDS_TRANSLATE_MODELS_DESCRIPTION" desc="Description of the list of translation models that were downloaded to translate pages on the device.">
++    Downloaded to translate pages on your device. Models that aren't used for 30 days are removed.
++  </message>
++  <message name="IDS_TRANSLATE_MODELS_EMPTY" desc="Shown instead of the list of downloaded translation models when there are none.">
++    No translation models downloaded
++  </message>
++  <message name="IDS_TRANSLATE_MODELS_NAME" desc="Name of a downloaded translation model, by the languages that it translates between.">
++    <ph name="SOURCE_LANGUAGE">$1<ex>German</ex></ph> to <ph name="TARGET_LANGUAGE">$2<ex>English</ex></ph>
++  </message>
++  <message name="IDS_TRANSLATE_MODELS_DETAILS" desc="Size of a downloaded translation model, and when it was last used.">
++    <ph name="SIZE">$1<ex>30.2 MB</ex></ph> · Last used <ph name="TIME">$2<ex>3 days ago</ex></ph>
++  </message>
++  <message name="IDS_TRANSLATE_MODELS_REMOVE_ARIA_LABEL" desc="Label for the button that removes a downloaded translation model.">
++    Remove <ph name="MODEL">$1<ex>German to English</ex></ph>
++  </message>
++
+ </grit-part>
+--- a/chrome/browser/resources/settings/languages_page/languages_browser_proxy.ts
++++ b/chrome/browser/resources/settings/languages_page/languages_browser_proxy.ts
+@@ -7,9 +7,15 @@
+  * to interact with the browser.
+  */
+ 
+-// <if expr="is_win">
+ import {sendWithPromise} from 'chrome://resources/js/cr.js';
+-// </if>
++
++/** A model that was downloaded to translate on the device. */
++export interface TranslationModel {
++  sourceLanguage: string;
++  targetLanguage: string;
++  name: string;
++  details: string;
++}
+ 
+ export interface LanguagesBrowserProxy {
+   // <if expr="is_win">
+@@ -24,6 +30,11 @@ export interface LanguagesBrowserProxy {
+   // </if>
+ 
+   getLanguageSettingsPrivate(): typeof chrome.languageSettingsPrivate;
++
++  getTranslationModels(): Promise<TranslationModel[]>;
++
++  removeTranslationModel(sourceLanguage: string, targetLanguage: string):
++      Promise<void>;
+ }
+ 
+ export class LanguagesBrowserProxyImpl implements LanguagesBrowserProxy {
+@@ -42,6 +53,15 @@ export class LanguagesBrowserProxyImpl i
+     return chrome.languageSettingsPrivate;
+   }
+ 
++  getTranslationModels() {
++    return sendWithPromise<TranslationModel[]>('getTranslationModels');
++  }
++
++  removeTranslationModel(sourceLanguage: string, targetLanguage: string) {
++    return sendWithPromise<void>(
++        'removeTranslationModel', sourceLanguage, targetLanguage);
++  }
++
+   static getInstance(): LanguagesBrowserProxy {
+     return instance || (instance = new LanguagesBrowserProxyImpl());
+   }
+--- a/chrome/browser/resources/settings/languages_page/translate_page.html.ts
++++ b/chrome/browser/resources/settings/languages_page/translate_page.html.ts
+@@ -105,6 +105,36 @@ ${this.translationProviders_.length > 1
+       $i18n{noLanguagesAdded}
+     </div>
+   </div>
++  <div class="cr-row continuation">
++    <div class="flex cr-padded-text">
++      <h2>$i18n{translationModels}</h2>
++      <div class="secondary">$i18n{translationModelsDescription}</div>
++    </div>
++  </div>
++  <div class="list-frame">
++    <div id="translationModelList" class="vertical-list" role="list">
++      ${this.translationModels_.map(item => html`
++        <div class="list-item" role="listitem">
++          <div class="start cr-padded-text">
++            <div>${item.name}</div>
++            <div class="secondary">${item.details}</div>
++          </div>
++          <cr-icon-button class="icon-delete-gray"
++              aria-label="${this.i18n('removeTranslationModelAriaLabel',
++                            item.name)}"
++              data-source-language="${item.sourceLanguage}"
++              data-target-language="${item.targetLanguage}"
++              @click="${this.onRemoveTranslationModelClick_}"
++              title="$i18n{delete}">
++          </cr-icon-button>
++        </div>
++      `)}
++    </div>
++    <div id="noTranslationModelsLabel" class="list-item" role="listitem"
++        ?hidden="${this.hasSome_(this.translationModels_)}">
++      $i18n{noTranslationModels}
++    </div>
++  </div>
+ </cr-collapse>
+ ${this.showAddAlwaysTranslateDialog_ ? html`
+   <settings-add-languages-dialog id="alwaysTranslateDialog"
+--- a/chrome/browser/resources/settings/languages_page/translate_page.ts
++++ b/chrome/browser/resources/settings/languages_page/translate_page.ts
+@@ -32,6 +32,8 @@ import {loadTimeData} from '../i18n_setu
+ import {getCss as getSettingsSharedCss} from '../settings_shared_lit.css.js';
+ 
+ import {getLanguageHelperInstance} from './languages.js';
++import type {TranslationModel} from './languages_browser_proxy.js';
++import {LanguagesBrowserProxyImpl} from './languages_browser_proxy.js';
+ import type {LanguageSettingsMetricsProxy} from './languages_settings_metrics_proxy.js';
+ import {LanguageSettingsActionType, LanguageSettingsMetricsProxyImpl} from './languages_settings_metrics_proxy.js';
+ import type {LanguageHelper, LanguagesModel} from './languages_types.js';
+@@ -71,6 +73,7 @@ export class SettingsTranslatePageElemen
+       addLanguagesDialogLanguages_: {type: Array},
+       translateEnabledPref_: {type: Object},
+       translationProviders_: {type: Array},
++      translationModels_: {type: Array},
+     };
+   }
+ 
+@@ -89,6 +92,7 @@ export class SettingsTranslatePageElemen
+   protected accessor showAddNeverTranslateDialog_: boolean = false;
+   protected accessor addLanguagesDialogLanguages_:
+       chrome.languageSettingsPrivate.Language[] = [];
++  protected accessor translationModels_: TranslationModel[] = [];
+   private languageHelper_: LanguageHelper;
+   private boundOnLanguagesChanged_: ((e: Event) => void)|null = null;
+   private languageSettingsMetricsProxy_: LanguageSettingsMetricsProxy =
+@@ -110,6 +114,8 @@ export class SettingsTranslatePageElemen
+     if (this.languageHelper_.languages) {
+       this.onLanguagesChanged_(this.languageHelper_.languages);
+     }
++
++    this.updateTranslationModels_();
+   }
+ 
+   override disconnectedCallback() {
+@@ -225,6 +231,18 @@ export class SettingsTranslatePageElemen
+    * Stamps and opens the Add Languages dialog, registering a listener to
+    * disable the dialog's dom-if again on close.
+    */
++  private async updateTranslationModels_() {
++    this.translationModels_ =
++        await LanguagesBrowserProxyImpl.getInstance().getTranslationModels();
++  }
++
++  protected async onRemoveTranslationModelClick_(e: Event) {
++    const button = e.currentTarget as HTMLElement;
++    await LanguagesBrowserProxyImpl.getInstance().removeTranslationModel(
++        button.dataset['sourceLanguage']!, button.dataset['targetLanguage']!);
++    await this.updateTranslationModels_();
++  }
++
+   protected onAddNeverTranslateLanguagesClick_(e: Event) {
+     e.preventDefault();
+     const translatableLanguages = this.getTranslatableLanguages_();
+--- a/chrome/browser/ui/webui/settings/languages_handler.cc
++++ b/chrome/browser/ui/webui/settings/languages_handler.cc
+@@ -4,14 +4,21 @@
+ 
+ #include "chrome/browser/ui/webui/settings/languages_handler.h"
+ 
++#include <algorithm>
++
+ #include "base/functional/bind.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/language/core/browser/pref_names.h"
+ #include "components/prefs/pref_service.h"
++#include "components/strings/grit/components_strings.h"
+ #include "content/public/browser/web_ui.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/l10n/time_format.h"
++#include "ui/base/text/bytes_formatting.h"
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+ #include "base/check_deref.h"
+@@ -43,6 +50,18 @@ void LanguagesHandler::RegisterMessages(
+       "setProspectiveUILanguage",
+       base::BindRepeating(&LanguagesHandler::HandleSetProspectiveUILanguage,
+                           base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "getTranslationModels",
++      base::BindRepeating(&LanguagesHandler::HandleGetTranslationModels,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "removeTranslationModel",
++      base::BindRepeating(&LanguagesHandler::HandleRemoveTranslationModel,
++                          base::Unretained(this)));
++}
++
++void LanguagesHandler::OnJavascriptDisallowed() {
++  weak_ptr_factory_.InvalidateWeakPtrs();
+ }
+ 
+ void LanguagesHandler::HandleGetProspectiveUILanguage(
+@@ -91,4 +110,69 @@ void LanguagesHandler::HandleSetProspect
+ #endif
+ }
+ 
++void LanguagesHandler::HandleGetTranslationModels(const base::ListValue& args) {
++  AllowJavascript();
++  translate::TranslationProvider* provider = translate::GetTranslationProvider(
++      *Profile::FromWebUI(web_ui())->GetPrefs());
++  if (!provider) {
++    ResolveJavascriptCallback(args[0], base::ListValue());
++    return;
++  }
++
++  provider->GetDownloadedModels(
++      base::BindOnce(&LanguagesHandler::OnGotTranslationModels,
++                     weak_ptr_factory_.GetWeakPtr(), args[0].Clone()));
++}
++
++void LanguagesHandler::OnGotTranslationModels(
++    base::Value callback_id,
++    std::vector<translate::TranslationProvider::DownloadedModel> models) {
++  const std::string& locale = g_browser_process->GetApplicationLocale();
++  base::ListValue list;
++  for (const auto& model : models) {
++    // Usage is recorded when a translation starts, so it's never quite now.
++    const base::TimeDelta unused_for =
++        std::max(base::Time::Now() - model.last_used, base::Minutes(1));
++    list.Append(
++        base::DictValue()
++            .Set("sourceLanguage", model.source_lang)
++            .Set("targetLanguage", model.target_lang)
++            .Set("name", l10n_util::GetStringFUTF16(
++                             IDS_TRANSLATE_MODELS_NAME,
++                             l10n_util::GetDisplayNameForLocale(
++                                 model.source_lang, locale, true),
++                             l10n_util::GetDisplayNameForLocale(
++                                 model.target_lang, locale, true)))
++            .Set("details",
++                 l10n_util::GetStringFUTF16(
++                     IDS_TRANSLATE_MODELS_DETAILS, ui::FormatBytes(model.size),
++                     ui::TimeFormat::Simple(ui::TimeFormat::FORMAT_ELAPSED,
++                                            ui::TimeFormat::LENGTH_LONG,
++                                            unused_for))));
++  }
++
++  ResolveJavascriptCallback(callback_id, list);
++}
++
++void LanguagesHandler::HandleRemoveTranslationModel(
++    const base::ListValue& args) {
++  AllowJavascript();
++  CHECK_EQ(3U, args.size());
++  translate::TranslationProvider* provider = translate::GetTranslationProvider(
++      *Profile::FromWebUI(web_ui())->GetPrefs());
++  if (!provider) {
++    ResolveJavascriptCallback(args[0], base::Value());
++    return;
++  }
++
++  provider->RemoveDownloadedModel(
++      args[1].GetString(), args[2].GetString(),
++      base::BindOnce(&LanguagesHandler::OnTranslationModelRemoved,
++                     weak_ptr_factory_.GetWeakPtr(), args[0].Clone()));
++}
++
++void LanguagesHandler::OnTranslationModelRemoved(base::Value callback_id) {
++  ResolveJavascriptCallback(callback_id, base::Value());
++}
++
+ }  // namespace settings
+--- a/chrome/browser/ui/webui/settings/languages_handler.h
++++ b/chrome/browser/ui/webui/settings/languages_handler.h
+@@ -5,8 +5,13 @@
+ #ifndef CHROME_BROWSER_UI_WEBUI_SETTINGS_LANGUAGES_HANDLER_H_
+ #define CHROME_BROWSER_UI_WEBUI_SETTINGS_LANGUAGES_HANDLER_H_
+ 
++#include <vector>
++
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/values.h"
+ #include "chrome/browser/ui/webui/settings/settings_page_ui_handler.h"
++#include "components/translate/core/browser/translation_provider.h"
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+ class Profile;
+@@ -31,7 +36,7 @@ class LanguagesHandler : public Settings
+   // SettingsPageUIHandler implementation.
+   void RegisterMessages() override;
+   void OnJavascriptAllowed() override {}
+-  void OnJavascriptDisallowed() override {}
++  void OnJavascriptDisallowed() override;
+ 
+  private:
+   // Returns the prospective UI language. May not match the actual UI language,
+@@ -43,9 +48,21 @@ class LanguagesHandler : public Settings
+   // The actual UI language will not change until the next restart.
+   void HandleSetProspectiveUILanguage(const base::ListValue& args);
+ 
++  // Lists the models that were downloaded to translate on the device.
++  void HandleGetTranslationModels(const base::ListValue& args);
++  void OnGotTranslationModels(
++      base::Value callback_id,
++      std::vector<translate::TranslationProvider::DownloadedModel> models);
++
++  // Removes a downloaded translation model.
++  void HandleRemoveTranslationModel(const base::ListValue& args);
++  void OnTranslationModelRemoved(base::Value callback_id);
++
+ #if BUILDFLAG(IS_CHROMEOS)
+   raw_ptr<Profile> profile_;  // Weak pointer.
+ #endif
++
++  base::WeakPtrFactory<LanguagesHandler> weak_ptr_factory_{this};
+ };
+ 
+ }  // namespace settings
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -1545,6 +1545,14 @@ void AddLanguagesStrings(content::WebUID
+ 
+   html_source->AddString("translationProviders",
+                          base::WriteJson(translation_providers).value_or("[]"));
++  static constexpr webui::LocalizedString kTranslationModelStrings[] = {
++      {"translationModels", IDS_TRANSLATE_MODELS_TITLE},
++      {"translationModelsDescription", IDS_TRANSLATE_MODELS_DESCRIPTION},
++      {"noTranslationModels", IDS_TRANSLATE_MODELS_EMPTY},
++      {"removeTranslationModelAriaLabel",
++       IDS_TRANSLATE_MODELS_REMOVE_ARIA_LABEL},
++  };
++  html_source->AddLocalizedStrings(kTranslationModelStrings);
+ #endif  // !BUILDFLAG(IS_CHROMEOS)
+ #if BUILDFLAG(IS_CHROMEOS)
+   html_source->AddString("osSettingsLanguagesPageUrl",
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -173,9 +173,7 @@
+ #include "chrome/grit/settings_shared_resources_map.h"
+ #endif
+ 
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_CHROMEOS)
+ #include "chrome/browser/ui/webui/settings/languages_handler.h"
+-#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_CHROMEOS)
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+ #include "ash/webui/eche_app_ui/eche_app_manager.h"
+@@ -277,9 +275,10 @@ SettingsUI::SettingsUI(content::WebUI* w
+   AddSettingsPageUIHandler(std::make_unique<BraveImportDataHandler>());
+   AddSettingsPageUIHandler(std::make_unique<HatsHandler>());
+ 
+-#if BUILDFLAG(IS_WIN)
++#if !BUILDFLAG(IS_CHROMEOS)
++  // Also lists translation models, not just the UI language on Windows.
+   AddSettingsPageUIHandler(std::make_unique<LanguagesHandler>());
+-#endif  // BUILDFLAG(IS_WIN)
++#endif  // !BUILDFLAG(IS_CHROMEOS)
+ 
+   AddSettingsPageUIHandler(
+       std::make_unique<MediaDevicesSelectionHandler>(profile));
