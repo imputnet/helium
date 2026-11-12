@@ -20,12 +20,13 @@
      AppendTranslateItem();
    }
  }
-@@ -5989,6 +5988,11 @@ ToastController* RenderViewContextMenu::
+@@ -5989,6 +5988,12 @@ ToastController* RenderViewContextMenu::
  }
  
  bool RenderViewContextMenu::CanTranslate(bool menu_logging) {
 +  // Selected text can't be translated with a TranslationProvider yet.
-+  if (!translate::GetTranslationProvider() || !params_.selection_text.empty()) {
++  if (!translate::GetTranslationProvider(*GetProfile()->GetPrefs()) ||
++      !params_.selection_text.empty()) {
 +    return false;
 +  }
 +
@@ -99,7 +100,7 @@
    registry->RegisterBooleanPref(prefs::kWebAppCreateInQuickLaunchBar, true);
 +  // Translation is only offered by default when it stays on-device.
 +  const translate::TranslationProvider* translation_provider =
-+      translate::GetTranslationProvider();
++      translate::GetDefaultTranslationProvider();
    registry->RegisterBooleanPref(
 -      translate::prefs::kOfferTranslateEnabled, false,
 +      translate::prefs::kOfferTranslateEnabled,
@@ -156,7 +157,7 @@
                ?hidden="${!this.isProspectiveUiLanguage_(
 --- a/chrome/browser/resources/settings/languages_page/translate_page.html.ts
 +++ b/chrome/browser/resources/settings/languages_page/translate_page.html.ts
-@@ -4,10 +4,13 @@
+@@ -4,11 +4,25 @@
  
  import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
  
@@ -168,9 +169,21 @@
    return html`<!--_html_template_start_-->
 +${loadTimeData.getBoolean('enableHeliumTranslate') ? html`
  <settings-section page-title="$i18n{translatePageTitle}">
++${this.translationProviders_.length > 1 ? html`
++<div class="cr-row first">
++  <div class="flex cr-padded-text" aria-hidden="true">
++    $i18n{translationProvider}
++  </div>
++  <settings-dropdown-menu pref-key="helium.translate.provider"
++      label="$i18n{translationProvider}"
++      .menuOptions="${this.translationProviders_}">
++  </settings-dropdown-menu>
++</div>
++` : ''}
  <settings-toggle-button id="offerTranslateOtherLanguages"
      pref-key="translate.enabled"
-@@ -107,5 +110,6 @@ ${this.showAddNeverTranslateDialog_ ? ht
+     label="$i18n{offerToEnableTranslate}"
+@@ -107,5 +121,6 @@ ${this.showAddNeverTranslateDialog_ ? ht
    </settings-add-languages-dialog>
  ` : ''}
  </settings-section>
@@ -242,20 +255,42 @@
  #include "components/translate/core/common/translate_features.h"
  #include "components/wallet/core/browser/walletable_permission_utils.h"
  #include "components/wallet/core/common/wallet_features.h"
-@@ -1531,6 +1532,8 @@ void AddLanguagesStrings(content::WebUID
+@@ -1466,6 +1467,7 @@ void AddLanguagesStrings(content::WebUID
+ #endif
+       {"offerToEnableTranslate",
+        IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE},
++      {"translationProvider", IDS_SETTINGS_LANGUAGES_TRANSLATION_PROVIDER},
+       {"noLanguagesAdded", IDS_SETTINGS_LANGUAGES_NO_LANGUAGES_ADDED},
+       {"addLanguageAriaLabel", IDS_SETTINGS_LANGUAGES_ADD_ARIA_LABEL},
+       {"removeAutomaticLanguageAriaLabel",
+@@ -1531,6 +1533,18 @@ void AddLanguagesStrings(content::WebUID
        base::FeatureList::IsEnabled(translate::kEnableTranslatePdf)
            ? IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL_WITH_PDF
            : IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE_SUBLABEL);
 +  html_source->AddBoolean("enableHeliumTranslate",
 +                          translate::HasTranslationProvider());
++  base::ListValue translation_providers;
++  for (const translate::TranslationProvider* provider :
++       translate::GetTranslationProviders()) {
++    translation_providers.Append(base::DictValue()
++                                     .Set("value", provider->GetId())
++                                     .Set("name", provider->GetName()));
++  }
++
++  html_source->AddString("translationProviders",
++                         base::WriteJson(translation_providers).value_or("[]"));
  #endif  // !BUILDFLAG(IS_CHROMEOS)
  #if BUILDFLAG(IS_CHROMEOS)
    html_source->AddString("osSettingsLanguagesPageUrl",
 --- a/chrome/app/settings_strings.grdp
 +++ b/chrome/app/settings_strings.grdp
-@@ -1259,13 +1259,13 @@
+@@ -1258,14 +1258,17 @@
+       <message name="IDS_SETTINGS_LANGUAGES_PREFERRED_LANGUAGES_DESC" desc="Description text of the explanatory message about the list of preferred languages.">
          Let websites know the languages you speak. They'll show content in those languages, when possible.
        </message>
++      <message name="IDS_SETTINGS_LANGUAGES_TRANSLATION_PROVIDER" desc="The label of the menu that picks the service that translates pages.">
++        Translation service
++      </message>
        <message name="IDS_SETTINGS_LANGUAGES_OFFER_TO_ENABLE_TRANSLATE" desc="The label of the check-box that enables the prompt to translate a page.">
 -        Use Google Translate
 +        Offer to translate pages
@@ -270,7 +305,7 @@
  </message>
        <message name="IDS_SETTINGS_LANGUAGES_TRANSLATE_TARGET" desc="The label under a language's name in a list of enabled languages indicating that pages will be translated to this language.">
          This language is used when translating pages
-@@ -1286,7 +1286,7 @@
+@@ -1286,7 +1289,7 @@
          Remove <ph name="LANGUAGE_NAME">$1<ex>Swahili</ex></ph> from never offer translation languages
        </message>
        <message name="IDS_SETTINGS_TRANSLATE_PAGE_TITLE" desc="Name of the settings page which displays translate preferences.">
@@ -279,3 +314,50 @@
        </message>
        <message name="IDS_SETTINGS_TARGET_TRANSLATE_LABEL" desc="Label for the element to select the target language">
          Translate into this language
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -543,6 +543,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[translate::prefs::kOfferTranslateEnabled] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[translate::prefs::kTranslationProvider] =
++      settings_api::PrefType::kString;
+   (*s_allowlist)[translate::prefs::kBlockedLanguages] =
+       settings_api::PrefType::kList;
+   (*s_allowlist)[translate::prefs::kPrefNeverPromptSitesWithTime] =
+--- a/chrome/browser/resources/settings/languages_page/translate_page.ts
++++ b/chrome/browser/resources/settings/languages_page/translate_page.ts
+@@ -13,6 +13,7 @@ import 'chrome://resources/cr_elements/c
+ import 'chrome://resources/cr_elements/icons.html.js';
+ import './add_languages_dialog.js';
+ import './languages.js';
++import '../controls/settings_dropdown_menu.js';
+ import '../controls/settings_toggle_button.js';
+ import '../icons.html.js';
+ import '../settings_page/settings_section.js';
+@@ -25,7 +26,9 @@ import {assert} from 'chrome://resources
+ import {focusWithoutInk} from 'chrome://resources/js/focus_without_ink.js';
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
++import type {DropdownMenuOptionList} from '../controls/settings_dropdown_menu.js';
+ import type {SettingsToggleButtonElement} from '../controls/settings_toggle_button.js';
++import {loadTimeData} from '../i18n_setup.js';
+ import {getCss as getSettingsSharedCss} from '../settings_shared_lit.css.js';
+ 
+ import {getLanguageHelperInstance} from './languages.js';
+@@ -67,12 +70,15 @@ export class SettingsTranslatePageElemen
+       showAddNeverTranslateDialog_: {type: Boolean},
+       addLanguagesDialogLanguages_: {type: Array},
+       translateEnabledPref_: {type: Object},
++      translationProviders_: {type: Array},
+     };
+   }
+ 
+   protected accessor supportedLanguages_:
+       chrome.languageSettingsPrivate.Language[] = [];
+   protected accessor translateTarget_: string = '';
++  protected accessor translationProviders_: DropdownMenuOptionList =
++      JSON.parse(loadTimeData.getString('translationProviders'));
+   protected accessor alwaysTranslateLanguages_:
+       chrome.languageSettingsPrivate.Language[] = [];
+   protected accessor neverTranslateLanguages_:

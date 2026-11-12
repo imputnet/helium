@@ -11,7 +11,7 @@
    deps = [
 --- /dev/null
 +++ b/components/translate/core/browser/translation_provider.cc
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,167 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -24,6 +24,8 @@
 +#include "base/feature_list.h"
 +#include "base/functional/bind.h"
 +#include "base/no_destructor.h"
++#include "components/prefs/pref_service.h"
++#include "components/translate/core/browser/translate_pref_names.h"
 +#include "components/translate/core/common/translate_features.h"
 +
 +namespace translate {
@@ -141,21 +143,45 @@
 +         !GetProviders().empty();
 +}
 +
-+TranslationProvider* GetTranslationProvider() {
++std::vector<TranslationProvider*> GetTranslationProviders() {
++  std::vector<TranslationProvider*> providers;
 +  if (!HasTranslationProvider()) {
-+    return nullptr;
++    return providers;
 +  }
 +
-+  const auto& providers = GetProviders();
++  for (const auto& provider : GetProviders()) {
++    providers.push_back(provider.get());
++  }
++
++  return providers;
++}
++
++TranslationProvider* GetDefaultTranslationProvider() {
++  const std::vector<TranslationProvider*> providers = GetTranslationProviders();
 +  const auto it = std::ranges::find_if(
-+      providers, [](const auto& provider) { return provider->IsAvailable(); });
-+  return it == providers.end() ? nullptr : it->get();
++      providers,
++      [](TranslationProvider* provider) { return provider->IsAvailable(); });
++  return it == providers.end() ? nullptr : *it;
++}
++
++TranslationProvider* GetTranslationProvider(const PrefService& prefs) {
++  const std::string& id = prefs.GetString(prefs::kTranslationProvider);
++  const std::vector<TranslationProvider*> providers = GetTranslationProviders();
++  const auto it = std::ranges::find_if(
++      providers,
++      [&](TranslationProvider* provider) { return provider->GetId() == id; });
++  if (it == providers.end()) {
++    return GetDefaultTranslationProvider();
++  }
++
++  // Not another one, which may send text where the user didn't want it.
++  return (*it)->IsAvailable() ? *it : nullptr;
 +}
 +
 +}  // namespace translate
 --- /dev/null
 +++ b/components/translate/core/browser/translation_provider.h
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,215 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -273,6 +299,12 @@
 + public:
 +  virtual ~TranslationProvider() = default;
 +
++  // Identifies the provider in prefs, so it has to stay the same.
++  virtual std::string GetId() const = 0;
++
++  // Shown in settings when there's more than one provider to choose from.
++  virtual std::u16string GetName() const = 0;
++
 +  // Whether the provider can translate right now.
 +  virtual bool IsAvailable() const = 0;
 +
@@ -351,9 +383,16 @@
 +// none is available right now. For UI that is built once, like browser actions.
 +bool HasTranslationProvider();
 +
-+// Returns the first available provider, or nullptr if there is none or
-+// kHeliumTranslate is disabled.
-+TranslationProvider* GetTranslationProvider();
++// The registered providers, or none if kHeliumTranslate is disabled.
++std::vector<TranslationProvider*> GetTranslationProviders();
++
++// Returns the first available provider, which is used until the user picks
++// one, or nullptr if there is none.
++TranslationProvider* GetDefaultTranslationProvider();
++
++// Returns the provider picked in |prefs|, or the default one if it isn't
++// registered. Returns nullptr if that provider isn't available.
++TranslationProvider* GetTranslationProvider(const PrefService& prefs);
 +
 +}  // namespace translate
 +
@@ -414,3 +453,37 @@
    // Returns true if Reading Mode is open.
    virtual bool IsReadingModeOpen() const = 0;
  };
+--- a/components/translate/core/browser/translate_pref_names.h
++++ b/components/translate/core/browser/translate_pref_names.h
+@@ -24,6 +24,9 @@ inline constexpr char kBlockedLanguages[
+ inline constexpr char kPrefNeverPromptSitesWithTime[] =
+     "translate_site_blocklist_with_time";
+ 
++// The ID of the TranslationProvider that the user picked.
++inline constexpr char kTranslationProvider[] = "helium.translate.provider";
++
+ // LINT.IfChange(DataRegion)
+ // The data region setting. 0: Unset, 1: US, 2: EU.
+ // Same value as chrome::prefs::kChromeDataRegionSetting.
+--- a/components/translate/core/browser/translate_prefs.cc
++++ b/components/translate/core/browser/translate_prefs.cc
+@@ -36,6 +36,7 @@
+ #include "components/strings/grit/components_locale_settings.h"
+ #include "components/translate/core/browser/translate_download_manager.h"
+ #include "components/translate/core/browser/translate_pref_names.h"
++#include "components/translate/core/browser/translation_provider.h"
+ #include "components/translate/core/common/translate_language_matcher.h"
+ #include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
+ #include "ui/base/l10n/chromium_language_matcher.h"
+@@ -990,6 +991,11 @@ void TranslatePrefs::RegisterProfilePref
+   registry->RegisterListPref(translate::prefs::kBlockedLanguages,
+                              TranslatePrefs::GetDefaultBlockedLanguages(),
+                              user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
++  // Not synced, since providers differ between platforms.
++  const TranslationProvider* default_provider = GetDefaultTranslationProvider();
++  registry->RegisterStringPref(
++      prefs::kTranslationProvider,
++      default_provider ? default_provider->GetId() : std::string());
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+   registry->RegisterDictionaryPref(
+       kPrefTranslateAutoAlwaysCount,

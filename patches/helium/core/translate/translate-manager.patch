@@ -27,15 +27,16 @@
  
  namespace translate {
  namespace {
-@@ -76,6 +80,16 @@ TranslateManager::TranslateInitCallbackL
+@@ -76,6 +80,17 @@ TranslateManager::TranslateInitCallbackL
  TranslateManager::LanguageDetectedCallbackList* g_detection_callback_list_ =
      nullptr;
  
 +// Whether translating from |source_lang| to |target_lang| needs the network,
 +// as far as the provider knows.
-+bool TranslationNeedsNetwork(const std::string& source_lang,
++bool TranslationNeedsNetwork(const PrefService& prefs,
++                             const std::string& source_lang,
 +                             const std::string& target_lang) {
-+  const TranslationProvider* provider = GetTranslationProvider();
++  const TranslationProvider* provider = GetTranslationProvider(prefs);
 +  return !provider || provider->SendsTextOffDevice() ||
 +         provider->GetPairState(source_lang, target_lang) ==
 +             TranslationProvider::PairState::kNeedsSetup;
@@ -44,33 +45,36 @@
  std::string GetForcedTranslateLanguage() {
    return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
        switches::kForcedTranslateLanguage);
-@@ -200,7 +214,11 @@ bool TranslateManager::CanManuallyTransl
+@@ -200,7 +215,12 @@ bool TranslateManager::CanManuallyTransl
                                                      bool is_partial_translate) {
    bool can_translate = true;
  
 -  if (net::NetworkChangeNotifier::IsOffline()) {
 +  const std::string display_target_lang = GetTargetLanguageForDisplay(
 +      translate_client_->GetTranslatePrefs().get(), language_model_);
-+  if (TranslationNeedsNetwork(language_state_.source_language(),
++  if (TranslationNeedsNetwork(*translate_client_->GetPrefs(),
++                              language_state_.source_language(),
 +                              display_target_lang) &&
 +      net::NetworkChangeNotifier::IsOffline()) {
      if (!menu_logging) {
        return false;
      }
-@@ -210,7 +228,7 @@ bool TranslateManager::CanManuallyTransl
+@@ -210,7 +230,8 @@ bool TranslateManager::CanManuallyTransl
      can_translate = false;
    }
  
 -  if (!ignore_missing_key_for_testing_ &&
-+  if (!GetTranslationProvider() && !ignore_missing_key_for_testing_ &&
++  if (!GetTranslationProvider(*translate_client_->GetPrefs()) &&
++      !ignore_missing_key_for_testing_ &&
        !::google_apis::HasAPIKeyConfigured()) {
      if (!menu_logging) {
        return false;
-@@ -464,6 +482,16 @@ void TranslateManager::TranslatePage(std
+@@ -464,6 +485,17 @@ void TranslateManager::TranslatePage(std
  
    GetActiveTranslateMetricsLogger()->LogTranslationStarted(translation_type);
  
-+  if (TranslationProvider* provider = GetTranslationProvider()) {
++  if (TranslationProvider* provider =
++          GetTranslationProvider(*translate_client_->GetPrefs())) {
 +    provider->PrepareTranslation(
 +        source_lang, std::string(target_lang), *translate_client_->GetPrefs(),
 +        base::BindOnce(&TranslateManager::ConfirmTranslationSetup, GetWeakPtr(),
@@ -83,7 +87,7 @@
    TranslateScript* script = TranslateDownloadManager::GetInstance()->script();
    DCHECK(script != nullptr);
  
-@@ -502,6 +530,56 @@ void TranslateManager::RevertTranslation
+@@ -502,6 +534,57 @@ void TranslateManager::RevertTranslation
    translate_client_->RevertPdfTranslation();
  }
  
@@ -114,7 +118,8 @@
 +    return;
 +  }
 +
-+  const TranslationProvider* provider = GetTranslationProvider();
++  const TranslationProvider* provider =
++      GetTranslationProvider(*translate_client_->GetPrefs());
 +  if (result != TranslationProvider::PrepareResult::kReady || !provider) {
 +    const TranslateErrors error =
 +        result == TranslationProvider::PrepareResult::kUnsupported
@@ -140,21 +145,22 @@
  void TranslateManager::DoTranslatePage(std::string_view translate_script,
                                         std::string_view source_lang,
                                         std::string_view target_lang) {
-@@ -786,7 +864,7 @@ void TranslateManager::SetIgnoreMissingK
+@@ -786,7 +869,7 @@ void TranslateManager::SetIgnoreMissingK
  // static
  bool TranslateManager::IsAvailable(const TranslatePrefs* prefs) {
    // These conditions mirror the conditions in InitiateTranslation.
 -  return (ignore_missing_key_for_testing_ ||
-+  return (GetTranslationProvider() || ignore_missing_key_for_testing_ ||
++  return (HasTranslationProvider() || ignore_missing_key_for_testing_ ||
            ::google_apis::HasAPIKeyConfigured()) &&
           prefs->IsOfferTranslateEnabled();
  }
-@@ -961,15 +1039,19 @@ void TranslateManager::FilterIsTranslate
+@@ -961,15 +1044,21 @@ void TranslateManager::FilterIsTranslate
  
    // Also, skip if the connection is currently offline - initiation doesn't make
    // sense there, either.
 -  if (net::NetworkChangeNotifier::IsOffline()) {
-+  if (TranslationNeedsNetwork(std::string(page_language_code),
++  if (TranslationNeedsNetwork(*translate_client_->GetPrefs(),
++                              std::string(page_language_code),
 +                              std::string(target_lang)) &&
 +      net::NetworkChangeNotifier::IsOffline()) {
      decision->PreventAllTriggering();
@@ -168,7 +174,8 @@
 +  const bool can_use_translate_element =
 +      command_line.HasSwitch(translate::switches::kTranslateScriptURL) &&
 +      (ignore_missing_key_for_testing_ || ::google_apis::HasAPIKeyConfigured());
-+  if (!GetTranslationProvider() && !can_use_translate_element) {
++  if (!GetTranslationProvider(*translate_client_->GetPrefs()) &&
++      !can_use_translate_element) {
      // Without an API key, translate won't work, so don't offer to translate in
      // the first place. Leave kOfferTranslateEnabled on, though, because that
      // settings syncs and we don't want to turn off translate everywhere else.
