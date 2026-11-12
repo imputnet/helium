@@ -19,7 +19,7 @@
 +BASE_FEATURE(kHeliumNativeFrameMaterials, base::FEATURE_DISABLED_BY_DEFAULT);
 +
 +bool HeliumNativeFrameAvailable() {
-+#if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)
 +  return base::FeatureList::IsEnabled(kHeliumNativeFrameMaterials);
 +#else
 +  return false;
@@ -42,14 +42,15 @@
  #endif /* CHROME_BROWSER_HELIUM_FLAG_CHOICES_H_ */
 --- a/chrome/browser/helium_flag_entries.h
 +++ b/chrome/browser/helium_flag_entries.h
-@@ -75,5 +75,9 @@
+@@ -75,5 +75,10 @@
       "prevent access to networks that require a proxy. Helium flag.",
       kOsAll, SINGLE_VALUE_TYPE(switches::kNoProxyServer)},
      // ui
 +    {helium::kHeliumNativeFrameMaterialsCommandLine, "Native frame materials",
 +     "Enables an option to apply native materials to the browser frame "
 +     "surfaces. May cause UI clarity issues. Helium flag.",
-+     kOsMac, FEATURE_VALUE_TYPE(features::kHeliumNativeFrameMaterials)},
++     kOsMac | kOsLinux | kOsWin,
++     FEATURE_VALUE_TYPE(features::kHeliumNativeFrameMaterials)},
      // platform
  #endif  // CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_
 --- a/chrome/common/pref_names.h
@@ -160,13 +161,17 @@
          pref-key="browser.show_home_button" label="$i18n{showHomeButton}"
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium/native_frame_materials.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,73 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_NATIVE_FRAME_MATERIALS_H_
 +#define CHROME_BROWSER_UI_VIEWS_HELIUM_NATIVE_FRAME_MATERIALS_H_
++
++#include <optional>
++
++#include "third_party/skia/include/core/SkColor.h"
 +
 +class BrowserView;
 +class BrowserWindowInterface;
@@ -177,6 +182,11 @@
 +
 +namespace helium {
 +
++// The material tint is a black or white neutral overlay with the theme color
++// layered on top.
++inline constexpr float kNativeFrameMaterialNeutralAlpha = 0.2f;
++float GetNativeFrameMaterialThemeAlpha(bool is_dark);
++
 +bool ShouldUseNativeFrameMaterials(const BrowserView* browser_view);
 +bool ShouldUseNativeFrameMaterials(const BrowserWindowInterface* browser);
 +bool ShouldUseNativeFrameMaterials(const views::View* view);
@@ -184,28 +194,109 @@
 +// Whether the platform implements the material for |browser_view|.
 +bool PlatformSupportsNativeFrameMaterials(const BrowserView& browser_view);
 +
++// Whether the platform material has a vibrant base of its own, like
++// NSVisualEffectView or acrylic. A plain compositor blur has none, so surfaces
++// on the frame are drawn lighter to keep the blur visible.
++bool HasVibrantNativeFrameMaterial();
++
++// Whether the material should be dark. Follows the toolbar rather than the
++// browser color mode, since custom color themes pick their text colors from it.
++bool IsNativeFrameMaterialDark(SkColor toolbar_color);
++
++// Keeps the hue of |toolbar_color| but limits its chroma and tone, so that
++// loud theme colors don't fight with whatever is blurred behind the frame.
++SkColor GetNativeFrameMaterialThemeColor(SkColor toolbar_color, bool is_dark);
++
++// The neutral overlay and theme color composited into a single color.
++SkColor GetNativeFrameMaterialTintColor(const views::View* view);
++
++// Color for surfaces drawn on top of the frame material, such as the active
++// tab and the location bar, given their regular |color|. |emphasis| scales the
++// strength of the light veil used without a vibrant material, e.g. for hover.
++// Returns nullopt where these surfaces keep their regular colors.
++std::optional<SkColor> GetNativeFrameMaterialSurfaceColor(
++    const views::View* view,
++    SkColor color,
++    float emphasis = 1.0f);
++
++// The background of a selected tab with the regular |color| on the frame
++// material, or the regular color without the material.
++SkColor GetNativeFrameMaterialTabColor(const views::View* view,
++                                       SkColor color,
++                                       bool active);
++
++// Color for surfaces that float over web contents, such as the Frameless mode
++// tab strip. The native material only shows what is behind the window, so
++// these blur what is below them inside the window and paint this tint on top.
++// Returns nullopt where floating surfaces stay opaque.
++std::optional<SkColor> GetNativeFrameMaterialFloatingColor(
++    const views::View* view);
++
 +}  // namespace helium
 +
 +#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_NATIVE_FRAME_MATERIALS_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium/native_frame_materials.cc
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,180 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/views/helium/native_frame_materials.h"
 +
++#include <algorithm>
++
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
 +#include "chrome/browser/ui/ui_features.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/common/pref_names.h"
 +#include "components/prefs/pref_service.h"
++#include "third_party/material_color_utilities/src/cpp/cam/hct.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/color_utils.h"
 +#include "ui/views/view.h"
 +#include "ui/views/widget/widget.h"
 +
 +namespace helium {
++
++namespace {
++
++// Light material needs a stronger theme tint than dark material to avoid
++// looking washed out.
++constexpr float kDarkThemeAlpha = 0.55f;
++constexpr float kLightThemeAlpha = 0.8f;
++
++// Saturated theme colors mixed with a colorful backdrop turn muddy, so the
++// tint only keeps a hint of the theme hue at a tone that suits the mode.
++constexpr double kMaxThemeChroma = 10;
++constexpr double kDarkThemeMinTone = 6;
++constexpr double kDarkThemeMaxTone = 26;
++constexpr double kLightThemeMinTone = 88;
++constexpr double kLightThemeMaxTone = 100;
++
++// Without a vibrant material underneath, the regular near-opaque tab and
++// location bar colors hide the blur. Use a white veil instead.
++constexpr float kDarkThemeSurfaceAlpha = 0.1f;
++constexpr float kLightThemeSurfaceAlpha = 0.6f;
++
++SkColor GetToolbarColor(const views::View* view) {
++  return view->GetColorProvider()->GetColor(kColorToolbar);
++}
++
++// |color| with its chroma limited to that of the material tint.
++material_color_utilities::Hct GetMutedColor(SkColor color) {
++  material_color_utilities::Hct hct(SkColorSetA(color, SK_AlphaOPAQUE));
++  hct.set_chroma(std::min(hct.get_chroma(), kMaxThemeChroma));
++  return hct;
++}
++
++}  // namespace
++
++float GetNativeFrameMaterialThemeAlpha(bool is_dark) {
++  return is_dark ? kDarkThemeAlpha : kLightThemeAlpha;
++}
 +
 +bool ShouldUseNativeFrameMaterials(const BrowserView* browser_view) {
 +  if (!features::HeliumNativeFrameAvailable() || !browser_view) {
@@ -236,9 +327,94 @@
 +             : nullptr);
 +}
 +
++bool IsNativeFrameMaterialDark(SkColor toolbar_color) {
++  return color_utils::IsDark(toolbar_color);
++}
++
++SkColor GetNativeFrameMaterialThemeColor(SkColor toolbar_color, bool is_dark) {
++  const double min_tone = is_dark ? kDarkThemeMinTone : kLightThemeMinTone;
++  const double max_tone = is_dark ? kDarkThemeMaxTone : kLightThemeMaxTone;
++  material_color_utilities::Hct hct = GetMutedColor(toolbar_color);
++  hct.set_tone(std::clamp(hct.get_tone(), min_tone, max_tone));
++  return hct.ToInt();
++}
++
++SkColor GetNativeFrameMaterialTintColor(const views::View* view) {
++  const SkColor toolbar_color = GetToolbarColor(view);
++  const bool is_dark = IsNativeFrameMaterialDark(toolbar_color);
++
++  const float neutral_value = is_dark ? 0 : 1;
++  const SkColor4f neutral{neutral_value, neutral_value, neutral_value,
++                          kNativeFrameMaterialNeutralAlpha};
++  SkColor4f tint = SkColor4f::FromColor(
++      GetNativeFrameMaterialThemeColor(toolbar_color, is_dark));
++  tint.fA = GetNativeFrameMaterialThemeAlpha(is_dark);
++
++  const float alpha = tint.fA + neutral.fA * (1 - tint.fA);
++  const auto blend = [&](float t, float n) {
++    return (t * tint.fA + n * neutral.fA * (1 - tint.fA)) / alpha;
++  };
++
++  const SkColor4f color{blend(tint.fR, neutral.fR), blend(tint.fG, neutral.fG),
++                        blend(tint.fB, neutral.fB), alpha};
++  return color.toSkColor();
++}
++
++std::optional<SkColor> GetNativeFrameMaterialSurfaceColor(
++    const views::View* view,
++    SkColor color,
++    float emphasis) {
++  if (!ShouldUseNativeFrameMaterials(view)) {
++    return std::nullopt;
++  }
++
++  if (HasVibrantNativeFrameMaterial()) {
++    // Keep the regular color, but no more colorful than the frame tint, so
++    // custom color themes don't put saturated surfaces on a muted frame.
++    return SkColorSetA(GetMutedColor(color).ToInt(), SkColorGetA(color));
++  }
++
++  const bool is_dark = IsNativeFrameMaterialDark(GetToolbarColor(view));
++  const float alpha =
++      (is_dark ? kDarkThemeSurfaceAlpha : kLightThemeSurfaceAlpha) * emphasis;
++  return SkColorSetA(SK_ColorWHITE, std::clamp(alpha, 0.0f, 1.0f) * 255);
++}
++
++SkColor GetNativeFrameMaterialTabColor(const views::View* view,
++                                       SkColor color,
++                                       bool active) {
++  // Selected tabs stand out less than the active one.
++  const std::optional<SkColor> surface =
++      GetNativeFrameMaterialSurfaceColor(view, color, active ? 1.0f : 0.5f);
++  return surface.value_or(color);
++}
++
++std::optional<SkColor> GetNativeFrameMaterialFloatingColor(
++    const views::View* view) {
++  if (!ShouldUseNativeFrameMaterials(view)) {
++    return std::nullopt;
++  }
++
++  // The floating strip holds inactive tabs, whose text follows the theme's
++  // frame rather than its toolbar. Keep the frame color if the material tint
++  // would leave that text without contrast.
++  const bool is_dark = IsNativeFrameMaterialDark(GetToolbarColor(view));
++  const SkColor tab_text = view->GetColorProvider()->GetColor(
++      kColorTabForegroundInactiveFrameActive);
++  if (color_utils::IsDark(tab_text) == is_dark) {
++    return std::nullopt;
++  }
++
++  return GetNativeFrameMaterialTintColor(view);
++}
++
 +bool PlatformSupportsNativeFrameMaterials(const BrowserView& browser_view) {
 +  // Enabled by the platform patch that implements the material.
 +  return false;
++}
++
++bool HasVibrantNativeFrameMaterial() {
++  return true;
 +}
 +
 +}  // namespace helium
@@ -366,7 +542,17 @@
  #include "third_party/skia/include/core/SkPath.h"
  #include "third_party/skia/include/core/SkPathBuilder.h"
  #include "ui/base/ui_base_features.h"
-@@ -95,6 +96,15 @@ void CustomCornersBackground::SetVisible
+@@ -41,6 +42,9 @@
+ namespace {
+ // Radius of the corner blur used for the glass frame.
+ constexpr float kBackgroundBlurRadius = 5.0f;
++// Strong enough that page text below a floating surface does not compete
++// with its contents.
++constexpr float kNativeFrameMaterialBlurRadius = 30.0f;
+ 
+ int CornerToRadius(const CustomCornersBackground::Corner& corner,
+                    int default_radius) {
+@@ -95,6 +99,15 @@ void CustomCornersBackground::SetVisible
    view_->SchedulePaint();
  }
  
@@ -382,7 +568,22 @@
  void CustomCornersBackground::SetPrimaryColor(
      ColorChoiceWithAlpha primary_color) {
    if (primary_color_ == primary_color) {
-@@ -326,6 +336,10 @@ void CustomCornersBackground::Paint(gfx:
+@@ -158,7 +171,13 @@ void CustomCornersBackground::SetUseBack
+   }
+   auto* const layer = view_->layer();
+   CHECK(!layer->fills_bounds_opaquely());
+-  const float blur_radius = use_background_blur ? kBackgroundBlurRadius : 0.0f;
++  float blur_radius = 0.0f;
++  if (use_background_blur) {
++    blur_radius = paint_with_native_frame_materials_
++                      ? kNativeFrameMaterialBlurRadius
++                      : kBackgroundBlurRadius;
++  }
++
+   const std::optional<gfx::Rect> local_bounds =
+       use_background_blur ? std::make_optional(view_->GetLocalBounds())
+                           : std::nullopt;
+@@ -326,6 +345,10 @@ void CustomCornersBackground::Paint(gfx:
    if (!visible_) {
      return;
    }
@@ -393,16 +594,65 @@
  
    if (view->layer()) {
      CHECK(!view->layer()->fills_bounds_opaquely());
+@@ -408,7 +431,18 @@ void CustomCornersBackground::Paint(gfx:
+                           !radii[2].isZero() || !radii[3].isZero();
+   // Anti-aliasing an axis-aligned rectangle at fractional pixel boundaries
+   // produces semi-transparent edges and visible gaps between adjacent views.
+-  PaintPath(canvas, background_path, primary_color_, anti_alias);
++  const std::optional<SkColor> material_color =
++      paint_with_native_frame_materials_
++          ? helium::GetNativeFrameMaterialFloatingColor(&GetView())
++          : std::nullopt;
++  if (material_color) {
++    cc::PaintFlags flags;
++    flags.setAntiAlias(anti_alias);
++    flags.setColor(*material_color);
++    canvas->DrawPath(background_path, flags);
++  } else {
++    PaintPath(canvas, background_path, primary_color_, anti_alias);
++  }
+ 
+   // Paint strokes around the outside. Corners get strokes if they are between
+   // two sides with strokes and have a radius. Multiple paths may be drawn if
 --- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
-@@ -389,6 +389,7 @@ void VerticalTabStripRegionView::SetFloa
+@@ -44,6 +44,7 @@
+ #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
+ #include "chrome/browser/ui/views/frame/shadow_frame_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+@@ -389,6 +390,20 @@ void VerticalTabStripRegionView::SetFloa
  
    background->SetCorners(corners);
    background->SetOutline(outline);
 +  background->SetPaintWithNativeFrameMaterials(floating);
++  UpdateFloatingBackgroundBlur();
++}
++
++void VerticalTabStripRegionView::UpdateFloatingBackgroundBlur() {
++  auto* const custom_background =
++      background() ? background()->AsA<CustomCornersBackground>() : nullptr;
++  if (!custom_background) {
++    return;
++  }
++
++  custom_background->SetUseBackgroundBlur(
++      floating_style_ != FloatingStyle::kNone &&
++      helium::GetNativeFrameMaterialFloatingColor(this).has_value());
  }
  
  void VerticalTabStripRegionView::AddedToWidget() {
+@@ -474,6 +489,7 @@ void VerticalTabStripRegionView::Layout(
+   resize_area_->SetBoundsRect(
+       gfx::Rect(resize_area_x, 0, resize_area_width_, bounds().height()));
+   shadow_frame_->SetBoundsRect(GetLocalBounds());
++  UpdateFloatingBackgroundBlur();
+ 
+   // Ensure that we update the drop arrow position so that it does not render in
+   // the collapsed state when expand on hover is active.
 --- a/chrome/browser/ui/views/infobars/infobar_container_view.h
 +++ b/chrome/browser/ui/views/infobars/infobar_container_view.h
 @@ -34,6 +34,7 @@ class InfoBarContainerView : public view
@@ -593,7 +843,7 @@
    if (delegate_->IsPinned() && tabs::IsNewHorizontalPinnedTabStylingEnabled() &&
        !delegate_->IsGlassFrame()) {
      return true;
-@@ -703,6 +712,18 @@ SkColor HorizontalTabStyleViews::GetCurr
+@@ -703,10 +712,25 @@ SkColor HorizontalTabStyleViews::GetCurr
        delegate_->GetView()->GetWidget()
            ? delegate_->GetView()->GetWidget()->ShouldPaintAsActive()
            : true;
@@ -610,9 +860,17 @@
 +        static_cast<float>(delegate_->GetHoverAnimationValue()));
 +  }
    const bool frame_glass = delegate_->IsGlassFrame();
-   return tab_style()->GetCurrentTabBackgroundColor(
+-  return tab_style()->GetCurrentTabBackgroundColor(
++  const SkColor color = tab_style()->GetCurrentTabBackgroundColor(
        selection_state, hovered, GetHoverAnimationValue(), frame_active,
-@@ -768,7 +789,10 @@ void HorizontalTabStyleViews::PaintTabBa
+       frame_glass, delegate_->GetView()->GetColorProvider());
++  return helium::GetNativeFrameMaterialTabColor(
++      delegate_->GetView(), color,
++      selection_state == TabStyle::TabSelectionState::kActive);
+ }
+ 
+ TabStyle::TabSelectionState HorizontalTabStyleViews::GetSelectionState() const {
+@@ -768,7 +792,10 @@ void HorizontalTabStyleViews::PaintTabBa
                       flags);
    }
  
@@ -768,7 +1026,7 @@
    if (selection_state == TabStyle::TabSelectionState::kActive ||
        selection_state == TabStyle::TabSelectionState::kSelected) {
      return true;
-@@ -196,6 +214,18 @@ bool VerticalTabStyleViews::ShouldPaintT
+@@ -196,14 +214,29 @@ bool VerticalTabStyleViews::ShouldPaintT
  
  SkColor VerticalTabStyleViews::GetCurrentTabBackgroundColor(
      TabStyle::TabSelectionState selection_state) const {
@@ -785,8 +1043,20 @@
 +        static_cast<float>(delegate_->GetHoverAnimationValue()));
 +  }
    const bool frame_glass = delegate_->IsGlassFrame();
-   return tab_style()->GetCurrentTabBackgroundColor(
+-  return tab_style()->GetCurrentTabBackgroundColor(
++  const SkColor color = tab_style()->GetCurrentTabBackgroundColor(
        selection_state, delegate_->IsHoverAnimationActive(),
+       delegate_->GetHoverAnimationValue(),
+       delegate_->GetView()->GetWidget()
+           ? delegate_->GetView()->GetWidget()->ShouldPaintAsActive()
+           : true,
+       frame_glass, delegate_->GetView()->GetColorProvider());
++  return helium::GetNativeFrameMaterialTabColor(
++      delegate_->GetView(), color,
++      selection_state == TabStyle::TabSelectionState::kActive);
+ }
+ 
+ TabStyle::TabSelectionState VerticalTabStyleViews::GetSelectionState() const {
 --- a/chrome/browser/ui/views/tabs/common/tab_view.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_view.h
 @@ -197,6 +197,9 @@ class TabView : public views::View,
@@ -801,7 +1071,15 @@
  
 --- a/chrome/browser/ui/views/frame/BUILD.gn
 +++ b/chrome/browser/ui/views/frame/BUILD.gn
-@@ -1236,6 +1236,7 @@ source_set("custom_corners_background_im
+@@ -576,6 +576,7 @@ source_set("vertical_tab_strip_region_vi
+     "//chrome/browser/ui/tabs:features",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/views/animations",
++    "//chrome/browser/ui/views/helium:native_frame_materials",
+     "//chrome/browser/ui/views/tabs/common:impl",
+     "//chrome/browser/ui/views/tabs/organizer",
+     "//chrome/browser/ui/web_applications",
+@@ -1236,6 +1237,7 @@ source_set("custom_corners_background_im
      "//base",
      "//base:i18n",
      "//build:buildflag_header_h",
@@ -809,7 +1087,7 @@
      "//chrome/browser/ui:layout_constants",
      "//chrome/browser/ui/color:color_headers",
      "//chrome/browser/ui/color:mixers",
-@@ -1274,6 +1275,7 @@ source_set("themed_background_impl") {
+@@ -1274,6 +1276,7 @@ source_set("themed_background_impl") {
      "//chrome/browser/themes",
      "//chrome/browser/ui/color:color_headers",
      "//chrome/browser/ui/views/frame:browser_view_header",
@@ -817,7 +1095,7 @@
      "//chrome/browser/ui/views/tabs:tab_strip",
      "//ui/base",
      "//ui/color",
-@@ -1698,6 +1700,7 @@ source_set("multi_contents_background_vi
+@@ -1698,6 +1701,7 @@ source_set("multi_contents_background_vi
    ]
    deps = [
      ":themed_background",
@@ -827,7 +1105,7 @@
      "//ui/gfx/geometry",
 --- a/chrome/browser/ui/views/helium/BUILD.gn
 +++ b/chrome/browser/ui/views/helium/BUILD.gn
-@@ -19,3 +19,20 @@ source_set("frame_corner_radius") {
+@@ -19,3 +19,25 @@ source_set("frame_corner_radius") {
      sources += [ "frame_corner_radius_mac.mm" ]
    }
  }
@@ -842,9 +1120,14 @@
 +    "//chrome/browser/profiles:profile",
 +    "//chrome/browser/ui:ui_features",
 +    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/color:color_headers",
 +    "//chrome/browser/ui/views/frame:browser_view_header",
 +    "//chrome/common:constants",
 +    "//components/prefs",
++    "//skia",
++    "//third_party/material_color_utilities",
++    "//ui/color",
++    "//ui/gfx",
 +    "//ui/views",
 +  ]
 +}
@@ -891,3 +1174,97 @@
      "//chrome/browser:primitives",
      "//chrome/browser/dictation",
      "//chrome/browser/glic",
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -95,6 +95,10 @@ class VerticalTabStripRegionView final
+ 
+   void UpdateInteriorMargin();
+ 
++  // Blurs the web contents below the tab strip while it floats over them in
++  // Frameless mode with native frame materials.
++  void UpdateFloatingBackgroundBlur();
++
+   // views::LayoutDelegate:
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override;
+--- a/chrome/browser/ui/views/location_bar/BUILD.gn
++++ b/chrome/browser/ui/views/location_bar/BUILD.gn
+@@ -80,6 +80,7 @@ source_set("impl") {
+     "//chrome/browser/ui/dialogs",
+     "//chrome/browser/ui/select_file_policy",
+     "//chrome/browser/ui/views/frame:browser_view_header",
++    "//chrome/browser/ui/views/helium:native_frame_materials",
+   ]
+ 
+   if (toolkit_views) {
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -62,6 +62,7 @@
+ #include "chrome/browser/ui/views/chrome_layout_provider.h"
+ #include "chrome/browser/ui/views/chrome_typography.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/browser/ui/views/location_bar/content_setting_image_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_actions.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_layout.h"
+@@ -1462,6 +1463,15 @@ void LocationBarView::RefreshBackground(
+   SkColor hovered =
+       color_provider->GetColor(kColorLocationBarBackgroundHovered);
+ 
++  if (!high_contrast) {
++    const std::optional<SkColor> surface =
++        helium::GetNativeFrameMaterialSurfaceColor(this, normal);
++    const std::optional<SkColor> hovered_surface =
++        helium::GetNativeFrameMaterialSurfaceColor(this, hovered, 2.0f);
++    normal = surface.value_or(normal);
++    hovered = hovered_surface.value_or(hovered);
++  }
++
+   background_color_ = gfx::Tween::ColorValueBetween(opacity, normal, hovered);
+   if (is_caret_visible) {
+     // Match the background color to the popup if the Omnibox is visibly
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -73,6 +73,7 @@ source_set("impl") {
+     "//chrome/browser/ui/views/frame",
+     "//chrome/browser/ui/views/frame:browser_view_header",
+     "//chrome/browser/ui/views/frame:vertical_tab_strip_region_view",
++    "//chrome/browser/ui/views/helium:native_frame_materials",
+     "//chrome/browser/ui/views/tabs/common",
+     "//chrome/browser/ui/views/tabs/common:impl",
+     "//chrome/browser/ui/views/tabs/dragging:tab_drag_target",
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -37,5 +38,12 @@ VerticalNewTabButton::VerticalNewTabButt
+ 
+ VerticalNewTabButton::~VerticalNewTabButton() = default;
+ 
++void VerticalNewTabButton::OnThemeChanged() {
++  // Like inactive tabs, sit directly on the frame material instead of using
++  // the inactive tab color, which custom color themes make fully saturated.
++  SetPaintTransparent(helium::ShouldUseNativeFrameMaterials(this));
++  shared::NewTabButton::OnThemeChanged();
++}
++
+ BEGIN_METADATA(VerticalNewTabButton)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h
+@@ -17,6 +17,9 @@ class VerticalNewTabButton : public shar
+  public:
+   explicit VerticalNewTabButton(BrowserWindowInterface* browser);
+   ~VerticalNewTabButton() override;
++
++  // shared::NewTabButton:
++  void OnThemeChanged() override;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_NEW_TAB_BUTTON_H_
