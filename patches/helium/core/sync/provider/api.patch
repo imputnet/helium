@@ -97,10 +97,14 @@
            Change and grant access to features such as geolocation, microphone, camera, cookies, etc., for all your websites and extensions, including this extension.
 --- /dev/null
 +++ b/chrome/common/extensions/api/sync_vault_provider.webidl
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,214 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Lets an extension store the browser's end-to-end encrypted sync vaults.
++// The browser sends requests as events; the provider answers each one with
++// respond(), using the request's requestId.
 +
 +enum SyncVaultProviderError {
 +  "AUTH_REQUIRED",
@@ -122,32 +126,24 @@
 +  "QUOTA_EXCEEDED"
 +};
 +
++// Progress of a configure request, which may involve the user, such as
++// signing in. A request stays open until it is answered without a state, or
++// with READY. CONFIGURING times out like other requests; while the provider
++// waits for the user, the browser neither times out the request nor keeps the
++// provider's service worker alive.
 +enum ProviderConfigurationState {
-+  // Provider-owned work is continuing without user input.
 +  "CONFIGURING",
-+  // The provider has presented UI and is waiting for the user.
 +  "PENDING_USER_ACTION",
-+  // Terminal success.
 +  "READY"
 +};
 +
++// Sent for configure and list vaults requests.
 +dictionary ProviderRequest {
 +  required long requestId;
 +};
 +
-+// Creation is idempotent by vaultUuid. Retrying the same UUID must return
-+// success for the same logical vault rather than creating another vault.
++// Creation is idempotent by vaultUuid.
 +dictionary CreateVaultRequest {
-+  required long requestId;
-+  // Browser-generated stable identity. Providers store and return this value
-+  // but must not treat it as authenticated.
-+  required DOMString vaultUuid;
-+  // Provider-visible discovery label. It is not part of vault identity or the
-+  // authenticated vault format.
-+  required DOMString displayName;
-+};
-+
-+dictionary RenameVaultRequest {
 +  required long requestId;
 +  required DOMString vaultUuid;
 +  required DOMString displayName;
@@ -165,63 +161,51 @@
 +  required DOMString vaultUuid;
 +  required DOMString objectId;
 +  required ArrayBuffer data;
-+  // Missing means create only if absent. Present means replace only if the
-+  // provider's current revision matches this value.
++  // Missing means write only if absent. Present means replace only if the
++  // object's current revision matches; otherwise fail with CONFLICT.
 +  DOMString expectedRevision;
-+  // Present for immutable commit and payload objects. Providers record this
-+  // value as object metadata so epoch collection never depends on parsing the
-+  // browser-owned object identifier.
++  // Present for immutable objects, which are deleted by epoch.
 +  long retentionEpoch;
 +};
 +
++// Delete the objects whose retentionEpoch is below minimumRetainedEpoch.
 +dictionary CollectEpochsRequest {
 +  required long requestId;
 +  required DOMString vaultUuid;
-+  // Delete provider objects belonging to epochs below this value. The
-+  // operation is idempotent and must not affect fixed vault metadata.
 +  required long minimumRetainedEpoch;
 +};
 +
++// Wrap the 32-byte vault key with the user's account, and respond with
++// keyEnvelope. Sent only after the user agrees.
 +dictionary WrapKeyRequest {
 +  required long requestId;
 +  required DOMString vaultUuid;
-+  // Browser-generated 32-byte vault master key. Sent only after the user
-+  // consents to account-bound key access. The provider wraps this key using
-+  // its account credentials and returns |ProviderSuccess.keyEnvelope|.
 +  required ArrayBuffer vaultKey;
 +};
 +
++// Unwrap a keyEnvelope from an earlier wrap request, and respond with
++// vaultKey.
 +dictionary UnwrapKeyRequest {
 +  required long requestId;
 +  required DOMString vaultUuid;
-+  // Opaque provider-defined value returned by an earlier wrap request.
-+  // The provider unwraps it for the current account and returns the
-+  // original key as |ProviderSuccess.vaultKey|.
 +  required ArrayBuffer keyEnvelope;
 +};
 +
 +dictionary VaultInfo {
-+  // Provider-visible discovery label. The browser treats this as display-only
-+  // metadata and permits duplicate names.
 +  required DOMString displayName;
-+  // Untrusted copy of the browser-generated vault identity. The browser still
-+  // authenticates the encrypted head before joining the vault.
 +  required DOMString vaultUuid;
 +};
 +
++// The fields for the request being answered: configurationState for
++// configure, vaults for list vaults, data
++// and revision for read object, revision for write object, keyEnvelope for
++// wrap key, and vaultKey for unwrap key.
 +dictionary ProviderSuccess {
-+  // CONFIGURING and PENDING_USER_ACTION keep a configuration request active
-+  // and may be reported repeatedly as progress changes. A later success
-+  // response with READY completes that same request.
 +  ProviderConfigurationState configurationState;
 +  sequence<VaultInfo> vaults;
 +  ArrayBuffer data;
 +  DOMString revision;
-+  // Opaque account-bound wrapping of the vault key.
-+  // Valid only when responding to onWrapKeyRequested.
 +  ArrayBuffer keyEnvelope;
-+  // Original 32-byte vault master key recovered from a key envelope.
-+  // Valid only when responding to onUnwrapKeyRequested.
 +  ArrayBuffer vaultKey;
 +};
 +
@@ -230,22 +214,19 @@
 +  DOMString message;
 +};
 +
-+// Exactly one of success and failure must be present. The broker also validates
-+// the exact success fields permitted for the pending operation.
++// Exactly one of success and failure must be present.
 +dictionary ProviderResponse {
 +  required long requestId;
 +  ProviderSuccess success;
 +  ProviderFailure failure;
 +};
 +
++// The browser no longer needs the answer to a request.
 +dictionary RequestCancellation {
-+  // For an asynchronous configure request, this cancels the entire lifecycle,
-+  // including work continued after CONFIGURING or PENDING_USER_ACTION.
 +  required long requestId;
 +};
 +
-+// A transport hint, not authoritative state. Providers report only that a
-+// vault may have changed; the browser reads and authenticates its current head.
++// Tells the browser that a vault may have been changed by another device.
 +dictionary VaultChange {
 +  required DOMString vaultUuid;
 +};
@@ -256,7 +237,6 @@
 +
 +callback ProviderRequestListener = undefined (ProviderRequest request);
 +callback CreateVaultRequestListener = undefined (CreateVaultRequest request);
-+callback RenameVaultRequestListener = undefined (RenameVaultRequest request);
 +callback ReadObjectRequestListener = undefined (ReadObjectRequest request);
 +callback WriteObjectRequestListener = undefined (WriteObjectRequest request);
 +callback CollectEpochsRequestListener = undefined (CollectEpochsRequest request);
@@ -274,12 +254,6 @@
 +  static undefined addListener(CreateVaultRequestListener listener);
 +  static undefined removeListener(CreateVaultRequestListener listener);
 +  static boolean hasListener(CreateVaultRequestListener listener);
-+};
-+
-+interface RenameVaultRequestEvent : ExtensionEvent {
-+  static undefined addListener(RenameVaultRequestListener listener);
-+  static undefined removeListener(RenameVaultRequestListener listener);
-+  static boolean hasListener(RenameVaultRequestListener listener);
 +};
 +
 +interface ReadObjectRequestEvent : ExtensionEvent {
@@ -327,7 +301,6 @@
 +  static attribute ProviderRequestEvent onConfigureRequested;
 +  static attribute ProviderRequestEvent onListVaultsRequested;
 +  static attribute CreateVaultRequestEvent onCreateVaultRequested;
-+  static attribute RenameVaultRequestEvent onRenameVaultRequested;
 +  static attribute ReadObjectRequestEvent onReadObjectRequested;
 +  static attribute WriteObjectRequestEvent onWriteObjectRequested;
 +  static attribute CollectEpochsRequestEvent onCollectEpochsRequested;
@@ -434,7 +407,7 @@
    extensions::VerifyTrustApiService::GetFactoryInstance();
 --- /dev/null
 +++ b/chrome/browser/extensions/api/sync_vault_provider/BUILD.gn
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,34 @@
 +# Copyright 2026 The Helium Authors
 +# You can use, redistribute, and/or modify this source code under
 +# the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -453,6 +426,7 @@
 +
 +  public_deps = [
 +    "//base",
++    "//chrome/browser/sync/private_sync:provider_host",
 +    "//chrome/browser/profiles:profile",
 +    "//chrome/common/extensions",
 +    "//chrome/common/extensions/api",
@@ -462,6 +436,7 @@
 +  ]
 +
 +  deps = [
++    "//chrome/browser/ui/webui/extensions:headers",
 +    "//components/sync/engine/sync_vault",
 +    "//content/public/browser",
 +    "//third_party/blink/public/mojom/service_worker:storage",
@@ -517,7 +492,7 @@
 +        Error("Sync vault providers are unavailable in this profile."));
 +  }
 +  std::optional<std::string> error =
-+      service->NotifyVaultChanged(extension_id(), params->change);
++      service->NotifyVaultChanged(extension_id(), params->change.vault_uuid);
 +  return error ? RespondNow(Error(std::move(*error)))
 +               : RespondNow(NoArguments());
 +}
