@@ -8,7 +8,7 @@
  </grit-part>
 --- /dev/null
 +++ b/components/translate/core/browser/resources/helium_translate.js
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,975 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -57,6 +57,12 @@
 +    'CANVAS',
 +    'VIDEO',
 +    'AUDIO',
++  ]);
++
++  const COLLECTED_NODE_TYPES = new Set([
++    Node.TEXT_NODE,
++    Node.ELEMENT_NODE,
++    Node.DOCUMENT_FRAGMENT_NODE,
 +  ]);
 +
 +  const TRANSLATED_ATTRIBUTES = [
@@ -118,6 +124,9 @@
 +  const attributeKeys = new WeakMap();
 +  // The page's own lang attribute while the translation is shown.
 +  let savedLang = null;
++  // Whether elements with queued text are within a viewport height of it.
++  let nearViewport = new WeakMap();
++  let visibilityObserver = null;
 +
 +  // The last |granularity| boundary in |text| at or before |limit|, or 0.
 +  function lastBoundary(text, limit, granularity) {
@@ -306,12 +315,56 @@
 +    return keys[name];
 +  }
 +
++  // The element whose position decides how soon |segment| is translated.
++  function elementOf(segment) {
++    return segment.key instanceof Node ? parentOf(segment.key) :
++                                         segment.key.element;
++  }
++
++  function isNearViewport(element) {
++    if (!nearViewport.has(element)) {
++      // Not reported by |visibilityObserver| yet.
++      const rect = element.getBoundingClientRect();
++      const height = window.innerHeight;
++      const isRendered = rect.width > 0 || rect.height > 0;
++      const isNear = rect.bottom >= -height && rect.top <= 2 * height;
++      nearViewport.set(element, isRendered && isNear);
++    }
++
++    return nearViewport.get(element);
++  }
++
++  function watchVisibility(element) {
++    if (!visibilityObserver) {
++      visibilityObserver = new IntersectionObserver((entries) => {
++        for (const entry of entries) {
++          nearViewport.set(entry.target, entry.isIntersecting);
++        }
++      }, {rootMargin: '100% 0px'});
++    }
++
++    visibilityObserver.observe(element);
++  }
++
++  function stopWatchingVisibility() {
++    if (visibilityObserver) {
++      visibilityObserver.disconnect();
++      visibilityObserver = null;
++      nearViewport = new WeakMap();
++    }
++  }
++
 +  function queueSegment(segment) {
 +    if (queued.has(segment.key) || !isTranslatableText(segment.core)) {
 +      return;
 +    }
 +
 +    queued.add(segment.key);
++    const element = elementOf(segment);
++    if (element) {
++      watchVisibility(element);
++    }
++
 +    segment.pieces.forEach((piece, index) => {
 +      if (piece) {
 +        pending.push({segment, index});
@@ -389,9 +442,7 @@
 +  }
 +
 +  function collect(root) {
-+    if (root.nodeType !== Node.TEXT_NODE &&
-+        root.nodeType !== Node.ELEMENT_NODE &&
-+        root.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
++    if (!COLLECTED_NODE_TYPES.has(root.nodeType)) {
 +      return;
 +    }
 +
@@ -603,6 +654,7 @@
 +
 +  function reset() {
 +    stopObserving();
++    stopWatchingVisibility();
 +    pending = [];
 +    queued = new Set();
 +    inFlight = null;
@@ -614,6 +666,11 @@
 +    translationTime = 0;
 +  }
 +
++  // Whether the page is known to be in a language other than the target.
++  function hasForeignSource() {
++    return !!sourceLang && sourceLang !== targetLang;
++  }
++
 +  function markFinished() {
 +    if (finished) {
 +      return;
@@ -621,7 +678,7 @@
 +
 +    // The browser fails the translation when the detected language is unknown
 +    // or the target, and can't revert it then, so stop translating here.
-+    if (detectSource && (!sourceLang || sourceLang === targetLang)) {
++    if (detectSource && !hasForeignSource()) {
 +      fail(
 +          sourceLang ? ERROR['IDENTICAL_LANGUAGES'] :
 +                       ERROR['UNKNOWN_LANGUAGE']);
@@ -636,6 +693,7 @@
 +    error = true;
 +    errorCode = code;
 +    stopObserving();
++    stopWatchingVisibility();
 +    pending = [];
 +    queued = new Set();
 +    inFlight = null;
@@ -780,6 +838,7 @@
 +
 +      pruneDetached();
 +      if (!pending.length) {
++        stopWatchingVisibility();
 +        if (!finished) {
 +          markFinished();
 +        }
@@ -787,6 +846,15 @@
 +        return null;
 +      }
 +
++      // Text near the viewport goes first, the rest in page order.
++      const near = [];
++      const rest = [];
++      for (const piece of pending) {
++        const element = elementOf(piece.segment);
++        (element && isNearViewport(element) ? near : rest).push(piece);
++      }
++
++      pending = near.concat(rest);
 +      const pieces = [];
 +      let length = 0;
 +      while (pending.length && pieces.length < MAX_PIECES_PER_REQUEST) {
@@ -846,16 +914,17 @@
 +      }
 +
 +      // Each piece is sent as a segment with a single run.
-+      if (code !== ERROR['NONE'] || !Array.isArray(translations) ||
-+          translations.length !== pieces.length ||
-+          !translations.every(
-+              runs => Array.isArray(runs) && runs.length === 1)) {
++      const isWellFormed = Array.isArray(translations) &&
++          translations.length === pieces.length &&
++          translations.every(runs => Array.isArray(runs) && runs.length === 1);
++      if (code !== ERROR['NONE'] || !isWellFormed) {
 +        if (code === ERROR['NONE']) {
 +          code = ERROR['TRANSLATION_ERROR'];
 +        }
 +
-+        if (++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ||
-+            (!finished && FATAL_ERRORS.has(code))) {
++        const tooManyFailures =
++            ++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
++        if (tooManyFailures || (!finished && FATAL_ERRORS.has(code))) {
 +          if (finished) {
 +            // The page was already reported as translated, so stop
 +            // translating new content instead.
@@ -876,7 +945,7 @@
 +      consecutiveFailures = 0;
 +      // Prefer a source that needed translating, so a mixed-language page
 +      // isn't reported as already being in the target language.
-+      if (source && (!sourceLang || sourceLang === targetLang)) {
++      if (source && !hasForeignSource()) {
 +        sourceLang = source;
 +      }
 +
