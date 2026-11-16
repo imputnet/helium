@@ -221,7 +221,7 @@ BUILD_DEPENDENCY_PATHS = (
     'third_party/rust/chromium_crates_io/vendor/windows_aarch64_msvc-',
     'third_party/rust/chromium_crates_io/vendor/windows_x86_64_msvc-',
     'third_party/rust-toolchain/',
-    'third_party/siso/cipd/',
+    'third_party/siso/',
     'third_party/typescript/',
 )
 
