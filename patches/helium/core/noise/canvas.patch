@@ -83,7 +83,7 @@
  // AIPageContent.
 --- /dev/null
 +++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.cc
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,594 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -118,6 +118,7 @@
 +#include "third_party/skia/include/core/SkImageInfo.h"
 +#include "third_party/skia/src/core/SkHalf.h"
 +#include "third_party/skia/src/core/SkVx.h"
++#include "ui/gfx/geometry/rect.h"
 +#include "ui/gfx/skia_span_util.h"
 +
 +namespace blink {
@@ -140,7 +141,6 @@
 +constexpr size_t kRgbChannelsPerPixel = 3u;
 +using RgbBytes = std::array<uint8_t, kRgbChannelsPerPixel>;
 +using RgbNoise = std::array<int, kRgbChannelsPerPixel>;
-+constexpr std::array<uint8_t, 4u> kEmptyPixel({0, 0, 0, 0});
 +constexpr RgbBytes kMinRgbInitialValue = {255u, 255u, 255u};
 +constexpr RgbBytes kMaxRgbInitialValue = {0u, 0u, 0u};
 +constexpr float kFloatChannelScale = 1.0f / 255.0f;
@@ -304,34 +304,22 @@
 +  }
 +}
 +
++// Returns the pixel at |index| of a buffer with 4 channels per pixel.
 +template <typename T>
-+base::span<T, kChannelsPerPixel> GetPixelAt(const int x,
-+                                            const int y,
-+                                            const int width,
-+                                            const base::span<T> pixels) {
-+  return pixels
-+      .subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
++base::span<T, kChannelsPerPixel> GetPixel(base::span<T> pixels, size_t index) {
++  return pixels.subspan(index * kChannelsPerPixel)
 +      .template first<kChannelsPerPixel>();
 +}
 +
-+std::array<float, kChannelsPerPixel>
-+LoadHalfFloatPixel(base::span<const SkHalf> pixels, int x, int y, int width) {
-+  auto pixel =
-+      pixels.subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
-+          .first<kChannelsPerPixel>();
++std::array<float, kChannelsPerPixel> LoadHalfFloatPixel(
++    base::span<const SkHalf, kChannelsPerPixel> pixel) {
 +  skvx::half4 half_pixel = {pixel[0], pixel[1], pixel[2], pixel[3]};
 +  skvx::float4 float_pixel = skvx::from_half(half_pixel);
 +  return {float_pixel[0], float_pixel[1], float_pixel[2], float_pixel[3]};
 +}
 +
-+void StoreHalfFloatPixel(base::span<SkHalf> pixels,
-+                         int x,
-+                         int y,
-+                         int width,
++void StoreHalfFloatPixel(base::span<SkHalf, kChannelsPerPixel> destination,
 +                         const std::array<float, kChannelsPerPixel>& pixel) {
-+  auto destination =
-+      pixels.subspan(static_cast<size_t>((x + y * width) * kChannelsPerPixel))
-+          .first<kChannelsPerPixel>();
 +  skvx::float4 float_pixel = {std::isnan(pixel[0]) ? 0.0f : pixel[0],
 +                              std::isnan(pixel[1]) ? 0.0f : pixel[1],
 +                              std::isnan(pixel[2]) ? 0.0f : pixel[2],
@@ -342,29 +330,89 @@
 +  }
 +}
 +
-+template <typename LoadPixel>
-+bool UpdateHashAndCheckSmoothPixelNeighborhood(HeliumNoiseHash& hash,
-+                                               int x,
-+                                               int y,
-+                                               int width,
-+                                               int height,
-+                                               LoadPixel load_pixel) {
++// Quantizes |pixels| of |color_type|, tightly packed with 4 channels per
++// pixel, to RGBA8 values, so that noise is computed the same way for every
++// format.
++std::vector<uint32_t> QuantizePixels(SkColorType color_type,
++                                     base::span<const uint8_t> pixels) {
++  std::vector<uint32_t> quantized;
++  switch (color_type) {
++    case kRGBA_8888_SkColorType:
++    case kBGRA_8888_SkColorType:
++      for (size_t i = 0; i < pixels.size(); i += kChannelsPerPixel) {
++        quantized.push_back(base::U32FromLittleEndian(
++            pixels.subspan(i).first<kChannelsPerPixel>()));
++      }
++      break;
++    case kRGBA_F16_SkColorType: {
++      auto half_pixels =
++          base::span(reinterpret_cast<const SkHalf*>(pixels.data()),
++                     pixels.size() / sizeof(SkHalf));
++      for (size_t i = 0; i < half_pixels.size(); i += kChannelsPerPixel) {
++        std::array<float, kChannelsPerPixel> pixel = LoadHalfFloatPixel(
++            half_pixels.subspan(i).first<kChannelsPerPixel>());
++        quantized.push_back(QuantizedFloatPixelValue(base::span(pixel)));
++      }
++      break;
++    }
++    case kRGBA_F32_SkColorType: {
++      auto float_pixels =
++          base::span(reinterpret_cast<const float*>(pixels.data()),
++                     pixels.size() / sizeof(float));
++      for (size_t i = 0; i < float_pixels.size(); i += kChannelsPerPixel) {
++        quantized.push_back(QuantizedFloatPixelValue(
++            float_pixels.subspan(i).first<kChannelsPerPixel>()));
++      }
++      break;
++    }
++    default:
++      NOTREACHED() << "Unsupported canvas color type for noising: "
++                   << static_cast<int>(color_type);
++  }
++  return quantized;
++}
++
++// The unnoised canvas pixels that noise is computed from. Noise for a pixel
++// depends on its 3x3 neighborhood on the canvas, clamped to the canvas bounds,
++// so a pixel gets the same noise no matter which part of the canvas is read.
++struct NoiseSource {
++  // Returns the pixel at |x|, |y| in canvas coordinates.
++  uint32_t At(int x, int y) const {
++    DCHECK(rect.Contains(x, y));
++    return pixels[base::checked_cast<size_t>((x - rect.x()) +
++                                             (y - rect.y()) * rect.width())];
++  }
++
++  // Where |pixels| are on the canvas. It has to include every neighbor of the
++  // pixels being noised, as clamped to |canvas|.
++  gfx::Rect rect;
++  gfx::Rect canvas;
++  // Quantized pixels of |rect|, see QuantizePixels().
++  std::vector<uint32_t> pixels;
++};
++
++bool UpdateHashAndCheckSmoothNeighborhood(HeliumNoiseHash& hash,
++                                          const NoiseSource& source,
++                                          int x,
++                                          int y) {
 +  // Use one 3x3 pass both to feed local content into the stable hash and to
 +  // decide whether this pixel sits in a visually smooth area. The smoothness
 +  // decision must use the source pixels, not already-noised output.
 +  RgbBytes min_rgb = kMinRgbInitialValue;
 +  RgbBytes max_rgb = kMaxRgbInitialValue;
 +  for (int dy = -1; dy <= 1; ++dy) {
-+    const int sample_y = std::clamp(y + dy, 0, height - 1);
++    const int sample_y =
++        std::clamp(y + dy, source.canvas.y(), source.canvas.bottom() - 1);
 +    for (int dx = -1; dx <= 1; ++dx) {
-+      const int sample_x = std::clamp(x + dx, 0, width - 1);
-+      const auto sample_pixel = load_pixel(sample_x, sample_y);
-+      hash.Update(sample_pixel.hash_value);
-+      for (size_t channel = 0; channel < sample_pixel.rgb.size(); ++channel) {
-+        min_rgb[channel] =
-+            std::min(min_rgb[channel], sample_pixel.rgb[channel]);
-+        max_rgb[channel] =
-+            std::max(max_rgb[channel], sample_pixel.rgb[channel]);
++      const int sample_x =
++          std::clamp(x + dx, source.canvas.x(), source.canvas.right() - 1);
++      const uint32_t sample_pixel = source.At(sample_x, sample_y);
++      hash.Update(sample_pixel);
++      for (size_t channel = 0; channel < kRgbChannelsPerPixel; ++channel) {
++        const uint8_t value =
++            static_cast<uint8_t>((sample_pixel >> (channel * 8)) & 0xffu);
++        min_rgb[channel] = std::min(min_rgb[channel], value);
++        max_rgb[channel] = std::max(max_rgb[channel], value);
 +      }
 +    }
 +  }
@@ -376,195 +424,106 @@
 +  return true;
 +}
 +
-+struct NeighborhoodPixel {
-+  uint32_t hash_value;
-+  RgbBytes rgb;
-+};
-+
-+// The stable content component keeps repeated copies from averaging back to raw
-+// pixels. A separate coordinate component keeps a copied calibration sample
-+// from subtracting that stable component perfectly.
-+bool UpdateHashAndCheckSmoothBytePixelNeighborhood(
-+    HeliumNoiseHash& hash,
-+    int x,
-+    int y,
-+    int width,
-+    int height,
-+    base::span<const uint8_t> pixels) {
-+  return UpdateHashAndCheckSmoothPixelNeighborhood(
-+      hash, x, y, width, height, [width, pixels](int sample_x, int sample_y) {
-+        auto sample_pixel = GetPixelAt(sample_x, sample_y, width, pixels);
-+        return NeighborhoodPixel{
-+            base::U32FromLittleEndian(sample_pixel),
-+            {sample_pixel[0], sample_pixel[1], sample_pixel[2]}};
-+      });
-+}
-+
-+bool UpdateHashAndCheckSmoothQuantizedPixelNeighborhood(
-+    HeliumNoiseHash& hash,
-+    int x,
-+    int y,
-+    int width,
-+    int height,
-+    base::span<const uint32_t> quantized_pixels) {
-+  return UpdateHashAndCheckSmoothPixelNeighborhood(
-+      hash, x, y, width, height,
-+      [width, quantized_pixels](int sample_x, int sample_y) {
-+        const uint32_t sample_pixel =
-+            quantized_pixels[sample_x + sample_y * width];
-+        return NeighborhoodPixel{
-+            sample_pixel,
-+            {static_cast<uint8_t>(sample_pixel & 0xffu),
-+             static_cast<uint8_t>((sample_pixel >> 8) & 0xffu),
-+             static_cast<uint8_t>((sample_pixel >> 16) & 0xffu)}};
-+      });
-+}
-+
-+void UpdateHashWithPixelCoordinates(HeliumNoiseHash& hash,
-+                                    int x,
-+                                    int y,
-+                                    int x_offset,
-+                                    int y_offset) {
++void UpdateHashWithPixelCoordinates(HeliumNoiseHash& hash, int x, int y) {
 +  const uint64_t packed_coordinate =
-+      (static_cast<uint64_t>(static_cast<uint32_t>(y + y_offset)) << 32) |
-+      static_cast<uint32_t>(x + x_offset);
++      (static_cast<uint64_t>(static_cast<uint32_t>(y)) << 32) |
++      static_cast<uint32_t>(x);
 +  // Adjacent packed coordinates can otherwise produce visible axis-aligned
 +  // patterns on flat fills, so avalanche them before updating the hash.
 +  hash.Update(MixCanvasCoordinateSeed(packed_coordinate));
 +}
 +
-+// Adds noise to the provided pixels in place, using |token_hash| as the
-+// source for pseudo-randomness. This function assumes that there are 4
-+// channels per pixel.
++// Computes noise for the pixels of |rect| on the canvas from |source|, using
++// |token_hash| as the source for pseudo-randomness, and applies it to each
++// with |noise_pixel_at|, which gets the pixel's index within |rect|.
++//
++// The stable content component keeps repeated copies from averaging back to raw
++// pixels. A separate coordinate component keeps a copied calibration sample
++// from subtracting that stable component perfectly.
++template <typename NoisePixelAt>
 +void HeliumNoisePixels(const HeliumNoiseHash& token_hash,
-+                       base::span<uint8_t> pixels,
-+                       const int width,
-+                       const int height,
-+                       const int x_offset,
-+                       const int y_offset) {
-+  CHECK_EQ(pixels.size(),
-+           CheckedPixelStorageSize(width, height, sizeof(uint8_t)));
-+
-+  std::vector<uint8_t> source_pixel_storage(pixels.begin(), pixels.end());
-+  base::span<const uint8_t> source_pixels(source_pixel_storage);
-+
-+  for (int y = 0; y < height; ++y) {
-+    for (int x = 0; x < width; ++x) {
-+      auto source_pixel = GetPixelAt(x, y, width, source_pixels);
-+      if (source_pixel == kEmptyPixel) {
++                       const NoiseSource& source,
++                       const gfx::Rect& rect,
++                       NoisePixelAt noise_pixel_at) {
++  const gfx::Rect noised_rect = gfx::IntersectRects(rect, source.canvas);
++  for (int y = noised_rect.y(); y < noised_rect.bottom(); ++y) {
++    for (int x = noised_rect.x(); x < noised_rect.right(); ++x) {
++      const uint32_t source_pixel = source.At(x, y);
++      if (source_pixel == 0u) {
 +        continue;
 +      }
-+      auto pixel = GetPixelAt(x, y, width, pixels);
-+      pixel.copy_from(source_pixel);
 +
 +      HeliumNoiseHash content_hash = token_hash;
-+      content_hash.Update(base::U32FromLittleEndian(source_pixel));
++      content_hash.Update(source_pixel);
 +      const bool smooth_neighborhood =
-+          UpdateHashAndCheckSmoothBytePixelNeighborhood(
-+              content_hash, x, y, width, height, source_pixels);
++          UpdateHashAndCheckSmoothNeighborhood(content_hash, source, x, y);
 +      HeliumNoiseHash coordinate_hash = token_hash;
-+      UpdateHashWithPixelCoordinates(coordinate_hash, x, y, x_offset, y_offset);
-+      coordinate_hash.Update(base::U32FromLittleEndian(source_pixel));
++      UpdateHashWithPixelCoordinates(coordinate_hash, x, y);
++      coordinate_hash.Update(source_pixel);
 +      RgbNoise rgb_noise =
 +          GetRgbNoiseVector(content_hash, coordinate_hash, smooth_neighborhood);
-+      HeliumNoisePixel(pixel, coordinate_hash, rgb_noise);
++      noise_pixel_at(base::checked_cast<size_t>((x - rect.x()) +
++                                                (y - rect.y()) * rect.width()),
++                     coordinate_hash, rgb_noise);
 +    }
 +  }
 +}
 +
-+void HeliumNoiseFloatPixels(const HeliumNoiseHash& token_hash,
-+                            base::span<float> pixels,
-+                            const int width,
-+                            const int height,
-+                            const int x_offset,
-+                            const int y_offset) {
-+  CHECK_EQ(
-+      pixels.size(),
-+      CheckedPixelStorageSize(width, height, sizeof(float)) / sizeof(float));
-+
-+  std::vector<float> source_pixel_storage(pixels.begin(), pixels.end());
-+  base::span<const float> source_pixels(source_pixel_storage);
-+  std::vector<uint32_t> quantized_source_pixels;
-+  quantized_source_pixels.reserve(base::checked_cast<size_t>(width) *
-+                                  base::checked_cast<size_t>(height));
-+  for (int y = 0; y < height; ++y) {
-+    for (int x = 0; x < width; ++x) {
-+      quantized_source_pixels.push_back(
-+          QuantizedFloatPixelValue(GetPixelAt(x, y, width, source_pixels)));
++// Noises |pixels| of |color_type| in place. They cover |rect| on the canvas,
++// tightly packed with 4 channels per pixel.
++void HeliumNoisePixelBuffer(const HeliumNoiseHash& token_hash,
++                            const NoiseSource& source,
++                            SkColorType color_type,
++                            base::span<uint8_t> pixels,
++                            const gfx::Rect& rect) {
++  switch (color_type) {
++    case kRGBA_8888_SkColorType:
++    case kBGRA_8888_SkColorType:
++      CHECK_EQ(pixels.size(),
++               CheckedPixelStorageSize(rect.width(), rect.height(),
++                                       sizeof(uint8_t)));
++      HeliumNoisePixels(token_hash, source, rect,
++                        [pixels](size_t index, HeliumNoiseHash& coordinate_hash,
++                                 const RgbNoise& rgb_noise) {
++                          HeliumNoisePixel(GetPixel(pixels, index),
++                                           coordinate_hash, rgb_noise);
++                        });
++      return;
++    case kRGBA_F16_SkColorType: {
++      CHECK_EQ(pixels.size(), CheckedPixelStorageSize(
++                                  rect.width(), rect.height(), sizeof(SkHalf)));
++      auto half_pixels = base::span(reinterpret_cast<SkHalf*>(pixels.data()),
++                                    pixels.size() / sizeof(SkHalf));
++      HeliumNoisePixels(
++          token_hash, source, rect,
++          [half_pixels](size_t index, HeliumNoiseHash& coordinate_hash,
++                        const RgbNoise& rgb_noise) {
++            auto half_pixel = GetPixel(half_pixels, index);
++            std::array<float, kChannelsPerPixel> pixel =
++                LoadHalfFloatPixel(half_pixel);
++            HeliumNoiseFloatPixel(base::span(pixel), coordinate_hash,
++                                  rgb_noise);
++            StoreHalfFloatPixel(half_pixel, pixel);
++          });
++      return;
 +    }
-+  }
-+
-+  for (int y = 0; y < height; ++y) {
-+    for (int x = 0; x < width; ++x) {
-+      auto source_pixel = GetPixelAt(x, y, width, source_pixels);
-+      uint32_t quantized_source_pixel = quantized_source_pixels[x + y * width];
-+      if (quantized_source_pixel == 0u) {
-+        continue;
-+      }
-+      auto pixel = GetPixelAt(x, y, width, pixels);
-+      pixel.copy_from(source_pixel);
-+
-+      HeliumNoiseHash content_hash = token_hash;
-+      content_hash.Update(quantized_source_pixel);
-+      const bool smooth_neighborhood =
-+          UpdateHashAndCheckSmoothQuantizedPixelNeighborhood(
-+              content_hash, x, y, width, height, quantized_source_pixels);
-+      HeliumNoiseHash coordinate_hash = token_hash;
-+      UpdateHashWithPixelCoordinates(coordinate_hash, x, y, x_offset, y_offset);
-+      coordinate_hash.Update(quantized_source_pixel);
-+      RgbNoise rgb_noise =
-+          GetRgbNoiseVector(content_hash, coordinate_hash, smooth_neighborhood);
-+      HeliumNoiseFloatPixel(pixel, coordinate_hash, rgb_noise);
++    case kRGBA_F32_SkColorType: {
++      CHECK_EQ(pixels.size(), CheckedPixelStorageSize(
++                                  rect.width(), rect.height(), sizeof(float)));
++      auto float_pixels = base::span(reinterpret_cast<float*>(pixels.data()),
++                                     pixels.size() / sizeof(float));
++      HeliumNoisePixels(
++          token_hash, source, rect,
++          [float_pixels](size_t index, HeliumNoiseHash& coordinate_hash,
++                         const RgbNoise& rgb_noise) {
++            HeliumNoiseFloatPixel(GetPixel(float_pixels, index),
++                                  coordinate_hash, rgb_noise);
++          });
++      return;
 +    }
-+  }
-+}
-+
-+void HeliumNoiseHalfFloatPixels(const HeliumNoiseHash& token_hash,
-+                                base::span<SkHalf> pixels,
-+                                const int width,
-+                                const int height,
-+                                const int x_offset,
-+                                const int y_offset) {
-+  CHECK_EQ(
-+      pixels.size(),
-+      CheckedPixelStorageSize(width, height, sizeof(SkHalf)) / sizeof(SkHalf));
-+
-+  std::vector<SkHalf> source_pixel_storage(pixels.begin(), pixels.end());
-+  std::vector<uint32_t> quantized_source_pixels;
-+  quantized_source_pixels.reserve(base::checked_cast<size_t>(width) *
-+                                  base::checked_cast<size_t>(height));
-+  for (int y = 0; y < height; ++y) {
-+    for (int x = 0; x < width; ++x) {
-+      std::array<float, kChannelsPerPixel> source_pixel =
-+          LoadHalfFloatPixel(source_pixel_storage, x, y, width);
-+      quantized_source_pixels.push_back(
-+          QuantizedFloatPixelValue(base::span(source_pixel)));
-+    }
-+  }
-+  for (int y = 0; y < height; ++y) {
-+    for (int x = 0; x < width; ++x) {
-+      uint32_t quantized_source_pixel = quantized_source_pixels[x + y * width];
-+      if (quantized_source_pixel == 0u) {
-+        continue;
-+      }
-+      std::array<float, kChannelsPerPixel> source_pixel =
-+          LoadHalfFloatPixel(source_pixel_storage, x, y, width);
-+      std::array<float, kChannelsPerPixel> pixel = source_pixel;
-+
-+      HeliumNoiseHash content_hash = token_hash;
-+      content_hash.Update(quantized_source_pixel);
-+      const bool smooth_neighborhood =
-+          UpdateHashAndCheckSmoothQuantizedPixelNeighborhood(
-+              content_hash, x, y, width, height, quantized_source_pixels);
-+      HeliumNoiseHash coordinate_hash = token_hash;
-+      UpdateHashWithPixelCoordinates(coordinate_hash, x, y, x_offset, y_offset);
-+      coordinate_hash.Update(quantized_source_pixel);
-+      RgbNoise rgb_noise =
-+          GetRgbNoiseVector(content_hash, coordinate_hash, smooth_neighborhood);
-+      HeliumNoiseFloatPixel(base::span(pixel), coordinate_hash, rgb_noise);
-+
-+      StoreHalfFloatPixel(pixels, x, y, width, pixel);
-+    }
++    default:
++      NOTREACHED() << "Unsupported canvas color type for noising: "
++                   << static_cast<int>(color_type);
 +  }
 +}
 +
@@ -592,41 +551,6 @@
 +      return true;
 +    default:
 +      return false;
-+  }
-+}
-+
-+bool HeliumNoisePixelBuffer(const HeliumNoiseHash& token_hash,
-+                            SkColorType color_type,
-+                            base::span<uint8_t> pixels,
-+                            int width,
-+                            int height,
-+                            int x_offset,
-+                            int y_offset) {
-+  switch (color_type) {
-+    case kRGBA_8888_SkColorType:
-+    case kBGRA_8888_SkColorType:
-+      HeliumNoisePixels(token_hash, pixels, width, height, x_offset, y_offset);
-+      return true;
-+    case kRGBA_F16_SkColorType: {
-+      CHECK_EQ(pixels.size(),
-+               CheckedPixelStorageSize(width, height, sizeof(SkHalf)));
-+      auto half_pixels = base::span(reinterpret_cast<SkHalf*>(pixels.data()),
-+                                    pixels.size() / sizeof(SkHalf));
-+
-+      HeliumNoiseHalfFloatPixels(token_hash, half_pixels, width, height,
-+                                 x_offset, y_offset);
-+      return true;
-+    }
-+    case kRGBA_F32_SkColorType: {
-+      auto float_pixels = base::span(reinterpret_cast<float*>(pixels.data()),
-+                                     pixels.size() / sizeof(float));
-+      HeliumNoiseFloatPixels(token_hash, float_pixels, width, height, x_offset,
-+                             y_offset);
-+      return true;
-+    }
-+    default:
-+      NOTREACHED() << "Unsupported canvas color type for noising: "
-+                   << static_cast<int>(color_type);
 +  }
 +}
 +
@@ -674,12 +598,13 @@
 +
 +  base::span<uint8_t> modify_pixels =
 +      gfx::SkPixmapToWritableSpan(pixmap_to_noise);
-+
-+  if (!HeliumNoisePixelBuffer(*token_hash, pixmap_to_noise.colorType(),
-+                              modify_pixels, pixmap_to_noise.width(),
-+                              pixmap_to_noise.height(), 0, 0)) {
-+    return false;
-+  }
++  const gfx::Rect canvas_rect(pixmap_to_noise.width(),
++                              pixmap_to_noise.height());
++  const NoiseSource source{
++      canvas_rect, canvas_rect,
++      QuantizePixels(pixmap_to_noise.colorType(), modify_pixels)};
++  HeliumNoisePixelBuffer(*token_hash, source, pixmap_to_noise.colorType(),
++                         modify_pixels, canvas_rect);
 +
 +  auto noised_image = bm.asImage();
 +  snapshot = blink::UnacceleratedStaticBitmapImage::Create(
@@ -691,6 +616,7 @@
 +// static
 +bool CanvasNoisingHelper::MaybeNoiseImageData(
 +    ExecutionContext* execution_context,
++    StaticBitmapImage& snapshot,
 +    ImageData* image_data,
 +    int source_x,
 +    int source_y) {
@@ -713,15 +639,48 @@
 +    return true;
 +  }
 +
-+  return HeliumNoisePixelBuffer(*token_hash, color_type, pixels,
-+                                image_data->width(), image_data->height(),
-+                                source_x, source_y);
++  const gfx::Rect canvas_rect(snapshot.GetSize());
++  const gfx::Rect image_data_rect(source_x, source_y, image_data->width(),
++                                  image_data->height());
++  gfx::Rect source_rect = gfx::IntersectRects(image_data_rect, canvas_rect);
++  if (source_rect.IsEmpty()) {
++    return false;
++  }
++  // The readback's edge pixels have neighbors on the canvas outside of it.
++  source_rect.Outset(1);
++  source_rect.Intersect(canvas_rect);
++
++  NoiseSource source{source_rect, canvas_rect, {}};
++  SkPixmap image_data_pixmap = image_data->GetSkPixmap();
++  SkBitmap bm;
++  if (image_data_rect.Contains(source_rect)) {
++    // The readback already has every pixel its noise depends on.
++    source.rect = image_data_rect;
++    source.pixels = QuantizePixels(color_type, pixels);
++  } else if (bm.tryAllocPixels(image_data_pixmap.info().makeWH(
++                 source_rect.width(), source_rect.height())) &&
++             snapshot.PaintImageForCurrentFrame().readPixels(
++                 bm.info(), bm.getPixels(), bm.rowBytes(), source_rect.x(),
++                 source_rect.y())) {
++    source.pixels =
++        QuantizePixels(color_type, gfx::SkPixmapToSpan(bm.pixmap()));
++  } else {
++    // Without the pixels around it, the readback can only be noised as if it
++    // were the whole canvas, so its edges get different noise than in a full
++    // readback.
++    source = {image_data_rect, image_data_rect,
++              QuantizePixels(color_type, pixels)};
++  }
++
++  HeliumNoisePixelBuffer(*token_hash, source, color_type, pixels,
++                         image_data_rect);
++  return true;
 +}
 +
 +}  // namespace blink
 --- /dev/null
 +++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,41 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -748,9 +707,10 @@
 +  static bool MaybeNoiseSnapshot(ExecutionContext* execution_context,
 +                                 scoped_refptr<StaticBitmapImage>& snapshot);
 +
-+  // If allowed, performs noising in place on RGBA ImageData readbacks.
-+  // Returns true if noise was applied.
++  // If allowed, performs noising in place on RGBA ImageData readbacks of
++  // |snapshot|. Returns true if noise was applied.
 +  static bool MaybeNoiseImageData(ExecutionContext* execution_context,
++                                  StaticBitmapImage& snapshot,
 +                                  ImageData* image_data,
 +                                  int source_x,
 +                                  int source_y);
@@ -841,7 +801,7 @@
            snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
        DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
 +    } else {
-+      CanvasNoisingHelper::MaybeNoiseImageData(GetExecutionContext(),
++      CanvasNoisingHelper::MaybeNoiseImageData(GetExecutionContext(), *snapshot,
 +                                               image_data, sx, sy);
      }
    }
