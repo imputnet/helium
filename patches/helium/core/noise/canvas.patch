@@ -83,7 +83,7 @@
  // AIPageContent.
 --- /dev/null
 +++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.cc
-@@ -0,0 +1,594 @@
+@@ -0,0 +1,615 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -339,6 +339,7 @@
 +  switch (color_type) {
 +    case kRGBA_8888_SkColorType:
 +    case kBGRA_8888_SkColorType:
++      quantized.reserve(pixels.size() / kChannelsPerPixel);
 +      for (size_t i = 0; i < pixels.size(); i += kChannelsPerPixel) {
 +        quantized.push_back(base::U32FromLittleEndian(
 +            pixels.subspan(i).first<kChannelsPerPixel>()));
@@ -348,6 +349,7 @@
 +      auto half_pixels =
 +          base::span(reinterpret_cast<const SkHalf*>(pixels.data()),
 +                     pixels.size() / sizeof(SkHalf));
++      quantized.reserve(half_pixels.size() / kChannelsPerPixel);
 +      for (size_t i = 0; i < half_pixels.size(); i += kChannelsPerPixel) {
 +        std::array<float, kChannelsPerPixel> pixel = LoadHalfFloatPixel(
 +            half_pixels.subspan(i).first<kChannelsPerPixel>());
@@ -359,6 +361,7 @@
 +      auto float_pixels =
 +          base::span(reinterpret_cast<const float*>(pixels.data()),
 +                     pixels.size() / sizeof(float));
++      quantized.reserve(float_pixels.size() / kChannelsPerPixel);
 +      for (size_t i = 0; i < float_pixels.size(); i += kChannelsPerPixel) {
 +        quantized.push_back(QuantizedFloatPixelValue(
 +            float_pixels.subspan(i).first<kChannelsPerPixel>()));
@@ -375,13 +378,17 @@
 +// The unnoised canvas pixels that noise is computed from. Noise for a pixel
 +// depends on its 3x3 neighborhood on the canvas, clamped to the canvas bounds,
 +// so a pixel gets the same noise no matter which part of the canvas is read.
++// Returns the index of the pixel at |x|, |y| in canvas coordinates within a
++// buffer that covers |rect|.
++size_t PixelIndex(const gfx::Rect& rect, int x, int y) {
++  DCHECK(rect.Contains(x, y));
++  return base::checked_cast<size_t>((x - rect.x()) +
++                                    (y - rect.y()) * rect.width());
++}
++
 +struct NoiseSource {
 +  // Returns the pixel at |x|, |y| in canvas coordinates.
-+  uint32_t At(int x, int y) const {
-+    DCHECK(rect.Contains(x, y));
-+    return pixels[base::checked_cast<size_t>((x - rect.x()) +
-+                                             (y - rect.y()) * rect.width())];
-+  }
++  uint32_t At(int x, int y) const { return pixels[PixelIndex(rect, x, y)]; }
 +
 +  // Where |pixels| are on the canvas. It has to include every neighbor of the
 +  // pixels being noised, as clamped to |canvas|.
@@ -664,6 +671,20 @@
 +                 source_rect.y())) {
 +    source.pixels =
 +        QuantizePixels(color_type, gfx::SkPixmapToSpan(bm.pixmap()));
++    // GPU readbacks can fail without reporting it, so only take the pixels
++    // around the readback from this read. The readback's own pixels decide
++    // what gets noised, and a failed read can't make them look empty.
++    const std::vector<uint32_t> readback = QuantizePixels(color_type, pixels);
++    const gfx::Rect readback_rect =
++        gfx::IntersectRects(image_data_rect, canvas_rect);
++    for (int y = readback_rect.y(); y < readback_rect.bottom(); ++y) {
++      const size_t row_width =
++          base::checked_cast<size_t>(readback_rect.width());
++      base::span(source.pixels)
++          .subspan(PixelIndex(source_rect, readback_rect.x(), y), row_width)
++          .copy_from(base::span(readback).subspan(
++              PixelIndex(image_data_rect, readback_rect.x(), y), row_width));
++    }
 +  } else {
 +    // Without the pixels around it, the readback can only be noised as if it
 +    // were the whole canvas, so its edges get different noise than in a full
