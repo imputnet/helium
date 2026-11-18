@@ -1,0 +1,175 @@
+--- a/chrome/browser/ui/tabs/helium_pins_util.h
++++ b/chrome/browser/ui/tabs/helium_pins_util.h
+@@ -52,6 +52,17 @@ bool ActivateReplacementTab(BrowserWindo
+ // Returns the URL that pinning the tab holding contents would capture.
+ GURL GetPinnableUrl(content::WebContents* contents);
+ 
++// Returns the URL of the page that url shows, which differs from it for source
++// views.
++GURL GetPageUrl(const GURL& url);
++
++// Returns whether url is a web page, or the source view of one, on another
++// origin than the pinned URL of the persistent pin tab, which opens in a new
++// tab instead of in the pin. Other URLs stay in the pin, e.g. data: URLs, which
++// pages can't open as a whole page, or external protocols, which open in
++// another app.
++bool IsOutsidePin(tabs::TabInterface* tab, const GURL& url);
++
+ // Handles the user closing tab_handles in browser: persistent pins and
+ // their split partners are hibernated instead. When the active tab goes away,
+ // a loaded tab takes its place. If none is left, hibernating the last loaded
+--- a/chrome/browser/ui/tabs/helium_pins_util.cc
++++ b/chrome/browser/ui/tabs/helium_pins_util.cc
+@@ -35,7 +35,9 @@
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_user_data.h"
++#include "content/public/common/url_constants.h"
+ #include "url/gurl.h"
++#include "url/origin.h"
+ 
+ namespace helium_pins {
+ 
+@@ -304,6 +306,20 @@ GURL GetPinnableUrl(content::WebContents
+   return contents->GetController().GetVisibleEntry()->GetURL();
+ }
+ 
++GURL GetPageUrl(const GURL& url) {
++  return url.SchemeIs(content::kViewSourceScheme) ? GURL(url.GetContentPiece())
++                                                  : url;
++}
++
++bool IsOutsidePin(tabs::TabInterface* tab, const GURL& url) {
++  HeliumPinsTabController* const controller = GetPersistentPinController(tab);
++  const GURL page_url = GetPageUrl(url);
++  return controller && controller->pinned_url().is_valid() &&
++         page_url.SchemeIsHTTPOrHTTPS() &&
++         !url::Origin::Create(GetPageUrl(controller->pinned_url()))
++              .IsSameOriginWith(page_url);
++}
++
+ std::vector<tabs::TabHandle> HandleUserClosingTabs(
+     BrowserWindowInterface* browser,
+     std::vector<tabs::TabHandle> tab_handles) {
+--- a/chrome/browser/ui/tabs/helium_pins_navigation_throttle.h
++++ b/chrome/browser/ui/tabs/helium_pins_navigation_throttle.h
+@@ -13,8 +13,9 @@ class NavigationThrottleRegistry;
+ 
+ namespace helium_pins {
+ 
+-// Replaces the reload of a reactivated persistent pin's last page with its
+-// pinned URL.
++// Opens navigations from a persistent pin to other origins in a new tab;
++// redirects stay in the pin. Also replaces the reload of a reactivated pin's
++// last page with its pinned URL.
+ class HeliumPinsNavigationThrottle : public content::NavigationThrottle {
+  public:
+   static void MaybeCreateAndAdd(content::NavigationThrottleRegistry& registry);
+--- a/chrome/browser/ui/tabs/helium_pins_navigation_throttle.cc
++++ b/chrome/browser/ui/tabs/helium_pins_navigation_throttle.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/tabs/helium_pins_navigation_throttle.h"
+ 
+ #include <memory>
++#include <utility>
+ 
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+@@ -12,10 +13,14 @@
+ #include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
+ #include "chrome/browser/ui/tabs/helium_pins_util.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/frame_tree_node_id.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/navigation_throttle_registry.h"
++#include "content/public/browser/page_navigator.h"
+ #include "content/public/browser/reload_type.h"
+ #include "content/public/browser/restore_type.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/window_open_disposition.h"
+ #include "url/gurl.h"
+ 
+ namespace helium_pins {
+@@ -37,6 +42,24 @@ bool IsNavigationToExistingEntry(content
+          handle.GetRestoreType() == content::RestoreType::kRestored;
+ }
+ 
++// Returns whether handle should open outside of the pin of controller that it
++// navigates.
++bool ShouldOpenOutsidePin(content::NavigationHandle& handle,
++                          HeliumPinsTabController& controller) {
++  // POST requests can't be repeated in another tab.
++  if (handle.IsPost() || IsNavigationToExistingEntry(handle)) {
++    return false;
++  }
++
++  // Without a user gesture, the new tab would be blocked as a popup, so e.g.
++  // script redirects stay in the pin.
++  if (!handle.HasUserGesture()) {
++    return false;
++  }
++
++  return IsOutsidePin(&controller.tab(), handle.GetURL());
++}
++
+ void ReturnTabToPinnedUrl(tabs::TabHandle handle) {
+   if (HeliumPinsTabController* controller =
+           HeliumPinsTabController::From(handle.Get())) {
+@@ -75,7 +98,8 @@ bool ReplaceReloadWithReturn(content::Na
+ void HeliumPinsNavigationThrottle::MaybeCreateAndAdd(
+     content::NavigationThrottleRegistry& registry) {
+   content::NavigationHandle& handle = registry.GetNavigationHandle();
+-  if (handle.IsInPrimaryMainFrame() && GetNavigatedPinController(handle)) {
++  if ((handle.IsInPrimaryMainFrame() || handle.IsInPrerenderedMainFrame()) &&
++      GetNavigatedPinController(handle)) {
+     registry.AddThrottle(
+         std::make_unique<HeliumPinsNavigationThrottle>(registry));
+   }
+@@ -95,8 +119,30 @@ HeliumPinsNavigationThrottle::WillStartR
+     return PROCEED;
+   }
+ 
+-  return ReplaceReloadWithReturn(handle, *controller) ? CANCEL_AND_IGNORE
+-                                                      : PROCEED;
++  // Prerendered pages are shown without running throttles again, so pages that
++  // would open outside the pin aren't prerendered in it.
++  if (handle.IsInPrerenderedMainFrame()) {
++    return IsOutsidePin(&controller->tab(), handle.GetURL()) ? CANCEL : PROCEED;
++  }
++
++  if (ReplaceReloadWithReturn(handle, *controller)) {
++    return CANCEL_AND_IGNORE;
++  }
++
++  if (!ShouldOpenOutsidePin(handle, *controller)) {
++    return PROCEED;
++  }
++
++  // Keep the request's referrer, initiator and user gesture, and the source
++  // view of view-source: URLs.
++  content::OpenURLParams params =
++      content::OpenURLParams::FromNavigationHandle(&handle);
++  params.url = GetPinnableUrlForNavigation(handle);
++  params.frame_tree_node_id = content::FrameTreeNodeId();
++  params.disposition = WindowOpenDisposition::kNewForegroundTab;
++  handle.GetWebContents()->OpenURL(std::move(params),
++                                   /*navigation_handle_callback=*/{});
++  return CANCEL_AND_IGNORE;
+ }
+ 
+ content::NavigationThrottle::ThrottleCheckResult
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -1283,6 +1283,12 @@ base::WeakPtr<content::NavigationHandle>
+   NavigateParams params(browser, url,
+                         location_bar->navigation_params().transition);
+   params.disposition = location_bar->navigation_params().disposition;
++  // Leaving a pin opens a new tab. Choosing it here rather than in the pin's
++  // navigation throttle keeps what was typed, e.g. an explicit http:// scheme.
++  if (params.disposition == WindowOpenDisposition::kCurrentTab &&
++      helium_pins::IsOutsidePin(browser->GetActiveTabInterface(), url)) {
++    params.disposition = WindowOpenDisposition::kNewForegroundTab;
++  }
+   // Use ADD_INHERIT_OPENER so that all pages opened by the omnibox at least
+   // inherit the opener. In some cases the tabstrip will determine the group
+   // should be inherited, in which case the group is inherited instead of the
