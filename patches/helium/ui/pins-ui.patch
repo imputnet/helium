@@ -1,0 +1,514 @@
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -221,7 +221,8 @@ int GetLayoutConstant(LayoutConstant con
+     case LayoutConstant::kVerticalTabStripTopContainerButtonSize:
+       return 28;
+     case LayoutConstant::kVerticalTabPinnedBorderThickness:
+-      return 1;
++      // Pinned tabs are outlined by their container instead.
++      return 0;
+     default:
+       break;
+   }
+--- a/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
++++ b/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
+@@ -103,6 +103,9 @@ class DraggedTabsContainer : public TabD
+     bool should_float = false;
+   };
+ 
++  // How much wider than the dragged view the squashed drag layout is.
++  static constexpr int kSquashedDragHorizontalPadding = 4;
++
+   // Returns the expected visual data, relative to the host view, for a dragged
+   // view. Returns std::nullopt if the view is not being dragged.
+   std::optional<DraggedViewVisualData> GetVisualDataForDraggedView(
+@@ -189,7 +192,7 @@ class DraggedTabsContainer : public TabD
+ 
+   // Returns the bounds in `host_view_` coordinates to which dragged views
+   // should be clamped.
+-  gfx::Rect GetDraggingViewsClampingBounds() const;
++  virtual gfx::Rect GetDraggingViewsClampingBounds() const;
+ 
+   // Returns the bounds of the box containing all dragged views, adjusted to
+   // the point `point_in_container` and clamped to the bounds of the
+--- a/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+@@ -441,9 +441,8 @@ void DraggedTabsContainer::AddViewToSqua
+   if (is_source_dragged_view) {
+     dragging_views_bounds_.set_size(view_bounds.size());
+ 
+-    static constexpr int kDraggedViewHorizontalPadding = 4;
+     dragging_views_bounds_.set_width(view_bounds.width() +
+-                                     kDraggedViewHorizontalPadding);
++                                     kSquashedDragHorizontalPadding);
+   }
+   dragging_views_.insert(
+       {dragging_view,
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
+@@ -58,7 +58,10 @@ class PinnedTabContainerView
+   friend class PinnedTabContainerViewVerticalLayout;
+   friend class PinnedTabContainerViewHorizontalLayout;
+ 
+-  static constexpr int kTabPadding = 4;
++  static constexpr int kTabPadding = 2;
++
++  // The minimum width of a pin in the uncollapsed vertical tab strip.
++  static constexpr int kUncollapsedTabMinWidth = 42;
+ 
+   // DraggedTabsContainer:
+   views::ScrollView* GetScrollViewForContainer() const override;
+@@ -67,6 +70,7 @@ class PinnedTabContainerView
+   const views::ProposedLayout& GetLayoutForDrag() const override;
+   const TabCollectionNode* GetCollectionNodeFromView(
+       const views::View& view) const override;
++  gfx::Rect GetDraggingViewsClampingBounds() const override;
+ 
+   // While in horizontal orientation, the x-coordinate of the single row is
+   // used to determine the drop index.
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -5,6 +5,8 @@
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ 
+ #include "base/i18n/rtl.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view_horizontal_layout.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view_vertical_layout.h"
+@@ -16,7 +18,9 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/views/border.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/layout/layout_types.h"
+ #include "ui/views/layout/proposed_layout.h"
+@@ -26,6 +30,10 @@
+ 
+ namespace {
+ 
++// The outline around the pins of the vertical tab strip.
++constexpr int kBorderThickness = 1;
++constexpr int kBorderPadding = 2;
++
+ std::unique_ptr<PinnedTabContainerView::LayoutManager>
+ CreatePinnedTabContainerViewLayout(TabStripOrientation orientation) {
+   if (orientation == TabStripOrientation::kVertical) {
+@@ -73,6 +81,16 @@ PinnedTabContainerView::PinnedTabContain
+                      base::Unretained(this)));
+ 
+   if (orientation_ == TabStripOrientation::kVertical) {
++    // The pins are outlined like the contents of the window. The outline
++    // follows the corners of the pins inside it.
++    const int corner_radius =
++        GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius) +
++        kBorderPadding + kBorderThickness;
++    SetBorder(views::CreatePaddedBorder(
++        views::CreateRoundedRectBorder(kBorderThickness, corner_radius,
++                                       kColorToolbarContentAreaSeparator),
++        gfx::Insets(kBorderPadding)));
++
+     auto* state_controller =
+         collection_node_->GetController()->GetStateController();
+     CHECK(state_controller);
+@@ -284,6 +302,23 @@ views::ScrollView* PinnedTabContainerVie
+       const_cast<PinnedTabContainerView*>(this));
+ }
+ 
++gfx::Rect PinnedTabContainerView::GetDraggingViewsClampingBounds() const {
++  // Unlike the unpinned container, this one already leaves out the side
++  // padding of the tab strip, and its pins stay within its outline.
++  const auto* scroll_view = GetScrollViewForContainer();
++  CHECK(scroll_view);
++  gfx::Rect clamping_bounds = views::View::ConvertRectToTarget(
++      scroll_view, this, scroll_view->GetLocalBounds());
++  clamping_bounds.Inset(GetInsets());
++  // The squashed drag layout is wider than the dragged pin, which would
++  // otherwise stop short of the end of a row.
++  if (orientation_ == TabStripOrientation::kVertical) {
++    clamping_bounds.set_width(clamping_bounds.width() +
++                              kSquashedDragHorizontalPadding);
++  }
++  return clamping_bounds;
++}
++
+ void PinnedTabContainerView::UpdateTargetLayoutForDrag(
+     const std::vector<const views::View*>& views_to_snap) {
+   layout_manager_->ResetViewsToTargetLayout(views_to_snap);
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/common/helium_pinned_tab_container_view_vertical_layout.cc
+@@ -0,0 +1,205 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view_vertical_layout.h"
++
++#include <algorithm>
++#include <optional>
++
++#include "base/numerics/safe_conversions.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
++#include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/layout/proposed_layout.h"
++#include "ui/views/view.h"
++#include "ui/views/view_utils.h"
++
++PinnedTabContainerViewVerticalLayout::PinnedTabContainerViewVerticalLayout() =
++    default;
++PinnedTabContainerViewVerticalLayout::~PinnedTabContainerViewVerticalLayout() =
++    default;
++
++gfx::Size PinnedTabContainerViewVerticalLayout::GetMinimumSize(
++    const views::View* host) const {
++  if (!PinnedTabContainerView().collection_node_ ||
++      PinnedTabContainerView().collection_node_->GetDirectChildren().empty()) {
++    return gfx::Size();
++  }
++
++  // The minimum size should be enough to show a row and a half, if needed.
++  auto collapse_state = PinnedTabContainerView().GetTabStripCollapseState();
++  const int num_children =
++      PinnedTabContainerView().collection_node_->GetDirectChildren().size();
++  const float min_rows = std::min(
++      (collapse_state != tabs::VerticalTabStripCollapseState::kExpanded ? 1.5f
++                                                                        : 1.0f),
++      static_cast<float>(num_children));
++  const int min_height =
++      base::ClampCeil(
++          GetLayoutConstant(LayoutConstant::kVerticalTabPinnedHeight) *
++          min_rows) +
++      (min_rows > 1 ? PinnedTabContainerView::kTabPadding : 0) +
++      PinnedTabContainerView().GetInsets().height();
++  return gfx::Size(GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth),
++                   min_height);
++}
++
++views::ProposedLayout
++PinnedTabContainerViewVerticalLayout::CalculateProposedLayout(
++    const views::SizeBounds& size_bounds) const {
++  views::ProposedLayout layouts;
++  const auto children =
++      PinnedTabContainerView().collection_node_
++          ? PinnedTabContainerView().collection_node_->GetDirectChildren()
++          : TabCollectionNode::ChildViews();
++
++  // Pins are laid out within the container's outline, if any.
++  const gfx::Insets insets = PinnedTabContainerView().GetInsets();
++
++  int total_width = 0;
++  int total_height = 0;
++
++  int y = insets.top();
++
++  if (children.empty()) {
++    layouts.host_size = gfx::Size();
++    return layouts;
++  }
++
++  // Pins share a uniform slot width, and pinned splits take two slots.
++  const auto get_slots = [](const views::View* child) {
++    return views::IsViewClass<SplitTabView>(child) ? 2 : 1;
++  };
++  int total_slots = 0;
++  for (const views::View* child : children) {
++    total_slots += get_slots(child);
++  }
++
++  // Pins are wider while uncollapsed, so that fewer of them share a row.
++  const auto collapse_state =
++      PinnedTabContainerView().GetTabStripCollapseState();
++  const int slot_width =
++      collapse_state == tabs::VerticalTabStripCollapseState::kCollapsed
++          ? GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth)
++          : PinnedTabContainerView::kUncollapsedTabMinWidth;
++  int slots_per_row = total_slots;
++  std::optional<int> row_width;
++
++  // If the width is bounded, calculate how many slots fit on a row, and spread
++  // the pins evenly over the rows they need, so that the last row isn't left
++  // with fewer of them.
++  if (size_bounds.width().is_bounded() && size_bounds.width().value() > 0) {
++    row_width = size_bounds.width().value() - insets.width();
++
++    // When we are in collapsed state, only one child should be shown per row.
++    // During collapse animation and other cases, fit as many as possible.
++    if (collapse_state == tabs::VerticalTabStripCollapseState::kCollapsed) {
++      slots_per_row = 1;
++    } else {
++      const int max_slots_per_row = std::max(
++          1, (*row_width - slot_width) /
++                     (slot_width + PinnedTabContainerView::kTabPadding) +
++                 1);
++      const int num_rows =
++          (total_slots + max_slots_per_row - 1) / max_slots_per_row;
++      slots_per_row = (total_slots + num_rows - 1) / num_rows;
++
++      // Splits can't be broken across rows, so widen the rows until the pins
++      // fit on as many rows as planned.
++      const auto count_rows = [&](int row_size) {
++        int rows = 1;
++        int used_slots = 0;
++        for (const views::View* child : children) {
++          const int slots = get_slots(child);
++          if (used_slots > 0 && used_slots + slots > row_size) {
++            ++rows;
++            used_slots = 0;
++          }
++          used_slots += slots;
++        }
++        return rows;
++      };
++      while (slots_per_row < max_slots_per_row &&
++             count_rows(slots_per_row) > num_rows) {
++        ++slots_per_row;
++      }
++    }
++  }
++
++  // Returns the left edge of the slot at `index` of a row. The rounding of the
++  // slot widths is spread over the row, so that the last pin of a full row
++  // ends right at its edge.
++  const auto get_slot_x = [&](int index) {
++    return insets.left() +
++           (row_width
++                ? index * (*row_width + PinnedTabContainerView::kTabPadding) /
++                      slots_per_row
++                : index * (slot_width + PinnedTabContainerView::kTabPadding));
++  };
++
++  int row_slots = 0;
++  for (auto* child : children) {
++    const int slots = get_slots(child);
++
++    auto drag_data =
++        PinnedTabContainerView().GetVisualDataForDraggedView(*child);
++    const bool should_show_child = !(drag_data && drag_data->should_hide);
++    if (!should_show_child) {
++      layouts.child_layouts.emplace_back(child, false, gfx::Rect());
++      continue;
++    }
++
++    // Start a new row if the child doesn't fit on this one.
++    const bool takes_space = !drag_data || !drag_data->should_float;
++    if (takes_space && row_slots > 0 && row_slots + slots > slots_per_row) {
++      y = total_height + PinnedTabContainerView::kTabPadding;
++      row_slots = 0;
++    }
++
++    // A split wider than the row takes all of it.
++    const int first_slot = takes_space ? row_slots : 0;
++    const int end_slot = std::min(first_slot + slots, slots_per_row);
++    const int child_width = get_slot_x(end_slot) -
++                            PinnedTabContainerView::kTabPadding -
++                            get_slot_x(first_slot);
++    gfx::Rect bounds =
++        gfx::Rect(child->GetPreferredSize(views::SizeBounds(child_width, {})));
++    bounds.set_width(child_width);
++
++    bounds.set_y(drag_data ? drag_data->offset.y() : y);
++    // Pins that can only be dragged vertically, i.e. while the tab strip is
++    // collapsed, stay within the outline instead of moving to the edge of the
++    // container.
++    if (drag_data && PinnedTabContainerView().drag_axes() !=
++                         PinnedTabContainerView::DragAxes::kVerticalOnly) {
++      bounds.set_x(drag_data->offset.x() +
++                   (row_slots != 0 ? PinnedTabContainerView::kTabPadding : 0));
++    } else {
++      bounds.set_x(get_slot_x(first_slot));
++    }
++
++    if (takes_space) {
++      total_width = std::max(total_width, get_slot_x(first_slot) + child_width);
++      total_height = std::max(total_height, (y + bounds.height()));
++      row_slots += slots;
++    }
++
++    layouts.child_layouts.emplace_back(child, true, bounds);
++  }
++
++  // Make sure we snap to bounded width if defined. This is necessary as the
++  // `child_width` calculation above rounds width down and this can result in
++  // off-by-one width calculations when the number of children on a row changes.
++  // Changes in host width can be interpreted as a resize and animations may
++  // otherwise snap to target.
++  layouts.host_size =
++      gfx::Size(size_bounds.width().value_or(total_width + insets.right()),
++                total_height + insets.bottom());
++  return layouts;
++}
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view_layout.cc
+@@ -22,6 +22,10 @@
+ 
+ namespace {
+ 
++// The gap that the vertical tab strip region adds above the new tab button,
++// kBottomContainerGap in vertical_tab_strip_region_view.cc.
++constexpr int kNewTabButtonTopGap = 2;
++
+ // The pinned container main axis size should not be larger than half the
+ // available space unless the unpinned container will not fill that space.
+ // When pinned tabs are present, the size must be at least as large as the min
+@@ -265,14 +269,22 @@ views::ProposedLayout TabStripViewLayout
+   const int region_horizontal_padding =
+       GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
+ 
+-  const int region_vertical_padding = GetLayoutConstant(
+-      LayoutConstant::kVerticalTabStripCollapsedVerticalPadding);
++  // Pins are spaced from the unpinned tabs like from the sides.
++  const int region_vertical_padding = region_horizontal_padding;
++
++  // While collapsed, the outline around the pins extends into the side
++  // padding, so that the pins stay as wide as the unpinned tabs.
++  int pinned_horizontal_padding = region_horizontal_padding;
++  const auto* pinned_container = tab_strip_view->GetPinnedTabsContainer();
++  if (tab_strip_view->is_collapsed_ && pinned_container) {
++    pinned_horizontal_padding -= pinned_container->GetInsets().left();
++  }
+ 
+   int y = 0;
+ 
+   // Determine container preferred heights.
+   views::SizeBounds pinned_tab_container_size_bounds =
+-      size_bounds.Inset(gfx::Insets::TLBR(0, region_horizontal_padding, 0, 0));
++      size_bounds.Inset(gfx::Insets::VH(0, pinned_horizontal_padding));
+   const int pinned_preferred_height =
+       pinned_tabs_scroll_view
+           ->GetPreferredSize(pinned_tab_container_size_bounds)
+@@ -280,13 +292,20 @@ views::ProposedLayout TabStripViewLayout
+   const int unpinned_preferred_height =
+       unpinned_tabs_scroll_view->GetPreferredSize(size_bounds).height();
+ 
++  // Without unpinned tabs, the pins are spaced from the new tab button, which
++  // already has a gap above it.
++  const int pinned_bottom_padding =
++      unpinned_preferred_height != 0
++          ? region_vertical_padding
++          : region_vertical_padding - kNewTabButtonTopGap;
++
+   // If the height is bounded, calculate the available space for laying out the
+   // pinned and unpinned containers.
+   int remaining_height = 0;
+   if (size_bounds.height().is_bounded()) {
+     remaining_height = size_bounds.height().value();
+-    if (pinned_preferred_height != 0 && unpinned_preferred_height != 0) {
+-      remaining_height -= region_vertical_padding;
++    if (pinned_preferred_height != 0) {
++      remaining_height -= pinned_bottom_padding;
+     }
+     // Clamp the remaining height to 0 if we have less space.
+     remaining_height = std::max(remaining_height, 0);
+@@ -295,18 +314,15 @@ views::ProposedLayout TabStripViewLayout
+   // Place the pinned container.
+   int pinned_container_height = pinned_preferred_height;
+   if (size_bounds.height().is_bounded()) {
+-    int min_pinned_height = 0;
+-    if (const auto* pinned_container =
+-            tab_strip_view->GetPinnedTabsContainer()) {
+-      min_pinned_height = pinned_container->GetMinimumSize().height();
+-    }
++    const int min_pinned_height =
++        pinned_container ? pinned_container->GetMinimumSize().height() : 0;
+     pinned_container_height = CalculatePinnedContainerMainAxisSize(
+         pinned_preferred_height, unpinned_preferred_height, remaining_height,
+         min_pinned_height);
+     remaining_height -= pinned_container_height;
+   }
+   gfx::Rect pinned_container_bounds(
+-      region_horizontal_padding, y,
++      pinned_horizontal_padding, y,
+       pinned_tab_container_size_bounds.width().value(),
+       pinned_container_height);
+   layouts.child_layouts.emplace_back(pinned_tabs_scroll_view,
+@@ -314,11 +330,7 @@ views::ProposedLayout TabStripViewLayout
+                                      pinned_container_bounds);
+ 
+   if (pinned_container_bounds.height()) {
+-    y += pinned_container_bounds.height();
+-    // Add padding only if there are pinned and unpinned tabs.
+-    if (unpinned_preferred_height != 0) {
+-      y += region_vertical_padding;
+-    }
++    y += pinned_container_bounds.height() + pinned_bottom_padding;
+   }
+ 
+   // Place the unpinned container using the entire available width, we do not
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -1251,19 +1251,8 @@ void TabView::UpdateBorder() {
+     return;
+   }
+ 
+-  if (pinned_) {
+-    if (split_) {
+-      // Insets for border handled by the `SplitTabView`.
+-      SetBorder(views::CreateEmptyBorder(gfx::Insets(GetLayoutConstant(
+-          LayoutConstant::kVerticalTabPinnedBorderThickness))));
+-    } else {
+-      SetBorder(views::CreateRoundedRectBorder(
+-          GetLayoutConstant(LayoutConstant::kVerticalTabPinnedBorderThickness),
+-          GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius),
+-          IsFrameActive() ? kColorVerticalTabPinnedOutline
+-                          : kColorTabDividerFrameInactive));
+-    }
+-  } else if (GetBorder()) {
++  // Pinned tabs are outlined by their container instead.
++  if (GetBorder()) {
+     SetBorder(nullptr);
+   }
+ }
+--- a/chrome/browser/ui/views/tabs/common/split_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/split_tab_view.cc
+@@ -7,7 +7,6 @@
+ #include <algorithm>
+ #include <vector>
+ 
+-#include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+@@ -208,15 +207,8 @@ void SplitTabView::OnDataChanged() {
+ }
+ 
+ void SplitTabView::UpdateBorder() {
+-  if (pinned_) {
+-    const bool is_frame_active =
+-        GetWidget() ? GetWidget()->ShouldPaintAsActive() : true;
+-    SetBorder(views::CreateRoundedRectBorder(
+-        GetLayoutConstant(LayoutConstant::kVerticalTabPinnedBorderThickness),
+-        GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius),
+-        is_frame_active ? kColorTabDividerFrameActive
+-                        : kColorTabDividerFrameInactive));
+-  } else if (GetBorder()) {
++  // Pinned splits are outlined by their container instead.
++  if (GetBorder()) {
+     SetBorder(nullptr);
+   }
+ }
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -46,12 +46,12 @@ source_set("common") {
+ source_set("impl") {
+   sources = [
+     "dragged_tabs_container.cc",
++    "helium_pinned_tab_container_view_vertical_layout.cc",
+     "horizontal_tab_style_views.cc",
+     "horizontal_tab_style_views.h",
+     "pinned_tab_container_view.cc",
+     "pinned_tab_container_view_horizontal_layout.cc",
+     "pinned_tab_container_view_horizontal_layout.h",
+-    "pinned_tab_container_view_vertical_layout.cc",
+     "pinned_tab_container_view_vertical_layout.h",
+     "root_tab_collection_node.cc",
+     "split_tab_view.cc",
