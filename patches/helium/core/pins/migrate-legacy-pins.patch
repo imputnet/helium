@@ -1,0 +1,205 @@
+TODO: Remove this migration after January 2027.
+
+--- a/chrome/browser/ui/tabs/helium_pins_list.h
++++ b/chrome/browser/ui/tabs/helium_pins_list.h
+@@ -7,6 +7,7 @@
+ 
+ #include <stddef.h>
+ 
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -50,6 +51,10 @@ class PinList {
+   // Returns the value of the pinned tabs preference for the pin list.
+   base::ListValue ToPref() const;
+ 
++  // Returns the ids that FromPref() gave pins from lists saved before pins had
++  // ids.
++  const std::set<std::string>& migrated_ids() const { return migrated_ids_; }
++
+   // Returns the pin id, or end() if the list doesn't have it.
+   iterator Find(const std::string& id);
+ 
+@@ -66,6 +71,7 @@ class PinList {
+ 
+  private:
+   std::vector<Pin> pins_;
++  std::set<std::string> migrated_ids_;
+ };
+ 
+ }  // namespace helium_pins
+--- a/chrome/browser/ui/tabs/helium_pins_list.cc
++++ b/chrome/browser/ui/tabs/helium_pins_list.cc
+@@ -63,6 +63,16 @@ PinList PinList::FromPref(const base::Li
+                 : split_tabs::SplitTabLayout::kSideBySide,
+             dict->FindDouble(kSplitRatioKey).value_or(0.5));
+       }
++
++      continue;
++    }
++
++    // Lists written by PinnedTabCodec have no ids and repeat a URL for every
++    // window that pinned it, so all windows' pins are merged into one set.
++    if (!std::ranges::contains(list.pins_, pin_url, &Pin::url)) {
++      const std::string id = CreatePinId();
++      list.pins_.push_back({id, pin_url});
++      list.migrated_ids_.insert(id);
+     }
+   }
+ 
+--- a/chrome/browser/ui/tabs/helium_pins_service.h
++++ b/chrome/browser/ui/tabs/helium_pins_service.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_UI_TABS_HELIUM_PINS_SERVICE_H_
+ 
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -146,6 +147,12 @@ class HeliumPinsService : public KeyedSe
+   // RemoveStaleSplits() took the stale splits apart.
+   void ReconcileSplits(BrowserWindowInterface* browser);
+ 
++  // Takes the pinned splits made of restored tabs, which had no pin ids, into
++  // the pin list. Returns whether the pin list changed.
++  bool ImportLegacySplits(
++      BrowserWindowInterface* browser,
++      const std::vector<HeliumPinsTabController*>& restored);
++
+   // Adds a hibernated copy of pin at index of browser.
+   void InsertHibernatedPin(BrowserWindowInterface* browser,
+                            int index,
+@@ -187,6 +194,10 @@ class HeliumPinsService : public KeyedSe
+   // were inserted into them, whose splits may be outdated.
+   std::vector<base::WeakPtr<BrowserWindowInterface>> unreconciled_browsers_;
+ 
++  // Pins migrated from a list saved before pins had ids that no restored tab
++  // was matched to yet.
++  std::set<std::string> unclaimed_migrated_pins_;
++
+   base::ScopedObservation<ProfileBrowserCollection, BrowserCollectionObserver>
+       browser_collection_observation_{this};
+ 
+--- a/chrome/browser/ui/tabs/helium_pins_service.cc
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -190,6 +190,12 @@ HeliumPinsService::HeliumPinsService(Pro
+     : profile_(profile), prefs_(prefs), history_(history) {
+   if (prefs_) {
+     pins_ = PinList::FromPref(prefs_->GetList(prefs::kPinnedTabs));
++    unclaimed_migrated_pins_ = pins_.migrated_ids();
++
++    // Lists migrated by PinList::FromPref() are saved right away.
++    if (pins_.ToPref() != prefs_->GetList(prefs::kPinnedTabs)) {
++      SavePins();
++    }
+   }
+ 
+   ProfileBrowserCollection* const browsers =
+@@ -837,10 +843,26 @@ void HeliumPinsService::Reconcile(Browse
+   for (HeliumPinsTabController* controller : unidentified) {
+     content::WebContents* const contents = controller->tab().GetContents();
+     const GURL url = GetPinnableUrl(contents);
+-    const auto match = std::ranges::find_if(pins_, [&](const Pin& pin) {
++    auto match = std::ranges::find_if(pins_, [&](const Pin& pin) {
+       return pin.url == url && !present.contains(pin.id);
+     });
++
++    // Pin lists saved before pins had ids kept the page URL of source views,
++    // which sessions restore as view-source: URLs, so a migrated pin that no
++    // restored tab was matched to yet takes one over.
++    if (match == pins_.end() && GetPageUrl(url) != url) {
++      match = std::ranges::find_if(pins_, [&](const Pin& pin) {
++        return pin.url == GetPageUrl(url) &&
++               unclaimed_migrated_pins_.contains(pin.id);
++      });
++      if (match != pins_.end()) {
++        match->url = url;
++        pins_changed = true;
++      }
++    }
++
+     if (match != pins_.end()) {
++      unclaimed_migrated_pins_.erase(match->id);
+       controller->SetPin(match->id, match->url);
+       present[match->id] = controller;
+ 
+@@ -852,6 +874,12 @@ void HeliumPinsService::Reconcile(Browse
+     }
+   }
+ 
++  // Sessions saved before pins had ids restore pinned splits that the pin
++  // list doesn't have yet.
++  if (ImportLegacySplits(browser, unidentified)) {
++    pins_changed = true;
++  }
++
+   for (HeliumPinsTabController* controller : to_close) {
+     UnpinAndCloseCopy(controller);
+   }
+@@ -1024,6 +1052,64 @@ void HeliumPinsService::ReconcileSplits(
+   }
+ }
+ 
++bool HeliumPinsService::ImportLegacySplits(
++    BrowserWindowInterface* browser,
++    const std::vector<HeliumPinsTabController*>& restored) {
++  TabStripModel* const model = browser->GetTabStripModel();
++  bool changed = false;
++  for (HeliumPinsTabController* controller : restored) {
++    const std::optional<split_tabs::SplitTabId> split_id =
++        controller->tab().GetSplit();
++    if (!split_id) {
++      continue;
++    }
++
++    // Each split is imported once, with its first tab.
++    split_tabs::SplitTabData* const data = model->GetSplitData(*split_id);
++    const std::vector<tabs::TabInterface*> members = data->ListTabs();
++    if (members.front() != &controller->tab()) {
++      continue;
++    }
++
++    // Only splits of restored tabs whose pins aren't split yet are imported.
++    std::vector<std::string> ids;
++    for (tabs::TabInterface* member : members) {
++      HeliumPinsTabController* const member_controller =
++          HeliumPinsTabController::From(member);
++      const auto it = std::ranges::contains(restored, member_controller)
++                          ? pins_.Find(member_controller->pin_id())
++                          : pins_.end();
++      if (it == pins_.end() || !it->split.empty()) {
++        break;
++      }
++
++      ids.push_back(it->id);
++    }
++
++    if (ids.size() != members.size()) {
++      continue;
++    }
++
++    // The pins of a split follow each other in the pin list.
++    for (size_t i = 1; i < ids.size(); ++i) {
++      const auto it = pins_.Find(ids[i]);
++      Pin pin = std::move(*it);
++      pins_.erase(it);
++      pins_.insert(pins_.Find(ids[i - 1]) + 1, std::move(pin));
++    }
++
++    for (const std::string& id : ids) {
++      const auto it = pins_.Find(id);
++      it->split = ids.front();
++      it->split_visual_data = *data->visual_data();
++    }
++
++    changed = true;
++  }
++
++  return changed;
++}
++
+ void HeliumPinsService::InsertHibernatedPin(BrowserWindowInterface* browser,
+                                             int index,
+                                             const Pin& pin) {
