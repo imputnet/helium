@@ -1,0 +1,342 @@
+--- a/chrome/browser/ui/tabs/helium_pins_service.h
++++ b/chrome/browser/ui/tabs/helium_pins_service.h
+@@ -50,6 +50,19 @@ class HeliumPinsService : public KeyedSe
+     split_tabs::SplitTabVisualData split_visual_data;
+   };
+ 
++  // A window whose last unpinned tabs were dragged out while no pin was loaded.
++  struct WindowEmptiedByDrag {
++    base::WeakPtr<BrowserWindowInterface> browser;
++    std::vector<tabs::TabHandle> tabs;
++  };
++
++  // A pin that was dragged or moved out of its window.
++  struct DetachedPin {
++    tabs::TabHandle tab;
++    base::WeakPtr<BrowserWindowInterface> source;
++    std::string id;
++  };
++
+   // BrowserCollectionObserver:
+   void OnBrowserCreated(BrowserWindowInterface* browser) override;
+ 
+@@ -58,6 +71,7 @@ class HeliumPinsService : public KeyedSe
+       TabStripModel* tab_strip_model,
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
++  void OnTabWillBeRemoved(tabs::TabInterface* tab, int index) override;
+   void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
+   void OnSplitTabChanged(const SplitTabChange& change) override;
+ 
+@@ -81,6 +95,14 @@ class HeliumPinsService : public KeyedSe
+   void RemovePin(tabs::TabInterface* tab);
+   // Removes the pin `id` from the pin list and closes its tabs.
+   void UnpinEverywhere(const std::string& id);
++  // Turns pins that left their window into regular tabs, unless they were
++  // dropped among the pins of another window.
++  void HandleDetachedPins();
++  // Adds or removes the pins of tabs that were pinned or unpinned by a drag.
++  void HandleDraggedPinChanges();
++  // Closes the windows that were left with only hibernated pins after a drag,
++  // unless tabs were dragged back into them.
++  void CloseWindowsEmptiedByDrags();
+   // Takes the order of the pins in `browser` after the user moved one.
+   void ReorderPins(BrowserWindowInterface* browser);
+   // Returns the pin list position for a new pin `tab` in `browser`, right
+@@ -94,7 +116,8 @@ class HeliumPinsService : public KeyedSe
+                            HeliumPinsTabController* controller);
+ 
+   // Posts a Reconcile() of `browser`, after `delay` if given, or adds `browser`
+-  // to the one that is already posted.
++  // to the one that is already posted. Without `browser`, only retries handling
++  // the results of a drag.
+   void ScheduleReconcile(BrowserWindowInterface* browser,
+                          base::TimeDelta delay = base::TimeDelta());
+   void ScheduleReconcileOthers(BrowserWindowInterface* source);
+@@ -118,6 +141,17 @@ class HeliumPinsService : public KeyedSe
+   // True while this class modifies tab strips itself.
+   bool applying_changes_ = false;
+ 
++  std::vector<DetachedPin> detached_pins_;
++
++  // Tabs that were pinned or unpinned during a drag.
++  std::vector<tabs::TabHandle> dragged_pin_changes_;
++
++  // The loaded pins of the tab strip that tabs are being removed from.
++  raw_ptr<TabStripModel> removing_from_ = nullptr;
++  std::vector<tabs::TabHandle> loaded_pins_before_removal_;
++
++  std::vector<WindowEmptiedByDrag> windows_emptied_by_drags_;
++
+   std::vector<base::WeakPtr<BrowserWindowInterface>> pending_reconciles_;
+   bool reconcile_scheduled_ = false;
+ 
+--- a/chrome/browser/ui/tabs/helium_pins_service.cc
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -19,6 +19,8 @@
+ #include "base/values.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tab_list/tab_removed_reason.h"
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+@@ -129,6 +131,13 @@ void HeliumPinsService::OnTabStripModelC
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+     const TabStripSelectionChange& selection) {
++  std::vector<tabs::TabHandle> loaded_pins_before_removal;
++  if (change.type() == TabStripModelChange::kRemoved &&
++      removing_from_ == tab_strip_model) {
++    removing_from_ = nullptr;
++    loaded_pins_before_removal = std::exchange(loaded_pins_before_removal_, {});
++  }
++
+   BrowserWindowInterface* const browser =
+       tab_strip_model->delegate()->GetBrowserWindowInterface();
+   if (applying_changes_ || !IsSyncedBrowser(browser) ||
+@@ -148,15 +157,53 @@ void HeliumPinsService::OnTabStripModelC
+       break;
+     }
+     case TabStripModelChange::kRemoved: {
+-      // Closed or moved-away pins are replaced with a hibernated copy.
++      bool removed_pin = false;
++      std::vector<tabs::TabHandle> dragged_out;
+       for (const auto& removed : change.GetRemove()->contents) {
++        const tabs::TabHandle handle = removed.tab->GetHandle();
++        const bool is_dragged_out =
++            removed.remove_reason ==
++            TabRemovedReason::kInsertedIntoOtherTabStrip;
++        if (is_dragged_out) {
++          dragged_out.push_back(handle);
++        }
++
+         HeliumPinsTabController* const controller =
+             HeliumPinsTabController::From(removed.tab);
+-        if (controller && !controller->pin_id().empty()) {
+-          ScheduleReconcile(browser);
+-          break;
++        if (!controller || controller->pin_id().empty()) {
++          continue;
++        }
++        removed_pin = true;
++        // Where a pin that leaves the window ends up is only known once the
++        // drag is done, see HandleDetachedPins().
++        if (is_dragged_out &&
++            !std::ranges::contains(detached_pins_, handle, &DetachedPin::tab)) {
++          detached_pins_.push_back(
++              {handle, browser->GetWeakPtr(), controller->pin_id()});
+         }
+       }
++      // Closed or moved-away pins are replaced with a hibernated copy.
++      if (removed_pin) {
++        ScheduleReconcile(browser);
++      }
++
++      // Like closing them, dragging out the last unpinned tabs of a window
++      // without loaded pins closes the window.
++      const bool has_loaded_pins = std::ranges::any_of(
++          loaded_pins_before_removal,
++          [tab_strip_model](tabs::TabHandle handle) {
++            tabs::TabInterface* const tab = handle.Get();
++            return tab &&
++                   tab_strip_model->GetIndexOfTab(tab) != TabStripModel::kNoTab;
++          });
++      if (!dragged_out.empty() && !has_loaded_pins &&
++          !tab_strip_model->empty() &&
++          tab_strip_model->IndexOfFirstNonPinnedTab() ==
++              tab_strip_model->count()) {
++        windows_emptied_by_drags_.push_back(
++            {browser->GetWeakPtr(), std::move(dragged_out)});
++        ScheduleReconcile(browser);
++      }
+       break;
+     }
+     case TabStripModelChange::kMoved: {
+@@ -171,6 +218,23 @@ void HeliumPinsService::OnTabStripModelC
+   }
+ }
+ 
++void HeliumPinsService::OnTabWillBeRemoved(tabs::TabInterface* tab, int index) {
++  BrowserWindowInterface* const browser = tab->GetBrowserWindowInterface();
++  // Several tabs can be removed at once, so only look before the first one.
++  if (applying_changes_ || !IsSyncedBrowser(browser) ||
++      removing_from_ == browser->GetTabStripModel()) {
++    return;
++  }
++
++  removing_from_ = browser->GetTabStripModel();
++  loaded_pins_before_removal_.clear();
++  for (HeliumPinsTabController* controller : GetPinnedTabControllers(browser)) {
++    if (!IsHibernated(controller->tab().GetContents())) {
++      loaded_pins_before_removal_.push_back(controller->tab().GetHandle());
++    }
++  }
++}
++
+ void HeliumPinsService::OnTabPinnedStateChanged(tabs::TabInterface* tab,
+                                                 int index) {
+   BrowserWindowInterface* const browser = tab->GetBrowserWindowInterface();
+@@ -178,6 +242,16 @@ void HeliumPinsService::OnTabPinnedState
+     return;
+   }
+ 
++  // Drags pin and unpin tabs as they move them around, so the pin list only
++  // changes once the drag is done.
++  if (!CanChangePins(browser)) {
++    if (!std::ranges::contains(dragged_pin_changes_, tab->GetHandle())) {
++      dragged_pin_changes_.push_back(tab->GetHandle());
++    }
++    ScheduleReconcile(browser, kReconcileRetryDelay);
++    return;
++  }
++
+   if (tab->IsPinned()) {
+     AddPin(browser, tab);
+   } else {
+@@ -370,6 +444,95 @@ void HeliumPinsService::UnpinEverywhere(
+   }
+ }
+ 
++void HeliumPinsService::HandleDetachedPins() {
++  std::vector<DetachedPin> detached = std::exchange(detached_pins_, {});
++  for (const DetachedPin& pin : detached) {
++    tabs::TabInterface* const tab = pin.tab.Get();
++    BrowserWindowInterface* const target =
++        tab ? tab->GetBrowserWindowInterface() : nullptr;
++    // The pin is still being dragged.
++    if (IsSyncedBrowser(target) && !CanChangePins(target)) {
++      detached_pins_.push_back(pin);
++      continue;
++    }
++
++    // Its window gets a copy of the pin again, unless it's unpinned below.
++    if (pin.source) {
++      ScheduleReconcile(pin.source.get());
++    }
++
++    // Pins that were closed or went back to their window stay pins.
++    if (!IsSyncedBrowser(target) || target == pin.source.get()) {
++      continue;
++    }
++
++    // A pin dropped among the pins of another window only moves there.
++    const auto is_copy_in_target = [&](HeliumPinsTabController* copy) {
++      return &copy->tab() != tab &&
++             copy->tab().GetBrowserWindowInterface() == target;
++    };
++    if (tab->IsPinned() &&
++        std::ranges::any_of(GetPinCopies(pin.id), is_copy_in_target)) {
++      continue;
++    }
++
++    // Anywhere else, e.g. in a new window, it becomes a regular tab.
++    HeliumPinsTabController::From(tab)->ClearPin();
++    if (tab->IsPinned()) {
++      base::AutoReset<bool> applying_changes(&applying_changes_, true);
++      TabStripModel* const model = target->GetTabStripModel();
++      model->SetTabPinned(model->GetIndexOfTab(tab), false);
++    }
++    UnpinEverywhere(pin.id);
++  }
++}
++
++void HeliumPinsService::HandleDraggedPinChanges() {
++  std::vector<tabs::TabHandle> changes =
++      std::exchange(dragged_pin_changes_, {});
++  for (tabs::TabHandle handle : changes) {
++    tabs::TabInterface* const tab = handle.Get();
++    BrowserWindowInterface* const browser =
++        tab ? tab->GetBrowserWindowInterface() : nullptr;
++    if (!IsSyncedBrowser(browser)) {
++      continue;
++    }
++    if (!CanChangePins(browser)) {
++      dragged_pin_changes_.push_back(handle);
++    } else if (tab->IsPinned()) {
++      AddPin(browser, tab);
++    } else {
++      RemovePin(tab);
++    }
++  }
++}
++
++void HeliumPinsService::CloseWindowsEmptiedByDrags() {
++  // Tabs can still be dragged back while a drag is going on.
++  if (!std::ranges::all_of(GetSyncedBrowsers(), CanChangePins)) {
++    return;
++  }
++
++  std::vector<WindowEmptiedByDrag> windows =
++      std::exchange(windows_emptied_by_drags_, {});
++  for (const WindowEmptiedByDrag& window : windows) {
++    BrowserWindowInterface* const browser = window.browser.get();
++    if (!browser || browser->IsDeleteScheduled()) {
++      continue;
++    }
++    // The tabs may have come back later in the drag, e.g. to be pinned.
++    const bool tabs_returned =
++        std::ranges::any_of(window.tabs, [browser](tabs::TabHandle handle) {
++          tabs::TabInterface* const tab = handle.Get();
++          return tab && tab->GetBrowserWindowInterface() == browser;
++        });
++    TabStripModel* const model = browser->GetTabStripModel();
++    if (!tabs_returned && model->IndexOfFirstNonPinnedTab() == model->count()) {
++      chrome::CloseWindow(browser);
++    }
++  }
++}
++
+ void HeliumPinsService::ReorderPins(BrowserWindowInterface* browser) {
+   // Positions in the pin list of the pins in `browser`, and their new order.
+   std::vector<size_t> positions;
+@@ -428,7 +591,8 @@ std::string HeliumPinsService::InsertNew
+ 
+ void HeliumPinsService::ScheduleReconcile(BrowserWindowInterface* browser,
+                                           base::TimeDelta delay) {
+-  if (!std::ranges::contains(pending_reconciles_, browser,
++  if (browser &&
++      !std::ranges::contains(pending_reconciles_, browser,
+                              &base::WeakPtr<BrowserWindowInterface>::get)) {
+     pending_reconciles_.push_back(browser->GetWeakPtr());
+   }
+@@ -458,9 +622,13 @@ void HeliumPinsService::ReconcilePending
+     return;
+   }
+ 
+-  // Windows in the middle of a drag are retried later.
++  // Windows in the middle of a drag, which a dragged tab can pass through, are
++  // retried later. Tabs that the drag changed are handled once they are in a
++  // window that isn't in the middle of a drag.
+   std::vector<base::WeakPtr<BrowserWindowInterface>> pending =
+       std::exchange(pending_reconciles_, {});
++  HandleDetachedPins();
++  HandleDraggedPinChanges();
+   for (const base::WeakPtr<BrowserWindowInterface>& browser : pending) {
+     if (!browser || browser->IsDeleteScheduled() ||
+         !IsSyncedBrowser(browser.get())) {
+@@ -472,6 +640,12 @@ void HeliumPinsService::ReconcilePending
+       ScheduleReconcile(browser.get(), kReconcileRetryDelay);
+     }
+   }
++  CloseWindowsEmptiedByDrags();
++
++  if (!detached_pins_.empty() || !dragged_pin_changes_.empty() ||
++      !windows_emptied_by_drags_.empty()) {
++    ScheduleReconcile(nullptr, kReconcileRetryDelay);
++  }
+ }
+ 
+ void HeliumPinsService::Reconcile(BrowserWindowInterface* browser) {
+@@ -545,6 +719,10 @@ void HeliumPinsService::Reconcile(Browse
+   for (const Pin& pin : pins_) {
+     const auto it = present.find(pin.id);
+     if (it == present.end()) {
++      // Pins that are being dragged around get their copy after the drag.
++      if (std::ranges::contains(detached_pins_, pin.id, &DetachedPin::id)) {
++        continue;
++      }
+       const int index = std::min(next_index, model->IndexOfFirstNonPinnedTab());
+       InsertHibernatedPin(browser, index, pin);
+       next_index = index + 1;
