@@ -1,0 +1,734 @@
+--- /dev/null
++++ b/chrome/browser/ui/tabs/helium_pins_service.h
+@@ -0,0 +1,120 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_HELIUM_PINS_SERVICE_H_
++#define CHROME_BROWSER_UI_TABS_HELIUM_PINS_SERVICE_H_
++
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/tabs/public/tab_interface.h"
++#include "url/gurl.h"
++
++class BrowserWindowInterface;
++class GlobalBrowserCollection;
++class Profile;
++class TabStripModel;
++
++namespace helium_pins {
++
++class HeliumPinsTabController;
++
++// Keeps the pinned tabs of a profile's normal windows in sync with its pin
++// list. Each window has its own tab for every pin, a copy of the pin; missing
++// copies are added hibernated. The list is saved on every change, except for
++// off-the-record profiles.
++class HeliumPinsService : public KeyedService,
++                          public BrowserCollectionObserver,
++                          public TabStripModelObserver {
++ public:
++  explicit HeliumPinsService(Profile* profile);
++  HeliumPinsService(const HeliumPinsService&) = delete;
++  HeliumPinsService& operator=(const HeliumPinsService&) = delete;
++  ~HeliumPinsService() override;
++
++ private:
++  struct Pin {
++    std::string id;
++    GURL url;
++  };
++
++  // BrowserCollectionObserver:
++  void OnBrowserCreated(BrowserWindowInterface* browser) override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++
++  // Returns whether `browser` is a normal window of the profile.
++  bool IsSyncedBrowser(BrowserWindowInterface* browser) const;
++  std::vector<BrowserWindowInterface*> GetSyncedBrowsers() const;
++  // Returns the copies of the pin `id` in all synced windows.
++  std::vector<HeliumPinsTabController*> GetPinCopies(
++      const std::string& id) const;
++
++  std::vector<Pin>::iterator FindPin(const std::string& id);
++
++  // Reads the stored pin list.
++  void LoadPins();
++  void SavePins();
++
++  // Handles the user pinning or unpinning `tab` in `browser`.
++  void AddPin(BrowserWindowInterface* browser, tabs::TabInterface* tab);
++  void RemovePin(tabs::TabInterface* tab);
++  // Removes the pin `id` from the pin list and closes its tabs.
++  void UnpinEverywhere(const std::string& id);
++  // Takes the order of the pins in `browser` after the user moved one.
++  void ReorderPins(BrowserWindowInterface* browser);
++  // Returns the pin list position for a new pin `tab` in `browser`, right
++  // after the pin preceding it there.
++  size_t GetNewPinPosition(BrowserWindowInterface* browser,
++                           tabs::TabInterface* tab);
++  // Adds a new pin for the tab of `controller` to the pin list, right after the
++  // pin preceding it in `browser`, and links the tab to it. Returns the pin's
++  // id.
++  std::string InsertNewPin(BrowserWindowInterface* browser,
++                           HeliumPinsTabController* controller);
++
++  // Posts a Reconcile() of `browser`, after `delay` if given, or adds `browser`
++  // to the one that is already posted.
++  void ScheduleReconcile(BrowserWindowInterface* browser,
++                         base::TimeDelta delay = base::TimeDelta());
++  void ScheduleReconcileOthers(BrowserWindowInterface* source);
++  void ReconcilePending();
++  // Makes the pinned tabs of `browser` match the pin list.
++  void Reconcile(BrowserWindowInterface* browser);
++  // Adds a hibernated copy of `pin` at `index` of `browser`.
++  void InsertHibernatedPin(BrowserWindowInterface* browser,
++                           int index,
++                           const Pin& pin);
++
++  const raw_ptr<Profile> profile_;
++
++  std::vector<Pin> pins_;
++
++  // True while this class modifies tab strips itself.
++  bool applying_changes_ = false;
++
++  std::vector<base::WeakPtr<BrowserWindowInterface>> pending_reconciles_;
++  bool reconcile_scheduled_ = false;
++
++  base::ScopedObservation<GlobalBrowserCollection, BrowserCollectionObserver>
++      browser_collection_observation_{this};
++
++  base::WeakPtrFactory<HeliumPinsService> weak_factory_{this};
++};
++
++}  // namespace helium_pins
++
++#endif  // CHROME_BROWSER_UI_TABS_HELIUM_PINS_SERVICE_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -0,0 +1,521 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/helium_pins_service.h"
++
++#include <algorithm>
++#include <map>
++#include <optional>
++#include <utility>
++
++#include "base/auto_reset.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "chrome/browser/lifetime/browser_shutdown.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/web_contents.h"
++#include "url/url_constants.h"
++
++namespace helium_pins {
++
++namespace {
++
++// Keys of the pinned tabs preference entries. "url" is shared with
++// PinnedTabCodec, which still reads the list to open pins at startup.
++constexpr char kUrlKey[] = "url";
++constexpr char kIdKey[] = "id";
++
++// Retry delay for windows that can't be changed yet, e.g. during a tab drag.
++constexpr base::TimeDelta kReconcileRetryDelay = base::Milliseconds(250);
++
++std::string CreatePinId() {
++  return base::Uuid::GenerateRandomV4().AsLowercaseString();
++}
++
++GURL GetNewPinUrl(content::WebContents* contents) {
++  const GURL url = GetPinnableUrl(contents);
++  return url.is_valid() ? url : GURL(url::kAboutBlankURL);
++}
++
++// Returns the controllers of the pinned tabs of `browser`, in tab strip order.
++std::vector<HeliumPinsTabController*> GetPinnedTabControllers(
++    BrowserWindowInterface* browser) {
++  std::vector<HeliumPinsTabController*> controllers;
++  TabStripModel* const model = browser->GetTabStripModel();
++  for (int index = 0; index < model->IndexOfFirstNonPinnedTab(); ++index) {
++    if (HeliumPinsTabController* controller =
++            HeliumPinsTabController::From(model->GetTabAtIndex(index))) {
++      controllers.push_back(controller);
++    }
++  }
++  return controllers;
++}
++
++// Returns whether the pins of `browser` can be changed right now.
++bool CanChangePins(BrowserWindowInterface* browser) {
++  TabStripModel* const model = browser->GetTabStripModel();
++  return !model->empty() && !model->closing_all() &&
++         model->delegate()->IsTabStripEditable();
++}
++
++// Returns whether `tab` is a better copy of a pin to keep than `other`: the
++// one the user is looking at, or else one that is loaded.
++bool IsPreferredCopy(tabs::TabInterface* tab, tabs::TabInterface* other) {
++  if (tab->IsActivated() != other->IsActivated()) {
++    return tab->IsActivated();
++  }
++  return IsHibernated(other->GetContents()) &&
++         !IsHibernated(tab->GetContents());
++}
++
++}  // namespace
++
++HeliumPinsService::HeliumPinsService(Profile* profile) : profile_(profile) {
++  // Off-the-record profiles start without pins.
++  if (!profile_->IsOffTheRecord()) {
++    LoadPins();
++  }
++
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [this](BrowserWindowInterface* browser) {
++        OnBrowserCreated(browser);
++        return true;
++      });
++  browser_collection_observation_.Observe(
++      GlobalBrowserCollection::GetInstance());
++}
++
++HeliumPinsService::~HeliumPinsService() = default;
++
++void HeliumPinsService::OnBrowserCreated(BrowserWindowInterface* browser) {
++  if (!IsSyncedBrowser(browser)) {
++    return;
++  }
++
++  browser->GetTabStripModel()->AddObserver(this);
++  // Deferred, so that pins opened by startup or session restore are matched
++  // instead of duplicated.
++  ScheduleReconcile(browser);
++}
++
++void HeliumPinsService::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  BrowserWindowInterface* const browser =
++      tab_strip_model->delegate()->GetBrowserWindowInterface();
++  if (applying_changes_ || !IsSyncedBrowser(browser) ||
++      tab_strip_model->closing_all() ||
++      browser_shutdown::HasShutdownStarted()) {
++    return;
++  }
++
++  switch (change.type()) {
++    case TabStripModelChange::kInserted: {
++      // Pins can arrive from session restore, other windows or extensions.
++      if (std::ranges::any_of(
++              change.GetInsert()->contents,
++              [](const auto& inserted) { return inserted.tab->IsPinned(); })) {
++        ScheduleReconcile(browser);
++      }
++      break;
++    }
++    case TabStripModelChange::kRemoved: {
++      // Closed or moved-away pins are replaced with a hibernated copy.
++      for (const auto& removed : change.GetRemove()->contents) {
++        HeliumPinsTabController* const controller =
++            HeliumPinsTabController::From(removed.tab);
++        if (controller && !controller->pin_id().empty()) {
++          ScheduleReconcile(browser);
++          break;
++        }
++      }
++      break;
++    }
++    case TabStripModelChange::kMoved: {
++      if (IsPersistentPin(change.GetMove()->tab)) {
++        ReorderPins(browser);
++      }
++      break;
++    }
++    case TabStripModelChange::kReplaced:
++    case TabStripModelChange::kSelectionOnly:
++      break;
++  }
++}
++
++void HeliumPinsService::OnTabPinnedStateChanged(tabs::TabInterface* tab,
++                                                int index) {
++  BrowserWindowInterface* const browser = tab->GetBrowserWindowInterface();
++  if (applying_changes_ || !IsSyncedBrowser(browser)) {
++    return;
++  }
++
++  if (tab->IsPinned()) {
++    AddPin(browser, tab);
++  } else {
++    RemovePin(tab);
++  }
++}
++
++bool HeliumPinsService::IsSyncedBrowser(BrowserWindowInterface* browser) const {
++  return HasPersistentPins(browser) && browser->GetProfile() == profile_;
++}
++
++std::vector<BrowserWindowInterface*> HeliumPinsService::GetSyncedBrowsers()
++    const {
++  std::vector<BrowserWindowInterface*> browsers;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [this, &browsers](BrowserWindowInterface* browser) {
++        if (IsSyncedBrowser(browser) && !browser->IsDeleteScheduled()) {
++          browsers.push_back(browser);
++        }
++        return true;
++      });
++  return browsers;
++}
++
++std::vector<HeliumPinsTabController*> HeliumPinsService::GetPinCopies(
++    const std::string& id) const {
++  std::vector<HeliumPinsTabController*> copies;
++  for (BrowserWindowInterface* browser : GetSyncedBrowsers()) {
++    for (HeliumPinsTabController* controller :
++         GetPinnedTabControllers(browser)) {
++      if (controller->pin_id() == id) {
++        copies.push_back(controller);
++      }
++    }
++  }
++  return copies;
++}
++
++std::vector<HeliumPinsService::Pin>::iterator HeliumPinsService::FindPin(
++    const std::string& id) {
++  return std::ranges::find(pins_, id, &Pin::id);
++}
++
++void HeliumPinsService::LoadPins() {
++  for (const base::Value& value :
++       profile_->GetPrefs()->GetList(prefs::kPinnedTabs)) {
++    const base::DictValue* const dict = value.GetIfDict();
++    const std::string* const url = dict ? dict->FindString(kUrlKey) : nullptr;
++    if (!url) {
++      continue;
++    }
++    const std::string* const id = dict->FindString(kIdKey);
++    if (id && !id->empty() && FindPin(*id) == pins_.end()) {
++      pins_.push_back({*id, GURL(*url)});
++    }
++  }
++}
++
++void HeliumPinsService::SavePins() {
++  if (profile_->IsOffTheRecord()) {
++    return;
++  }
++
++  base::ListValue values;
++  for (const Pin& pin : pins_) {
++    base::DictValue value =
++        base::DictValue().Set(kUrlKey, pin.url.spec()).Set(kIdKey, pin.id);
++    values.Append(std::move(value));
++  }
++  PrefService* const prefs = profile_->GetPrefs();
++  prefs->SetList(prefs::kPinnedTabs, std::move(values));
++  // Pin list changes are rare, so write them right away.
++  prefs->CommitPendingWrite();
++}
++
++void HeliumPinsService::AddPin(BrowserWindowInterface* browser,
++                               tabs::TabInterface* tab) {
++  HeliumPinsTabController* const controller =
++      HeliumPinsTabController::From(tab);
++  if (!controller || FindPin(controller->pin_id()) != pins_.end()) {
++    return;
++  }
++
++  InsertNewPin(browser, controller);
++  SavePins();
++  ScheduleReconcileOthers(browser);
++}
++
++void HeliumPinsService::RemovePin(tabs::TabInterface* tab) {
++  HeliumPinsTabController* const controller =
++      HeliumPinsTabController::From(tab);
++  if (!controller || controller->pin_id().empty()) {
++    return;
++  }
++
++  const std::string id = controller->pin_id();
++  controller->ClearPin();
++  UnpinEverywhere(id);
++}
++
++void HeliumPinsService::UnpinEverywhere(const std::string& id) {
++  const auto it = FindPin(id);
++  if (it == pins_.end()) {
++    return;
++  }
++  pins_.erase(it);
++  SavePins();
++
++  base::AutoReset<bool> applying_changes(&applying_changes_, true);
++  for (HeliumPinsTabController* copy : GetPinCopies(id)) {
++    copy->ClearPin();
++    // Rather than closing a window, its last tab becomes a regular tab.
++    TabStripModel* const model =
++        copy->tab().GetBrowserWindowInterface()->GetTabStripModel();
++    if (model->count() == 1) {
++      model->SetTabPinned(0, false);
++      continue;
++    }
++    copy->tab().Close();
++  }
++}
++
++void HeliumPinsService::ReorderPins(BrowserWindowInterface* browser) {
++  // Positions in the pin list of the pins in `browser`, and their new order.
++  std::vector<size_t> positions;
++  std::vector<Pin> reordered;
++  for (HeliumPinsTabController* controller : GetPinnedTabControllers(browser)) {
++    const auto it = FindPin(controller->pin_id());
++    // A pin can have two tabs in a window for a moment, e.g. while it's
++    // dragged back in, so only its first one counts.
++    if (it != pins_.end() &&
++        !std::ranges::contains(reordered, it->id, &Pin::id)) {
++      positions.push_back(it - pins_.begin());
++      reordered.push_back(*it);
++    }
++  }
++
++  // Pins missing from `browser` keep their positions.
++  std::ranges::sort(positions);
++  bool changed = false;
++  for (size_t i = 0; i < positions.size(); ++i) {
++    if (pins_[positions[i]].id != reordered[i].id) {
++      pins_[positions[i]] = std::move(reordered[i]);
++      changed = true;
++    }
++  }
++
++  if (changed) {
++    SavePins();
++    ScheduleReconcileOthers(browser);
++  }
++}
++
++size_t HeliumPinsService::GetNewPinPosition(BrowserWindowInterface* browser,
++                                            tabs::TabInterface* tab) {
++  size_t position = 0;
++  for (HeliumPinsTabController* controller : GetPinnedTabControllers(browser)) {
++    if (&controller->tab() == tab) {
++      break;
++    }
++    const auto it = FindPin(controller->pin_id());
++    if (it != pins_.end()) {
++      position = it - pins_.begin() + 1;
++    }
++  }
++  return position;
++}
++
++std::string HeliumPinsService::InsertNewPin(
++    BrowserWindowInterface* browser,
++    HeliumPinsTabController* controller) {
++  tabs::TabInterface* const tab = &controller->tab();
++  const Pin pin{CreatePinId(), GetNewPinUrl(tab->GetContents())};
++  pins_.insert(pins_.begin() + GetNewPinPosition(browser, tab), pin);
++  controller->SetPin(pin.id, pin.url);
++  return pin.id;
++}
++
++void HeliumPinsService::ScheduleReconcile(BrowserWindowInterface* browser,
++                                          base::TimeDelta delay) {
++  if (!std::ranges::contains(pending_reconciles_, browser,
++                             &base::WeakPtr<BrowserWindowInterface>::get)) {
++    pending_reconciles_.push_back(browser->GetWeakPtr());
++  }
++  if (!reconcile_scheduled_) {
++    reconcile_scheduled_ = true;
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&HeliumPinsService::ReconcilePending,
++                       weak_factory_.GetWeakPtr()),
++        delay);
++  }
++}
++
++void HeliumPinsService::ScheduleReconcileOthers(
++    BrowserWindowInterface* source) {
++  for (BrowserWindowInterface* browser : GetSyncedBrowsers()) {
++    if (browser != source) {
++      ScheduleReconcile(browser);
++    }
++  }
++}
++
++void HeliumPinsService::ReconcilePending() {
++  reconcile_scheduled_ = false;
++  if (browser_shutdown::HasShutdownStarted()) {
++    pending_reconciles_.clear();
++    return;
++  }
++
++  // Windows in the middle of a drag are retried later.
++  std::vector<base::WeakPtr<BrowserWindowInterface>> pending =
++      std::exchange(pending_reconciles_, {});
++  for (const base::WeakPtr<BrowserWindowInterface>& browser : pending) {
++    if (!browser || browser->IsDeleteScheduled() ||
++        !IsSyncedBrowser(browser.get())) {
++      continue;
++    }
++    if (CanChangePins(browser.get())) {
++      Reconcile(browser.get());
++    } else {
++      ScheduleReconcile(browser.get(), kReconcileRetryDelay);
++    }
++  }
++}
++
++void HeliumPinsService::Reconcile(BrowserWindowInterface* browser) {
++  base::AutoReset<bool> applying_changes(&applying_changes_, true);
++  TabStripModel* const model = browser->GetTabStripModel();
++  bool pins_changed = false;
++
++  // Sort the pinned tabs of the window by their pin list entry.
++  std::map<std::string, HeliumPinsTabController*> present;
++  std::vector<HeliumPinsTabController*> unidentified;
++  std::vector<HeliumPinsTabController*> to_unpin;
++  std::vector<HeliumPinsTabController*> to_close;
++  for (HeliumPinsTabController* controller : GetPinnedTabControllers(browser)) {
++    const std::string& id = controller->pin_id();
++    if (id.empty()) {
++      unidentified.push_back(controller);
++    } else if (FindPin(id) == pins_.end()) {
++      // The pin was removed while this tab's window was closed.
++      to_unpin.push_back(controller);
++    } else if (auto it = present.find(id); it != present.end()) {
++      // A duplicate, e.g. dragged in from another window.
++      if (IsPreferredCopy(&controller->tab(), &it->second->tab())) {
++        to_close.push_back(std::exchange(it->second, controller));
++      } else {
++        to_close.push_back(controller);
++      }
++    } else {
++      present[id] = controller;
++    }
++  }
++
++  // Pins without an id, e.g. from startup or extensions, are matched by URL.
++  for (HeliumPinsTabController* controller : unidentified) {
++    content::WebContents* const contents = controller->tab().GetContents();
++    const GURL url = GetPinnableUrl(contents);
++    const auto match = std::ranges::find_if(pins_, [&](const Pin& pin) {
++      return pin.url == url && !present.contains(pin.id);
++    });
++    if (match != pins_.end()) {
++      controller->SetPin(match->id, match->url);
++      present[match->id] = controller;
++    } else {
++      present[InsertNewPin(browser, controller)] = controller;
++      pins_changed = true;
++    }
++  }
++
++  for (HeliumPinsTabController* controller : to_close) {
++    controller->ClearPin();
++    controller->tab().Close();
++  }
++  for (HeliumPinsTabController* controller : to_unpin) {
++    controller->ClearPin();
++    const int index = model->GetIndexOfTab(&controller->tab());
++    if (index != TabStripModel::kNoTab && model->IsTabPinned(index)) {
++      model->SetTabPinned(index, false);
++    }
++  }
++
++  // Tabs restored with their window can have an outdated pinned URL.
++  for (const auto& [id, controller] : present) {
++    const GURL& url = FindPin(id)->url;
++    if (controller->pinned_url() != url) {
++      controller->SetPinnedUrl(url);
++    }
++  }
++
++  // Add missing pins and restore the shared order.
++  int next_index = 0;
++  for (const Pin& pin : pins_) {
++    const auto it = present.find(pin.id);
++    if (it == present.end()) {
++      const int index = std::min(next_index, model->IndexOfFirstNonPinnedTab());
++      InsertHibernatedPin(browser, index, pin);
++      next_index = index + 1;
++      continue;
++    }
++
++    const int index = model->GetIndexOfTab(&it->second->tab());
++    if (index != next_index) {
++      model->MoveWebContentsAt(index, next_index, /*select_after_move=*/false);
++    }
++    ++next_index;
++  }
++
++  if (pins_changed) {
++    SavePins();
++    ScheduleReconcileOthers(browser);
++  }
++}
++
++void HeliumPinsService::InsertHibernatedPin(BrowserWindowInterface* browser,
++                                            int index,
++                                            const Pin& pin) {
++  sessions::SerializedNavigationEntry navigation;
++  navigation.set_index(0);
++  navigation.set_virtual_url(pin.url);
++
++  // Show the title of a loaded copy, if one is still at the pinned URL.
++  for (HeliumPinsTabController* copy : GetPinCopies(pin.id)) {
++    const content::NavigationEntry* const entry =
++        copy->tab().GetContents()->GetController().GetLastCommittedEntry();
++    if (entry && entry->GetURL() == pin.url) {
++      navigation.set_title(entry->GetTitle());
++    }
++  }
++
++  content::WebContents* const contents = chrome::AddRestoredTab(
++      browser, base::span_from_ref(navigation), index,
++      /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
++      /*group=*/std::nullopt, /*select=*/false, /*pin=*/true,
++      /*last_active_time_ticks=*/base::TimeTicks(),
++      /*last_active_time=*/base::Time(), /*storage_namespace=*/nullptr,
++      /*user_agent_override=*/sessions::SerializedUserAgentOverride(),
++      /*extra_data=*/{}, /*from_session_restore=*/false,
++      /*is_active_browser=*/std::nullopt,
++      chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
++
++  if (HeliumPinsTabController* controller = HeliumPinsTabController::From(
++          tabs::TabInterface::GetFromContents(contents))) {
++    controller->SetPin(pin.id, pin.url);
++  }
++}
++
++}  // namespace helium_pins
+--- a/chrome/browser/ui/tabs/pinned_tab_service_factory.h
++++ b/chrome/browser/ui/tabs/pinned_tab_service_factory.h
+@@ -8,16 +8,19 @@
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile_keyed_service_factory.h"
+ 
+-class PinnedTabService;
+ class Profile;
+ 
++namespace helium_pins {
++class HeliumPinsService;
++}  // namespace helium_pins
++
+ // Singleton that owns all PinnedTabServices and associates them with Profiles.
+ // Listens for the Profile's destruction notification and cleans up the
+ // associated PinnedTabService.
+ class PinnedTabServiceFactory : public ProfileKeyedServiceFactory {
+  public:
+-  // Returns the PinnedTabService that tracks pinning changes for `profile`.
+-  static PinnedTabService* GetForProfile(Profile* profile);
++  // Returns the persistent pins of `profile`.
++  static helium_pins::HeliumPinsService* GetForProfile(Profile* profile);
+ 
+   static PinnedTabServiceFactory* GetInstance();
+ 
+--- a/chrome/browser/ui/tabs/pinned_tab_service_factory.cc
++++ b/chrome/browser/ui/tabs/pinned_tab_service_factory.cc
+@@ -5,11 +5,12 @@
+ #include "chrome/browser/ui/tabs/pinned_tab_service_factory.h"
+ 
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/ui/tabs/pinned_tab_service.h"
++#include "chrome/browser/ui/tabs/helium_pins_service.h"
+ 
+ // static
+-PinnedTabService* PinnedTabServiceFactory::GetForProfile(Profile* profile) {
+-  return static_cast<PinnedTabService*>(
++helium_pins::HeliumPinsService* PinnedTabServiceFactory::GetForProfile(
++    Profile* profile) {
++  return static_cast<helium_pins::HeliumPinsService*>(
+       GetInstance()->GetServiceForBrowserContext(profile, true));
+ }
+ 
+@@ -21,11 +22,10 @@ PinnedTabServiceFactory* PinnedTabServic
+ PinnedTabServiceFactory::PinnedTabServiceFactory()
+     : ProfileKeyedServiceFactory(
+           "PinnedTabService",
++          // Off-the-record profiles get their own, in-memory pins.
+           ProfileSelections::Builder()
+-              .WithRegular(ProfileSelection::kOriginalOnly)
+-              // TODO(crbug.com/40257657): Check if this service is needed in
+-              // Guest mode.
+-              .WithGuest(ProfileSelection::kOriginalOnly)
++              .WithRegular(ProfileSelection::kOwnInstance)
++              .WithGuest(ProfileSelection::kOwnInstance)
+               // TODO(crbug.com/41488885): Check if this service is needed for
+               // Ash Internals.
+               .WithAshInternals(ProfileSelection::kOriginalOnly)
+@@ -36,7 +36,9 @@ PinnedTabServiceFactory::~PinnedTabServi
+ std::unique_ptr<KeyedService>
+ PinnedTabServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* profile) const {
+-  return std::make_unique<PinnedTabService>(static_cast<Profile*>(profile));
++  // Persistent pins replace the pinned tabs that PinnedTabService saves.
++  return std::make_unique<helium_pins::HeliumPinsService>(
++      static_cast<Profile*>(profile));
+ }
+ 
+ bool PinnedTabServiceFactory::ServiceIsCreatedWithBrowserContext() const {
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -438,6 +438,7 @@ if (!is_android) {
+   source_set("tabs") {
+     sources = [
+       "features.h",
++      "helium_pins_service.h",
+       "helium_pins_tab_controller.h",
+       "helium_pins_util.h",
+       "horizontal_tab_strip_metrics.h",
+@@ -513,6 +514,7 @@ if (!is_android) {
+     ]
+ 
+     sources = [
++      "helium_pins_service.cc",
+       "helium_pins_tab_controller.cc",
+       "helium_pins_util.cc",
+       "horizontal_tab_strip_metrics.cc",
