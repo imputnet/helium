@@ -1,0 +1,443 @@
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -513,6 +513,12 @@ class TabStripModel {
+   // tabstrip).)
+   int SetTabPinned(int index, bool pinned);
+ 
++  // Changes the pinned state of all tabs at `indices`, moving them in the
++  // process if necessary. If indices contains all tabs in a split, the whole
++  // split is pinned/unpinned. Otherwise, the tabs will be individually
++  // processed, resulting in the split being unsplit.
++  void SetTabsPinned(const std::vector<int> indices, bool pinned);
++
+   // Returns true if the tab at `index` is pinned.
+   // See description above class for details on pinned tabs.
+   bool IsTabPinned(int index) const;
+@@ -1381,12 +1387,6 @@ class TabStripModel {
+       const std::vector<int>& tab_indices,
+       int destination_index) const;
+ 
+-  // Changes the pinned state of all tabs at `indices`, moving them in the
+-  // process if necessary. If indices contains all tabs in a split, the whole
+-  // split is pinned/unpinned. Otherwise, the tabs will be individually
+-  // processed, resulting in the split being unsplit.
+-  void SetTabsPinned(const std::vector<int> indices, bool pinned);
+-
+   // Implementation for setting the pinned state of the tab at `index`.
+   int SetTabPinnedImpl(int indices, bool pinned);
+ 
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
+@@ -9,6 +9,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
++#include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ #include "components/tab_groups/tab_group_id.h"
+@@ -148,9 +149,17 @@ void RootTabCollectionNode::OnChildMoved
+ 
+   bool pin_state_changed = src_pinned != dst_pinned;
+ 
++  // Dragged tabs that get pinned or unpinned keep their views, which the drag
++  // still refers to.
++  const TabCollectionNode* const moved_node =
++      GetNodeForHandle(moved_node_handle);
++  const bool is_dragged =
++      moved_node && moved_node->view() &&
++      GetController()->GetDragHandler().IsViewDragging(*moved_node->view());
++
+   auto animate_layout = GetController()->ScopedAnimateLayout();
+ 
+-  if (pin_state_changed) {
++  if (pin_state_changed && !is_dragged) {
+     // Pin state change is treated as a remove and add instead of an attach and
+     // detach since we have separate concurrent animations in each container.
+     src_parent_node->RemoveChild(GetPassKey(), moved_node_handle,
+--- a/chrome/browser/ui/views/tabs/dragging/drag_session_data.h
++++ b/chrome/browser/ui/views/tabs/dragging/drag_session_data.h
+@@ -68,9 +68,14 @@ struct TabDragData final {
+   // If attached this is the view in `attached_context_`.
+   raw_ptr<views::View> attached_view = nullptr;
+ 
+-  // Is the tab pinned?
++  // Is the tab pinned? Tabs can be pinned or unpinned during the drag, so this
++  // is updated when they leave a window.
+   bool pinned = false;
+ 
++  // Whether the tab was pinned when the drag started, which a canceled drag
++  // restores.
++  bool pinned_at_start = false;
++
+   // Contains the information for the tab's group at the start of the drag.
+   struct TabGroupData {
+     tab_groups::TabGroupId group_id;
+--- a/chrome/browser/ui/views/tabs/dragging/drag_session_data.cc
++++ b/chrome/browser/ui/views/tabs/dragging/drag_session_data.cc
+@@ -33,6 +33,7 @@ TabDragData::TabDragData(TabDragContext*
+     contents = source_context->GetContentsForTab(view);
+     pinned = source_context->GetTabStripModel()->IsTabPinned(
+         source_model_index.value());
++    pinned_at_start = pinned;
+     tab_group_id = source_context->GetTabStripModel()->GetTabGroupForTab(
+         source_model_index.value());
+   } else {
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/dragging/helium_pins_drag_util.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_DRAGGING_HELIUM_PINS_DRAG_UTIL_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_DRAGGING_HELIUM_PINS_DRAG_UTIL_H_
++
++#include <optional>
++#include <vector>
++
++class TabStripModel;
++struct TabDragData;
++
++namespace helium_pins {
++
++// Pins or unpins the dragged tabs in `model`. Without `pinned`, gives them back
++// the pinned state they had when the drag started, since tabs can be pinned or
++// unpinned while they are dragged.
++void SetDraggedTabsPinned(TabStripModel& model,
++                          const std::vector<TabDragData>& tab_drag_data,
++                          std::optional<bool> pinned);
++
++}  // namespace helium_pins
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_DRAGGING_HELIUM_PINS_DRAG_UTIL_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/dragging/helium_pins_drag_util.cc
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/dragging/helium_pins_drag_util.h"
++
++#include <algorithm>
++
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
++
++namespace helium_pins {
++
++void SetDraggedTabsPinned(TabStripModel& model,
++                          const std::vector<TabDragData>& tab_drag_data,
++                          std::optional<bool> pinned) {
++  // Returns the sorted indices of the tabs that should be pinned, or unpinned
++  // if `pin` is false. SetTabsPinned() skips the ones that already are.
++  const auto get_indices_to_change = [&](bool pin) {
++    std::vector<int> indices;
++    for (const TabDragData& tab_data : tab_drag_data) {
++      const int index = tab_data.contents
++                            ? model.GetIndexOfWebContents(tab_data.contents)
++                            : TabStripModel::kNoTab;
++      if (index != TabStripModel::kNoTab &&
++          pinned.value_or(tab_data.pinned_at_start) == pin) {
++        indices.push_back(index);
++      }
++    }
++    std::ranges::sort(indices);
++    return indices;
++  };
++
++  // Unpinning moves tabs, so the tabs to pin are looked up afterwards.
++  model.SetTabsPinned(get_indices_to_change(false), false);
++  model.SetTabsPinned(get_indices_to_change(true), true);
++}
++
++}  // namespace helium_pins
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -45,6 +45,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_popup_presenter_base.h"
+ #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
++#include "chrome/browser/ui/views/tabs/dragging/helium_pins_drag_util.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_target.h"
+ #include "chrome/browser/ui/views/tabs/dragging/window_finder.h"
+@@ -1693,10 +1694,13 @@ TabDragController::Detach(ReleaseCapture
+   }
+ 
+   std::vector<int> dragged_indices;
+-  for (const auto& data : drag_data_.tab_drag_data_) {
++  for (auto& data : drag_data_.tab_drag_data_) {
+     if (data.contents) {
+       const int index = attached_model->GetIndexOfWebContents(data.contents);
+       if (index != TabStripModel::kNoTab) {
++        // Tabs can be pinned or unpinned during the drag, so they keep the
++        // state they have when they leave the window.
++        data.pinned = attached_model->IsTabPinned(index);
+         dragged_indices.push_back(index);
+       }
+     }
+@@ -2224,6 +2228,11 @@ void TabDragController::RevertDrag() {
+       attached_context_->SetTabDetached(tab_datum.attached_view);
+       tab_datum.attached_view = nullptr;
+     }
++  } else {
++    // Tabs reverted from another window get their pinned state back when
++    // they're inserted.
++    helium_pins::SetDraggedTabsPinned(*source_context_->GetTabStripModel(),
++                                      drag_data_.tab_drag_data_, std::nullopt);
+   }
+ 
+   // Revert each tab, split and group. We manually increment `i` because
+@@ -2458,7 +2467,8 @@ void TabDragController::RevertTabAt(size
+             from_index);
+     source_context_->GetTabStripModel()->InsertDetachedTabAt(
+         target_index, std::move(detached_tab),
+-        (tab_data.pinned ? AddTabTypes::ADD_PINNED : 0), existing_group);
++        (tab_data.pinned_at_start ? AddTabTypes::ADD_PINNED : 0),
++        existing_group);
+   } else {
+     // The Tab was moved within the TabDragContext where the drag
+     // was initiated. Move it back to the starting location.
+@@ -2513,7 +2523,7 @@ void TabDragController::RevertSplitAt(si
+         attached_context_->GetTabStripModel()->DetachSplitTabForInsertion(
+             split_id);
+     source_context_->GetTabStripModel()->InsertDetachedSplitTabAt(
+-        std::move(detached_split), target_index, tab_data.pinned,
++        std::move(detached_split), target_index, tab_data.pinned_at_start,
+         existing_group);
+   } else {
+     if (target_index > from_index) {
+@@ -2542,7 +2552,7 @@ void TabDragController::RevertSplitAt(si
+     }
+ 
+     source_context_->GetTabStripModel()->MoveSplitTo(
+-        split_id, target_index, tab_data.pinned, existing_group);
++        split_id, target_index, tab_data.pinned_at_start, existing_group);
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
+@@ -189,6 +189,10 @@ class TabDragHandler : public TabDragCon
+   // Resets member variables that track a drag being managed by this handler.
+   void ResetDragState();
+ 
++  // Updates the layout of the pinned tabs, which act as a drop zone in the
++  // horizontal tab strip while dragging even if there are none.
++  void UpdatePinDropZone();
++
+   // Returns the group id of the dragged group header, or null if the drag
+   // was not initiated by a group header.
+   std::optional<tab_groups::TabGroupId> GetDraggingGroupHeaderId() const;
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+@@ -27,6 +28,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
++#include "chrome/browser/ui/views/tabs/dragging/helium_pins_drag_util.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
+ #include "components/tab_groups/tab_group_id.h"
+@@ -349,6 +351,16 @@ void TabDragHandler::HandleDraggedTabsIn
+   CHECK(drag_controller_);
+   const auto& drag_session_data = drag_controller_->GetSessionData();
+ 
++  // Tabs are pinned as they enter the pinned tabs, and unpinned as they leave
++  // them.
++  if (!IsDraggingGroups() &&
++      (node.type() == TabCollectionNode::Type::PINNED ||
++       node.type() == TabCollectionNode::Type::UNPINNED)) {
++    helium_pins::SetDraggedTabsPinned(
++        *tab_strip_model_, drag_session_data.tab_drag_data_,
++        node.type() == TabCollectionNode::Type::PINNED);
++  }
++
+   const TabDragData* source_drag_data =
+       drag_session_data.source_view_drag_data();
+   const content::WebContents* source_contents = source_drag_data->contents;
+@@ -686,6 +698,7 @@ std::unique_ptr<TabDragController> TabDr
+ 
+ void TabDragHandler::DestroyDragController() {
+   drag_controller_.reset();
++  UpdatePinDropZone();
+ }
+ 
+ void TabDragHandler::StartedDragging(const std::vector<views::View*>& views) {
+@@ -749,17 +762,20 @@ void TabDragHandler::StartedDragging(con
+     dragged_view->SetProperty(kOffsetAtTabDragStart, offset);
+   }
+ 
++  UpdatePinDropZone();
+   GetWidget()->LayoutRootViewIfNecessary();
+ }
+ 
+ void TabDragHandler::DraggedTabsDetached() {
+   expand_on_hover_lock_.reset();
+   scroll_synchronizers_.clear();
++  UpdatePinDropZone();
+ }
+ 
+ void TabDragHandler::StoppedDragging() {
+   expand_on_hover_lock_.reset();
+   scroll_synchronizers_.clear();
++  UpdatePinDropZone();
+ 
+   if (!drag_controller_) {
+     return;
+@@ -854,6 +870,17 @@ void TabDragHandler::ResetDragState() {
+   scroll_synchronizers_.clear();
+ }
+ 
++void TabDragHandler::UpdatePinDropZone() {
++  // Without pins, the pinned tabs container is only shown while dragging.
++  if (auto* tab_strip_view = views::AsViewClass<TabStripView>(
++          tab_strip_region_view_->GetTabStripView())) {
++    if (PinnedTabContainerView* pinned_container =
++            tab_strip_view->GetPinnedTabsContainer()) {
++      pinned_container->InvalidateLayout();
++    }
++  }
++}
++
+ bool TabDragHandler::HandleDraggedTabsIntoPosition(
+     const TabCollectionNode& container_node,
+     const TabCollectionNode* target) {
+--- a/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+@@ -283,6 +283,12 @@ void DraggedTabsContainer::InitializeDra
+   const auto* source_dragged_view = drag_handler.GetDraggedViewForAttachedView(
+       controller.GetSessionData().source_view_drag_data()->attached_view);
+ 
++  // The dragged views are only in this container if moving them here, e.g. by
++  // pinning or unpinning them, worked out.
++  if (!dragging_views_.contains(source_dragged_view)) {
++    return;
++  }
++
+   const auto source_view_target_position = GetDraggingViewPositionForBounds(
+       source_dragged_view, dragged_bounds_in_container,
+       dragging_views_.at(source_dragged_view).offset);
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
+@@ -89,6 +89,11 @@ class PinnedTabContainerView
+   void ResetCollectionNode();
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 
++  // Whether a drag of tabs that can be pinned is going on in this window. In
++  // the horizontal tab strip, an empty container then takes the size of a pin,
++  // so tabs can be dropped in.
++  bool ShowsDropZone() const;
++
+   const TabStripOrientation orientation_;
+   raw_ptr<TabCollectionNode> collection_node_ = nullptr;
+   const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -120,6 +120,10 @@ bool PinnedTabContainerView::IsDragging(
+   return GetDragHandler().IsDragging();
+ }
+ 
++bool PinnedTabContainerView::ShowsDropZone() const {
++  return IsDragging() && !GetDragHandler().IsDraggingGroups();
++}
++
+ bool PinnedTabContainerView::IsViewDragging(
+     const views::View& child_view) const {
+   if (!collection_node_ || !collection_node_->GetController()) {
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view_horizontal_layout.h
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view_horizontal_layout.h
+@@ -29,6 +29,11 @@ class PinnedTabContainerViewHorizontalLa
+   // views::LayoutManagerBase:
+   views::ProposedLayout CalculateProposedLayout(
+       const views::SizeBounds& size_bounds) const override;
++
++ private:
++  // The size of the container while it's an empty drop zone for pins, or an
++  // empty size if it isn't one.
++  gfx::Size GetDropZoneSize() const;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_HORIZONTAL_LAYOUT_H_
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view_horizontal_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view_horizontal_layout.cc
+@@ -23,7 +23,7 @@ gfx::Size PinnedTabContainerViewHorizont
+     const views::View* host) const {
+   if (!PinnedTabContainerView().collection_node_ ||
+       PinnedTabContainerView().collection_node_->GetDirectChildren().empty()) {
+-    return gfx::Size();
++    return GetDropZoneSize();
+   }
+ 
+   int min_width = 0;
+@@ -90,7 +90,16 @@ PinnedTabContainerViewHorizontalLayout::
+     layouts.child_layouts.emplace_back(child, true, bounds);
+   }
+ 
+-  const int host_width = visible_count > 0 ? (x + tab_overlap) : 0;
++  const int host_width =
++      visible_count > 0 ? (x + tab_overlap) : GetDropZoneSize().width();
+   layouts.host_size = gfx::Size(host_width, container_height);
+   return layouts;
+ }
++
++gfx::Size PinnedTabContainerViewHorizontalLayout::GetDropZoneSize() const {
++  if (!PinnedTabContainerView().ShowsDropZone()) {
++    return gfx::Size();
++  }
++  return gfx::Size(TabStyle::Get()->GetPinnedWidth(/*is_split=*/false),
++                   TabStyle::Get()->GetStandardHeight());
++}
+--- a/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
+@@ -37,6 +37,7 @@
+ #include "ui/base/dragdrop/os_exchange_data.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/display/screen.h"
++#include "ui/views/controls/scroll_view.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_utils.h"
+ 
+@@ -416,7 +417,13 @@ TabDragTarget* BaseTabStripRegionView::G
+   // Note: if the drag has not attached to this tab strip yet, it doesn't matter
+   // which container is used because the first drag loop iteration just attaches
+   // it.
+-  if (drag_handler_->IsDraggingPinnedTabs()) {
++  //
++  // Tabs are pinned while they are dragged over the pinned tabs.
++  const views::ScrollView* const pinned_tabs_scroll_view =
++      tab_strip_view_->pinned_tabs_scroll_view();
++  if (!drag_handler_->IsDraggingGroups() &&
++      pinned_tabs_scroll_view->GetVisible() &&
++      pinned_tabs_scroll_view->GetBoundsInScreen().Contains(point_in_screen)) {
+     return &GetPinnedTabsContainer()->GetTabDragTarget(point_in_screen);
+   }
+   return &GetUnpinnedTabsContainer()->GetTabDragTarget(point_in_screen);
+--- a/chrome/browser/ui/views/tabs/dragging/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/dragging/BUILD.gn
+@@ -19,6 +19,7 @@ source_set("dragging") {
+   public = [
+     "drag_session_data.h",
+     "dragging_tabs_session.h",
++    "helium_pins_drag_util.h",
+     "tab_drag_context.h",
+     "tab_drag_controller.h",
+     "window_finder.h",
+@@ -52,6 +53,7 @@ source_set("impl") {
+   sources = [
+     "drag_session_data.cc",
+     "dragging_tabs_session.cc",
++    "helium_pins_drag_util.cc",
+     "tab_drag_context.cc",
+     "tab_drag_controller.cc",
+     "window_finder.cc",
