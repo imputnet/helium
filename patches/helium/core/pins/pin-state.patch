@@ -1,0 +1,481 @@
+--- /dev/null
++++ b/chrome/browser/ui/tabs/helium_pins_tab_controller.h
+@@ -0,0 +1,86 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_HELIUM_PINS_TAB_CONTROLLER_H_
++#define CHROME_BROWSER_UI_TABS_HELIUM_PINS_TAB_CONTROLLER_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ref.h"
++#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++#include "url/gurl.h"
++
++namespace content {
++class WebContents;
++}  // namespace content
++
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
++namespace helium_pins {
++
++// Persistent pin state of a tab: its pin list entry and pinned URL. Kept on the
++// tab so it survives discards, and mirrored into session extra data.
++class HeliumPinsTabController {
++ public:
++  explicit HeliumPinsTabController(tabs::TabInterface& tab);
++  HeliumPinsTabController(const HeliumPinsTabController&) = delete;
++  HeliumPinsTabController& operator=(const HeliumPinsTabController&) = delete;
++  ~HeliumPinsTabController();
++
++  DECLARE_USER_DATA(HeliumPinsTabController);
++
++  static HeliumPinsTabController* From(tabs::TabInterface* tab);
++
++  // Holds the pin state from a restored tab's `extra_data` until the tab's
++  // controller is created.
++  static void StashRestoredState(
++      content::WebContents* contents,
++      const std::map<std::string, std::string>& extra_data);
++
++  // Returns the session extra data for the tab holding `contents`, or an empty
++  // map if it isn't a persistent pin.
++  static std::map<std::string, std::string> GetSessionExtraData(
++      content::WebContents* contents);
++
++  tabs::TabInterface& tab() { return *tab_; }
++
++  // Returns whether the tab is pinned and in the profile's pin list.
++  bool IsLinkedPin() const;
++
++  const std::string& pin_id() const { return pin_id_; }
++  const GURL& pinned_url() const { return pinned_url_; }
++
++  // Links the tab to the pin list entry `id` with the pinned URL `url`.
++  void SetPin(const std::string& id, const GURL& url);
++  // Replaces the pinned URL.
++  void SetPinnedUrl(const GURL& url);
++  // Unlinks the tab from the pin list.
++  void ClearPin();
++
++ private:
++  void OnDidInsert(tabs::TabInterface* tab);
++
++  // Returns the pin state as session extra data. Values are empty for tabs
++  // without a pin, which clears previously persisted data.
++  std::map<std::string, std::string> GetExtraData() const;
++  // Writes the pin state to the session of the window holding the tab.
++  void PersistSessionData();
++
++  const raw_ref<tabs::TabInterface> tab_;
++
++  std::string pin_id_;
++  GURL pinned_url_;
++
++  std::vector<base::CallbackListSubscription> tab_subscriptions_;
++  ui::ScopedUnownedUserData<HeliumPinsTabController> scoped_unowned_user_data_;
++};
++
++}  // namespace helium_pins
++
++#endif  // CHROME_BROWSER_UI_TABS_HELIUM_PINS_TAB_CONTROLLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/helium_pins_tab_controller.cc
+@@ -0,0 +1,165 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "components/sessions/core/session_id.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace helium_pins {
++
++namespace {
++
++// Session extra data keys.
++constexpr char kPinIdKey[] = "helium.pinned_tab_id";
++constexpr char kPinnedUrlKey[] = "helium.pinned_tab_url";
++
++std::string FindValue(const std::map<std::string, std::string>& extra_data,
++                      const char* key) {
++  const auto it = extra_data.find(key);
++  return it == extra_data.end() ? std::string() : it->second;
++}
++
++// Carries a restored pin's session extra data until its controller is created.
++class RestoredPinState : public content::WebContentsUserData<RestoredPinState> {
++ public:
++  ~RestoredPinState() override = default;
++
++  const std::map<std::string, std::string>& extra_data() const {
++    return extra_data_;
++  }
++
++ private:
++  friend class content::WebContentsUserData<RestoredPinState>;
++
++  RestoredPinState(content::WebContents* contents,
++                   std::map<std::string, std::string> extra_data)
++      : content::WebContentsUserData<RestoredPinState>(*contents),
++        extra_data_(std::move(extra_data)) {}
++
++  const std::map<std::string, std::string> extra_data_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(RestoredPinState);
++
++}  // namespace
++
++DEFINE_USER_DATA(HeliumPinsTabController);
++
++HeliumPinsTabController::HeliumPinsTabController(tabs::TabInterface& tab)
++    : tab_(tab),
++      scoped_unowned_user_data_(tab.GetUnownedUserDataHost(), *this) {
++  content::WebContents* const contents = tab.GetContents();
++  if (const RestoredPinState* state =
++          RestoredPinState::FromWebContents(contents)) {
++    pin_id_ = FindValue(state->extra_data(), kPinIdKey);
++    pinned_url_ = GURL(FindValue(state->extra_data(), kPinnedUrlKey));
++    contents->RemoveUserData(RestoredPinState::UserDataKey());
++  }
++
++  tab_subscriptions_.push_back(tab.RegisterDidInsert(base::BindRepeating(
++      &HeliumPinsTabController::OnDidInsert, base::Unretained(this))));
++}
++
++HeliumPinsTabController::~HeliumPinsTabController() = default;
++
++// static
++HeliumPinsTabController* HeliumPinsTabController::From(
++    tabs::TabInterface* tab) {
++  return tab ? Get(tab->GetUnownedUserDataHost()) : nullptr;
++}
++
++// static
++void HeliumPinsTabController::StashRestoredState(
++    content::WebContents* contents,
++    const std::map<std::string, std::string>& extra_data) {
++  if (!FindValue(extra_data, kPinIdKey).empty()) {
++    RestoredPinState::CreateForWebContents(contents, extra_data);
++  }
++}
++
++// static
++std::map<std::string, std::string> HeliumPinsTabController::GetSessionExtraData(
++    content::WebContents* contents) {
++  HeliumPinsTabController* const controller =
++      From(tabs::TabInterface::MaybeGetFromContents(contents));
++  if (!controller || !controller->IsLinkedPin()) {
++    return {};
++  }
++  return controller->GetExtraData();
++}
++
++bool HeliumPinsTabController::IsLinkedPin() const {
++  return !pin_id_.empty() && tab_->IsPinned();
++}
++
++void HeliumPinsTabController::SetPin(const std::string& id, const GURL& url) {
++  pin_id_ = id;
++  pinned_url_ = url;
++  PersistSessionData();
++}
++
++void HeliumPinsTabController::SetPinnedUrl(const GURL& url) {
++  pinned_url_ = url;
++  PersistSessionData();
++}
++
++void HeliumPinsTabController::ClearPin() {
++  if (pin_id_.empty() && pinned_url_.is_empty()) {
++    return;
++  }
++  pin_id_.clear();
++  pinned_url_ = GURL();
++  PersistSessionData();
++}
++
++void HeliumPinsTabController::OnDidInsert(tabs::TabInterface* tab) {
++  // The tab may have moved to a different window. Drags can insert a pin
++  // without pinning it first, so where a pin ends up is only decided once the
++  // drag is done.
++  if (tab->IsPinned()) {
++    PersistSessionData();
++  }
++}
++
++std::map<std::string, std::string> HeliumPinsTabController::GetExtraData()
++    const {
++  return {
++      {kPinIdKey, pin_id_},
++      {kPinnedUrlKey, pinned_url_.is_valid() ? pinned_url_.spec() : ""},
++  };
++}
++
++void HeliumPinsTabController::PersistSessionData() {
++  content::WebContents* const contents = tab_->GetContents();
++  SessionService* const session_service = SessionServiceFactory::GetForProfile(
++      Profile::FromBrowserContext(contents->GetBrowserContext()));
++  if (!session_service) {
++    return;
++  }
++
++  const SessionID window_id =
++      sessions::SessionTabHelper::IdForWindowContainingTab(contents);
++  const SessionID tab_id = sessions::SessionTabHelper::IdForTab(contents);
++  if (!window_id.is_valid() || !tab_id.is_valid()) {
++    return;
++  }
++
++  for (const auto& [key, value] : GetExtraData()) {
++    session_service->AddTabExtraData(window_id, tab_id, key.c_str(), value);
++  }
++}
++
++}  // namespace helium_pins
+--- /dev/null
++++ b/chrome/browser/ui/tabs/helium_pins_util.h
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_HELIUM_PINS_UTIL_H_
++#define CHROME_BROWSER_UI_TABS_HELIUM_PINS_UTIL_H_
++
++class BrowserWindowInterface;
++class GURL;
++
++namespace content {
++class WebContents;
++}  // namespace content
++
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
++// Persistent pinned tabs: pins are shared by all normal windows of a profile,
++// survive restarts, and are hibernated instead of closed.
++namespace helium_pins {
++
++class HeliumPinsTabController;
++
++// Returns whether `browser` keeps persistent pins: only normal windows do.
++bool HasPersistentPins(BrowserWindowInterface* browser);
++
++// Returns the controller of `tab` if it is pinned, belongs to its profile's pin
++// list, and its window keeps persistent pins.
++HeliumPinsTabController* GetPersistentPinController(tabs::TabInterface* tab);
++bool IsPersistentPin(tabs::TabInterface* tab);
++
++// Returns whether `contents` is hibernated: discarded, or restored but not
++// loaded yet.
++bool IsHibernated(content::WebContents* contents);
++
++// Returns the URL that pinning the tab holding `contents` would capture.
++GURL GetPinnableUrl(content::WebContents* contents);
++
++}  // namespace helium_pins
++
++#endif  // CHROME_BROWSER_UI_TABS_HELIUM_PINS_UTIL_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/helium_pins_util.cc
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
++
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
++#include "chrome/browser/ui/tabs/tab_utils.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/web_contents.h"
++#include "url/gurl.h"
++
++namespace helium_pins {
++
++bool HasPersistentPins(BrowserWindowInterface* browser) {
++  return browser && browser->GetType() == BrowserWindowInterface::TYPE_NORMAL;
++}
++
++HeliumPinsTabController* GetPersistentPinController(tabs::TabInterface* tab) {
++  HeliumPinsTabController* const controller =
++      HeliumPinsTabController::From(tab);
++  return controller && controller->IsLinkedPin() &&
++                 HasPersistentPins(tab->GetBrowserWindowInterface())
++             ? controller
++             : nullptr;
++}
++
++bool IsPersistentPin(tabs::TabInterface* tab) {
++  return GetPersistentPinController(tab) != nullptr;
++}
++
++bool IsHibernated(content::WebContents* contents) {
++  return contents->WasDiscarded() || IsRestoredTabPendingLoad(contents);
++}
++
++GURL GetPinnableUrl(content::WebContents* contents) {
++  const content::NavigationEntry* const entry =
++      contents->GetController().GetLastCommittedEntry();
++  if (entry && !entry->IsInitialEntry() && entry->GetURL().is_valid()) {
++    return entry->GetURL();
++  }
++  // The tab hasn't committed its first navigation yet.
++  return contents->GetVisibleURL();
++}
++
++}  // namespace helium_pins
+--- a/chrome/browser/ui/tabs/public/tab_features.h
++++ b/chrome/browser/ui/tabs/public/tab_features.h
+@@ -128,6 +128,10 @@ namespace back_to_opener {
+ class BackToOpenerController;
+ }  // namespace back_to_opener
+ 
++namespace helium_pins {
++class HeliumPinsTabController;
++}  // namespace helium_pins
++
+ namespace blocked_content {
+ class PopupBlockerTabHelper;
+ class PopupOpenerTabHelper;
+@@ -821,6 +825,9 @@ class TabFeatures {
+   std::unique_ptr<back_to_opener::BackToOpenerController>
+       back_to_opener_controller_;
+ 
++  std::unique_ptr<helium_pins::HeliumPinsTabController>
++      helium_pins_tab_controller_;
++
+   std::unique_ptr<dictation::DictationIphController> dictation_iph_controller_;
+ 
+   std::unique_ptr<skills::SkillsUiTabControllerInterface>
+--- a/chrome/browser/ui/tabs/tab_features.cc
++++ b/chrome/browser/ui/tabs/tab_features.cc
+@@ -165,6 +165,7 @@
+ #include "chrome/browser/ui/tabs/alert/child_tab_alert_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+ #include "chrome/browser/ui/tabs/back_to_opener/back_to_opener_controller.h"
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
+ #include "chrome/browser/ui/tabs/inactive_window_mouse_event_controller.h"
+ #include "chrome/browser/ui/tabs/page_context_eligibility_helper.h"
+ #include "chrome/browser/ui/tabs/public/tab_dialog_manager.h"
+@@ -1029,6 +1030,11 @@ void TabFeatures::Init(TabInterface& tab
+             .CreateInstance<back_to_opener::BackToOpenerController>(tab, tab);
+   }
+ 
++  // Created for all tabs, since any tab can become a persistent pin.
++  helium_pins_tab_controller_ =
++      GetUserDataFactory().CreateInstance<helium_pins::HeliumPinsTabController>(
++          tab, tab);
++
+   if (base::FeatureList::IsEnabled(dictation::kDictation) &&
+       profile->IsRegularProfile()) {
+     dictation_iph_controller_ =
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_activation_tracker.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+@@ -89,6 +90,8 @@ std::unique_ptr<WebContents> CreateResto
+       web_contents.get(), extra_data);
+   send_tab_to_self::SendTabToSelfActivationTracker::RestoreFromExtraData(
+       web_contents.get(), extra_data);
++  helium_pins::HeliumPinsTabController::StashRestoredState(web_contents.get(),
++                                                           extra_data);
+ 
+   std::vector<std::unique_ptr<NavigationEntry>> entries =
+       ContentSerializedNavigationBuilder::ToNavigationEntries(
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -216,6 +217,8 @@ std::map<std::string, std::string> Brows
+               &browser_.get())) {
+     extra_data.merge(contextual_tasks_controller->GetTabRestoreData(tab));
+   }
++  extra_data.merge(helium_pins::HeliumPinsTabController::GetSessionExtraData(
++      tab->GetContents()));
+ 
+   return extra_data;
+ }
+--- a/chrome/browser/sessions/session_service_base.cc
++++ b/chrome/browser/sessions/session_service_base.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+ #include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -673,6 +674,13 @@ void SessionServiceBase::BuildCommandsFo
+   if (is_pinned) {
+     command_storage_manager()->AppendRebuildCommand(
+         sessions::CreatePinnedStateCommand(session_id, true));
++
++    // Tab extra data is otherwise lost when commands are rebuilt.
++    for (const auto& [key, value] :
++         helium_pins::HeliumPinsTabController::GetSessionExtraData(tab)) {
++      command_storage_manager()->AppendRebuildCommand(
++          sessions::CreateAddTabExtraDataCommand(session_id, key, value));
++    }
+   }
+ 
+   // Record the association between the sessionStorage namespace and the tab.
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -438,6 +438,8 @@ if (!is_android) {
+   source_set("tabs") {
+     sources = [
+       "features.h",
++      "helium_pins_tab_controller.h",
++      "helium_pins_util.h",
+       "horizontal_tab_strip_metrics.h",
+       "hover_tab_selector.h",
+       "new_tab_grouping_user_data.h",
+@@ -511,6 +513,8 @@ if (!is_android) {
+     ]
+ 
+     sources = [
++      "helium_pins_tab_controller.cc",
++      "helium_pins_util.cc",
+       "horizontal_tab_strip_metrics.cc",
+       "hover_tab_selector.cc",
+       "other_device_tabs_sub_menu_model.cc",
