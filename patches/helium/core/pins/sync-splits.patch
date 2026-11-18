@@ -1,0 +1,325 @@
+--- a/chrome/browser/ui/tabs/helium_pins_service.h
++++ b/chrome/browser/ui/tabs/helium_pins_service.h
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "components/keyed_service/core/keyed_service.h"
++#include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "url/gurl.h"
+ 
+@@ -44,6 +45,9 @@ class HeliumPinsService : public KeyedSe
+   struct Pin {
+     std::string id;
+     GURL url;
++    // The id of the first pin of the split that this pin is part of, if any.
++    std::string split;
++    split_tabs::SplitTabVisualData split_visual_data;
+   };
+ 
+   // BrowserCollectionObserver:
+@@ -55,6 +59,7 @@ class HeliumPinsService : public KeyedSe
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
+   void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void OnSplitTabChanged(const SplitTabChange& change) override;
+ 
+   // Returns whether `browser` is a normal window of the profile.
+   bool IsSyncedBrowser(BrowserWindowInterface* browser) const;
+@@ -67,6 +72,8 @@ class HeliumPinsService : public KeyedSe
+ 
+   // Reads the stored pin list.
+   void LoadPins();
++  // Reads which pins are split from the stored pin list.
++  void LoadSplits();
+   void SavePins();
+ 
+   // Handles the user pinning or unpinning `tab` in `browser`.
+@@ -94,6 +101,11 @@ class HeliumPinsService : public KeyedSe
+   void ReconcilePending();
+   // Makes the pinned tabs of `browser` match the pin list.
+   void Reconcile(BrowserWindowInterface* browser);
++  // Takes the pinned splits of `browser` into the pin list. Returns whether
++  // the pin list changed.
++  bool UpdateSplits(BrowserWindowInterface* browser);
++  // Splits and unsplits the pins of `browser` to match the pin list.
++  void ReconcileSplits(BrowserWindowInterface* browser);
+   // Adds a hibernated copy of `pin` at `index` of `browser`.
+   void InsertHibernatedPin(BrowserWindowInterface* browser,
+                            int index,
+--- a/chrome/browser/ui/tabs/helium_pins_service.cc
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -10,6 +10,7 @@
+ #include <utility>
+ 
+ #include "base/auto_reset.h"
++#include "base/containers/map_util.h"
+ #include "base/containers/span.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+@@ -29,6 +30,8 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/split_tabs/split_tab_id.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+@@ -43,6 +46,10 @@ namespace {
+ // PinnedTabCodec, which still reads the list to open pins at startup.
+ constexpr char kUrlKey[] = "url";
+ constexpr char kIdKey[] = "id";
++constexpr char kSplitKey[] = "split";
++constexpr char kSplitLayoutKey[] = "split_layout";
++constexpr char kSplitRatioKey[] = "split_ratio";
++constexpr char kStackedLayout[] = "stacked";
+ 
+ // Retry delay for windows that can't be changed yet, e.g. during a tab drag.
+ constexpr base::TimeDelta kReconcileRetryDelay = base::Milliseconds(250);
+@@ -93,6 +100,7 @@ HeliumPinsService::HeliumPinsService(Pro
+   // Off-the-record profiles start without pins.
+   if (!profile_->IsOffTheRecord()) {
+     LoadPins();
++    LoadSplits();
+   }
+ 
+   GlobalBrowserCollection::GetInstance()->ForEach(
+@@ -177,6 +185,45 @@ void HeliumPinsService::OnTabPinnedState
+   }
+ }
+ 
++void HeliumPinsService::OnSplitTabChanged(const SplitTabChange& change) {
++  BrowserWindowInterface* const browser =
++      change.model->delegate()->GetBrowserWindowInterface();
++  // Closing a window takes its splits apart, which the other windows keep.
++  if (applying_changes_ || !IsSyncedBrowser(browser) ||
++      change.model->closing_all() || browser->IsDeleteScheduled() ||
++      browser_shutdown::HasShutdownStarted()) {
++    return;
++  }
++
++  // Splits dragged between windows are handled once the drag is done.
++  switch (change.type) {
++    case SplitTabChange::Type::kAdded:
++      if (change.GetAddedChange()->reason() ==
++          SplitTabChange::SplitTabAddReason::kInsertedFromAnotherTabstrip) {
++        return;
++      }
++      break;
++    case SplitTabChange::Type::kRemoved:
++      if (change.GetRemovedChange()->reason() ==
++          SplitTabChange::SplitTabRemoveReason::kDetachedToAnotherTabstrip) {
++        return;
++      }
++      break;
++    case SplitTabChange::Type::kVisualsChanged:
++      if (change.GetVisualsChange()->is_intermediate()) {
++        return;
++      }
++      break;
++    case SplitTabChange::Type::kContentsChanged:
++      break;
++  }
++
++  if (UpdateSplits(browser)) {
++    SavePins();
++    ScheduleReconcileOthers(browser);
++  }
++}
++
+ bool HeliumPinsService::IsSyncedBrowser(BrowserWindowInterface* browser) const {
+   return HasPersistentPins(browser) && browser->GetProfile() == profile_;
+ }
+@@ -228,6 +275,27 @@ void HeliumPinsService::LoadPins() {
+   }
+ }
+ 
++void HeliumPinsService::LoadSplits() {
++  for (const base::Value& value :
++       profile_->GetPrefs()->GetList(prefs::kPinnedTabs)) {
++    const base::DictValue* const dict = value.GetIfDict();
++    const std::string* const id = dict ? dict->FindString(kIdKey) : nullptr;
++    const std::string* const split =
++        dict ? dict->FindString(kSplitKey) : nullptr;
++    const auto it = id && split ? FindPin(*id) : pins_.end();
++    if (it == pins_.end()) {
++      continue;
++    }
++    it->split = *split;
++    const std::string* const layout = dict->FindString(kSplitLayoutKey);
++    it->split_visual_data = split_tabs::SplitTabVisualData(
++        layout && *layout == kStackedLayout
++            ? split_tabs::SplitTabLayout::kStacked
++            : split_tabs::SplitTabLayout::kSideBySide,
++        dict->FindDouble(kSplitRatioKey).value_or(0.5));
++  }
++}
++
+ void HeliumPinsService::SavePins() {
+   if (profile_->IsOffTheRecord()) {
+     return;
+@@ -237,6 +305,14 @@ void HeliumPinsService::SavePins() {
+   for (const Pin& pin : pins_) {
+     base::DictValue value =
+         base::DictValue().Set(kUrlKey, pin.url.spec()).Set(kIdKey, pin.id);
++    if (!pin.split.empty()) {
++      value.Set(kSplitKey, pin.split);
++      if (pin.split_visual_data.split_layout() ==
++          split_tabs::SplitTabLayout::kStacked) {
++        value.Set(kSplitLayoutKey, kStackedLayout);
++      }
++      value.Set(kSplitRatioKey, pin.split_visual_data.split_ratio());
++    }
+     values.Append(std::move(value));
+   }
+   PrefService* const prefs = profile_->GetPrefs();
+@@ -254,6 +330,8 @@ void HeliumPinsService::AddPin(BrowserWi
+   }
+ 
+   InsertNewPin(browser, controller);
++  // Splits are pinned as a whole.
++  UpdateSplits(browser);
+   SavePins();
+   ScheduleReconcileOthers(browser);
+ }
+@@ -461,7 +539,8 @@ void HeliumPinsService::Reconcile(Browse
+     }
+   }
+ 
+-  // Add missing pins and restore the shared order.
++  // Add missing pins and restore the shared order. Splits are moved as a whole,
++  // so that they aren't broken up.
+   int next_index = 0;
+   for (const Pin& pin : pins_) {
+     const auto it = present.find(pin.id);
+@@ -472,19 +551,125 @@ void HeliumPinsService::Reconcile(Browse
+       continue;
+     }
+ 
+-    const int index = model->GetIndexOfTab(&it->second->tab());
+-    if (index != next_index) {
+-      model->MoveWebContentsAt(index, next_index, /*select_after_move=*/false);
++    tabs::TabInterface* const tab = &it->second->tab();
++    const int index = model->GetIndexOfTab(tab);
++    // The tab's split was already put in place with another of its pins.
++    if (index < next_index) {
++      continue;
++    }
++
++    if (const std::optional<split_tabs::SplitTabId> split = tab->GetSplit()) {
++      const std::vector<tabs::TabInterface*> split_tabs =
++          model->GetSplitData(*split)->ListTabs();
++      if (model->GetIndexOfTab(split_tabs.front()) != next_index) {
++        model->MoveSplitTo(*split, next_index, /*pinned=*/true,
++                           /*group_id=*/std::nullopt);
++      }
++      next_index += split_tabs.size();
++    } else {
++      if (index != next_index) {
++        model->MoveWebContentsAt(index, next_index,
++                                 /*select_after_move=*/false);
++      }
++      ++next_index;
+     }
+-    ++next_index;
+   }
+ 
++  ReconcileSplits(browser);
++
+   if (pins_changed) {
+     SavePins();
+     ScheduleReconcileOthers(browser);
+   }
+ }
+ 
++bool HeliumPinsService::UpdateSplits(BrowserWindowInterface* browser) {
++  TabStripModel* const model = browser->GetTabStripModel();
++  // The first pin of each split in `browser`.
++  std::map<split_tabs::SplitTabId, std::string> first_pins;
++  bool changed = false;
++  for (HeliumPinsTabController* controller : GetPinnedTabControllers(browser)) {
++    const auto it = FindPin(controller->pin_id());
++    if (it == pins_.end()) {
++      continue;
++    }
++    std::string split;
++    split_tabs::SplitTabVisualData visual_data;
++    if (const std::optional<split_tabs::SplitTabId> split_id =
++            controller->tab().GetSplit()) {
++      split = first_pins.try_emplace(*split_id, it->id).first->second;
++      visual_data = *model->GetSplitData(*split_id)->visual_data();
++    }
++    if (it->split != split || it->split_visual_data != visual_data) {
++      it->split = std::move(split);
++      it->split_visual_data = visual_data;
++      changed = true;
++    }
++  }
++  return changed;
++}
++
++void HeliumPinsService::ReconcileSplits(BrowserWindowInterface* browser) {
++  TabStripModel* const model = browser->GetTabStripModel();
++  std::map<std::string, tabs::TabInterface*> pin_tabs;
++  for (HeliumPinsTabController* controller : GetPinnedTabControllers(browser)) {
++    pin_tabs[controller->pin_id()] = &controller->tab();
++  }
++  const auto find_pin = [this](tabs::TabInterface* tab) -> const Pin* {
++    HeliumPinsTabController* const controller =
++        HeliumPinsTabController::From(tab);
++    const auto it = controller ? FindPin(controller->pin_id()) : pins_.end();
++    return it == pins_.end() ? nullptr : &*it;
++  };
++
++  // Unsplit pinned splits that aren't in the pin list, and update the others.
++  for (const split_tabs::SplitTabId& split_id : model->ListSplits()) {
++    split_tabs::SplitTabData* const data = model->GetSplitData(split_id);
++    const std::vector<tabs::TabInterface*> members = data->ListTabs();
++    if (!members.front()->IsPinned()) {
++      continue;
++    }
++    const Pin* const pin = find_pin(members.front());
++    if (!pin || pin->split.empty() ||
++        std::ranges::any_of(members, [&](tabs::TabInterface* tab) {
++          const Pin* const member_pin = find_pin(tab);
++          return !member_pin || member_pin->split != pin->split;
++        })) {
++      model->RemoveSplit(split_id);
++      continue;
++    }
++    const split_tabs::SplitTabVisualData& visual_data = pin->split_visual_data;
++    if (data->visual_data()->split_layout() != visual_data.split_layout()) {
++      model->UpdateSplitLayout(split_id, visual_data.split_layout());
++    }
++    if (data->visual_data()->split_ratio() != visual_data.split_ratio()) {
++      model->UpdateSplitRatio(split_id, visual_data.split_ratio());
++    }
++  }
++
++  // Split the pins that are split in the pin list.
++  for (size_t i = 0; i + 1 < pins_.size(); ++i) {
++    const Pin& first = pins_[i];
++    const Pin& second = pins_[i + 1];
++    if (first.split != first.id || second.split != first.id) {
++      continue;
++    }
++    tabs::TabInterface* const first_tab =
++        base::FindPtrOrNull(pin_tabs, first.id);
++    tabs::TabInterface* const second_tab =
++        base::FindPtrOrNull(pin_tabs, second.id);
++    if (!first_tab || !second_tab || first_tab->IsSplit() ||
++        second_tab->IsSplit()) {
++      continue;
++    }
++    std::vector<int> indices = {model->GetIndexOfTab(first_tab),
++                                model->GetIndexOfTab(second_tab)};
++    std::ranges::sort(indices);
++    model->RestoreSplit(split_tabs::SplitTabId::GenerateNew(), indices,
++                        first.split_visual_data);
++  }
++}
++
+ void HeliumPinsService::InsertHibernatedPin(BrowserWindowInterface* browser,
+                                             int index,
+                                             const Pin& pin) {
