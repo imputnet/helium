@@ -1,6 +1,14 @@
 --- a/chrome/browser/ui/browser_tabrestore.h
 +++ b/chrome/browser/ui/browser_tabrestore.h
-@@ -27,6 +27,13 @@ struct SerializedUserAgentOverride;
+@@ -14,6 +14,7 @@
+ #include "components/sessions/core/session_types.h"
+ 
+ class BrowserWindowInterface;
++class GURL;
+ 
+ namespace content {
+ class SessionStorageNamespaceHandle;
+@@ -27,6 +28,13 @@ struct SerializedUserAgentOverride;
  
  namespace chrome {
  
@@ -14,7 +22,7 @@
  // Add a tab with its session history restored from the SessionRestore and
  // TabRestoreService systems. If `select` is true, the tab is selected.
  // |tab_index| gives the index to insert the tab at. |selected_navigation| is
-@@ -41,7 +48,8 @@ namespace chrome {
+@@ -41,7 +49,8 @@ namespace chrome {
  // restore. |last_active_time| is the value to use to indicate the last time the
  // WebContents was made active, if this is left default initialized then the
  // creation time will be used. If `is_active_browser` is set, it indicates
@@ -24,7 +32,7 @@
  // Returns the WebContents of the restored tab.
  content::WebContents* AddRestoredTab(
      BrowserWindowInterface* browser,
-@@ -58,7 +66,9 @@ content::WebContents* AddRestoredTab(
+@@ -58,7 +67,18 @@ content::WebContents* AddRestoredTab(
      const sessions::SerializedUserAgentOverride& user_agent_override,
      const std::map<std::string, std::string>& extra_data,
      bool from_session_restore,
@@ -32,20 +40,40 @@
 +    std::optional<bool> is_active_browser,
 +    RestoredTabLoadPolicy load_policy =
 +        RestoredTabLoadPolicy::kLoadIfVisible);
++
++// Adds a background tab at tab_index that shows url, with title unless
++// it's empty, and isn't loaded until it's activated. If pin is true, the tab
++// is pinned. Returns the WebContents of the tab.
++content::WebContents* AddDeferredTab(BrowserWindowInterface* browser,
++                                     const GURL& url,
++                                     const std::u16string& title,
++                                     int tab_index,
++                                     bool pin);
  
  // Replaces the state of the currently selected tab with the session
  // history restored from the SessionRestore and TabRestoreService systems.
 --- a/chrome/browser/ui/browser_tabrestore.cc
 +++ b/chrome/browser/ui/browser_tabrestore.cc
-@@ -27,6 +27,7 @@
+@@ -27,7 +27,10 @@
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/webui_browser/webui_browser.h"
  #include "chrome/common/buildflags.h"
 +#include "components/favicon/content/content_favicon_driver.h"
  #include "components/sessions/content/content_serialized_navigation_builder.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
  #include "components/tab_groups/tab_group_id.h"
  #include "components/tabs/public/tab_group.h"
-@@ -143,7 +144,8 @@ WebContents* AddRestoredTabImpl(std::uni
+ #include "components/tabs/public/tab_interface.h"
+@@ -40,6 +43,7 @@
+ #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/range/range.h"
++#include "url/gurl.h"
+ 
+ using content::NavigationEntry;
+ using content::RestoreType;
+@@ -143,7 +147,8 @@ WebContents* AddRestoredTabImpl(std::uni
                                  bool select,
                                  bool pin,
                                  bool from_session_restore,
@@ -55,7 +83,7 @@
    TabStripModel* const tab_strip_model = browser->tab_strip_model();
  
    int add_types = select ? AddTabTypes::ADD_ACTIVE : AddTabTypes::ADD_NONE;
-@@ -259,10 +261,19 @@ WebContents* AddRestoredTabImpl(std::uni
+@@ -259,10 +264,19 @@ WebContents* AddRestoredTabImpl(std::uni
    should_load = (browser->GetType() != BrowserWindowInterface::Type::TYPE_APP);
  #endif  // BUILDFLAG(IS_MAC)
  
@@ -76,7 +104,7 @@
    return raw_web_contents;
  }
  
-@@ -283,16 +294,17 @@ WebContents* AddRestoredTab(
+@@ -283,16 +297,38 @@ WebContents* AddRestoredTab(
      const sessions::SerializedUserAgentOverride& user_agent_override,
      const std::map<std::string, std::string>& extra_data,
      bool from_session_restore,
@@ -95,6 +123,27 @@
 +  return AddRestoredTabImpl(
 +      std::move(web_contents), browser, tab_index, group, select, pin,
 +      from_session_restore, is_active_browser, load_policy);
++}
++
++WebContents* AddDeferredTab(BrowserWindowInterface* browser,
++                            const GURL& url,
++                            const std::u16string& title,
++                            int tab_index,
++                            bool pin) {
++  SerializedNavigationEntry navigation;
++  navigation.set_index(0);
++  navigation.set_virtual_url(url);
++  navigation.set_title(title);
++  return AddRestoredTab(
++      browser, base::span_from_ref(navigation), tab_index,
++      /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
++      /*group=*/std::nullopt, /*select=*/false, pin,
++      /*last_active_time_ticks=*/base::TimeTicks(),
++      /*last_active_time=*/base::Time(), /*storage_namespace=*/nullptr,
++      /*user_agent_override=*/sessions::SerializedUserAgentOverride(),
++      /*extra_data=*/{}, /*from_session_restore=*/false,
++      /*is_active_browser=*/std::nullopt,
++      RestoredTabLoadPolicy::kDeferUntilActivation);
  }
  
  WebContents* ReplaceRestoredTab(
@@ -508,15 +557,7 @@
            UpdateTabBrowserIDs(browser_id, context->GetSessionID());
 --- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 +++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
-@@ -14,6 +14,7 @@
- 
- #include "base/auto_reset.h"
- #include "base/command_line.h"
-+#include "base/containers/span.h"
- #include "base/functional/bind.h"
- #include "base/supports_user_data.h"
- #include "base/version.h"
-@@ -34,6 +35,7 @@
+@@ -34,6 +34,7 @@
  #include "chrome/browser/sessions/session_service_factory.h"
  #include "chrome/browser/signin/account_consistency_mode_manager.h"
  #include "chrome/browser/ui/browser_commands.h"
@@ -524,48 +565,17 @@
  #include "chrome/browser/ui/browser_tabstrip.h"
  #include "chrome/browser/ui/browser_window.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
-@@ -64,6 +66,8 @@
- #include "components/custom_handlers/protocol_handler_registry.h"
- #include "components/helium_services/pref_names.h"
- #include "components/prefs/pref_service.h"
-+#include "components/sessions/core/serialized_navigation_entry.h"
-+#include "components/sessions/core/serialized_user_agent_override.h"
- #include "components/signin/public/base/signin_switches.h"
- #include "components/tab_groups/tab_group_id.h"
- #include "content/public/browser/child_process_security_policy.h"
-@@ -214,6 +218,24 @@ BrowserWindowInterface* GetExistingBrows
-   return workspace_browser;
- }
- 
-+void AddDeferredPinnedStartupTab(BrowserWindowInterface* browser,
-+                                 const GURL& url) {
-+  sessions::SerializedNavigationEntry navigation;
-+  navigation.set_index(0);
-+  navigation.set_virtual_url(url);
-+  chrome::AddRestoredTab(
-+      browser, base::span_from_ref(navigation),
-+      browser->tab_strip_model()->IndexOfFirstNonPinnedTab(),
-+      /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
-+      /*group=*/std::nullopt, /*select=*/false, /*pin=*/true,
-+      /*last_active_time_ticks=*/base::TimeTicks(),
-+      /*last_active_time=*/base::Time(), /*storage_namespace=*/nullptr,
-+      /*user_agent_override=*/sessions::SerializedUserAgentOverride(),
-+      /*extra_data=*/{}, /*from_session_restore=*/false,
-+      /*is_active_browser=*/std::nullopt,
-+      chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
-+}
-+
- }  // namespace
- 
- StartupBrowserCreatorImpl::StartupBrowserCreatorImpl(
-@@ -433,6 +455,13 @@ BrowserWindowInterface* StartupBrowserCr
+@@ -433,6 +434,16 @@ BrowserWindowInterface* StartupBrowserCr
        continue;
      }
  
 +    // Pinned tabs from the startup-tab provider do not pass through the session
 +    // restore tab loader, so add background ones without loading them.
 +    if (!first_tab && tab.type == StartupTab::Type::kPinned) {
-+      AddDeferredPinnedStartupTab(browser, tab.url);
++      chrome::AddDeferredTab(
++          browser, tab.url, /*title=*/std::u16string(),
++          browser->tab_strip_model()->IndexOfFirstNonPinnedTab(),
++          /*pin=*/true);
 +      continue;
 +    }
 +
