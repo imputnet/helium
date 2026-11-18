@@ -1,0 +1,743 @@
+--- a/ui/views/widget/drop_helper.cc
++++ b/ui/views/widget/drop_helper.cc
+@@ -116,6 +116,11 @@ DragOperation DropHelper::OnDrop(const O
+                                  drag_operation);
+   auto output_drag_op = ui::mojom::DragOperation::kNone;
+   auto drop_cb = drop_view->GetDropCallback(drop_event);
++  // Like in GetDropCallback(), a view without a drop callback takes no drop,
++  // e.g. a tab strip that only tracks dragged tabs.
++  if (!drop_cb) {
++    return output_drag_op;
++  }
+   std::move(drop_cb).Run(drop_event, output_drag_op,
+                          /*drag_image_layer_owner=*/nullptr);
+   return output_drag_op;
+--- a/ui/views/cocoa/drag_drop_client_mac.h
++++ b/ui/views/cocoa/drag_drop_client_mac.h
+@@ -18,7 +18,9 @@
+ #include "ui/views/widget/drop_helper.h"
+ 
+ namespace gfx {
++class ImageSkia;
+ class Point;
++class Vector2d;
+ }  // namespace gfx
+ 
+ namespace remote_cocoa {
+@@ -50,6 +52,12 @@ class VIEWS_EXPORT DragDropClientMac : p
+                         int operation,
+                         ui::mojom::DragEventSource source);
+ 
++  // Replaces the image of the drag session started by StartDragAndDrop(), if
++  // it is still running, and places its top left corner at `offset` from the
++  // mouse pointer. An empty image hides it.
++  void UpdateDragImage(const gfx::ImageSkia& image,
++                       const gfx::Vector2d& offset);
++
+   DropHelper* drop_helper() { return &drop_helper_; }
+ 
+   // remote_cocoa::DragDropClient:
+@@ -82,6 +90,9 @@ class VIEWS_EXPORT DragDropClientMac : p
+   // The closure for the drag and drop's run loop.
+   base::OnceClosure quit_closure_;
+ 
++  // The drag session started by StartDragAndDrop(), while it is running.
++  NSDraggingSession* __weak drag_session_ = nil;
++
+   // Whether |this| is the source of current dragging session.
+   bool is_drag_source_ = false;
+ };
+--- a/ui/views/cocoa/drag_drop_client_mac.mm
++++ b/ui/views/cocoa/drag_drop_client_mac.mm
+@@ -10,10 +10,14 @@
+ #import "components/remote_cocoa/app_shim/bridged_content_view.h"
+ #import "components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h"
+ #include "components/remote_cocoa/app_shim/window_move_loop.h"
++#include "ui/base/clipboard/clipboard_constants.h"
++#include "ui/base/clipboard/clipboard_format_type.h"
+ #include "ui/base/cocoa/drag_permission.h"
+ #include "ui/base/dragdrop/drag_drop_types.h"
+ #include "ui/base/dragdrop/mojom/drag_drop_types.mojom.h"
+ #import "ui/base/dragdrop/os_exchange_data_provider_mac.h"
++#include "ui/gfx/geometry/vector2d.h"
++#include "ui/gfx/image/image_skia.h"
+ #include "ui/gfx/image/image_skia_util_mac.h"
+ #include "ui/views/drag_utils.h"
+ #include "ui/views/widget/native_widget_mac.h"
+@@ -113,6 +117,15 @@ void DragDropClientMac::StartDragAndDrop
+     // FB24907244.) In that case, bail.
+     return;
+   }
++  drag_session_ = session;
++
++  // Dragged tabs that aren't dropped onto a tab strip open in a new window
++  // where they were dropped, so their image shouldn't slide back.
++  if (exchange_data_->HasCustomFormat(
++          ui::ClipboardFormatType::CustomPlatformType(
++              ui::kMimeTypeWindowDrag))) {
++    session.animatesToStartingPositionsOnCancelOrFail = NO;
++  }
+ 
+   // Since Drag and drop is asynchronous on the Mac, spin a nested run loop for
+   // consistency with other platforms.
+@@ -156,9 +169,35 @@ NSDragOperation DragDropClientMac::Drop(
+       static_cast<int>(drag_operation));
+ }
+ 
++void DragDropClientMac::UpdateDragImage(const gfx::ImageSkia& image,
++                                        const gfx::Vector2d& offset) {
++  if (!drag_session_) {
++    return;
++  }
++
++  // Without a view, the frame is in screen coordinates, whose y-axis points up.
++  NSImage* ns_image = image.isNull() ? nil : gfx::NSImageFromImageSkia(image);
++  const NSSize size = ns_image ? ns_image.size : NSMakeSize(1, 1);
++  // Use the location AppKit draws the drag image at, which can lag behind the
++  // mouse.
++  const NSPoint location = drag_session_.draggingLocation;
++  const NSRect dragging_frame =
++      NSMakeRect(location.x + offset.x(), location.y - offset.y() - size.height,
++                 size.width, size.height);
++  [drag_session_ enumerateDraggingItemsWithOptions:0
++      forView:nil
++      classes:@[ NSPasteboardItem.class ]
++      searchOptions:@{}
++      usingBlock:^(NSDraggingItem* item, NSInteger index, BOOL* stop) {
++        [item setDraggingFrame:dragging_frame contents:ns_image];
++        *stop = YES;
++      }];
++}
++
+ void DragDropClientMac::EndDrag() {
+   exchange_data_.reset();
+   is_drag_source_ = false;
++  drag_session_ = nil;
+ 
+   // Allow a test to invoke EndDrag() without spinning the nested run loop.
+   if (!quit_closure_.is_null()) {
+--- a/ui/views/widget/native_widget_mac.h
++++ b/ui/views/widget/native_widget_mac.h
+@@ -37,6 +37,11 @@ class ApplicationHost;
+ class NativeWidgetNSWindowBridge;
+ }  // namespace remote_cocoa
+ 
++namespace gfx {
++class ImageSkia;
++class Vector2d;
++}  // namespace gfx
++
+ namespace views {
+ namespace test {
+ class MockNativeWidgetMac;
+@@ -75,6 +80,12 @@ class VIEWS_EXPORT NativeWidgetMac : pub
+   // Called when the window has moved.
+   void OnWindowDidEndMove();
+ 
++  // Replaces the image of the drag session started by RunDragDropLoop(), if it
++  // is still running, and places its top left corner at `offset` from the
++  // mouse pointer. An empty image hides it.
++  void UpdateDragImage(const gfx::ImageSkia& image,
++                       const gfx::Vector2d& offset);
++
+   // Called when the user will start resizing the window.
+   virtual void OnWindowWillStartLiveResize();
+ 
+--- a/ui/views/widget/native_widget_mac.mm
++++ b/ui/views/widget/native_widget_mac.mm
+@@ -981,6 +981,13 @@ void NativeWidgetMac::RunDragDropLoop(st
+                                                         operation, source);
+ }
+ 
++void NativeWidgetMac::UpdateDragImage(const gfx::ImageSkia& image,
++                                      const gfx::Vector2d& offset) {
++  if (ns_window_host_) {
++    ns_window_host_->drag_drop_client()->UpdateDragImage(image, offset);
++  }
++}
++
+ void NativeWidgetMac::CancelDragDropLoop(View* view) {
+   if (!ns_window_host_) {
+     return;
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
+@@ -236,6 +236,10 @@ class TabDragController : public views::
+ 
+   class SourceTabStripEmptinessTracker;
+ 
++#if BUILDFLAG(IS_MAC)
++  class DragImageMorph;
++#endif
++
+   class DraggedTabsClosedTracker;
+ 
+   // Used to indicate the direction the mouse has moved when attached.
+@@ -385,6 +389,26 @@ class TabDragController : public views::
+   // StartSystemDnDSessionIfNecessary() for more details.
+   void HideAttachedContext();
+ 
++#if BUILDFLAG(IS_MAC)
++  // Captures the dragged tab under the pointer, for the drag image to morph
++  // out of and back into.
++  void CaptureDraggedTabImage();
++  // Shows `image` with its top left corner at `offset` from the pointer as the
++  // image of the system drag session.
++  void SetSystemDnDDragImage(const gfx::ImageSkia& image,
++                             const gfx::Vector2d& offset);
++  // Animates the drag image from the current one to `image` at `offset`, then
++  // reveals `view_to_reveal` and runs `done`.
++  void MorphSystemDnDDragImage(const gfx::ImageSkia& image,
++                               const gfx::Vector2d& offset,
++                               views::View* view_to_reveal,
++                               base::OnceClosure done);
++  // Morphs the drag image out of the dragged tab when it leaves a tab strip,
++  // and back into it when it enters one.
++  void MorphSystemDnDDragImageOutOfTab();
++  void MorphSystemDnDDragImageIntoTab();
++#endif  // BUILDFLAG(IS_MAC)
++
+   // Returns the compatible TabDragContext to drag to at the specified point
+   // (screen coordinates), or nullptr if there is none. May end the drag on
+   // some platforms as a result of reentrancy during system calls, hence this
+@@ -729,6 +753,28 @@ class TabDragController : public views::
+   // time StartSystemDnDSessionIfNecessary() is called.
+   bool system_drag_and_drop_session_running_ = false;
+ 
++  // On macOS, whether tabs dragged out of their window show an image of them
++  // until they are dropped, instead of a new window. Decided when the drag
++  // starts.
++  bool use_system_drag_and_drop_ = false;
++
++  // The widget that started the system drag session.
++  base::WeakPtr<views::Widget> system_drag_and_drop_widget_;
++
++#if BUILDFLAG(IS_MAC)
++  // The dragged tab, and its position relative to the pointer when it left a
++  // tab strip.
++  gfx::ImageSkia dragged_tab_image_;
++  gfx::Vector2d dragged_tab_image_offset_;
++
++  // The current image of the system drag session, and its position relative to
++  // the pointer.
++  gfx::ImageSkia current_drag_image_;
++  gfx::Vector2d current_drag_image_offset_;
++
++  std::unique_ptr<DragImageMorph> drag_image_morph_;
++#endif  // BUILDFLAG(IS_MAC)
++
+   // True if in the process of moving the last tab in
+   // the TabStrip out of `attached_context_` so that it can be
+   // inserted into another TabStrip.
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -99,9 +99,28 @@
+ 
+ #if BUILDFLAG(IS_MAC)
+ #include "base/debug/dump_without_crashing.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/strings/string_number_conversions.h"
++#include "chrome/browser/ui/views/helium/frame_corner_radius.h"
+ #include "components/crash/core/common/crash_key.h"
+ #include "components/remote_cocoa/browser/window.h"
++#include "skia/ext/image_operations.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/compositor/canvas_painter.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/linear_animation.h"
++#include "ui/gfx/animation/tween.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/size_conversions.h"
++#include "ui/gfx/image/canvas_image_source.h"
++#include "ui/gfx/image/image_skia_rep.h"
++#include "ui/gfx/skbitmap_operations.h"
++#include "ui/views/drag_utils.h"
++#include "ui/views/paint_info.h"
++#include "ui/views/view_tracker.h"
++#include "ui/views/widget/native_widget_mac.h"
+ #endif
+ 
+ #if defined(USE_AURA)
+@@ -262,6 +281,7 @@ BrowserView* GetBrowserViewForContext(co
+   return nullptr;
+ }
+ 
++#if !BUILDFLAG(IS_MAC)
+ void UpdateSystemDnDDragImage(TabDragContext* attached_context,
+                               const gfx::ImageSkia& image) {
+ #if BUILDFLAG(IS_LINUX)
+@@ -274,6 +294,56 @@ void UpdateSystemDnDDragImage(TabDragCon
+   }
+ #endif  // BUILDFLAG(IS_LINUX)
+ }
++#else
++// Returns where macOS places a drag image of `size` relative to the pointer:
++// centered horizontally over it, and slightly above it.
++gfx::Vector2d GetDefaultDragImageOffset(const gfx::Size& size) {
++  return gfx::Vector2d(-size.width() / 2, -size.height() * 3 / 4);
++}
++
++// Paints `view` into an image. A view without a layer of its own paints at its
++// position within its parent, so that part is cut out.
++gfx::ImageSkia CreateViewImage(views::View* view) {
++  const gfx::Rect bounds =
++      view->layer() ? gfx::Rect(view->size()) : view->bounds();
++  const gfx::Size canvas_size(bounds.right(), bounds.bottom());
++  const float scale = views::ScaleFactorForDragFromWidget(view->GetWidget());
++  SkBitmap bitmap;
++  view->Paint(views::PaintInfo::CreateRootPaintInfo(
++      ui::CanvasPainter(&bitmap, canvas_size, scale, SK_ColorTRANSPARENT,
++                        /*is_pixel_canvas=*/true)
++          .context(),
++      canvas_size));
++  return gfx::ImageSkiaOperations::ExtractSubset(
++      gfx::ImageSkia::CreateFromBitmap(bitmap, scale), bounds);
++}
++
++// Draws `image` on top of fainter copies of itself, offset down and to the
++// right, so that it looks like a stack of tabs.
++class TabStackImageSource : public gfx::CanvasImageSource {
++ public:
++  static constexpr int kOffset = 4;
++
++  TabStackImageSource(const gfx::ImageSkia& image, int layers)
++      : gfx::CanvasImageSource(image.size() +
++                               gfx::Size(layers * kOffset, layers * kOffset)),
++        image_(image),
++        layers_(layers) {}
++
++  // gfx::CanvasImageSource:
++  void Draw(gfx::Canvas* canvas) override {
++    for (int i = layers_; i > 0; --i) {
++      canvas->DrawImageInt(image_, i * kOffset, i * kOffset,
++                           /*alpha=*/0xFF / (i + 1));
++    }
++    canvas->DrawImageInt(image_, 0, 0);
++  }
++
++ private:
++  const gfx::ImageSkia image_;
++  const int layers_;
++};
++#endif  // BUILDFLAG(IS_MAC)
+ 
+ class DefaultTabDragPointResolver : public TabDragPointResolver {
+  public:
+@@ -339,6 +409,105 @@ class EventTracker : public ui::EventObs
+   std::unique_ptr<views::EventMonitor> event_monitor_;
+ };
+ 
++#if BUILDFLAG(IS_MAC)
++// Morphs the drag image of a system drag session from one image and position
++// relative to the pointer to another, by resizing and cross-fading them.
++class TabDragController::DragImageMorph : public gfx::AnimationDelegate {
++ public:
++  using SetImageCallback = base::RepeatingCallback<void(const gfx::ImageSkia&,
++                                                        const gfx::Vector2d&)>;
++
++  // `view_to_reveal` is made visible again once the morph ends, or when it is
++  // destroyed early.
++  DragImageMorph(gfx::ImageSkia from_image,
++                 gfx::Vector2d from_offset,
++                 gfx::ImageSkia to_image,
++                 gfx::Vector2d to_offset,
++                 float scale,
++                 views::View* view_to_reveal,
++                 SetImageCallback set_image,
++                 base::OnceClosure done)
++      : from_image_(from_image.isNull() ? to_image : std::move(from_image)),
++        from_offset_(from_offset),
++        to_image_(std::move(to_image)),
++        to_offset_(to_offset),
++        scale_(scale),
++        view_to_reveal_(view_to_reveal),
++        set_image_(std::move(set_image)),
++        done_(std::move(done)) {}
++  DragImageMorph(const DragImageMorph&) = delete;
++  DragImageMorph& operator=(const DragImageMorph&) = delete;
++  ~DragImageMorph() override { RevealView(); }
++
++  void Start() {
++    if (gfx::Animation::ShouldRenderRichAnimation()) {
++      animation_.Start();
++    } else {
++      AnimationEnded(&animation_);
++    }
++  }
++
++ private:
++  static constexpr base::TimeDelta kDuration = base::Milliseconds(180);
++
++  // gfx::AnimationDelegate:
++  void AnimationProgressed(const gfx::Animation* animation) override {
++    const double value = gfx::Tween::CalculateValue(
++        gfx::Tween::EASE_OUT, animation->GetCurrentValue());
++    // Interpolate the edges, so that rounding doesn't make the image jitter.
++    const gfx::Rect bounds = gfx::Tween::RectValueBetween(
++        value,
++        gfx::Rect(gfx::PointAtOffsetFromOrigin(from_offset_),
++                  from_image_.size()),
++        gfx::Rect(gfx::PointAtOffsetFromOrigin(to_offset_), to_image_.size()));
++    gfx::Size size = bounds.size();
++    size.SetToMax(gfx::Size(1, 1));
++    const gfx::Vector2d offset = bounds.OffsetFromOrigin();
++    // The images may not have reps at the same scales, so blend bitmaps.
++    set_image_.Run(gfx::ImageSkia::CreateFromBitmap(
++                       SkBitmapOperations::CreateBlendedBitmap(
++                           GetBitmap(from_image_, size),
++                           GetBitmap(to_image_, size), value),
++                       scale_),
++                   offset);
++  }
++
++  void AnimationEnded(const gfx::Animation* animation) override {
++    set_image_.Run(to_image_, to_offset_);
++    RevealView();
++    if (done_) {
++      std::move(done_).Run();
++    }
++  }
++
++  SkBitmap GetBitmap(const gfx::ImageSkia& image, const gfx::Size& size) const {
++    const gfx::Size pixel_size = gfx::ScaleToCeiledSize(size, scale_);
++    return skia::ImageOperations::Resize(
++        image.GetRepresentation(scale_).GetBitmap(),
++        skia::ImageOperations::RESIZE_GOOD, pixel_size.width(),
++        pixel_size.height());
++  }
++
++  void RevealView() {
++    if (views::View* view = view_to_reveal_.view(); view && view->layer()) {
++      view->layer()->SetOpacity(1.0f);
++    }
++    view_to_reveal_.SetView(nullptr);
++  }
++
++  const gfx::ImageSkia from_image_;
++  const gfx::Vector2d from_offset_;
++  const gfx::ImageSkia to_image_;
++  const gfx::Vector2d to_offset_;
++  const float scale_;
++  views::ViewTracker view_to_reveal_;
++  const SetImageCallback set_image_;
++  base::OnceClosure done_;
++  gfx::LinearAnimation animation_{
++      kDuration, gfx::LinearAnimation::kDefaultFrameRate, this};
++};
++#endif  // BUILDFLAG(IS_MAC)
++
+ class TabDragController::SourceTabStripEmptinessTracker
+     : public TabStripModelObserver {
+  public:
+@@ -679,12 +848,19 @@ bool TabDragController::IsSystemDnDSessi
+ void TabDragController::OnSystemDnDUpdated(const ui::DropTargetEvent& event) {
+   CHECK(IsSystemDnDSessionRunning());
+   VLOG(2) << __func__ << " event=" << event.ToString();
++#if BUILDFLAG(IS_MAC)
++  // On macOS, drop target events are relative to the window under the pointer,
++  // so use the pointer's location on the screen instead.
++  std::ignore = g_tab_drag_controller->Drag(
++      display::Screen::Get()->GetCursorScreenPoint());
++#else
+   // It is important to use the event's root location instead of its location.
+   // The latter may have been transformed to be relative to a child window, e.g.
+   // Aura's clipping window. But we need the location relative to the browser
+   // window, i.e. the root location.
+   // ignore the Liveness; it's fine if `g_tab_drag_controller` dies here.
+   std::ignore = g_tab_drag_controller->Drag(event.root_location());
++#endif
+ }
+ 
+ // static
+@@ -1236,10 +1412,16 @@ TabDragController::Liveness TabDragContr
+     return Liveness::kAlive;
+   }
+ 
++#if BUILDFLAG(IS_MAC)
++  const bool morph_into_tab =
++      current_state_ == DragState::kDraggingUsingSystemDnD;
++#endif
+   if (current_state_ == DragState::kDraggingUsingSystemDnD) {
+     current_state_ = DragState::kDraggingTabs;
++#if !BUILDFLAG(IS_MAC)
+     // Hide the drag image while attached.
+     UpdateSystemDnDDragImage(attached_context_, {});
++#endif
+   }
+ 
+   // In this case we're either:
+@@ -1254,6 +1436,11 @@ TabDragController::Liveness TabDragContr
+   CHECK(ref);
+ 
+   StartDraggingTabsSession(false, point_in_screen);
++#if BUILDFLAG(IS_MAC)
++  if (morph_into_tab) {
++    MorphSystemDnDDragImageIntoTab();
++  }
++#endif
+   // Activate() may trigger a focus loss or window event that ends the drag and
+   // destroys `this`.
+   attached_context_->GetWidget()->Activate();
+@@ -1264,7 +1451,11 @@ TabDragController::Liveness TabDragContr
+ }
+ 
+ bool TabDragController::ShouldDragWindowUsingSystemDnD() {
++#if BUILDFLAG(IS_MAC)
++  return use_system_drag_and_drop_;
++#else
+   return !GetAttachedBrowserWidget()->IsMoveLoopSupported();
++#endif
+ }
+ 
+ void TabDragController::RequestTabThumbnail() {
+@@ -1294,7 +1485,11 @@ void TabDragController::OnTabThumbnailAv
+   const SkBitmap& thumbnail = result.has_value() ? result->bitmap : SkBitmap();
+   VLOG(1) << __func__ << " " << thumbnail.width() << "x" << thumbnail.height();
+   constexpr size_t kTargetHeightDip = 200;
++#if BUILDFLAG(IS_MAC)
++  const int kRoundedCornerRadius = GetGenericFrameRadius();
++#else
+   constexpr int kRoundedCornerRadius = 4;
++#endif
+ 
+   // Exit early if CopyFromSurfaceSecure() failed, e.g. because the tab was
+   // deleted after the drag started.
+@@ -1311,8 +1506,19 @@ void TabDragController::OnTabThumbnailAv
+       target_size);
+   drag_image_ = gfx::ImageSkiaOperations::CreateImageWithRoundRectClip(
+       kRoundedCornerRadius, drag_image_);
++#if BUILDFLAG(IS_MAC)
++  // Several tabs, e.g. a selection or a group, are shown as a stack.
++  if (const int num_tabs = drag_data_.num_dragging_tabs(); num_tabs > 1) {
++    drag_image_ = gfx::CanvasImageSource::MakeImageSkia<TabStackImageSource>(
++        drag_image_, num_tabs > 2 ? 2 : 1);
++  }
++#endif
+   if (current_state_ == DragState::kDraggingUsingSystemDnD) {
++#if BUILDFLAG(IS_MAC)
++    MorphSystemDnDDragImageOutOfTab();
++#else
+     UpdateSystemDnDDragImage(attached_context_, drag_image_);
++#endif
+   }
+ }
+ 
+@@ -1325,12 +1531,17 @@ TabDragController::Liveness TabDragContr
+ 
+   if (system_drag_and_drop_session_running_) {
+     // Show the drag image again.
++#if BUILDFLAG(IS_MAC)
++    MorphSystemDnDDragImageOutOfTab();
++#else
+     UpdateSystemDnDDragImage(attached_context_, drag_image_);
++#endif
+ 
+     return Liveness::kAlive;
+   }
+ 
+   system_drag_and_drop_session_running_ = true;
++  system_drag_and_drop_widget_ = context->GetWidget()->GetWeakPtr();
+ 
+   if (attached_context_ == source_context_ &&
+       drag_data_.num_dragging_tabs() ==
+@@ -1354,11 +1565,22 @@ TabDragController::Liveness TabDragContr
+   // If the drag image is already available, set it right away. Else we'll get a
+   // call to OnTabThumbnailAvailable() and will update it after starting the DnD
+   // session.
++#if BUILDFLAG(IS_MAC)
++  // macOS can't start a drag session without an image, so start with a
++  // transparent one. The drag image then morphs out of the dragged tab.
++  SkBitmap placeholder;
++  placeholder.allocN32Pixels(1, 1);
++  placeholder.eraseColor(SK_ColorTRANSPARENT);
++  data_provider->SetDragImage(gfx::ImageSkia::CreateFrom1xBitmap(placeholder),
++                              {0, 0});
++  MorphSystemDnDDragImageOutOfTab();
++#else
+   if (!drag_image_.isNull()) {
+     VLOG(1) << __func__ << " setting drag image";
+     data_provider->SetDragImage(
+         drag_image_, {drag_image_.width() / 2, drag_image_.height() / 2});
+   }
++#endif
+ 
+   // Pull into a local to avoid use-after-free if RunDragDropLoop deletes
+   // `this`.
+@@ -1389,6 +1611,14 @@ TabDragController::Liveness TabDragContr
+   // another window's tab strip, because that destroys the window. The DnD
+   // session is still running and functional, though.
+ 
++#if BUILDFLAG(IS_MAC)
++  // On macOS, `RunDragDropLoop()` only returns once the drag session ended,
++  // wherever the tabs were dropped.
++  if (ref && system_drag_and_drop_session_running_) {
++    system_drag_and_drop_session_running_ = false;
++    EndDrag(EndDragReason::kComplete);
++  }
++#else
+   // If we're still alive and haven't updated our state yet, this means the drag
+   // session ended while we were dragging all of the only window's tabs. We need
+   // to end the drag session ourselves.
+@@ -1396,6 +1626,7 @@ TabDragController::Liveness TabDragContr
+     VLOG(1) << __func__ << " Ending drag";
+     EndDrag(EndDragReason::kComplete);
+   }
++#endif
+ 
+   if (drag_loop_done_callback) {
+     std::move(drag_loop_done_callback).Run();
+@@ -1404,6 +1635,81 @@ TabDragController::Liveness TabDragContr
+   return ref ? Liveness::kAlive : Liveness::kDeleted;
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++void TabDragController::CaptureDraggedTabImage() {
++  views::View* const view = drag_data_.source_view_drag_data()->attached_view;
++  if (!view || !view->GetWidget()) {
++    return;
++  }
++  dragged_tab_image_ = CreateViewImage(view);
++  dragged_tab_image_offset_ = view->GetBoundsInScreen().origin() -
++                              display::Screen::Get()->GetCursorScreenPoint();
++}
++
++void TabDragController::SetSystemDnDDragImage(const gfx::ImageSkia& image,
++                                              const gfx::Vector2d& offset) {
++  current_drag_image_ = image;
++  current_drag_image_offset_ = offset;
++  // The drag session belongs to the widget that started it.
++  if (system_drag_and_drop_widget_) {
++    static_cast<views::NativeWidgetMac*>(
++        system_drag_and_drop_widget_->native_widget())
++        ->UpdateDragImage(image, offset);
++  }
++}
++
++void TabDragController::MorphSystemDnDDragImage(const gfx::ImageSkia& image,
++                                                const gfx::Vector2d& offset,
++                                                views::View* view_to_reveal,
++                                                base::OnceClosure done) {
++  // Replacing a morph reveals the view it was hiding.
++  drag_image_morph_ = std::make_unique<DragImageMorph>(
++      current_drag_image_, current_drag_image_offset_, image, offset,
++      views::ScaleFactorForDragFromWidget(system_drag_and_drop_widget_.get()),
++      view_to_reveal,
++      base::BindRepeating(&TabDragController::SetSystemDnDDragImage,
++                          weak_factory_.GetWeakPtr()),
++      std::move(done));
++  drag_image_morph_->Start();
++}
++
++void TabDragController::MorphSystemDnDDragImageOutOfTab() {
++  // Grow out of the dragged tab into the page thumbnail. Until the thumbnail
++  // is available, the tab stays in place, so that the morph happens at once
++  // instead of in two steps. OnTabThumbnailAvailable() calls this again.
++  if (!dragged_tab_image_.isNull()) {
++    SetSystemDnDDragImage(dragged_tab_image_, dragged_tab_image_offset_);
++  }
++  if (!drag_image_.isNull()) {
++    MorphSystemDnDDragImage(drag_image_,
++                            GetDefaultDragImageOffset(drag_image_.size()),
++                            /*view_to_reveal=*/nullptr, base::DoNothing());
++  }
++}
++
++void TabDragController::MorphSystemDnDDragImageIntoTab() {
++  views::View* const view = drag_data_.source_view_drag_data()->attached_view;
++  if (!view || dragged_tab_image_.isNull()) {
++    SetSystemDnDDragImage({}, {});
++    return;
++  }
++
++  // Keep the tab hidden while the drag image shrinks into it, then hide the
++  // drag image.
++  if (view->layer()) {
++    view->layer()->SetOpacity(0.0f);
++  }
++  MorphSystemDnDDragImage(
++      dragged_tab_image_,
++      view->GetBoundsInScreen().origin() -
++          display::Screen::Get()->GetCursorScreenPoint(),
++      view,
++      base::BindOnce(&TabDragController::SetSystemDnDDragImage,
++                     weak_factory_.GetWeakPtr(), gfx::ImageSkia(),
++                     gfx::Vector2d()));
++}
++#endif  // BUILDFLAG(IS_MAC)
++
+ void TabDragController::HideAttachedContext() {
+   CHECK_EQ(current_state_, DragState::kDraggingUsingSystemDnD);
+   CHECK(GetAttachedBrowserWidget()->IsVisible());
+@@ -1485,6 +1791,15 @@ void TabDragController::StartDrag() {
+   drag_start_time_ = base::TimeTicks::Now();
+   drag_data_.drag_start_time = *drag_start_time_;
+ 
++#if BUILDFLAG(IS_MAC)
++  // Dragging all of a window's tabs still moves the window.
++  TabStripModel* const model = source_context_->GetTabStripModel();
++  use_system_drag_and_drop_ =
++      drag_data_.num_dragging_tabs() != model->count() &&
++      !(model->GetFocusedGroup().has_value() &&
++        drag_data_.group_header_id() == model->GetFocusedGroup());
++#endif
++
+   // Request a thumbnail to use as drag image if we'll use fallback tab
+   // dragging.
+   if (ShouldDragWindowUsingSystemDnD()) {
+@@ -1852,6 +2167,14 @@ TabDragController::DetachIntoNewBrowserA
+         drag_data_.attached_views());
+   }
+ 
++#if BUILDFLAG(IS_MAC)
++  if (ShouldDragWindowUsingSystemDnD()) {
++    // The drag image morphs out of the dragged tab, so capture it while it's
++    // still in the tab strip.
++    CaptureDraggedTabImage();
++  }
++#endif
++
+   BrowserWindowInterface* browser =
+       CreateBrowserForDrag(attached_context_, new_size);
+ 
+@@ -2153,6 +2476,13 @@ void TabDragController::EndDragImpl(EndD
+             views::CancelDragDropLoop(view, /*allow_widget_mismatch=*/true);
+           }
+ #endif  // defined(USE_AURA)
++#if BUILDFLAG(IS_MAC)
++          // Make sure the nested loop of the drag session ends.
++          if (system_drag_and_drop_session_running_ &&
++              system_drag_and_drop_widget_) {
++            system_drag_and_drop_widget_->CancelDragDropLoop(nullptr);
++          }
++#endif
+ 
+           // Make the hidden window containing the dragged tabs visible. Show()
+           // may trigger platform event handlers that synchronously close the
+@@ -2161,6 +2491,16 @@ void TabDragController::EndDragImpl(EndD
+           if (!ref) {
+             return;
+           }
++#if BUILDFLAG(IS_MAC)
++          // Place the window where the tabs were dropped. Like in
++          // DetachIntoNewBrowserAndRunMoveLoop(), this happens after showing
++          // it.
++          views::Widget* const widget = GetAttachedBrowserWidget();
++          widget->SetBounds(
++              gfx::Rect(display::Screen::Get()->GetCursorScreenPoint() -
++                            CalculateWindowDragOffset(),
++                        widget->GetSize()));
++#endif
+         }
+         CompleteDrag();
+       }
+--- a/chrome/browser/ui/views/tabs/dragging/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/dragging/BUILD.gn
+@@ -79,6 +79,7 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs:tab_strip_model_observer",
+     "//chrome/browser/ui/views/frame:browser_view_header",
++    "//chrome/browser/ui/views/helium:frame_corner_radius",
+     "//chrome/browser/ui/views/omnibox",
+     "//chrome/browser/ui/views/tabs:tab",
+     "//chrome/browser/ui/views/tabs:tab_strip",
