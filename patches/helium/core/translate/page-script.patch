@@ -8,7 +8,7 @@
  </grit-part>
 --- /dev/null
 +++ b/components/translate/core/browser/resources/helium_translate.js
-@@ -0,0 +1,1275 @@
+@@ -0,0 +1,1238 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -95,12 +95,6 @@
 +  // sentence around them.
 +  const CONTEXT_TAGS = new Set(['CODE', 'KBD', 'SAMP', 'VAR']);
 +
-+  const COLLECTED_NODE_TYPES = new Set([
-+    Node.TEXT_NODE,
-+    Node.ELEMENT_NODE,
-+    Node.DOCUMENT_FRAGMENT_NODE,
-+  ]);
-+
 +  const TRANSLATED_ATTRIBUTES = [
 +    'title',
 +    'alt',
@@ -139,7 +133,6 @@
 +  const HAS_LETTER = /\p{L}/u;
 +
 +  let finished = false;
-+  let error = false;
 +  let errorCode = ERROR['NONE'];
 +  let sourceLang = '';
 +  let targetLang = '';
@@ -214,14 +207,14 @@
 +  // Text of a text node or attribute. |element| and |attribute| are context for
 +  // the provider, |eligible| rechecks whether it may be translated where it is
 +  // now, and |requeue| queues its location again once the page changed it.
-+  function Segment(
-+      key, element, attribute, get, set, connected, eligible, requeue) {
++  function Segment(key, element, attribute, get, set, eligible, requeue) {
 +    this.key = key;
 +    this.element = element;
 +    this.attribute = attribute;
 +    this.get = get;
 +    this.set = set;
-+    this.connected = connected;
++    this.connected = () =>
++        (key instanceof Node ? key : key.element).isConnected;
 +    this.eligible = eligible;
 +    this.requeue = requeue;
 +    this.original = get();
@@ -248,10 +241,6 @@
 +      attribute: segment.attribute,
 +      runs: [{text: segment.pieces[index], translate: true, segment, index}],
 +    };
-+  }
-+
-+  function isTranslatableText(text) {
-+    return !!text && HAS_LETTER.test(text);
 +  }
 +
 +  // Whether |element| starts a block of text of its own instead of running on
@@ -636,7 +625,7 @@
 +  }
 +
 +  function queueSegment(segment) {
-+    if (queued.has(segment.key) || !isTranslatableText(segment.core)) {
++    if (queued.has(segment.key) || !HAS_LETTER.test(segment.core)) {
 +      return;
 +    }
 +
@@ -681,7 +670,6 @@
 +        (value) => {
 +          node.nodeValue = value;
 +        },
-+        () => node.isConnected,
 +        () => {
 +          const parent = parentOf(node);
 +          return !!parent && translateState(parent) === true;
@@ -711,7 +699,6 @@
 +          (value) => {
 +            element.setAttribute(name, value);
 +          },
-+          () => element.isConnected,
 +          () => hasTranslatableAttributes(element) &&
 +              (name !== 'value' || hasTranslatableValue(element)),
 +          () => {
@@ -723,13 +710,7 @@
 +  }
 +
 +  function collect(root) {
-+    if (!COLLECTED_NODE_TYPES.has(root.nodeType)) {
-+      return;
-+    }
-+
-+    const parent = root.nodeType === Node.DOCUMENT_FRAGMENT_NODE ?
-+        root.host :
-+        parentOf(root);
++    const parent = parentOf(root);
 +    const inherited = parent ? translateState(parent) : true;
 +    if (inherited === null) {
 +      return;
@@ -788,12 +769,8 @@
 +
 +  function collectDocument() {
 +    const title = document.querySelector('head > title');
-+    if (title && translateState(title)) {
-+      for (const child of title.childNodes) {
-+        if (child.nodeType === Node.TEXT_NODE) {
-+          queueTextNode(child);
-+        }
-+      }
++    if (title) {
++      collect(title);
 +    }
 +
 +    if (document.body) {
@@ -808,12 +785,7 @@
 +          collect(node);
 +        }
 +      } else if (record.type === 'characterData') {
-+        // The page replaced translated text, so its value is the new original.
-+        const entry = translated.get(record.target);
-+        if (entry && record.target.nodeValue !== entry.value) {
-+          translated.delete(record.target);
-+        }
-+
++        // Text the page replaced is queued as a new original.
 +        collect(record.target);
 +      } else if (record.type === 'attributes') {
 +        const name = record.attributeName;
@@ -833,12 +805,6 @@
 +            collect(record.target);
 +          } else {
 +            restoreTextIn(record.target);
-+          }
-+        } else {
-+          const key = attributeKey(record.target, name);
-+          const entry = translated.get(key);
-+          if (entry && record.target.getAttribute(name) !== entry.value) {
-+            translated.delete(key);
 +          }
 +        }
 +
@@ -936,14 +902,22 @@
 +    }
 +  }
 +
-+  function reset() {
++  // Stops translating: no more observing, batches or queued text.
++  function stopTranslating() {
 +    stopObserving();
 +    stopWatchingVisibility();
 +    pending = [];
 +    queued = new Set();
 +    inFlight = null;
++  }
++
++  function failed() {
++    return errorCode !== ERROR['NONE'];
++  }
++
++  function reset() {
++    stopTranslating();
 +    finished = false;
-+    error = false;
 +    errorCode = ERROR['NONE'];
 +    consecutiveFailures = 0;
 +    pollsSincePrune = 0;
@@ -974,13 +948,8 @@
 +  }
 +
 +  function fail(code) {
-+    error = true;
 +    errorCode = code;
-+    stopObserving();
-+    stopWatchingVisibility();
-+    pending = [];
-+    queued = new Set();
-+    inFlight = null;
++    stopTranslating();
 +    // The browser can't revert a failed translation.
 +    restoreAll();
 +  }
@@ -1009,9 +978,7 @@
 +    }
 +
 +    segment.set(value);
-+    if (!translated.has(segment.key)) {
-+      translated.set(segment.key, {segment: segment, value: value});
-+    }
++    translated.set(segment.key, {segment: segment, value: value});
 +  }
 +
 +  // Puts the translation of each of |runs| in its piece of text. A run can
@@ -1099,7 +1066,7 @@
 +    },
 +
 +    get error() {
-+      return error;
++      return failed();
 +    },
 +
 +    get errorCode() {
@@ -1123,7 +1090,7 @@
 +    },
 +
 +    get textActive() {
-+      return !error && (!!observer || !!inFlight || pending.length > 0);
++      return !failed() && (!!observer || !!inFlight || pending.length > 0);
 +    },
 +
 +    translate(originalLang, target) {
@@ -1158,7 +1125,7 @@
 +
 +    // The next segments to translate, or null if there are none right now.
 +    takeTextRequest() {
-+      if (error || inFlight) {
++      if (failed() || inFlight) {
 +        return null;
 +      }
 +
@@ -1169,9 +1136,7 @@
 +      pruneDetached();
 +      if (!pending.length) {
 +        stopWatchingVisibility();
-+        if (!finished) {
-+          markFinished();
-+        }
++        markFinished();
 +
 +        return null;
 +      }
@@ -1240,9 +1205,7 @@
 +          if (finished) {
 +            // The page was already reported as translated, so stop
 +            // translating new content instead.
-+            stopObserving();
-+            pending = [];
-+            queued = new Set();
++            stopTranslating();
 +          } else {
 +            fail(code);
 +          }
