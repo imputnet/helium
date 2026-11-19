@@ -78,7 +78,7 @@ def _rename_files_with_dirs(root_dir, source_dir, sorted_file_iter):
         complete_source_path = Path(source_dir, partial_path)
         try:
             complete_source_path.parent.mkdir(parents=True, exist_ok=True)
-            complete_path.rename(complete_source_path)
+            complete_path.replace(complete_source_path)
         except FileNotFoundError:
             get_logger().warning('Could not move prepended patch: %s', complete_path)
         if past_parent != complete_path.parent:
