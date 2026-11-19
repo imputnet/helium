@@ -8,7 +8,7 @@
  </grit-part>
 --- /dev/null
 +++ b/components/translate/core/browser/resources/helium_translate.js
-@@ -0,0 +1,975 @@
+@@ -0,0 +1,1275 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -58,6 +58,42 @@
 +    'VIDEO',
 +    'AUDIO',
 +  ]);
++
++  // Elements whose text runs on with the text around them, unless the page
++  // lays them out as blocks.
++  const INLINE_TAGS = new Set([
++    'A',    'ABBR', 'B',    'BDI',  'BDO',    'BIG',    'CITE', 'CODE',
++    'DATA', 'DEL',  'DFN',  'EM',   'FONT',   'I',      'INS',  'KBD',
++    'MARK', 'NOBR', 'Q',    'S',    'SAMP',   'SMALL',  'SPAN', 'STRIKE',
++    'STRONG', 'SUB', 'SUP', 'TIME', 'TT',     'U',      'VAR',
++  ]);
++
++  // Controls, whose text is a label of its own whatever surrounds it.
++  const CONTROL_TAGS = new Set([
++    'BUTTON',
++    'LABEL',
++    'SELECT',
++    'OPTION',
++    'OPTGROUP',
++    'SUMMARY',
++    'LEGEND',
++  ]);
++  const CONTROL_ROLES = new Set([
++    'button',
++    'checkbox',
++    'menuitem',
++    'menuitemcheckbox',
++    'menuitemradio',
++    'option',
++    'radio',
++    'switch',
++    'tab',
++    'treeitem',
++  ]);
++
++  // Skipped inline elements whose text still helps the provider read the
++  // sentence around them.
++  const CONTEXT_TAGS = new Set(['CODE', 'KBD', 'SAMP', 'VAR']);
 +
 +  const COLLECTED_NODE_TYPES = new Set([
 +    Node.TEXT_NODE,
@@ -202,8 +238,253 @@
 +    this.dropped = false;
 +  }
 +
++  // What is sent for piece |index| of |segment|. Each pending item is sent as
++  // one segment, {element, attribute, runs}, and each run is {text, translate,
++  // segment, index}: piece |index| of |segment|, or text the page keeps, like
++  // code, without a segment, which the provider sees but doesn't translate.
++  function pieceItem(segment, index) {
++    return {
++      element: segment.element,
++      attribute: segment.attribute,
++      runs: [{text: segment.pieces[index], translate: true, segment, index}],
++    };
++  }
++
 +  function isTranslatableText(text) {
 +    return !!text && HAS_LETTER.test(text);
++  }
++
++  // Whether |element| starts a block of text of its own instead of running on
++  // with the text around it. |displays| caches computed styles.
++  function isBlock(element, displays) {
++    const tag = element.tagName.toUpperCase();
++    const role = (element.getAttribute('role') || '').toLowerCase();
++    if (CONTROL_TAGS.has(tag) || CONTROL_ROLES.has(role)) {
++      return true;
++    }
++
++    if (!INLINE_TAGS.has(tag)) {
++      return true;
++    }
++
++    let display = displays.get(element);
++    if (display === undefined) {
++      display = getComputedStyle(element).display;
++      displays.set(element, display);
++    }
++
++    return display !== 'inline' && display !== 'contents';
++  }
++
++  // The block that the text of |node| runs on in, and the link it's in
++  // within that block, if any.
++  function placeOf(node, displays) {
++    let link = null;
++    for (let element = parentOf(node); element; element = parentOf(element)) {
++      if (isBlock(element, displays)) {
++        return {block: element, link};
++      }
++
++      if (!link &&
++          (element.tagName.toUpperCase() === 'A' ||
++           (element.getAttribute('role') || '').toLowerCase() === 'link')) {
++        link = element;
++      }
++    }
++
++    return {block: null, link};
++  }
++
++  // The text nodes of |element|'s own running text, in document order, with
++  // null where a block inside it, like a line break, separates words. Text
++  // that is never shown as text is left out.
++  function inlineTextOf(element, displays) {
++    const nodes = [];
++    const stack = [element];
++    while (stack.length) {
++      const node = stack.pop();
++      if (node === null || node.nodeType === Node.TEXT_NODE) {
++        nodes.push(node);
++        continue;
++      }
++
++      for (let child = node.lastChild; child; child = child.previousSibling) {
++        if (child.nodeType === Node.TEXT_NODE) {
++          stack.push(child);
++        } else if (child.nodeType === Node.ELEMENT_NODE) {
++          const tag = child.tagName.toUpperCase();
++          if (isBlock(child, displays)) {
++            stack.push(null);
++          } else if (!SKIPPED_TAGS.has(tag) || CONTEXT_TAGS.has(tag)) {
++            stack.push(child);
++          }
++        }
++      }
++    }
++
++    return nodes;
++  }
++
++  // The runs of |element|'s running text that |segments| translate, with the
++  // text around them that stays, like code. Null if a segment isn't in it.
++  function runsIn(element, segments, displays) {
++    const runs = [];
++    let matched = 0;
++    for (const node of inlineTextOf(element, displays)) {
++      const segment = node && segments.get(node);
++      // Text that is translated on its own, or already was, is left out.
++      if (node && !segment && HAS_LETTER.test(node.nodeValue) &&
++          translateState(parentOf(node)) === true) {
++        continue;
++      }
++
++      // Whitespace as the page shows it: one space between words.
++      let text = ' ';
++      if (segment) {
++        text = (segment.leading ? ' ' : '') + segment.core +
++            (segment.trailing ? ' ' : '');
++      } else if (node) {
++        text = node.nodeValue.replace(/\s+/g, ' ');
++      }
++
++      const previous = runs[runs.length - 1];
++      if (text.startsWith(' ') && (!previous || previous.text.endsWith(' '))) {
++        text = text.slice(1);
++      }
++
++      if (segment) {
++        runs.push({text, translate: true, segment, index: 0});
++        ++matched;
++      } else if (text.trim()) {
++        runs.push({text, translate: false, segment: null, index: 0});
++      } else if (text && previous) {
++        previous.text += ' ';
++      }
++    }
++
++    return matched === segments.size ? runs : null;
++  }
++
++  // Splits |runs| that are too long for one segment between sentences, or
++  // else between runs.
++  function splitRuns(runs) {
++    const chunks = [];
++    let chunk = [];
++    let length = 0;
++    let sentenceEnd = 0;
++    for (const run of runs) {
++      while (chunk.length && length + run.text.length > MAX_PIECE_CHARS) {
++        const cut = sentenceEnd || chunk.length;
++        chunks.push(chunk.slice(0, cut));
++        chunk = chunk.slice(cut);
++        length = chunk.reduce((sum, run) => sum + run.text.length, 0);
++        sentenceEnd = 0;
++      }
++
++      chunk.push(run);
++      length += run.text.length;
++      if (/[.!?:;\u3002\uff01\uff1f]\s*$/.test(run.text)) {
++        sentenceEnd = chunk.length;
++      }
++    }
++
++    chunks.push(chunk);
++    return chunks.filter(chunk => chunk.some(run => run.translate));
++  }
++
++  // Queues the text nodes of |stretch|, one stretch of a block's running text,
++  // as segments with runs: the whole stretch, or each link of it when it's
++  // only links side by side, like a menu.
++  function queueStretch(stretch, displays) {
++    if (!stretch.length) {
++      return;
++    }
++
++    const block = stretch[0].place.block;
++    const parts = [];
++    if (!block || stretch.some(member => !member.place.link)) {
++      parts.push({element: block, members: stretch});
++    } else {
++      for (const member of stretch) {
++        const last = parts[parts.length - 1];
++        if (last && last.element === member.place.link) {
++          last.members.push(member);
++        } else {
++          parts.push({element: member.place.link, members: [member]});
++        }
++      }
++    }
++
++    for (const part of parts) {
++      const segments =
++          new Map(part.members.map(m => [m.segment.key, m.segment]));
++      const runs = part.element && runsIn(part.element, segments, displays);
++      if (!runs) {
++        for (const member of part.members) {
++          pending.push(pieceItem(member.segment, 0));
++        }
++        continue;
++      }
++
++      for (const chunk of splitRuns(runs)) {
++        const translated = chunk.filter(run => run.translate);
++        if (chunk.length === 1) {
++          pending.push(pieceItem(translated[0].segment, 0));
++          continue;
++        }
++
++        // A lone run in a block keeps its own element as context, like a link.
++        const element = translated.length === 1 ?
++            translated[0].segment.element :
++            part.element.localName;
++        pending.push({element, attribute: '', runs: chunk});
++      }
++    }
++  }
++
++  // Joins the text nodes queued from |start| on into segments of running
++  // text, so that a sentence split around links reaches the provider whole.
++  function groupPending(start) {
++    const displays = new Map();
++    const items = pending.splice(start);
++    let stretch = [];
++    for (const item of items) {
++      const segment = item.runs[0].segment;
++      if (!(segment.key instanceof Node)) {
++        // Attributes are labels of their own, and don't break up the text.
++        pending.push(item);
++        continue;
++      }
++
++      if (segment.pieces.length > 1) {
++        queueStretch(stretch, displays);
++        stretch = [];
++        pending.push(item);
++        continue;
++      }
++
++      const place = placeOf(segment.key, displays);
++      if (stretch.length && place.block !== stretch[0].place.block) {
++        queueStretch(stretch, displays);
++        stretch = [];
++      }
++
++      stretch.push({segment, place});
++    }
++
++    queueStretch(stretch, displays);
++  }
++
++  // How much text a pending item sends.
++  function itemLength(item) {
++    return item.runs.reduce((sum, run) => sum + run.text.length, 0);
++  }
++
++  // The element whose position decides how soon a pending item is
++  // translated.
++  function itemElement(item) {
++    const run = item.runs.find(run => run.segment);
++    return run ? elementOf(run.segment) : null;
 +  }
 +
 +  function isSkippedElement(element) {
@@ -367,7 +648,7 @@
 +
 +    segment.pieces.forEach((piece, index) => {
 +      if (piece) {
-+        pending.push({segment, index});
++        pending.push(pieceItem(segment, index));
 +      }
 +    });
 +  }
@@ -454,6 +735,7 @@
 +      return;
 +    }
 +
++    const start = pending.length;
 +    // Iterative, carrying the inherited translate state down.
 +    const stack = [[root, inherited]];
 +    while (stack.length) {
@@ -500,6 +782,8 @@
 +        stack.push([child, translates]);
 +      }
 +    }
++
++    groupPending(start);
 +  }
 +
 +  function collectDocument() {
@@ -713,9 +997,10 @@
 +      return;
 +    }
 +
++    // A null result keeps the piece as it was.
 +    const text = segment.pieces
 +                     .map(
-+                         (piece, index) => (segment.results[index] || piece) +
++                         (piece, index) => (segment.results[index] ?? piece) +
 +                             segment.separators[index])
 +                     .join('');
 +    const value = segment.leading + text + segment.trailing;
@@ -729,24 +1014,69 @@
 +    }
 +  }
 +
-+  // Requeues a failed batch, dropping segments that failed too often.
-+  function retryPieces(pieces) {
-+    const retried = new Set();
-+    for (const piece of pieces) {
-+      const segment = piece.segment;
-+      if (segment.dropped) {
-+        continue;
++  // Puts the translation of each of |runs| in its piece of text. A run can
++  // lose all its words to the runs around it, so only runs that all came back
++  // empty keep their originals.
++  function applyRuns(runs, translations) {
++    const keep =
++        runs.every((run, i) => !run.segment || !translations[i].trim());
++    runs.forEach((run, i) => {
++      const segment = run.segment;
++      if (!segment || segment.dropped) {
++        return;
 +      }
 +
-+      if (!retried.has(segment)) {
-+        retried.add(segment);
-+        if (++segment.retries > MAX_SEGMENT_RETRIES) {
-+          dropSegment(segment);
-+          continue;
++      segment.results[run.index] = keep ? null : translations[i].trim();
++      if (--segment.remaining === 0) {
++        applySegment(segment);
++      }
++    });
++  }
++
++  // Whether |segment| can still be sent as it was queued. If not, drops it,
++  // and queues its location again if the page changed its text.
++  function isSendable(segment) {
++    if (segment.dropped) {
++      return false;
++    }
++
++    if (!segment.connected()) {
++      dropSegment(segment);
++      return false;
++    }
++
++    if (segment.get() !== segment.original) {
++      dropSegment(segment);
++      segment.requeue();
++      return false;
++    }
++
++    if (!segment.eligible()) {
++      dropSegment(segment);
++      return false;
++    }
++
++    return true;
++  }
++
++  // Requeues a failed batch, dropping items whose segments failed too often.
++  function retryItems(items) {
++    const retried = new Set();
++    for (const item of items) {
++      const segments = item.runs.map(run => run.segment)
++                           .filter(segment => segment && !segment.dropped);
++      for (const segment of segments) {
++        if (!retried.has(segment)) {
++          retried.add(segment);
++          ++segment.retries;
 +        }
 +      }
 +
-+      pending.push(piece);
++      if (segments.some(segment => segment.retries > MAX_SEGMENT_RETRIES)) {
++        segments.forEach(dropSegment);
++      } else if (segments.length) {
++        pending.push(item);
++      }
 +    }
 +  }
 +
@@ -850,73 +1180,55 @@
 +      const near = [];
 +      const rest = [];
 +      for (const piece of pending) {
-+        const element = elementOf(piece.segment);
++        const element = itemElement(piece);
 +        (element && isNearViewport(element) ? near : rest).push(piece);
 +      }
 +
 +      pending = near.concat(rest);
-+      const pieces = [];
++      const items = [];
 +      let length = 0;
-+      while (pending.length && pieces.length < MAX_PIECES_PER_REQUEST) {
-+        const piece = pending[0];
-+        const segment = piece.segment;
-+        const text = segment.pieces[piece.index];
-+        if (pieces.length && length + text.length > MAX_CHARS_PER_REQUEST) {
++      while (pending.length && items.length < MAX_PIECES_PER_REQUEST) {
++        const item = pending[0];
++        if (items.length && length + itemLength(item) > MAX_CHARS_PER_REQUEST) {
 +          break;
 +        }
 +
 +        pending.shift();
-+        if (segment.dropped) {
++        // Leaves out runs whose text can't be sent anymore.
++        item.runs = item.runs.filter(
++            run => !run.segment || isSendable(run.segment));
++        if (!item.runs.some(run => run.segment)) {
 +          continue;
 +        }
 +
-+        if (!segment.connected()) {
-+          dropSegment(segment);
-+          continue;
-+        }
-+
-+        if (segment.get() !== segment.original) {
-+          dropSegment(segment);
-+          segment.requeue();
-+          continue;
-+        }
-+
-+        if (!segment.eligible()) {
-+          dropSegment(segment);
-+          continue;
-+        }
-+
-+        pieces.push(piece);
-+        length += text.length;
++        items.push(item);
++        length += itemLength(item);
 +      }
 +
-+      if (!pieces.length) {
++      if (!items.length) {
 +        return null;
 +      }
 +
-+      inFlight = pieces;
-+      return pieces.map(piece => {
-+        const segment = piece.segment;
-+        return {
-+          runs: [{text: segment.pieces[piece.index], translate: true}],
-+          element: segment.element,
-+          attribute: segment.attribute,
-+        };
-+      });
++      // The browser only reads the fields of a segment, so the items go as
++      // they are.
++      inFlight = items;
++      return items;
 +    },
 +
 +    // |source| is the language the browser translated from.
 +    onTextResponse(translations, code, source) {
-+      const pieces = inFlight;
++      const items = inFlight;
 +      inFlight = null;
-+      if (!pieces) {
++      if (!items) {
 +        return;
 +      }
 +
-+      // Each piece is sent as a segment with a single run.
++      // A translation for each run of each sent segment.
 +      const isWellFormed = Array.isArray(translations) &&
-+          translations.length === pieces.length &&
-+          translations.every(runs => Array.isArray(runs) && runs.length === 1);
++          translations.length === items.length &&
++          translations.every(
++              (runs, i) =>
++                  Array.isArray(runs) && runs.length === items[i].runs.length);
 +      if (code !== ERROR['NONE'] || !isWellFormed) {
 +        if (code === ERROR['NONE']) {
 +          code = ERROR['TRANSLATION_ERROR'];
@@ -938,7 +1250,7 @@
 +          return;
 +        }
 +
-+        retryPieces(pieces);
++        retryItems(items);
 +        return;
 +      }
 +
@@ -953,19 +1265,7 @@
 +        handleMutations(observer.takeRecords());
 +      }
 +
-+      for (let i = 0; i < pieces.length; ++i) {
-+        const segment = pieces[i].segment;
-+        if (segment.dropped) {
-+          continue;
-+        }
-+
-+        const translation = translations[i][0];
-+        segment.results[pieces[i].index] =
-+            typeof translation === 'string' ? translation : '';
-+        if (--segment.remaining === 0) {
-+          applySegment(segment);
-+        }
-+      }
++      items.forEach((item, i) => applyRuns(item.runs, translations[i]));
 +
 +      if (observer) {
 +        // Our own writes are ignored through |translated|, but the page may
