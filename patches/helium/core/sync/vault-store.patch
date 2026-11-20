@@ -1,28 +1,19 @@
 --- a/components/sync/engine/sync_vault/BUILD.gn
 +++ b/components/sync/engine/sync_vault/BUILD.gn
-@@ -17,6 +17,9 @@ source_set("sync_vault") {
-     "sync_vault_format.cc",
-     "sync_vault_format.h",
-     "sync_vault_limits.h",
-+    "sync_vault_state_codec.h",
-+    "sync_vault_store.cc",
-+    "sync_vault_store.h",
-     "sync_vault_transport.h",
+@@ -21,9 +21,8 @@ source_set("sync_vault") {
    ]
  
-@@ -25,5 +28,8 @@ source_set("sync_vault") {
+   public_deps = [
++    ":sync_vault_proto",
+     "//base",
      "//crypto",
    ]
- 
+-
 -  deps = [ ":sync_vault_proto" ]
-+  deps = [
-+    ":sync_vault_proto",
-+    "//components/sync/protocol",
-+  ]
  }
 --- /dev/null
 +++ b/components/sync/engine/sync_vault/sync_vault_store.cc
-@@ -0,0 +1,888 @@
+@@ -0,0 +1,642 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -30,26 +21,16 @@
 +#include "components/sync/engine/sync_vault/sync_vault_store.h"
 +
 +#include <algorithm>
-+#include <cstddef>
-+#include <cstdint>
-+#include <limits>
-+#include <memory>
-+#include <optional>
-+#include <string>
-+#include <string_view>
 +#include <utility>
-+#include <vector>
 +
 +#include "base/check.h"
 +#include "base/containers/span.h"
 +#include "base/functional/bind.h"
 +#include "base/memory/ptr_util.h"
 +#include "base/notreached.h"
-+#include "base/numerics/checked_math.h"
-+#include "base/numerics/clamped_math.h"
-+#include "base/numerics/safe_conversions.h"
-+#include "components/sync/engine/sync_vault/sync_vault_cryptographer.h"
-+#include "components/sync/engine/sync_vault/sync_vault_state_codec.h"
++#include "components/sync/engine/loopback_server/loopback_server_state_delta.h"
++#include "components/sync/engine/sync_vault/sync_vault_format.h"
++#include "components/sync/engine/sync_vault/sync_vault_limits.h"
 +#include "crypto/hash.h"
 +
 +namespace syncer {
@@ -57,11 +38,20 @@
 +namespace {
 +
 +constexpr char kHeadObjectId[] = "head";
-+constexpr size_t kMaximumMetadataContainerBytes =
++constexpr size_t kMaximumHeadBytes =
 +    kSyncVaultMaximumMetadataPlaintextBytes + kSyncVaultContainerOverheadBytes;
-+// Retain roughly a snapshot's worth of changes, or this much for small vaults.
-+// This controls compaction frequency, not the amount of synced user data.
-+constexpr uint64_t kMinimumEpochHistoryBytes = 256 * 1024 * 1024;
++constexpr size_t kMaximumCommitBytes =
++    kSyncVaultMaximumCommitPlaintextBytes + kSyncVaultContainerOverheadBytes;
++// Payloads are written and read one chunk at a time, which bounds the memory
++// needed for large snapshots. Small payloads stay in their commit, which
++// keeps the commits loaded to catch up small as well.
++constexpr size_t kPayloadChunkBytes = 4 * 1024 * 1024;
++constexpr size_t kMaximumInlinePayloadBytes = 64 * 1024;
++// Write a new snapshot once the deltas outgrow the last one, or this.
++constexpr uint64_t kMinimumEpochDeltaBytes = 256 * 1024 * 1024;
++// Epochs are limited to kSyncVaultEpochCommitTarget commits, and the
++// previous epoch is retained.
++constexpr uint64_t kMaximumCommitAncestry = 2 * kSyncVaultEpochCommitTarget;
 +constexpr base::TimeDelta kEpochCollectionRetryDelay = base::Minutes(1);
 +
 +SyncVaultStoreError MapTransportError(SyncVaultTransportError error) {
@@ -89,151 +79,73 @@
 +}
 +
 +SyncVaultStoreError MapCryptoError(SyncVaultCryptoError error) {
-+  switch (error) {
-+    case SyncVaultCryptoError::kInvalidKey:
-+      return SyncVaultStoreError::kInvalidVaultKey;
-+    case SyncVaultCryptoError::kInvalidContext:
-+    case SyncVaultCryptoError::kMalformedContainer:
-+      return SyncVaultStoreError::kMalformedObject;
-+    case SyncVaultCryptoError::kObjectTooLarge:
-+      return SyncVaultStoreError::kObjectTooLarge;
-+    case SyncVaultCryptoError::kAuthenticationFailed:
-+      return SyncVaultStoreError::kAuthenticationFailed;
-+  }
-+  NOTREACHED();
-+}
-+
-+SyncVaultStoreError MapFormatError(SyncVaultFormatError error) {
-+  switch (error) {
-+    case SyncVaultFormatError::kMalformed:
-+    case SyncVaultFormatError::kInvalidValue:
-+      return SyncVaultStoreError::kMalformedObject;
-+    case SyncVaultFormatError::kUnsupportedVersion:
-+      return SyncVaultStoreError::kUnsupportedVersion;
-+    case SyncVaultFormatError::kLimitExceeded:
-+      return SyncVaultStoreError::kObjectTooLarge;
-+  }
-+  NOTREACHED();
-+}
-+
-+SyncVaultStoreError MapStateCodecReadError(SyncVaultStateCodecError error) {
-+  switch (error) {
-+    case SyncVaultStateCodecError::kMalformed:
-+    case SyncVaultStateCodecError::kInvalidValue:
-+      return SyncVaultStoreError::kMalformedObject;
-+    case SyncVaultStateCodecError::kUnsupportedVersion:
-+      return SyncVaultStoreError::kUnsupportedVersion;
-+    case SyncVaultStateCodecError::kLimitExceeded:
-+      return SyncVaultStoreError::kObjectTooLarge;
-+  }
-+  NOTREACHED();
-+}
-+
-+SyncVaultStoreError MapStateCodecWriteError(SyncVaultStateCodecError error) {
-+  return error == SyncVaultStateCodecError::kLimitExceeded
-+             ? SyncVaultStoreError::kObjectTooLarge
++  return error == SyncVaultCryptoError::kAuthenticationFailed
++             ? SyncVaultStoreError::kAuthenticationFailed
 +             : SyncVaultStoreError::kInvalidData;
 +}
 +
-+bool IsAmbiguousWriteError(SyncVaultStoreError error) {
-+  return error == SyncVaultStoreError::kNetworkError ||
-+         error == SyncVaultStoreError::kTemporaryError;
++SyncVaultStoreError MapFormatError(SyncVaultFormatError error) {
++  return error == SyncVaultFormatError::kUnsupportedVersion
++             ? SyncVaultStoreError::kUnsupportedVersion
++             : SyncVaultStoreError::kInvalidData;
 +}
 +
-+SyncVaultObjectDigest ContentDigest(base::span<const uint8_t> encrypted_data) {
-+  return SyncVaultObjectDigest{crypto::hash::Sha256(encrypted_data)};
++// A failed write may still have been applied.
++bool IsAmbiguousWriteError(SyncVaultTransportError error) {
++  return error == SyncVaultTransportError::kNetworkError ||
++         error == SyncVaultTransportError::kTemporaryError;
 +}
 +
-+bool HasValidContentAddress(const SyncVaultObjectDigest& object_digest,
-+                            base::span<const uint8_t> encrypted_data) {
-+  return object_digest == ContentDigest(encrypted_data);
++std::string Digest(base::span<const uint8_t> data) {
++  const auto digest = crypto::hash::Sha256(data);
++  return std::string(base::as_string_view(digest));
 +}
 +
-+base::expected<SyncVaultCommitHeader, SyncVaultStoreError> NextCommitHeader(
-+    const std::optional<SyncVaultCommitHeader>& base,
-+    bool start_new_epoch,
-+    size_t payload_size) {
-+  if (!base) {
-+    return SyncVaultCommitHeader{.generation = 1,
-+                                 .epoch_start_generation = 1,
-+                                 .epoch_payload_bytes = payload_size};
-+  }
-+  SyncVaultCommitHeader next = *base;
-+  next.generation++;
-+  if (start_new_epoch) {
-+    if (base->epoch == std::numeric_limits<uint32_t>::max()) {
-+      return base::unexpected(SyncVaultStoreError::kObjectTooLarge);
-+    }
-+    next.epoch++;
-+    next.epoch_start_generation = next.generation;
-+    next.minimum_retained_generation = MinimumRetainedGenerationForEpoch(
-+        next.epoch, base->epoch_start_generation);
-+    next.epoch_payload_bytes = 0;
-+  }
-+  base::CheckedNumeric<uint64_t> bytes = next.epoch_payload_bytes;
-+  bytes += payload_size;
-+  if (!bytes.AssignIfValid(&next.epoch_payload_bytes)) {
-+    return base::unexpected(SyncVaultStoreError::kObjectTooLarge);
-+  }
-+  return next;
++std::vector<uint8_t> Serialize(const google::protobuf::MessageLite& message) {
++  std::vector<uint8_t> data(message.ByteSizeLong());
++  CHECK(message.SerializeToArray(data.data(), data.size()));
++  return data;
 +}
 +
 +}  // namespace
 +
-+SyncVaultState::SyncVaultState(
-+    std::vector<uint8_t> data,
-+    SyncVaultHead head,
-+    std::optional<SyncVaultCommitHeader> commit_header,
-+    std::string head_revision,
-+    base::UnguessableToken store_token)
-+    : data_(std::move(data)),
-+      head_(std::move(head)),
-+      commit_header_(std::move(commit_header)),
-+      head_revision_(std::move(head_revision)),
-+      store_token_(store_token) {}
-+
 +// static
-+SyncVaultStore::CreateResult SyncVaultStore::Create(
-+    std::unique_ptr<SyncVaultTransport> transport,
-+    std::unique_ptr<SyncVaultStateCodec> state_codec,
-+    base::span<const uint8_t> vault_key,
-+    std::string vault_uuid,
-+    std::optional<SyncVaultCheckpoint> checkpoint,
-+    PersistCheckpointCallback persist_checkpoint_callback) {
-+  if (!transport || !state_codec || !persist_checkpoint_callback) {
++base::expected<std::unique_ptr<SyncVaultStore>, SyncVaultStoreError>
++SyncVaultStore::Create(std::unique_ptr<SyncVaultTransport> transport,
++                       base::span<const uint8_t> vault_key,
++                       std::string vault_uuid,
++                       std::optional<sync_pb::SyncVaultCheckpoint> checkpoint,
++                       PersistCheckpointCallback persist_checkpoint) {
++  CHECK(transport);
++  CHECK(persist_checkpoint);
++  if (checkpoint && checkpoint->vault_uuid() != vault_uuid) {
 +    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
++  if (!checkpoint) {
++    checkpoint.emplace();
++    checkpoint->set_format_version(kSyncVaultFormatVersion);
++    checkpoint->set_vault_uuid(vault_uuid);
++    checkpoint->set_generation(0);
 +  }
 +  auto cryptographer =
 +      SyncVaultCryptographer::Create(vault_key, std::move(vault_uuid));
 +  if (!cryptographer.has_value()) {
-+    return base::unexpected(MapCryptoError(cryptographer.error()));
-+  }
-+  if (checkpoint &&
-+      checkpoint->vault_uuid != cryptographer.value()->vault_uuid()) {
-+    return base::unexpected(SyncVaultStoreError::kInvalidData);
-+  }
-+  SyncVaultCheckpoint effective_checkpoint = checkpoint.value_or(
-+      SyncVaultCheckpoint{cryptographer.value()->vault_uuid(), 0, {}});
-+  if (!SerializeSyncVaultCheckpoint(effective_checkpoint).has_value()) {
 +    return base::unexpected(SyncVaultStoreError::kInvalidData);
 +  }
 +  return base::WrapUnique(new SyncVaultStore(
-+      std::move(transport), std::move(state_codec),
-+      std::move(cryptographer.value()), std::move(effective_checkpoint),
-+      std::move(persist_checkpoint_callback)));
++      std::move(transport), std::move(cryptographer.value()),
++      std::move(*checkpoint), std::move(persist_checkpoint)));
 +}
 +
 +SyncVaultStore::SyncVaultStore(
 +    std::unique_ptr<SyncVaultTransport> transport,
-+    std::unique_ptr<SyncVaultStateCodec> state_codec,
 +    std::unique_ptr<SyncVaultCryptographer> cryptographer,
-+    SyncVaultCheckpoint checkpoint,
-+    PersistCheckpointCallback persist_checkpoint_callback)
++    sync_pb::SyncVaultCheckpoint checkpoint,
++    PersistCheckpointCallback persist_checkpoint)
 +    : transport_(std::move(transport)),
-+      state_codec_(std::move(state_codec)),
 +      cryptographer_(std::move(cryptographer)),
 +      checkpoint_(std::move(checkpoint)),
-+      persist_checkpoint_callback_(std::move(persist_checkpoint_callback)) {
++      persist_checkpoint_(std::move(persist_checkpoint)) {
 +  DETACH_FROM_SEQUENCE(sequence_checker_);
 +}
 +
@@ -241,652 +153,486 @@
 +
 +void SyncVaultStore::SetCancelationSignal(
 +    CancelationSignal* cancelation_signal) {
-+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  CHECK(cancelation_signal);
 +  transport_->SetCancelationSignal(cancelation_signal);
 +}
 +
-+SyncVaultStore::ReadResult SyncVaultStore::ReadState() {
++SyncVaultStore::Result SyncVaultStore::Initialize() {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  HeadResult head = ReadHead();
-+  if (!head.has_value()) {
-+    return base::unexpected(head.error());
++  sync_pb::SyncVaultHead head;
++  head.set_format_version(kSyncVaultFormatVersion);
++  auto encrypted =
++      cryptographer_->Encrypt(SyncVaultObjectRole::kHead, Serialize(head));
++  if (!encrypted.has_value()) {
++    return base::unexpected(MapCryptoError(encrypted.error()));
 +  }
-+  return ReadStateForHead(std::move(head->head), std::move(head->revision),
-+                          nullptr);
-+}
-+
-+SyncVaultStore::RefreshResult SyncVaultStore::RefreshState(
-+    SyncVaultState* loaded_state) {
-+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  if (!loaded_state || !OwnsState(*loaded_state)) {
-+    return base::unexpected(SyncVaultStoreError::kInvalidData);
-+  }
-+  HeadResult current = ReadHead();
-+  if (!current.has_value()) {
-+    return base::unexpected(current.error());
-+  }
-+  if (current->head == loaded_state->head()) {
-+    loaded_state->head_revision_ = std::move(current->revision);
-+    return RefreshOutcome::kUnchanged;
-+  }
-+  ReadResult refreshed = ReadStateForHead(
-+      std::move(current->head), std::move(current->revision), loaded_state);
-+  if (!refreshed.has_value()) {
-+    return base::unexpected(refreshed.error());
-+  }
-+  *loaded_state = std::move(refreshed.value());
-+  return RefreshOutcome::kChanged;
-+}
-+
-+SyncVaultStore::ReadResult SyncVaultStore::ReadStateForHead(
-+    SyncVaultHead head,
-+    std::string head_revision,
-+    const SyncVaultState* loaded_state) {
-+  if (!head.commit_digest) {
-+    if (checkpoint_.generation != 0) {
-+      return base::unexpected(SyncVaultStoreError::kRollback);
-+    }
-+    return SyncVaultState({}, std::move(head), std::nullopt,
-+                          std::move(head_revision), store_token_);
-+  }
-+
-+  AuthenticatedHeadResult authenticated = AuthenticateHead(head);
-+  if (!authenticated.has_value()) {
-+    return base::unexpected(authenticated.error());
-+  }
-+  CHECK(!authenticated->commits_newest_first.empty());
-+  auto& commits = authenticated->commits_newest_first;
-+  // Reconstruction may append parents and invalidate references into commits.
-+  const SyncVaultCommitHeader latest_header = commits.front().commit.header;
-+
-+  std::vector<uint8_t> state;
-+  const bool can_apply_incrementally =
-+      loaded_state && IsAtCheckpoint(*loaded_state) &&
-+      loaded_state->generation() >= latest_header.epoch_start_generation &&
-+      commits.size() == latest_header.generation - loaded_state->generation();
-+  if (can_apply_incrementally) {
-+    // AuthenticateHead checked the new links. Only the transition from our
-+    // retained header to the oldest new commit remains to be checked.
-+    if (!IsValidSyncVaultCommitTransition(*loaded_state->head().commit_digest,
-+                                          *loaded_state->commit_header(),
-+                                          commits.back().commit)) {
-+      return base::unexpected(SyncVaultStoreError::kMalformedObject);
-+    }
-+    StateDataResult applied = ApplyCommitPayloads(
-+        loaded_state->data(), authenticated->commits_newest_first);
-+    if (!applied.has_value()) {
-+      return base::unexpected(applied.error());
-+    }
-+    state = std::move(applied.value());
-+  } else if (loaded_state && loaded_state->head() == head) {
-+    state = loaded_state->data();
-+  } else {
-+    StateDataResult reconstructed = ReconstructState(&authenticated.value());
-+    if (!reconstructed.has_value()) {
-+      return base::unexpected(reconstructed.error());
-+    }
-+    state = std::move(reconstructed.value());
-+  }
-+
-+  const SyncVaultCommit& accepted_commit = commits.front().commit;
-+  if (accepted_commit.header.generation > checkpoint_.generation &&
-+      !AdvanceCheckpoint(head, accepted_commit.header)) {
-+    return base::unexpected(SyncVaultStoreError::kCheckpointPersistenceFailed);
-+  }
-+  MaybeCollectEpochs(accepted_commit);
-+  return SyncVaultState(std::move(state), std::move(head),
-+                        accepted_commit.header, std::move(head_revision),
-+                        store_token_);
-+}
-+
-+base::expected<void, SyncVaultStoreError>
-+SyncVaultStore::VerifyInitializedVault() {
-+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  HeadResult head = ReadHead();
-+  if (!head.has_value()) {
-+    return base::unexpected(head.error());
-+  }
-+  if (!head->head.commit_digest) {
-+    if (checkpoint_.generation != 0) {
-+      return base::unexpected(SyncVaultStoreError::kRollback);
-+    }
++  auto written = transport_->WriteObject(kHeadObjectId, std::nullopt,
++                                         std::move(*encrypted), std::nullopt);
++  if (written.has_value()) {
 +    return base::ok();
 +  }
-+  AuthenticatedHeadResult authenticated = AuthenticateHead(head->head);
-+  if (!authenticated.has_value()) {
-+    return base::unexpected(authenticated.error());
++  if (written.error() != SyncVaultTransportError::kConflict &&
++      !IsAmbiguousWriteError(written.error())) {
++    return base::unexpected(MapTransportError(written.error()));
 +  }
++  // The head exists already, possibly from this write.
++  return Verify();
++}
++
++SyncVaultStore::Result SyncVaultStore::Verify() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  auto head = ReadHead();
++  if (!head.has_value()) {
++    return base::unexpected(head.error());
++  }
++  if (head->commit_digest.empty()) {
++    return base::ok();
++  }
++  auto commits = ReadNewCommits(head->commit_digest);
++  if (!commits.has_value()) {
++    return base::unexpected(commits.error());
++  }
++  return AdvanceCheckpoint(commits->front());
++}
++
++base::expected<bool, SyncVaultStoreError> SyncVaultStore::Load() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  auto head = ReadHead();
++  if (!head.has_value()) {
++    return base::unexpected(head.error());
++  }
++  if (state_ && head->commit_digest == head_.commit_digest) {
++    head_.revision = std::move(head->revision);
++    return false;
++  }
++  if (head->commit_digest.empty()) {
++    state_ = std::make_unique<LoopbackServerVaultState>();
++    head_ = std::move(*head);
++    head_commit_.Clear();
++    return true;
++  }
++
++  auto new_commits = ReadNewCommits(head->commit_digest);
++  if (!new_commits.has_value()) {
++    return base::unexpected(new_commits.error());
++  }
++  std::vector<CommitEntry>& commits = *new_commits;
++  const uint64_t epoch_start = commits.front().commit.epoch_start_generation();
++
++  // Apply the new commits to the loaded state when they follow it, and
++  // otherwise rebuild it from the latest snapshot.
++  const bool follows_state =
++      state_ && !head_.commit_digest.empty() &&
++      IsValidSyncVaultCommitTransition(head_.commit_digest, head_commit_,
++                                       commits.back().commit);
++  if (!follows_state) {
++    // Do not keep the old state in memory while building the new one.
++    state_.reset();
++    while (commits.back().commit.generation() > epoch_start) {
++      const std::string digest = commits.back().commit.parent_commit_digest();
++      auto parent = ReadCommit(digest);
++      if (!parent.has_value()) {
++        return base::unexpected(parent.error());
++      }
++      if (!IsValidSyncVaultCommitTransition(digest, *parent,
++                                            commits.back().commit)) {
++        return base::unexpected(SyncVaultStoreError::kInvalidData);
++      }
++      commits.push_back({digest, std::move(*parent)});
++    }
++    while (commits.back().commit.generation() < epoch_start) {
++      commits.pop_back();
++    }
++    state_ = std::make_unique<LoopbackServerVaultState>();
++  }
++  for (auto it = commits.rbegin(); it != commits.rend(); ++it) {
++    Result applied = ReadPayload(it->commit);
++    if (!applied.has_value()) {
++      state_.reset();
++      return base::unexpected(applied.error());
++    }
++  }
++
++  CommitEntry& latest = commits.front();
++  latest.commit.clear_inline_payload();
++  latest.commit.clear_payload_chunk_digests();
++  head_ = std::move(*head);
++  head_commit_ = latest.commit;
++  Result advanced = AdvanceCheckpoint(latest);
++  if (!advanced.has_value()) {
++    state_.reset();
++    return base::unexpected(advanced.error());
++  }
++  MaybeCollectEpochs();
++  return true;
++}
++
++SyncVaultStore::Result SyncVaultStore::Commit() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  CHECK(state_);
++  Result result = WriteCommit();
++  if (!result.has_value()) {
++    state_.reset();
++  }
++  return result;
++}
++
++void SyncVaultStore::Discard() {
++  state_.reset();
++}
++
++SyncVaultStore::Result SyncVaultStore::WriteCommit() {
++  const bool has_commits = !head_.commit_digest.empty();
++  const uint64_t epoch_commits =
++      has_commits ? head_commit_.generation() -
++                        head_commit_.epoch_start_generation() + 1
++                  : 0;
++  const bool snapshot = !has_commits || state_->RequiresSnapshot() ||
++                        epoch_commits >= kSyncVaultEpochCommitTarget ||
++                        head_commit_.epoch_delta_bytes() >=
++                            std::max(kMinimumEpochDeltaBytes,
++                                     head_commit_.epoch_snapshot_bytes());
++
++  sync_pb::SyncVaultCommit commit;
++  commit.set_format_version(kSyncVaultFormatVersion);
++  commit.set_generation(head_commit_.generation() + 1);
++  if (has_commits) {
++    commit.set_parent_commit_digest(head_.commit_digest);
++  }
++  if (snapshot) {
++    // Each snapshot starts an epoch. The previous epoch is kept so that
++    // profiles which loaded it can still catch up from their checkpoint.
++    commit.set_epoch(has_commits ? head_commit_.epoch() + 1 : 0);
++    commit.set_epoch_start_generation(commit.generation());
++    commit.set_minimum_retained_generation(
++        has_commits ? head_commit_.epoch_start_generation() : 0);
++  } else {
++    commit.set_epoch(head_commit_.epoch());
++    commit.set_epoch_start_generation(head_commit_.epoch_start_generation());
++    commit.set_minimum_retained_generation(
++        head_commit_.minimum_retained_generation());
++    commit.set_epoch_snapshot_bytes(head_commit_.epoch_snapshot_bytes());
++  }
++
++  auto payload_bytes = WritePayload(snapshot, commit);
++  if (!payload_bytes.has_value()) {
++    return base::unexpected(payload_bytes.error());
++  }
++  if (snapshot) {
++    commit.set_epoch_snapshot_bytes(*payload_bytes);
++    commit.set_epoch_delta_bytes(0);
++  } else {
++    commit.set_epoch_delta_bytes(head_commit_.epoch_delta_bytes() +
++                                 *payload_bytes);
++  }
++
++  auto digest = WriteImmutableObject(SyncVaultObjectRole::kCommit,
++                                     Serialize(commit), commit.epoch());
++  if (!digest.has_value()) {
++    return base::unexpected(digest.error());
++  }
++  Result head_written = WriteHead(*digest);
++  if (!head_written.has_value()) {
++    return head_written;
++  }
++
++  state_->MarkWritten();
++  commit.clear_inline_payload();
++  commit.clear_payload_chunk_digests();
++  head_commit_ = commit;
++  Result advanced = AdvanceCheckpoint({std::move(*digest), std::move(commit)});
++  if (!advanced.has_value()) {
++    return advanced;
++  }
++  MaybeCollectEpochs();
 +  return base::ok();
 +}
 +
-+SyncVaultStore::ReadResult SyncVaultStore::InitializeEmptyVaultAndReadState() {
-+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  HeadResult existing = ReadHead();
-+  if (existing.has_value()) {
-+    return ReadStateForHead(std::move(existing->head),
-+                            std::move(existing->revision), nullptr);
-+  }
-+  if (existing.error() != SyncVaultStoreError::kIncompleteHistory) {
-+    return base::unexpected(existing.error());
-+  }
-+  WriteResult initialization = InitializeVault();
-+  if (!initialization.has_value()) {
-+    return base::unexpected(initialization.error());
-+  }
-+  return ReadState();
-+}
-+
-+SyncVaultStore::StateDataResult SyncVaultStore::TakePayload(
-+    SyncVaultCommit* commit) const {
-+  CHECK(commit);
-+  if (!commit->inline_payload.empty()) {
-+    return std::move(commit->inline_payload);
-+  }
-+  std::vector<uint8_t> payload;
-+  payload.reserve(commit->external_payload_size);
-+  size_t remaining_bytes = commit->external_payload_size;
-+  std::vector<SyncVaultObjectDigest> chunk_digests =
-+      std::move(commit->payload_chunk_digests);
-+  for (const SyncVaultObjectDigest& chunk_digest : chunk_digests) {
-+    const size_t chunk_size =
-+        std::min(remaining_bytes, kSyncVaultMaximumPayloadPlaintextBytes);
-+    ObjectResult object =
-+        ReadObject(GetSyncVaultImmutableObjectId(chunk_digest),
-+                   kSyncVaultMaximumEncryptedObjectBytes);
-+    if (!object.has_value()) {
-+      return base::unexpected(object.error());
-+    }
-+    if (!object->has_value()) {
-+      return base::unexpected(SyncVaultStoreError::kIncompleteHistory);
-+    }
-+    if (!HasValidContentAddress(chunk_digest, object->value().data)) {
-+      return base::unexpected(SyncVaultStoreError::kAuthenticationFailed);
-+    }
-+    auto plaintext = cryptographer_->Decrypt(SyncVaultObjectRole::kPayload,
-+                                             object->value().data);
-+    if (!plaintext.has_value()) {
-+      return base::unexpected(MapCryptoError(plaintext.error()));
-+    }
-+    if (plaintext->size() != chunk_size) {
-+      return base::unexpected(SyncVaultStoreError::kMalformedObject);
-+    }
-+    payload.insert(payload.end(), plaintext->begin(), plaintext->end());
-+    remaining_bytes -= chunk_size;
-+  }
-+  CHECK_EQ(remaining_bytes, 0u);
-+  return payload;
-+}
-+
-+SyncVaultStore::StateDataResult SyncVaultStore::ReconstructState(
-+    AuthenticatedHead* authenticated) const {
-+  CHECK(authenticated);
-+  CHECK(!authenticated->commits_newest_first.empty());
-+  const uint64_t epoch_start_generation =
-+      authenticated->commits_newest_first.front()
-+          .commit.header.epoch_start_generation;
-+  while (authenticated->commits_newest_first.back().commit.header.generation >
-+         epoch_start_generation) {
-+    const CommitEntry& child = authenticated->commits_newest_first.back();
-+    CommitObjectResult parent_result =
-+        ReadCommit(*child.commit.parent_commit_digest);
-+    if (!parent_result.has_value()) {
-+      return base::unexpected(parent_result.error());
-+    }
-+    SyncVaultCommit parent = std::move(parent_result.value());
-+    if (!IsValidSyncVaultCommitTransition(*child.commit.parent_commit_digest,
-+                                          parent.header, child.commit)) {
-+      return base::unexpected(SyncVaultStoreError::kMalformedObject);
-+    }
-+    authenticated->commits_newest_first.push_back(
-+        {*child.commit.parent_commit_digest, std::move(parent)});
-+  }
-+
-+  const size_t delta_count = base::checked_cast<size_t>(
-+      authenticated->commits_newest_first.front().commit.header.generation -
-+      epoch_start_generation);
-+  CHECK_LT(delta_count, authenticated->commits_newest_first.size());
-+  StateDataResult state =
-+      TakePayload(&authenticated->commits_newest_first[delta_count].commit);
-+  if (!state.has_value()) {
-+    return base::unexpected(state.error());
-+  }
-+  SyncVaultStateValidationResult snapshot_validation =
-+      state_codec_->ValidateSnapshot(state.value());
-+  if (!snapshot_validation.has_value()) {
-+    return base::unexpected(
-+        MapStateCodecReadError(snapshot_validation.error()));
-+  }
-+  if (delta_count == 0) {
-+    return state;
-+  }
-+  return ApplyCommitPayloads(
-+      state.value(),
-+      base::span(authenticated->commits_newest_first).first(delta_count));
-+}
-+
-+SyncVaultStore::StateDataResult SyncVaultStore::ApplyCommitPayloads(
-+    base::span<const uint8_t> base_state,
-+    base::span<CommitEntry> newest_first) const {
-+  auto reconstruction = state_codec_->StartReconstruction(base_state);
-+  if (!reconstruction.has_value()) {
-+    return base::unexpected(MapStateCodecReadError(reconstruction.error()));
-+  }
-+  for (auto it = newest_first.rbegin(); it != newest_first.rend(); ++it) {
-+    StateDataResult payload = TakePayload(&it->commit);
-+    if (!payload.has_value()) {
-+      return base::unexpected(payload.error());
-+    }
-+    auto applied = (*reconstruction)->ApplyDelta(*payload);
-+    if (!applied.has_value()) {
-+      return base::unexpected(MapStateCodecReadError(applied.error()));
-+    }
-+  }
-+  auto applied = (*reconstruction)->Finish();
-+  if (!applied.has_value()) {
-+    return base::unexpected(MapStateCodecReadError(applied.error()));
-+  }
-+  return std::move(applied.value());
-+}
-+
-+SyncVaultStore::CommitResult SyncVaultStore::CommitMutation(
-+    const SyncVaultState& base_state,
-+    std::optional<std::vector<uint8_t>> delta,
-+    std::vector<uint8_t> snapshot) {
-+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  const size_t resulting_state_size = snapshot.size();
-+  if (!OwnsState(base_state) ||
-+      base_state.generation() == std::numeric_limits<uint64_t>::max() ||
-+      resulting_state_size == 0) {
-+    return base::unexpected(SyncVaultStoreError::kInvalidData);
-+  }
-+  const bool use_delta = base_state.generation() > 0 && delta &&
-+                         !delta->empty() &&
-+                         delta->size() < resulting_state_size;
-+  const auto& base_commit = base_state.commit_header();
-+  const uint64_t base_epoch_payload_bytes =
-+      base_commit ? base_commit->epoch_payload_bytes : 0;
-+  const uint64_t commits_in_epoch =
-+      base_commit
-+          ? base_commit->generation - base_commit->epoch_start_generation + 1
-+          : 0;
-+  const uint64_t pending_payload_bytes = base::checked_cast<uint64_t>(
-+      use_delta ? delta->size() : resulting_state_size);
-+  const uint64_t state_bytes =
-+      base::checked_cast<uint64_t>(resulting_state_size);
-+  const uint64_t epoch_payload_target = base::ClampAdd(
-+      state_bytes, std::max(kMinimumEpochHistoryBytes, state_bytes));
-+  const bool byte_target_reached =
-+      base::ClampAdd(base_epoch_payload_bytes, pending_payload_bytes) >=
-+      epoch_payload_target;
-+  const bool start_new_epoch =
-+      base_commit &&
-+      (!use_delta || commits_in_epoch >= kSyncVaultEpochCommitTarget ||
-+       byte_target_reached);
-+  const bool write_snapshot = !use_delta || start_new_epoch;
-+  if (write_snapshot) {
-+    auto validation = state_codec_->ValidateSnapshot(snapshot);
-+    if (!validation.has_value()) {
-+      return base::unexpected(MapStateCodecWriteError(validation.error()));
-+    }
-+    delta.reset();
-+  }
-+  base::span<const uint8_t> payload =
-+      delta ? base::span(*delta) : base::span(snapshot);
-+
-+  SyncVaultCommit commit;
-+  auto header = NextCommitHeader(base_commit, start_new_epoch, payload.size());
-+  if (!header.has_value()) {
-+    return base::unexpected(header.error());
-+  }
-+  commit.header = header.value();
-+  commit.parent_commit_digest = base_state.head().commit_digest;
-+
-+  StateDataResult serialized_commit = PrepareCommitPayload(payload, &commit);
-+  if (!serialized_commit.has_value()) {
-+    return base::unexpected(serialized_commit.error());
-+  }
-+
-+  auto encrypted_commit = cryptographer_->Encrypt(SyncVaultObjectRole::kCommit,
-+                                                  serialized_commit.value());
-+  if (!encrypted_commit.has_value()) {
-+    return base::unexpected(MapCryptoError(encrypted_commit.error()));
-+  }
-+  const SyncVaultObjectDigest commit_digest =
-+      ContentDigest(encrypted_commit.value());
-+  WriteResult commit_write = WriteImmutableObject(
-+      commit_digest, std::move(encrypted_commit.value()), commit.header.epoch);
-+  if (!commit_write.has_value()) {
-+    return base::unexpected(commit_write.error());
-+  }
-+
-+  SyncVaultHead new_head{commit_digest};
-+  auto serialized_head = SerializeSyncVaultHead(new_head);
-+  if (!serialized_head.has_value()) {
-+    return base::unexpected(MapFormatError(serialized_head.error()));
-+  }
-+  auto encrypted_head = cryptographer_->Encrypt(SyncVaultObjectRole::kHead,
-+                                                serialized_head.value());
-+  if (!encrypted_head.has_value()) {
-+    return base::unexpected(MapCryptoError(encrypted_head.error()));
-+  }
-+  WriteResult head_write =
-+      WriteObject(kHeadObjectId, base_state.head_revision(),
-+                  std::move(encrypted_head.value()), std::nullopt);
-+  if (!head_write.has_value() && IsAmbiguousWriteError(head_write.error())) {
-+    HeadResult current = ReadHead();
-+    if (current.has_value() && current->head == new_head) {
-+      head_write = std::move(current->revision);
-+    }
-+  }
-+  if (!head_write.has_value()) {
-+    return base::unexpected(head_write.error());
-+  }
-+  if (!AdvanceCheckpoint(new_head, commit.header)) {
-+    return base::unexpected(SyncVaultStoreError::kCheckpointPersistenceFailed);
-+  }
-+  MaybeCollectEpochs(commit);
-+  return SyncVaultState(std::move(snapshot), std::move(new_head), commit.header,
-+                        std::move(head_write.value()), store_token_);
-+}
-+
-+SyncVaultStore::StateDataResult SyncVaultStore::PrepareCommitPayload(
-+    base::span<const uint8_t> payload,
-+    SyncVaultCommit* commit) {
-+  if (payload.size() <= kSyncVaultMaximumCommitPlaintextBytes) {
-+    commit->inline_payload.assign(payload.begin(), payload.end());
-+    auto serialized = SerializeSyncVaultCommit(*commit);
-+    if (serialized.has_value()) {
-+      return std::move(serialized.value());
-+    }
-+    if (serialized.error() != SyncVaultFormatError::kLimitExceeded) {
-+      return base::unexpected(MapFormatError(serialized.error()));
-+    }
-+    // The payload fits alone, but protobuf metadata can push it over the limit.
-+    std::vector<uint8_t>().swap(commit->inline_payload);
-+  }
-+  for (size_t offset = 0; offset < payload.size();) {
-+    const size_t chunk_size = std::min(payload.size() - offset,
-+                                       kSyncVaultMaximumPayloadPlaintextBytes);
-+    auto encrypted = cryptographer_->Encrypt(
-+        SyncVaultObjectRole::kPayload, payload.subspan(offset, chunk_size));
-+    if (!encrypted.has_value()) {
-+      return base::unexpected(MapCryptoError(encrypted.error()));
-+    }
-+    const SyncVaultObjectDigest object_digest =
-+        ContentDigest(encrypted.value());
-+    WriteResult write = WriteImmutableObject(
-+        object_digest, std::move(encrypted.value()), commit->header.epoch);
-+    if (!write.has_value()) {
-+      return base::unexpected(write.error());
-+    }
-+    commit->payload_chunk_digests.push_back(object_digest);
-+    offset += chunk_size;
-+  }
-+  commit->external_payload_size = base::checked_cast<uint32_t>(payload.size());
-+  auto serialized = SerializeSyncVaultCommit(*commit);
-+  if (!serialized.has_value()) {
-+    return base::unexpected(MapFormatError(serialized.error()));
-+  }
-+  return std::move(serialized.value());
-+}
-+
-+SyncVaultStore::ObjectResult SyncVaultStore::ReadObject(
-+    const std::string& object_id,
-+    size_t maximum_bytes) const {
-+  SyncVaultTransport::ReadResult result =
-+      transport_->ReadObject(object_id, maximum_bytes);
-+  if (!result.has_value()) {
-+    return base::unexpected(MapTransportError(result.error()));
-+  }
-+  if (result->has_value() &&
-+      (result->value().data.size() > maximum_bytes ||
-+       !IsValidSyncVaultRevision(result->value().revision))) {
-+    return base::unexpected(SyncVaultStoreError::kInvalidData);
-+  }
-+  return std::move(result.value());
-+}
-+
-+SyncVaultStore::WriteResult SyncVaultStore::WriteObject(
-+    const std::string& object_id,
-+    std::optional<std::string> expected_revision,
-+    std::vector<uint8_t> data,
-+    std::optional<uint32_t> retention_epoch) {
-+  SyncVaultTransport::WriteResult result =
-+      transport_->WriteObject(object_id, std::move(expected_revision),
-+                              std::move(data), retention_epoch);
-+  if (!result.has_value()) {
-+    return base::unexpected(MapTransportError(result.error()));
-+  }
-+  if (!IsValidSyncVaultRevision(result.value())) {
-+    return base::unexpected(SyncVaultStoreError::kInvalidData);
-+  }
-+  return std::move(result.value());
-+}
-+
-+SyncVaultStore::HeadResult SyncVaultStore::ReadHead() {
-+  ObjectResult object =
-+      ReadObject(kHeadObjectId, kMaximumMetadataContainerBytes);
++base::expected<SyncVaultStore::Head, SyncVaultStoreError>
++SyncVaultStore::ReadHead() {
++  auto object = transport_->ReadObject(kHeadObjectId, kMaximumHeadBytes);
 +  if (!object.has_value()) {
-+    return base::unexpected(object.error());
++    return base::unexpected(MapTransportError(object.error()));
 +  }
 +  if (!object->has_value()) {
 +    return base::unexpected(SyncVaultStoreError::kIncompleteHistory);
 +  }
++  if (!IsValidSyncVaultRevision((*object)->revision)) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
 +  auto plaintext =
-+      cryptographer_->Decrypt(SyncVaultObjectRole::kHead, object->value().data);
++      cryptographer_->Decrypt(SyncVaultObjectRole::kHead, (*object)->data);
 +  if (!plaintext.has_value()) {
 +    return base::unexpected(MapCryptoError(plaintext.error()));
 +  }
-+  auto head = ParseSyncVaultHead(plaintext.value());
++  auto head = ParseSyncVaultHead(*plaintext);
 +  if (!head.has_value()) {
 +    return base::unexpected(MapFormatError(head.error()));
 +  }
-+  return VersionedHead{std::move(head.value()),
-+                       std::move(object->value().revision)};
++
++  // The head is only empty before the first commit.
++  if (head->commit_digest().empty() && checkpoint_.generation() != 0) {
++    return base::unexpected(SyncVaultStoreError::kRollback);
++  }
++
++  return Head{head->commit_digest(), std::move((*object)->revision)};
 +}
 +
-+SyncVaultStore::AuthenticatedHeadResult SyncVaultStore::AuthenticateHead(
-+    const SyncVaultHead& head) const {
-+  if (!head.commit_digest) {
-+    return base::unexpected(SyncVaultStoreError::kMalformedObject);
++SyncVaultStore::Result SyncVaultStore::WriteHead(
++    const std::string& commit_digest) {
++  sync_pb::SyncVaultHead head;
++  head.set_format_version(kSyncVaultFormatVersion);
++  head.set_commit_digest(commit_digest);
++  auto encrypted =
++      cryptographer_->Encrypt(SyncVaultObjectRole::kHead, Serialize(head));
++  if (!encrypted.has_value()) {
++    return base::unexpected(MapCryptoError(encrypted.error()));
 +  }
-+  CommitObjectResult latest_result = ReadCommit(*head.commit_digest);
-+  if (!latest_result.has_value()) {
-+    return base::unexpected(latest_result.error());
++  auto written = transport_->WriteObject(kHeadObjectId, head_.revision,
++                                         std::move(*encrypted), std::nullopt);
++  if (!written.has_value() && IsAmbiguousWriteError(written.error())) {
++    auto current = ReadHead();
++    if (current.has_value() && current->commit_digest == commit_digest) {
++      written = std::move(current->revision);
++    }
 +  }
-+  SyncVaultCommit latest = std::move(latest_result.value());
++  if (!written.has_value()) {
++    return base::unexpected(MapTransportError(written.error()));
++  }
++  if (!IsValidSyncVaultRevision(*written)) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
++  head_ = {commit_digest, std::move(*written)};
++  return base::ok();
++}
 +
-+  const uint64_t latest_generation = latest.header.generation;
-+  const uint64_t minimum_retained_generation =
-+      latest.header.minimum_retained_generation;
-+  const bool is_newer_than_checkpoint =
-+      latest_generation > checkpoint_.generation;
-+  if (!is_newer_than_checkpoint) {
-+    const SyncVaultHistoryValidationResult validation =
-+        ValidateSyncVaultHistory(checkpoint_, latest, *head.commit_digest, {});
-+    if (validation == SyncVaultHistoryValidationResult::kRollback) {
-+      return base::unexpected(SyncVaultStoreError::kRollback);
-+    }
-+    if (validation != SyncVaultHistoryValidationResult::kAcceptCurrent) {
-+      return base::unexpected(SyncVaultStoreError::kFork);
-+    }
++base::expected<sync_pb::SyncVaultCommit, SyncVaultStoreError>
++SyncVaultStore::ReadCommit(const std::string& digest) {
++  auto plaintext = ReadImmutableObject(SyncVaultObjectRole::kCommit, digest,
++                                       kMaximumCommitBytes);
++  if (!plaintext.has_value()) {
++    return base::unexpected(plaintext.error());
 +  }
++  auto commit = ParseSyncVaultCommit(*plaintext);
++  if (!commit.has_value()) {
++    return base::unexpected(MapFormatError(commit.error()));
++  }
++  return std::move(*commit);
++}
 +
-+  AuthenticatedHead authenticated;
-+  authenticated.commits_newest_first.push_back(
-+      {*head.commit_digest, std::move(latest)});
-+  if (!is_newer_than_checkpoint) {
-+    return authenticated;
++base::expected<std::vector<SyncVaultStore::CommitEntry>, SyncVaultStoreError>
++SyncVaultStore::ReadNewCommits(const std::string& head_digest) {
++  auto latest = ReadCommit(head_digest);
++  if (!latest.has_value()) {
++    return base::unexpected(latest.error());
 +  }
-+  if (checkpoint_.generation == 0 ||
-+      checkpoint_.generation < minimum_retained_generation) {
-+    if (ValidateSyncVaultHistory(
-+            checkpoint_, authenticated.commits_newest_first.front().commit,
-+            *head.commit_digest,
-+            {}) != SyncVaultHistoryValidationResult::kAcceptBaseline) {
-+      return base::unexpected(SyncVaultStoreError::kMalformedObject);
++  const uint64_t checkpoint_generation = checkpoint_.generation();
++  const uint64_t latest_generation = latest->generation();
++  if (latest_generation < checkpoint_generation) {
++    return base::unexpected(SyncVaultStoreError::kRollback);
++  }
++  if (latest_generation == checkpoint_generation &&
++      head_digest != checkpoint_.commit_digest()) {
++    return base::unexpected(SyncVaultStoreError::kFork);
++  }
++  std::vector<CommitEntry> commits;
++  commits.push_back({head_digest, std::move(*latest)});
++  // Without the checkpoint's commit to link to, accept the head as is.
++  if (latest_generation == checkpoint_generation ||
++      checkpoint_generation == 0 ||
++      checkpoint_generation <
++          commits.front().commit.minimum_retained_generation()) {
++    return commits;
++  }
++  if (latest_generation - checkpoint_generation > kMaximumCommitAncestry) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
++  while (commits.back().commit.generation() > checkpoint_generation + 1) {
++    const std::string digest = commits.back().commit.parent_commit_digest();
++    auto parent = ReadCommit(digest);
++    if (!parent.has_value()) {
++      return base::unexpected(parent.error());
 +    }
-+    return authenticated;
++    if (!IsValidSyncVaultCommitTransition(digest, *parent,
++                                          commits.back().commit)) {
++      return base::unexpected(SyncVaultStoreError::kInvalidData);
++    }
++    commits.push_back({digest, std::move(*parent)});
 +  }
-+  if (latest_generation - checkpoint_.generation >
-+      kSyncVaultMaximumCommitAncestry) {
-+    return base::unexpected(SyncVaultStoreError::kObjectTooLarge);
++  if (commits.back().commit.parent_commit_digest() !=
++      checkpoint_.commit_digest()) {
++    return base::unexpected(SyncVaultStoreError::kFork);
 +  }
++  return commits;
++}
 +
-+  SyncVaultObjectDigest commit_digest = *head.commit_digest;
-+  for (uint64_t generation = latest_generation;
-+       generation > checkpoint_.generation + 1; --generation) {
-+    const SyncVaultCommit& commit =
-+        authenticated.commits_newest_first.back().commit;
-+    commit_digest = *commit.parent_commit_digest;
-+    CommitObjectResult parent_result = ReadCommit(commit_digest);
-+    if (!parent_result.has_value()) {
-+      return base::unexpected(parent_result.error());
++SyncVaultStore::Result SyncVaultStore::ReadPayload(
++    const sync_pb::SyncVaultCommit& commit) {
++  bool inline_payload_read = false;
++  int next_chunk = 0;
++  std::vector<uint8_t> chunk;
++  std::optional<SyncVaultStoreError> error;
++  auto reader = [&]() -> base::span<const uint8_t> {
++    if (commit.has_inline_payload()) {
++      if (inline_payload_read) {
++        return {};
++      }
++      inline_payload_read = true;
++      return base::as_byte_span(commit.inline_payload());
 +    }
-+    SyncVaultCommit parent = std::move(parent_result.value());
-+    if (!IsValidSyncVaultCommitTransition(commit_digest, parent.header,
-+                                          commit)) {
-+      return base::unexpected(SyncVaultStoreError::kMalformedObject);
++    if (error || next_chunk == commit.payload_chunk_digests_size()) {
++      return {};
 +    }
-+    authenticated.commits_newest_first.push_back(
-+        {commit_digest, std::move(parent)});
++    auto plaintext =
++        ReadImmutableObject(SyncVaultObjectRole::kPayload,
++                            commit.payload_chunk_digests(next_chunk++),
++                            kSyncVaultMaximumEncryptedObjectBytes);
++    if (!plaintext.has_value()) {
++      error = plaintext.error();
++      return {};
++    }
++    chunk = std::move(*plaintext);
++    return chunk;
++  };
++  const LoopbackServerVaultState::ReadResult result = state_->Read(
++      reader, commit.generation() == commit.epoch_start_generation());
++  if (error) {
++    return base::unexpected(*error);
 +  }
-+
-+  std::vector<AuthenticatedSyncVaultCommit> ancestry;
-+  ancestry.reserve(authenticated.commits_newest_first.size());
-+  for (const CommitEntry& entry : authenticated.commits_newest_first) {
-+    ancestry.push_back({entry.object_digest, entry.commit.header.generation,
-+                        entry.commit.parent_commit_digest});
-+  }
-+  switch (ValidateSyncVaultHistory(
-+      checkpoint_, authenticated.commits_newest_first.front().commit,
-+      *head.commit_digest, ancestry)) {
-+    case SyncVaultHistoryValidationResult::kAcceptDescendant:
-+      return authenticated;
-+    case SyncVaultHistoryValidationResult::kRollback:
-+      return base::unexpected(SyncVaultStoreError::kRollback);
-+    case SyncVaultHistoryValidationResult::kFork:
-+      return base::unexpected(SyncVaultStoreError::kFork);
-+    case SyncVaultHistoryValidationResult::kIncompleteHistory:
-+      return base::unexpected(SyncVaultStoreError::kIncompleteHistory);
-+    case SyncVaultHistoryValidationResult::kAcceptCurrent:
-+    case SyncVaultHistoryValidationResult::kAcceptBaseline:
-+    case SyncVaultHistoryValidationResult::kInvalidHistory:
-+      return base::unexpected(SyncVaultStoreError::kMalformedObject);
++  switch (result) {
++    case LoopbackServerVaultState::ReadResult::kSuccess:
++      if (next_chunk != commit.payload_chunk_digests_size()) {
++        return base::unexpected(SyncVaultStoreError::kInvalidData);
++      }
++      return base::ok();
++    case LoopbackServerVaultState::ReadResult::kMalformed:
++      return base::unexpected(SyncVaultStoreError::kInvalidData);
++    case LoopbackServerVaultState::ReadResult::kUnsupportedVersion:
++      return base::unexpected(SyncVaultStoreError::kUnsupportedVersion);
 +  }
 +  NOTREACHED();
 +}
 +
-+bool SyncVaultStore::OwnsState(const SyncVaultState& state) const {
-+  return state.store_token_ == store_token_;
-+}
-+
-+bool SyncVaultStore::IsAtCheckpoint(const SyncVaultState& state) const {
-+  return state.generation() == checkpoint_.generation &&
-+         state.head().commit_digest == checkpoint_.commit_digest;
-+}
-+
-+SyncVaultStore::CommitObjectResult SyncVaultStore::ReadCommit(
-+    const SyncVaultObjectDigest& commit_digest) const {
-+  ObjectResult result = ReadObject(GetSyncVaultImmutableObjectId(commit_digest),
-+                                   kSyncVaultMaximumEncryptedObjectBytes);
-+  if (!result.has_value()) {
-+    return base::unexpected(result.error());
++base::expected<uint64_t, SyncVaultStoreError> SyncVaultStore::WritePayload(
++    bool snapshot,
++    sync_pb::SyncVaultCommit& commit) {
++  std::vector<uint8_t> buffer;
++  uint64_t total_bytes = 0;
++  std::optional<SyncVaultStoreError> error;
++  auto flush = [&] {
++    auto digest = WriteImmutableObject(SyncVaultObjectRole::kPayload, buffer,
++                                       commit.epoch());
++    if (!digest.has_value()) {
++      error = digest.error();
++      return false;
++    }
++    commit.add_payload_chunk_digests(std::move(*digest));
++    buffer.clear();
++    return true;
++  };
++  auto writer = [&](base::span<const uint8_t> bytes) {
++    total_bytes += bytes.size();
++    while (!bytes.empty()) {
++      if (buffer.size() == kPayloadChunkBytes && !flush()) {
++        return false;
++      }
++      const size_t count =
++          std::min(bytes.size(), kPayloadChunkBytes - buffer.size());
++      buffer.insert(buffer.end(), bytes.begin(), bytes.begin() + count);
++      bytes = bytes.subspan(count);
++    }
++    return true;
++  };
++  const bool written =
++      snapshot ? state_->WriteSnapshot(writer) : state_->WriteDelta(writer);
++  if (error) {
++    return base::unexpected(*error);
 +  }
-+  if (!result->has_value()) {
++  if (!written) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
++  }
++  if (commit.payload_chunk_digests_size() == 0 &&
++      buffer.size() <= kMaximumInlinePayloadBytes) {
++    commit.set_inline_payload(buffer.data(), buffer.size());
++  } else if (!flush()) {
++    return base::unexpected(*error);
++  }
++  return total_bytes;
++}
++
++base::expected<std::vector<uint8_t>, SyncVaultStoreError>
++SyncVaultStore::ReadImmutableObject(SyncVaultObjectRole role,
++                                    const std::string& digest,
++                                    size_t maximum_bytes) {
++  auto object =
++      transport_->ReadObject(GetSyncVaultObjectId(digest), maximum_bytes);
++  if (!object.has_value()) {
++    return base::unexpected(MapTransportError(object.error()));
++  }
++  if (!object->has_value()) {
 +    return base::unexpected(SyncVaultStoreError::kIncompleteHistory);
 +  }
-+  if (!HasValidContentAddress(commit_digest, result->value().data)) {
-+    return base::unexpected(SyncVaultStoreError::kAuthenticationFailed);
++  if (Digest((*object)->data) != digest) {
++    return base::unexpected(SyncVaultStoreError::kInvalidData);
 +  }
-+  auto plaintext = cryptographer_->Decrypt(SyncVaultObjectRole::kCommit,
-+                                           result->value().data);
++  auto plaintext = cryptographer_->Decrypt(role, (*object)->data);
 +  if (!plaintext.has_value()) {
 +    return base::unexpected(MapCryptoError(plaintext.error()));
 +  }
-+  auto commit = ParseSyncVaultCommit(plaintext.value());
-+  if (!commit.has_value()) {
-+    return base::unexpected(MapFormatError(commit.error()));
-+  }
-+  return std::move(commit.value());
++  return std::move(*plaintext);
 +}
 +
-+SyncVaultStore::WriteResult SyncVaultStore::InitializeVault() {
-+  SyncVaultHead initial_head;
-+  auto serialized_head = SerializeSyncVaultHead(initial_head);
-+  if (!serialized_head.has_value()) {
-+    return base::unexpected(MapFormatError(serialized_head.error()));
++base::expected<std::string, SyncVaultStoreError>
++SyncVaultStore::WriteImmutableObject(SyncVaultObjectRole role,
++                                     base::span<const uint8_t> plaintext,
++                                     uint32_t epoch) {
++  auto encrypted = cryptographer_->Encrypt(role, plaintext);
++  if (!encrypted.has_value()) {
++    return base::unexpected(MapCryptoError(encrypted.error()));
 +  }
-+  auto encrypted_head = cryptographer_->Encrypt(SyncVaultObjectRole::kHead,
-+                                                serialized_head.value());
-+  if (!encrypted_head.has_value()) {
-+    return base::unexpected(MapCryptoError(encrypted_head.error()));
++  std::string digest = Digest(*encrypted);
++  const std::string object_id = GetSyncVaultObjectId(digest);
++  auto written = transport_->WriteObject(object_id, std::nullopt,
++                                         std::move(*encrypted), epoch);
++  if (written.has_value()) {
++    return digest;
 +  }
-+  WriteResult head_write =
-+      WriteObject(kHeadObjectId, std::nullopt,
-+                  std::move(encrypted_head.value()), std::nullopt);
-+  if (head_write.has_value()) {
-+    return head_write;
++  if (written.error() != SyncVaultTransportError::kConflict &&
++      !IsAmbiguousWriteError(written.error())) {
++    return base::unexpected(MapTransportError(written.error()));
 +  }
-+  if (head_write.error() != SyncVaultStoreError::kConflict &&
-+      !IsAmbiguousWriteError(head_write.error())) {
-+    return base::unexpected(head_write.error());
-+  }
-+  HeadResult existing_head = ReadHead();
-+  if (!existing_head.has_value()) {
-+    return base::unexpected(head_write.error());
-+  }
-+  if (existing_head->head.commit_digest) {
-+    return base::unexpected(SyncVaultStoreError::kConflict);
-+  }
-+  return std::move(existing_head->revision);
-+}
-+
-+SyncVaultStore::WriteResult SyncVaultStore::WriteImmutableObject(
-+    const SyncVaultObjectDigest& object_digest,
-+    std::vector<uint8_t> encrypted_data,
-+    uint32_t retention_epoch) {
-+  const std::string object_id = GetSyncVaultImmutableObjectId(object_digest);
-+  WriteResult write = WriteObject(object_id, std::nullopt,
-+                                  std::move(encrypted_data), retention_epoch);
-+  if (write.has_value()) {
-+    return write;
-+  }
-+  if (write.error() != SyncVaultStoreError::kConflict &&
-+      !IsAmbiguousWriteError(write.error())) {
-+    return base::unexpected(write.error());
-+  }
-+  ObjectResult existing =
-+      ReadObject(object_id, kSyncVaultMaximumEncryptedObjectBytes);
++  // The object may exist already, as its name is its content's digest.
++  auto existing =
++      transport_->ReadObject(object_id, kSyncVaultMaximumEncryptedObjectBytes);
 +  if (existing.has_value() && existing->has_value() &&
-+      HasValidContentAddress(object_digest, existing->value().data)) {
-+    return existing->value().revision;
++      Digest((*existing)->data) == digest) {
++    return digest;
 +  }
-+  return base::unexpected(write.error());
++  return base::unexpected(MapTransportError(written.error()));
 +}
 +
-+bool SyncVaultStore::AdvanceCheckpoint(const SyncVaultHead& head,
-+                                       const SyncVaultCommitHeader& commit) {
-+  SyncVaultCheckpoint next{cryptographer_->vault_uuid(), commit.generation,
-+                           head.commit_digest};
-+  if (!persist_checkpoint_callback_.Run(next)) {
-+    return false;
++SyncVaultStore::Result SyncVaultStore::AdvanceCheckpoint(
++    const CommitEntry& entry) {
++  if (entry.commit.generation() <= checkpoint_.generation()) {
++    return base::ok();
 +  }
-+  checkpoint_ = std::move(next);
-+  return true;
++  sync_pb::SyncVaultCheckpoint checkpoint = checkpoint_;
++  checkpoint.set_generation(entry.commit.generation());
++  checkpoint.set_commit_digest(entry.digest);
++  if (!persist_checkpoint_.Run(checkpoint)) {
++    return base::unexpected(SyncVaultStoreError::kCheckpointPersistenceFailed);
++  }
++  checkpoint_ = std::move(checkpoint);
++  return base::ok();
 +}
 +
-+void SyncVaultStore::MaybeCollectEpochs(const SyncVaultCommit& commit) {
-+  if (commit.header.epoch <= 1) {
++void SyncVaultStore::MaybeCollectEpochs() {
++  // Objects from before the previous epoch are no longer referenced.
++  if (head_commit_.epoch() <= 1) {
 +    return;
 +  }
-+  const uint32_t minimum_retained_epoch = commit.header.epoch - 1;
-+  if (last_collection_floor_ &&
-+      *last_collection_floor_ >= minimum_retained_epoch) {
-+    return;
-+  }
-+  if (collection_in_progress_ ||
++  const uint32_t minimum_retained_epoch = head_commit_.epoch() - 1;
++  if (collected_epochs_before_ >= minimum_retained_epoch ||
++      collection_in_progress_ ||
 +      base::TimeTicks::Now() < next_collection_attempt_) {
 +    return;
 +  }
@@ -898,12 +644,11 @@
 +}
 +
 +void SyncVaultStore::OnEpochsCollected(
-+    uint32_t floor,
++    uint32_t minimum_retained_epoch,
 +    SyncVaultTransport::CollectResult result) {
 +  collection_in_progress_ = false;
 +  if (result.has_value()) {
-+    last_collection_floor_ = floor;
-+    next_collection_attempt_ = {};
++    collected_epochs_before_ = minimum_retained_epoch;
 +  } else {
 +    next_collection_attempt_ =
 +        base::TimeTicks::Now() + kEpochCollectionRetryDelay;
@@ -913,7 +658,7 @@
 +}  // namespace syncer
 --- /dev/null
 +++ b/components/sync/engine/sync_vault/sync_vault_store.h
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,165 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -921,7 +666,6 @@
 +#ifndef COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_STORE_H_
 +#define COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_STORE_H_
 +
-+#include <cstddef>
 +#include <cstdint>
 +#include <memory>
 +#include <optional>
@@ -934,15 +678,14 @@
 +#include "base/sequence_checker.h"
 +#include "base/time/time.h"
 +#include "base/types/expected.h"
-+#include "base/unguessable_token.h"
-+#include "components/sync/engine/sync_vault/sync_vault_format.h"
++#include "components/sync/engine/sync_vault/sync_vault.pb.h"
++#include "components/sync/engine/sync_vault/sync_vault_cryptographer.h"
 +#include "components/sync/engine/sync_vault/sync_vault_transport.h"
 +
 +namespace syncer {
 +
 +class CancelationSignal;
-+class SyncVaultCryptographer;
-+class SyncVaultStateCodec;
++class LoopbackServerVaultState;
 +
 +enum class SyncVaultStoreError {
 +  kAuthenticationRequired,
@@ -951,179 +694,128 @@
 +  kTemporaryError,
 +  kQuotaExceeded,
 +  kAccessDenied,
-+  kInvalidData,
 +  kUnsupported,
 +  kAborted,
-+  kInvalidVaultKey,
++  // The vault holds data that cannot be read, or the provider misbehaved.
++  kInvalidData,
++  // The vault key does not decrypt the vault.
 +  kAuthenticationFailed,
-+  kMalformedObject,
 +  kUnsupportedVersion,
-+  kObjectTooLarge,
++  // The vault is older than, or diverges from, the local checkpoint.
 +  kRollback,
 +  kFork,
++  // The vault is not initialized, or history it refers to is missing.
 +  kIncompleteHistory,
 +  kCheckpointPersistenceFailed,
 +};
 +
-+class SyncVaultState {
-+ public:
-+  SyncVaultState(const SyncVaultState&) = delete;
-+  SyncVaultState& operator=(const SyncVaultState&) = delete;
-+  SyncVaultState(SyncVaultState&&) = default;
-+  SyncVaultState& operator=(SyncVaultState&&) = default;
-+  ~SyncVaultState() = default;
-+
-+  const std::vector<uint8_t>& data() const { return data_; }
-+  size_t state_size() const { return data_.size(); }
-+  const SyncVaultHead& head() const { return head_; }
-+  const std::optional<SyncVaultCommitHeader>& commit_header() const {
-+    return commit_header_;
-+  }
-+  const std::string& head_revision() const { return head_revision_; }
-+  uint64_t generation() const {
-+    return commit_header_ ? commit_header_->generation : 0;
-+  }
-+
-+ private:
-+  friend class SyncVaultStore;
-+
-+  SyncVaultState(std::vector<uint8_t> data,
-+                 SyncVaultHead head,
-+                 std::optional<SyncVaultCommitHeader> commit_header,
-+                 std::string head_revision,
-+                 base::UnguessableToken store_token);
-+
-+  std::vector<uint8_t> data_;
-+  SyncVaultHead head_;
-+  std::optional<SyncVaultCommitHeader> commit_header_;
-+  std::string head_revision_;
-+  base::UnguessableToken store_token_;
-+};
-+
-+// Implements the browser-owned encrypted journal over an opaque object
-+// provider. Immutable commits and any external payload chunks are installed
-+// first; only the fixed head is conditionally replaced.
++// Keeps a LoopbackServer's state in an encrypted journal of immutable
++// commits, published by conditionally replacing a single head object.
 +class SyncVaultStore {
 + public:
++  using Result = base::expected<void, SyncVaultStoreError>;
 +  using PersistCheckpointCallback =
-+      base::RepeatingCallback<bool(const SyncVaultCheckpoint&)>;
-+  using CreateResult =
-+      base::expected<std::unique_ptr<SyncVaultStore>, SyncVaultStoreError>;
-+  using ReadResult = base::expected<SyncVaultState, SyncVaultStoreError>;
-+  enum class RefreshOutcome { kUnchanged, kChanged };
-+  using RefreshResult = base::expected<RefreshOutcome, SyncVaultStoreError>;
-+  using CommitResult = base::expected<SyncVaultState, SyncVaultStoreError>;
++      base::RepeatingCallback<bool(const sync_pb::SyncVaultCheckpoint&)>;
 +
-+  static CreateResult Create(
-+      std::unique_ptr<SyncVaultTransport> transport,
-+      std::unique_ptr<SyncVaultStateCodec> state_codec,
-+      base::span<const uint8_t> vault_key,
-+      std::string vault_uuid,
-+      std::optional<SyncVaultCheckpoint> checkpoint,
-+      PersistCheckpointCallback persist_checkpoint_callback);
++  // `checkpoint` is the last commit this profile authenticated, if any.
++  static base::expected<std::unique_ptr<SyncVaultStore>, SyncVaultStoreError>
++  Create(std::unique_ptr<SyncVaultTransport> transport,
++         base::span<const uint8_t> vault_key,
++         std::string vault_uuid,
++         std::optional<sync_pb::SyncVaultCheckpoint> checkpoint,
++         PersistCheckpointCallback persist_checkpoint);
 +
 +  SyncVaultStore(const SyncVaultStore&) = delete;
 +  SyncVaultStore& operator=(const SyncVaultStore&) = delete;
 +  ~SyncVaultStore();
 +
 +  void SetCancelationSignal(CancelationSignal* cancelation_signal);
-+  ReadResult ReadState();
-+  // Authenticates the current head and the commit ancestry needed to anchor it
-+  // without fetching state payloads or advancing the local checkpoint.
-+  base::expected<void, SyncVaultStoreError> VerifyInitializedVault();
-+  // Authenticates the current head and replaces `loaded_state` only when its
-+  // commit differs. A provider-only revision change is updated in place.
-+  RefreshResult RefreshState(SyncVaultState* loaded_state);
-+  // Creates an authenticated empty head when needed, then reads it back through
-+  // the normal verification path. This is intended
-+  // for new-vault setup; joining an existing vault must use ReadState() so a
-+  // missing remote history cannot be silently initialized.
-+  ReadResult InitializeEmptyVaultAndReadState();
-+  // Publishes a trusted local snapshot or smaller delta and retains the
-+  // snapshot in the returned state for subsequent incremental refreshes.
-+  CommitResult CommitMutation(const SyncVaultState& base_state,
-+                              std::optional<std::vector<uint8_t>> delta,
-+                              std::vector<uint8_t> snapshot);
 +
-+  const SyncVaultCheckpoint& checkpoint() const { return checkpoint_; }
++  // Creates an empty head unless the vault already has one.
++  Result Initialize();
++  // Checks that the key decrypts the vault's head and latest commit, and
++  // checkpoints them.
++  Result Verify();
++
++  // Brings the state up to date with the vault's head, and returns whether it
++  // changed.
++  base::expected<bool, SyncVaultStoreError> Load();
++  bool IsLoaded() const { return !!state_; }
++  // The state as of the last successful Load() or Commit().
++  LoopbackServerVaultState& state() { return *state_; }
++  // Publishes the state's changes. On failure the state is discarded, and
++  // must be loaded again.
++  Result Commit();
++  // Discards the state, which must be loaded again.
++  void Discard();
++
++  const sync_pb::SyncVaultCheckpoint& checkpoint() const { return checkpoint_; }
++  // Payload bytes of the current snapshot and the deltas after it.
++  uint64_t payload_bytes() const {
++    return head_commit_.epoch_snapshot_bytes() +
++           head_commit_.epoch_delta_bytes();
++  }
 +
 + private:
-+  SyncVaultStore(std::unique_ptr<SyncVaultTransport> transport,
-+                 std::unique_ptr<SyncVaultStateCodec> state_codec,
-+                 std::unique_ptr<SyncVaultCryptographer> cryptographer,
-+                 SyncVaultCheckpoint checkpoint,
-+                 PersistCheckpointCallback persist_checkpoint_callback);
-+
-+  using ObjectResult =
-+      base::expected<std::optional<OpaqueSyncVaultObject>, SyncVaultStoreError>;
-+  struct VersionedHead {
-+    SyncVaultHead head;
++  struct Head {
++    // Empty for a vault without commits.
++    std::string commit_digest;
 +    std::string revision;
 +  };
-+
-+  using HeadResult = base::expected<VersionedHead, SyncVaultStoreError>;
-+  using CommitObjectResult =
-+      base::expected<SyncVaultCommit, SyncVaultStoreError>;
-+  using WriteResult = base::expected<std::string, SyncVaultStoreError>;
-+  using StateDataResult =
-+      base::expected<std::vector<uint8_t>, SyncVaultStoreError>;
-+
 +  struct CommitEntry {
-+    SyncVaultObjectDigest object_digest;
-+    SyncVaultCommit commit;
++    std::string digest;
++    sync_pb::SyncVaultCommit commit;
 +  };
 +
-+  struct AuthenticatedHead {
-+    // Starts with the head's commit and, when needed for checkpoint
-+    // authentication, continues toward the checkpoint without including it.
-+    std::vector<CommitEntry> commits_newest_first;
-+  };
++  SyncVaultStore(std::unique_ptr<SyncVaultTransport> transport,
++                 std::unique_ptr<SyncVaultCryptographer> cryptographer,
++                 sync_pb::SyncVaultCheckpoint checkpoint,
++                 PersistCheckpointCallback persist_checkpoint);
 +
-+  using AuthenticatedHeadResult =
-+      base::expected<AuthenticatedHead, SyncVaultStoreError>;
++  base::expected<Head, SyncVaultStoreError> ReadHead();
++  Result WriteHead(const std::string& commit_digest);
++  base::expected<sync_pb::SyncVaultCommit, SyncVaultStoreError> ReadCommit(
++      const std::string& digest);
++  // Reads the head's commit and the commits after the checkpoint, newest
++  // first, verifying that they descend from it.
++  base::expected<std::vector<CommitEntry>, SyncVaultStoreError> ReadNewCommits(
++      const std::string& head_digest);
++  Result ReadPayload(const sync_pb::SyncVaultCommit& commit);
++  // Writes the state's snapshot or delta, and returns its size.
++  base::expected<uint64_t, SyncVaultStoreError> WritePayload(
++      bool snapshot,
++      sync_pb::SyncVaultCommit& commit);
 +
-+  ObjectResult ReadObject(const std::string& object_id,
-+                          size_t maximum_bytes) const;
-+  WriteResult WriteObject(const std::string& object_id,
-+                          std::optional<std::string> expected_revision,
-+                          std::vector<uint8_t> data,
-+                          std::optional<uint32_t> retention_epoch);
-+  HeadResult ReadHead();
-+  AuthenticatedHeadResult AuthenticateHead(const SyncVaultHead& head) const;
-+  bool OwnsState(const SyncVaultState& state) const;
-+  bool IsAtCheckpoint(const SyncVaultState& state) const;
-+  ReadResult ReadStateForHead(SyncVaultHead head,
-+                              std::string head_revision,
-+                              const SyncVaultState* loaded_state);
-+  StateDataResult TakePayload(SyncVaultCommit* commit) const;
-+  // Chooses inline or external storage and returns the serialized commit.
-+  StateDataResult PrepareCommitPayload(base::span<const uint8_t> payload,
-+                                       SyncVaultCommit* commit);
-+  StateDataResult ReconstructState(AuthenticatedHead* authenticated) const;
-+  StateDataResult ApplyCommitPayloads(
-+      base::span<const uint8_t> base_state,
-+      base::span<CommitEntry> newest_first) const;
-+  CommitObjectResult ReadCommit(
-+      const SyncVaultObjectDigest& commit_digest) const;
-+  WriteResult InitializeVault();
-+  WriteResult WriteImmutableObject(const SyncVaultObjectDigest& object_digest,
-+                                   std::vector<uint8_t> encrypted_data,
-+                                   uint32_t retention_epoch);
-+  bool AdvanceCheckpoint(const SyncVaultHead& head,
-+                         const SyncVaultCommitHeader& commit);
-+  void MaybeCollectEpochs(const SyncVaultCommit& commit);
-+  void OnEpochsCollected(uint32_t floor,
++  base::expected<std::vector<uint8_t>, SyncVaultStoreError> ReadImmutableObject(
++      SyncVaultObjectRole role,
++      const std::string& digest,
++      size_t maximum_bytes);
++  // Returns the digest that names the encrypted object.
++  base::expected<std::string, SyncVaultStoreError> WriteImmutableObject(
++      SyncVaultObjectRole role,
++      base::span<const uint8_t> plaintext,
++      uint32_t epoch);
++
++  Result WriteCommit();
++  Result AdvanceCheckpoint(const CommitEntry& entry);
++  void MaybeCollectEpochs();
++  void OnEpochsCollected(uint32_t minimum_retained_epoch,
 +                         SyncVaultTransport::CollectResult result);
 +
 +  std::unique_ptr<SyncVaultTransport> transport_;
-+  std::unique_ptr<SyncVaultStateCodec> state_codec_;
 +  std::unique_ptr<SyncVaultCryptographer> cryptographer_;
-+  SyncVaultCheckpoint checkpoint_;
-+  PersistCheckpointCallback persist_checkpoint_callback_;
-+  std::optional<uint32_t> last_collection_floor_;
-+  base::TimeTicks next_collection_attempt_;
++  sync_pb::SyncVaultCheckpoint checkpoint_;
++  PersistCheckpointCallback persist_checkpoint_;
++
++  // The loaded state and the head it corresponds to.
++  std::unique_ptr<LoopbackServerVaultState> state_;
++  Head head_;
++  // `head_`'s commit without its payload.
++  sync_pb::SyncVaultCommit head_commit_;
++
++  uint32_t collected_epochs_before_ = 0;
 +  bool collection_in_progress_ = false;
-+  const base::UnguessableToken store_token_ = base::UnguessableToken::Create();
++  base::TimeTicks next_collection_attempt_;
 +
 +  SEQUENCE_CHECKER(sequence_checker_);
 +  base::WeakPtrFactory<SyncVaultStore> weak_ptr_factory_{this};
@@ -1132,61 +824,14 @@
 +}  // namespace syncer
 +
 +#endif  // COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_STORE_H_
---- /dev/null
-+++ b/components/sync/engine/sync_vault/sync_vault_state_codec.h
-@@ -0,0 +1,55 @@
-+// Copyright 2026 The Helium Authors
-+// You can use, redistribute, and/or modify this source code under
-+// the terms of the GPL-3.0 license that can be found in the LICENSE file.
-+
-+#ifndef COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_STATE_CODEC_H_
-+#define COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_STATE_CODEC_H_
-+
-+#include <cstdint>
-+#include <memory>
-+#include <vector>
-+
-+#include "base/containers/span.h"
-+#include "base/types/expected.h"
-+
-+namespace syncer {
-+
-+enum class SyncVaultStateCodecError {
-+  kMalformed,
-+  kUnsupportedVersion,
-+  kLimitExceeded,
-+  kInvalidValue,
-+};
-+
-+using SyncVaultStateCodecResult =
-+    base::expected<std::vector<uint8_t>, SyncVaultStateCodecError>;
-+using SyncVaultStateValidationResult =
-+    base::expected<void, SyncVaultStateCodecError>;
-+// Validates and reconstructs backend state from authenticated payloads. The
-+// vault format treats snapshots and deltas as opaque. Base snapshots passed
-+// to StartReconstruction() have already passed validation.
-+class SyncVaultStateCodec {
-+ public:
-+  virtual ~SyncVaultStateCodec() = default;
-+
-+  virtual SyncVaultStateValidationResult ValidateSnapshot(
-+      base::span<const uint8_t> state) const = 0;
-+
-+  class Reconstruction {
-+   public:
-+    virtual ~Reconstruction() = default;
-+    virtual SyncVaultStateValidationResult ApplyDelta(
-+        base::span<const uint8_t> delta) = 0;
-+    virtual SyncVaultStateCodecResult Finish() const = 0;
-+  };
-+  using ReconstructionResult =
-+      base::expected<std::unique_ptr<Reconstruction>, SyncVaultStateCodecError>;
-+  // Keeps parsed state between deltas. Callers can release each payload before
-+  // reading the next one, without reparsing the full state for every delta.
-+  virtual ReconstructionResult StartReconstruction(
-+      base::span<const uint8_t> base_state) const = 0;
-+};
-+
-+}  // namespace syncer
-+
-+#endif  // COMPONENTS_SYNC_ENGINE_SYNC_VAULT_SYNC_VAULT_STATE_CODEC_H_
+--- a/components/sync/engine/BUILD.gn
++++ b/components/sync/engine/BUILD.gn
+@@ -94,6 +94,8 @@ static_library("engine") {
+     "events/protocol_event_buffer.cc",
+     "events/protocol_event_buffer.h",
+     "events/protocol_event_observer.h",
++    "sync_vault/sync_vault_store.cc",
++    "sync_vault/sync_vault_store.h",
+     "forwarding_data_type_processor.cc",
+     "forwarding_data_type_processor.h",
+     "get_updates_delegate.cc",
