@@ -226,7 +226,7 @@
 +// Color for surfaces that float over web contents, such as the Frameless mode
 +// tab strip. The native material only shows what is behind the window, so
 +// these blur what is below them inside the window and paint this tint on top.
-+// Returns nullopt where floating surfaces stay opaque.
++// Returns nullopt without native frame materials.
 +std::optional<SkColor> GetNativeFrameMaterialFloatingColor(
 +    const views::View* view);
 +
@@ -245,7 +245,7 @@
 +#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_NATIVE_FRAME_MATERIALS_H_
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium/native_frame_materials.cc
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,190 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -412,16 +412,6 @@
 +std::optional<SkColor> GetNativeFrameMaterialFloatingColor(
 +    const views::View* view) {
 +  if (!ShouldUseNativeFrameMaterials(view)) {
-+    return std::nullopt;
-+  }
-+
-+  // The floating strip holds inactive tabs, whose text follows the theme's
-+  // frame rather than its toolbar. Keep the frame color if the material tint
-+  // would leave that text without contrast.
-+  const bool is_dark = IsNativeFrameMaterialDark(GetToolbarColor(view));
-+  const SkColor tab_text = view->GetColorProvider()->GetColor(
-+      kColorTabForegroundInactiveFrameActive);
-+  if (color_utils::IsDark(tab_text) == is_dark) {
 +    return std::nullopt;
 +  }
 +
@@ -1098,7 +1088,30 @@
      return GetHoverOpacity() > 0.5f;
    }
    return selection_state == TabStyle::TabSelectionState::kSelected;
-@@ -662,6 +662,10 @@ SkPath HorizontalTabStyleViews::GetOverl
+@@ -439,12 +439,16 @@ float HorizontalTabStyleViews::GetCurren
+ }
+ 
+ TabStyle::TabColors HorizontalTabStyleViews::CalculateTargetColors() const {
+-  return tab_style()->CalculateTargetColors(
+-      GetSelectionState(), IsApparentlyActive(), IsHovering(),
+-      delegate_->GetView()->GetWidget()
+-          ? delegate_->GetView()->GetWidget()->ShouldPaintAsActive()
+-          : true,
+-      delegate_->GetView()->GetColorProvider());
++  const bool apparently_active = IsApparentlyActive();
++  const bool hovered = IsHovering();
++  return GetNativeFrameMaterialTabColors(
++      tab_style()->CalculateTargetColors(
++          GetSelectionState(), apparently_active, hovered,
++          delegate_->GetView()->GetWidget()
++              ? delegate_->GetView()->GetWidget()->ShouldPaintAsActive()
++              : true,
++          delegate_->GetView()->GetColorProvider()),
++      apparently_active, hovered);
+ }
+ 
+ TabStyle::SeparatorBounds HorizontalTabStyleViews::GetSeparatorBounds(
+@@ -662,6 +666,10 @@ SkPath HorizontalTabStyleViews::GetOverl
  bool HorizontalTabStyleViews::ShouldPaintTabBackgroundColor(
      TabStyle::TabSelectionState selection_state,
      bool has_custom_background) const {
@@ -1109,7 +1122,7 @@
    if (delegate_->IsPinned() && tabs::IsNewHorizontalPinnedTabStylingEnabled() &&
        !delegate_->IsGlassFrame()) {
      return true;
-@@ -705,9 +709,12 @@ SkColor HorizontalTabStyleViews::GetCurr
+@@ -705,9 +713,12 @@ SkColor HorizontalTabStyleViews::GetCurr
            ? delegate_->GetView()->GetWidget()->ShouldPaintAsActive()
            : true;
    const bool frame_glass = delegate_->IsGlassFrame();
@@ -1123,7 +1136,7 @@
  }
  
  TabStyle::TabSelectionState HorizontalTabStyleViews::GetSelectionState() const {
-@@ -769,7 +776,9 @@ void HorizontalTabStyleViews::PaintTabBa
+@@ -769,7 +780,9 @@ void HorizontalTabStyleViews::PaintTabBa
                       flags);
    }
  
@@ -1276,6 +1289,27 @@
  }
  
  TabStyle::TabSelectionState VerticalTabStyleViews::GetSelectionState() const {
+@@ -250,10 +265,14 @@ bool VerticalTabStyleViews::IsApparently
+ }
+ 
+ TabStyle::TabColors VerticalTabStyleViews::CalculateTargetColors() const {
+-  return tab_style()->CalculateTargetColors(
+-      GetSelectionState(), IsApparentlyActive(), delegate_->IsHovering(),
+-      delegate_->GetView()->GetWidget()
+-          ? delegate_->GetView()->GetWidget()->ShouldPaintAsActive()
+-          : true,
+-      delegate_->GetView()->GetColorProvider());
++  const bool apparently_active = IsApparentlyActive();
++  const bool hovered = delegate_->IsHovering();
++  return GetNativeFrameMaterialTabColors(
++      tab_style()->CalculateTargetColors(
++          GetSelectionState(), apparently_active, hovered,
++          delegate_->GetView()->GetWidget()
++              ? delegate_->GetView()->GetWidget()->ShouldPaintAsActive()
++              : true,
++          delegate_->GetView()->GetColorProvider()),
++      apparently_active, hovered);
+ }
 --- a/chrome/browser/ui/views/tabs/common/tab_view.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_view.h
 @@ -198,6 +198,9 @@ class TabView : public views::View,
@@ -1569,7 +1603,7 @@
  
  // static
  std::u16string ui::metadata::TypeConverter<TabStyle::TabColors>::ToString(
-@@ -74,3 +77,32 @@ std::unique_ptr<TabStyleViews> TabStyleV
+@@ -74,3 +77,50 @@ std::unique_ptr<TabStyleViews> TabStyleV
  TabStyleViews::TabStyleViews() : tab_style_(TabStyle::Get()) {}
  
  TabStyleViews::~TabStyleViews() = default;
@@ -1602,9 +1636,27 @@
 +      hover_color, SK_ColorTRANSPARENT,
 +      static_cast<float>(delegate()->GetHoverAnimationValue()));
 +}
++
++TabStyle::TabColors TabStyleViews::GetNativeFrameMaterialTabColors(
++    TabStyle::TabColors colors,
++    bool apparently_active,
++    bool hovered) const {
++  const views::View* view = delegate()->GetView();
++  if (apparently_active || hovered || !view->GetColorProvider() ||
++      !UsesNativeFrameMaterials()) {
++    return colors;
++  }
++
++  const SkColor material_color = SkColorSetA(
++      helium::GetNativeFrameMaterialTintColor(view), SK_AlphaOPAQUE);
++  colors.foreground_color =
++      color_utils::BlendForMinContrast(colors.foreground_color, material_color)
++          .color;
++  return colors;
++}
 --- a/chrome/browser/ui/views/tabs/tab_style_views.h
 +++ b/chrome/browser/ui/views/tabs/tab_style_views.h
-@@ -150,6 +150,17 @@ class TabStyleViews {
+@@ -150,6 +150,24 @@ class TabStyleViews {
  
    const TabStyle* tab_style() const { return tab_style_; }
  
@@ -1618,6 +1670,13 @@
 +  SkColor GetNativeFrameMaterialTabBackgroundColor(
 +      TabStyle::TabSelectionState selection_state,
 +      SkColor color) const;
++  // Themes pick the text of inactive tabs for their frame color, which the
++  // material shows in place of, so it is kept readable on the material. Hovered
++  // tabs paint the theme's background below their text.
++  TabStyle::TabColors GetNativeFrameMaterialTabColors(
++      TabStyle::TabColors colors,
++      bool apparently_active,
++      bool hovered) const;
 +
   private:
    const raw_ptr<const TabStyle> tab_style_;
