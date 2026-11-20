@@ -1,0 +1,179 @@
+--- a/chrome/browser/browsing_data/BUILD.gn
++++ b/chrome/browser/browsing_data/BUILD.gn
+@@ -99,6 +99,8 @@ source_set("impl") {
+   deps = [
+     ":browsing_data",
+     ":constants",
++    "//brave/browser/containers",
++    "//brave/components/containers/core/common",
+     "//chrome/browser:browser_process",
+     "//chrome/browser:browser_process_platform_part",
+     "//chrome/browser/autocomplete",
+--- a/chrome/browser/browsing_data/chrome_browsing_data_remover_delegate.cc
++++ b/chrome/browser/browsing_data/chrome_browsing_data_remover_delegate.cc
+@@ -30,6 +30,8 @@
+ #include "base/task/thread_pool.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
++#include "brave/browser/containers/used_container_storage_partitions.h"
++#include "brave/components/containers/core/common/features.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/autocomplete/zero_suggest_cache_service_factory.h"
+ #include "chrome/browser/autofill/autofill_entity_data_manager_factory.h"
+@@ -320,6 +322,14 @@ bool ChromeBrowsingDataRemoverDelegate::
+   return profile_->GetPrefs()->GetBoolean(prefs::kAllowDeletingBrowserHistory);
+ }
+ 
++std::vector<content::StoragePartitionConfig>
++ChromeBrowsingDataRemoverDelegate::GetAdditionalStoragePartitionConfigs() {
++  if (!base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    return {};
++  }
++  return containers::GetUsedContainerStoragePartitionConfigs(profile_);
++}
++
+ void ChromeBrowsingDataRemoverDelegate::RemoveEmbedderData(
+     const base::Time& delete_begin,
+     const base::Time& delete_end,
+--- a/chrome/browser/browsing_data/chrome_browsing_data_remover_delegate.h
++++ b/chrome/browser/browsing_data/chrome_browsing_data_remover_delegate.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_BROWSING_DATA_CHROME_BROWSING_DATA_REMOVER_DELEGATE_H_
+ 
+ #include <memory>
++#include <vector>
+ 
+ #include "base/cancelable_callback.h"
+ #include "base/functional/callback_forward.h"
+@@ -76,6 +77,8 @@ class ChromeBrowsingDataRemoverDelegate
+       uint64_t origin_type_mask,
+       base::OnceCallback<void(/*failed_data_types=*/uint64_t)> callback)
+       override;
++  std::vector<content::StoragePartitionConfig>
++  GetAdditionalStoragePartitionConfigs() override;
+   void OnStartRemoving() override;
+   void OnDoneRemoving() override;
+ 
+--- a/content/browser/browsing_data/browsing_data_remover_impl.cc
++++ b/content/browser/browsing_data/browsing_data_remover_impl.cc
+@@ -10,6 +10,7 @@
+ #include <set>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+@@ -278,12 +279,34 @@ void BrowsingDataRemoverImpl::RemoveInte
+           base::NotFatalUntil::M159);
+   }
+ 
++  // Data on the embedder's other StoragePartitions is removed by tasks queued
++  // right after this one, and the observer is told when the last one is done.
++  std::vector<RemovalTask> partition_tasks;
++  if (embedder_delegate_ &&
++      !filter_builder->GetStoragePartitionConfig().has_value() &&
++      (remove_mask & DATA_TYPE_ON_STORAGE_PARTITION)) {
++    for (const StoragePartitionConfig& config :
++         embedder_delegate_->GetAdditionalStoragePartitionConfigs()) {
++      std::unique_ptr<BrowsingDataFilterBuilder> partition_filter_builder =
++          filter_builder->Copy();
++      partition_filter_builder->SetStoragePartitionConfig(config);
++      partition_tasks.emplace_back(
++          delete_begin, delete_end, remove_mask & DATA_TYPE_ON_STORAGE_PARTITION,
++          origin_type_mask, std::move(partition_filter_builder),
++          /*observer=*/nullptr);
++    }
++    if (!partition_tasks.empty() && observer) {
++      partition_tasks.back().observers.push_back(observer);
++      observer = nullptr;
++    }
++  }
++
+   RemovalTask task(delete_begin, delete_end, remove_mask, origin_type_mask,
+                    std::move(filter_builder), observer);
+ 
+   // If there is an identical deletion task that is not already running,
+   // we don't have to perform the deletion twice.
+-  for (size_t i = 1; i < task_queue_.size(); i++) {
++  for (size_t i = 1; partition_tasks.empty() && i < task_queue_.size(); i++) {
+     if (task_queue_[i].IsSameDeletion(task)) {
+       if (observer)
+         task_queue_[i].observers.push_back(observer);
+@@ -292,11 +315,14 @@ void BrowsingDataRemoverImpl::RemoveInte
+   }
+ 
+   task_queue_.push_back(std::move(task));
++  for (RemovalTask& partition_task : partition_tasks) {
++    task_queue_.push_back(std::move(partition_task));
++  }
+ 
+   // If this is the only scheduled task, execute it immediately. Otherwise,
+   // it will be automatically executed when all tasks scheduled before it
+   // finish.
+-  if (task_queue_.size() == 1) {
++  if (task_queue_.size() == 1 + partition_tasks.size()) {
+     SetRemoving(true);
+     RunNextTask();
+   }
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -86,6 +86,7 @@ source_set("browser_sources") {
+     "browser_url_handler.h",
+     "browsing_data_filter_builder.h",
+     "browsing_data_remover.h",
++    "browsing_data_remover_delegate.cc",
+     "browsing_data_remover_delegate.h",
+     "browsing_instance_id.h",
+     "btm_redirect.cc",
+--- /dev/null
++++ b/content/public/browser/browsing_data_remover_delegate.cc
+@@ -0,0 +1,16 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "content/public/browser/browsing_data_remover_delegate.h"
++
++#include "content/public/browser/storage_partition_config.h"
++
++namespace content {
++
++std::vector<StoragePartitionConfig>
++BrowsingDataRemoverDelegate::GetAdditionalStoragePartitionConfigs() {
++  return {};
++}
++
++}  // namespace content
+--- a/content/public/browser/browsing_data_remover_delegate.h
++++ b/content/public/browser/browsing_data_remover_delegate.h
+@@ -5,6 +5,8 @@
+ #ifndef CONTENT_PUBLIC_BROWSER_BROWSING_DATA_REMOVER_DELEGATE_H_
+ #define CONTENT_PUBLIC_BROWSER_BROWSING_DATA_REMOVER_DELEGATE_H_
+ 
++#include <vector>
++
+ #include "base/functional/callback_forward.h"
+ 
+ namespace base {
+@@ -22,6 +24,7 @@ class Origin;
+ namespace content {
+ 
+ class BrowsingDataFilterBuilder;
++class StoragePartitionConfig;
+ 
+ class BrowsingDataRemoverDelegate {
+  public:
+@@ -55,6 +58,12 @@ class BrowsingDataRemoverDelegate {
+       uint64_t origin_type_mask,
+       base::OnceCallback<void(/*failed_data_types=*/uint64_t)> callback) = 0;
+ 
++  // Returns the configs of non-default StoragePartitions that should be
++  // cleared along with the default one whenever a removal isn't limited to a
++  // StoragePartition.
++  virtual std::vector<StoragePartitionConfig>
++  GetAdditionalStoragePartitionConfigs();
++
+   // Called when the BrowsingDataRemover starts executing a task.
+   virtual void OnStartRemoving() {}
+ 
