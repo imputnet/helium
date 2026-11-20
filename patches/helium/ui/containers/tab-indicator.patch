@@ -1,0 +1,353 @@
+--- a/chrome/browser/ui/views/tabs/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/BUILD.gn
+@@ -252,7 +252,11 @@ source_set("tab") {
+ }
+ 
+ source_set("tab_impl") {
+-  sources = [ "tab.cc" ]
++  sources = [
++    "container_tab_accent.cc",
++    "container_tab_accent.h",
++    "tab.cc",
++  ]
+ 
+   deps = [
+     ":base",
+@@ -260,11 +264,17 @@ source_set("tab_impl") {
+     ":tab_strip",
+     ":tab_style_views",
+     "//base",
++    "//brave/browser/containers",
++    "//brave/components/containers/content/browser",
++    "//brave/components/containers/core/browser",
++    "//brave/components/containers/core/common",
++    "//brave/components/containers/core/mojom",
+     "//cc/paint",
+     "//chrome/app:generated_resources",
+     "//chrome/browser/dictation",
+     "//chrome/browser/glic",
+     "//chrome/browser/glic/browser_ui:glow",
++    "//chrome/browser/profiles:profile",
+     "//chrome/browser/themes",
+     "//chrome/browser/ui:browser_element_identifiers",
+     "//chrome/browser/ui:layout_constants",
+@@ -287,6 +297,7 @@ source_set("tab_impl") {
+     "//chrome/common:chrome_features",
+     "//components/contextual_tasks/public:feature_list",
+     "//components/tabs:public",
++    "//content/public/browser",
+     "//skia",
+     "//ui/accessibility:ax_enums_mojo",
+     "//ui/base",
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
+@@ -44,6 +44,7 @@
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/browser_tab_strip_controller.h"
++#include "chrome/browser/ui/views/tabs/container_tab_accent.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
+ #include "chrome/browser/ui/views/tabs/tab/alert_indicator_button.h"
+@@ -370,6 +371,7 @@ Tab::Tab(tabs::TabHandle handle, TabSlot
+   SetEventTargeter(std::make_unique<views::ViewTargeter>(this));
+ 
+   icon_ = AddChildView(std::make_unique<TabIcon>());
++  container_accent_ = std::make_unique<ContainerTabAccent>(*this);
+ 
+   alert_indicator_button_ =
+       AddChildView(std::make_unique<AlertIndicatorButton>(this));
+@@ -930,6 +932,11 @@ void Tab::PaintChildren(const views::Pai
+ 
+ void Tab::OnPaint(gfx::Canvas* canvas) {
+   tab_style_views()->PaintTab(canvas);
++  container_accent_->Paint(
++      canvas,
++      tab_style_views()->GetPath(TabStyle::PathType::kHighlight,
++                                 canvas->image_scale(), {}),
++      IsActive());
+ }
+ 
+ void Tab::AddedToWidget() {
+@@ -1009,8 +1016,13 @@ void Tab::SetSplit(std::optional<split_t
+ }
+ 
+ std::u16string Tab::GetRenderedTooltipText(const gfx::Point& p) const {
+-  if (base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII("tab-hover-cards") == "tooltip")
+-    return GetTooltipText(data_.title, data_.alert_state.has_value() ? data_.alert_state.value() : std::optional<tabs::TabAlert>());
++  if (base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII("tab-hover-cards") == "tooltip") {
++    std::u16string tooltip = GetTooltipText(data_.title, data_.alert_state.has_value() ? data_.alert_state.value() : std::optional<tabs::TabAlert>());
++    if (!container_accent_->container_name().empty()) {
++      tooltip += u"\n" + container_accent_->container_name();
++    }
++    return tooltip;
++  }
+   // Tab hover cards replace tooltips for tabs.
+   return std::u16string();
+ }
+@@ -1591,6 +1603,8 @@ void Tab::OnTabDataChanged(TabChangeType
+     return;
+   }
+ 
++  container_accent_->Update(tab_handle_.Get());
++
+   if (tab_data == data_) {
+     return;
+   }
+@@ -1641,7 +1655,7 @@ void Tab::OnTabDataChanged(TabChangeType
+   if (did_alert_state_change || did_title_change) {
+     TooltipTextChanged();
+   }
+-  SetHoverCardDataFrom(data_);
++  SetHoverCardDataFrom(data_, container_accent_->container_name());
+   if (controller_->HoverCardIsShowing(this)) {
+     controller_->UpdateHoverCard(
+         this, TabSlotController::HoverCardUpdateType::kTabDataChanged);
+--- a/chrome/browser/ui/views/tabs/tab.h
++++ b/chrome/browser/ui/views/tabs/tab.h
+@@ -35,6 +35,7 @@
+ 
+ enum class TabChangeType;
+ class TabCloseButton;
++class ContainerTabAccent;
+ class TabSlotController;
+ class TabIcon;
+ struct TabSizeInfo;
+@@ -300,6 +301,8 @@ class Tab : public gfx::AnimationDelegat
+   // The tab handle associated with the view.
+   const tabs::TabHandle tab_handle_;
+ 
++  std::unique_ptr<ContainerTabAccent> container_accent_;
++
+   // The controller, never nullptr.
+   const raw_ptr<TabSlotController> controller_;
+ 
+--- a/chrome/browser/ui/views/tabs/hovercard/hover_card_anchor_target.cc
++++ b/chrome/browser/ui/views/tabs/hovercard/hover_card_anchor_target.cc
+@@ -80,7 +80,8 @@ HoverCardAnchorTarget::HoverCardAnchorTa
+ HoverCardAnchorTarget::~HoverCardAnchorTarget() = default;
+ 
+ void HoverCardAnchorTarget::SetHoverCardDataFrom(
+-    const tabs::TabData& tab_data) {
++    const tabs::TabData& tab_data,
++    const std::u16string& container_name) {
+   hover_card_data_.emplace<TabCardData>();
+   GURL domain_url;
+   std::optional<tabs::TabAlert> alert_state;
+@@ -126,6 +127,10 @@ void HoverCardAnchorTarget::SetHoverCard
+ 
+   card_data.thumbnail = tab_data.thumbnail;
+   card_data.title_data = GetTabTitleLabel(tab_data);
++  if (!container_name.empty()) {
++    domain = l10n_util::GetStringFUTF16(IDS_HOVER_CARD_DOMAIN_IN_CONTAINER,
++                                        domain, container_name);
++  }
+   card_data.domain_data = {domain, false, gfx::ELIDE_HEAD, is_domain_url};
+ 
+   // Now set the collaboration data.
+--- a/chrome/browser/ui/views/tabs/hovercard/hover_card_anchor_target.h
++++ b/chrome/browser/ui/views/tabs/hovercard/hover_card_anchor_target.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_HOVERCARD_HOVER_CARD_ANCHOR_TARGET_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_HOVERCARD_HOVER_CARD_ANCHOR_TARGET_H_
+ 
++#include <string>
+ #include <variant>
+ 
+ #include "base/memory/raw_ptr.h"
+@@ -81,7 +82,10 @@ class HoverCardAnchorTarget {
+   virtual views::BubbleBorder::Arrow GetAnchorPosition() const = 0;
+ 
+  protected:
+-  void SetHoverCardDataFrom(const tabs::TabData& data);
++  // |container_name| names the container of a tab in one, shown with its
++  // domain.
++  void SetHoverCardDataFrom(const tabs::TabData& data,
++                            const std::u16string& container_name = {});
+   void SetHoverCardDataFrom(const tabs::TabGroupData& group_data);
+ 
+  private:
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/container_tab_accent.cc
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/container_tab_accent.h"
++
++#include <utility>
++
++#include "base/strings/utf_string_conversions.h"
++#include "brave/browser/containers/containers_service_factory.h"
++#include "brave/components/containers/content/browser/storage_partition_utils.h"
++#include "brave/components/containers/core/common/features.h"
++#include "brave/components/containers/core/mojom/containers.mojom.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "third_party/skia/include/core/SkPath.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/scoped_canvas.h"
++#include "ui/views/view.h"
++
++namespace {
++
++// The outline is softer on tabs that aren't active.
++constexpr SkAlpha kActiveOutlineAlpha = 0xb0;
++constexpr SkAlpha kInactiveOutlineAlpha = 0x70;
++
++}  // namespace
++
++ContainerTabAccent::ContainerTabAccent(views::View& tab_view)
++    : tab_view_(tab_view) {}
++
++ContainerTabAccent::~ContainerTabAccent() = default;
++
++void ContainerTabAccent::Update(tabs::TabInterface* tab) {
++  content::WebContents* contents = tab ? tab->GetContents() : nullptr;
++  containers::ContainersService* service =
++      contents && base::FeatureList::IsEnabled(containers::features::kContainers)
++          ? ContainersServiceFactory::GetForProfile(
++                Profile::FromBrowserContext(contents->GetBrowserContext()))
++          : nullptr;
++
++  if (!service) {
++    service_observation_.Reset();
++  } else if (!service_observation_.IsObservingSource(service)) {
++    service_observation_.Reset();
++    service_observation_.Observe(service);
++  }
++
++  std::string container_id =
++      service ? containers::GetContainerIdForWebContents(contents)
++              : std::string();
++  if (container_id == container_id_) {
++    return;
++  }
++  container_id_ = std::move(container_id);
++  ReadContainer();
++}
++
++void ContainerTabAccent::Paint(gfx::Canvas* canvas,
++                               const SkPath& highlight_path,
++                               bool is_active) const {
++  if (!color_) {
++    return;
++  }
++
++  gfx::ScopedCanvas scoped_canvas(canvas);
++  const float scale = canvas->UndoDeviceScaleFactor();
++
++  // Only the inner half of the stroke is inside the clip, which leaves a 1dp
++  // outline flush with the inside of the tab's shape.
++  canvas->ClipPath(highlight_path, true);
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  flags.setStyle(cc::PaintFlags::kStroke_Style);
++  flags.setStrokeWidth(2 * scale);
++  flags.setColor(SkColorSetA(
++      *color_, is_active ? kActiveOutlineAlpha : kInactiveOutlineAlpha));
++  canvas->DrawPath(highlight_path, flags);
++}
++
++void ContainerTabAccent::ReadContainer() {
++  containers::mojom::ContainerPtr container;
++  if (!container_id_.empty()) {
++    container =
++        service_observation_.GetSource()->GetRuntimeContainerById(container_id_);
++  }
++  name_ = container ? base::UTF8ToUTF16(container->name) : std::u16string();
++  color_ = container ? std::optional<SkColor>(container->background_color)
++                     : std::nullopt;
++  tab_view_->SchedulePaint();
++}
++
++void ContainerTabAccent::OnContainersListChanged() {
++  // The container may have been renamed or recolored.
++  ReadContainer();
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/container_tab_accent.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_CONTAINER_TAB_ACCENT_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_CONTAINER_TAB_ACCENT_H_
++
++#include <optional>
++#include <string>
++
++#include "base/memory/raw_ref.h"
++#include "base/scoped_observation.h"
++#include "brave/components/containers/core/browser/containers_service.h"
++#include "brave/components/containers/core/browser/containers_service_observer.h"
++#include "third_party/skia/include/core/SkColor.h"
++
++class SkPath;
++
++namespace gfx {
++class Canvas;
++}  // namespace gfx
++
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
++namespace views {
++class View;
++}  // namespace views
++
++// Outlines the inside of the tab view of a tab in a container with the
++// container's color, and keeps it up to date when the container is edited.
++class ContainerTabAccent : public containers::ContainersServiceObserver {
++ public:
++  explicit ContainerTabAccent(views::View& tab_view);
++  ContainerTabAccent(const ContainerTabAccent&) = delete;
++  ContainerTabAccent& operator=(const ContainerTabAccent&) = delete;
++  ~ContainerTabAccent() override;
++
++  // Looks up the container of |tab|'s contents.
++  void Update(tabs::TabInterface* tab);
++
++  // Paints the outline just inside |highlight_path|, given in pixels for the
++  // canvas' image scale.
++  void Paint(gfx::Canvas* canvas,
++             const SkPath& highlight_path,
++             bool is_active) const;
++
++  // The name of the tab's container, or empty if it isn't in one.
++  const std::u16string& container_name() const { return name_; }
++
++ private:
++  // Reads the name and color of `container_id_`.
++  void ReadContainer();
++
++  // containers::ContainersServiceObserver:
++  void OnContainersListChanged() override;
++
++  const raw_ref<views::View> tab_view_;
++  std::string container_id_;
++  std::u16string name_;
++  std::optional<SkColor> color_;
++  base::ScopedObservation<containers::ContainersService,
++                          containers::ContainersServiceObserver>
++      service_observation_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_CONTAINER_TAB_ACCENT_H_
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -493,6 +493,9 @@ are declared in tools/grit/grit_args.gni
+       <message name="IDS_TAB_LOADING_TITLE" desc="The text to be displayed in the title of a tab before a title is discovered.">
+         Loading...
+       </message>
++      <message name="IDS_HOVER_CARD_DOMAIN_IN_CONTAINER" desc="The source line of a hover card for a tab in a container: its domain, then the name of the container.">
++        <ph name="DOMAIN">$1<ex>example.com</ex></ph> · <ph name="CONTAINER">$2<ex>Work</ex></ph>
++      </message>
+       <message name="IDS_HOVER_CARD_FILE_URL_SOURCE" desc="The text to be displayed in the source line of a hover card when viewing a local file.">
+         local or shared file
+       </message>
