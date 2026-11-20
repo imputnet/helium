@@ -1,0 +1,791 @@
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -45,6 +45,8 @@ enum TabContextMenuCommand {
+   CommandToggleFocusGroup,
+   CommandDiscard,
+   CommandToggleTabMuted,
++  CommandReturnToPinnedUrl,
++  CommandUseCurrentUrlAsPinnedUrl,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -12485,6 +12485,12 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_HIBERNATE_OTHER_TABS" desc="The label of the 'Hibernate other tabs' Tab context menu item.">
+           Hibernate other tabs
+         </message>
++        <message name="IDS_TAB_CXMENU_RETURN_TO_PINNED_URL" desc="The label of the Tab context menu item that navigates a pinned tab back to the URL it was pinned at.">
++          Return to pinned URL
++        </message>
++        <message name="IDS_TAB_CXMENU_USE_CURRENT_URL_AS_PINNED_URL" desc="The label of the Tab context menu item that makes the current URL of a pinned tab the URL it returns to.">
++          Use current URL as pinned URL
++        </message>
+         <message name="IDS_TAB_CXMENU_COPY_URL" desc="The label of the 'Copy URL' Tab context menu item.">
+           Copy URL
+         </message>
+@@ -12645,6 +12651,12 @@ Check your passwords anytime in <ph name
+         <message name="IDS_TAB_CXMENU_HIBERNATE_OTHER_TABS" desc="In Title Case: The label of the 'Hibernate Other Tabs' Tab context menu item.">
+           Hibernate Other Tabs
+         </message>
++        <message name="IDS_TAB_CXMENU_RETURN_TO_PINNED_URL" desc="In Title Case: The label of the Tab context menu item that navigates a pinned tab back to the URL it was pinned at.">
++          Return to Pinned URL
++        </message>
++        <message name="IDS_TAB_CXMENU_USE_CURRENT_URL_AS_PINNED_URL" desc="In Title Case: The label of the Tab context menu item that makes the current URL of a pinned tab the URL it returns to.">
++          Use Current URL as Pinned URL
++        </message>
+         <message name="IDS_TAB_CXMENU_COPY_URL" desc="In Title Case: The label of the 'Copy URL' Tab context menu item.">
+           Copy URL
+         </message>
+--- a/chrome/browser/ui/tabs/helium_pins_tab_controller.h
++++ b/chrome/browser/ui/tabs/helium_pins_tab_controller.h
+@@ -11,6 +11,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ref.h"
++#include "content/public/browser/web_contents_observer.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ #include "url/gurl.h"
+ 
+@@ -26,12 +27,12 @@ namespace helium_pins {
+ 
+ // Persistent pin state of a tab: its pin list entry and pinned URL. Kept on the
+ // tab so it survives discards, and mirrored into session extra data.
+-class HeliumPinsTabController {
++class HeliumPinsTabController : public content::WebContentsObserver {
+  public:
+   explicit HeliumPinsTabController(tabs::TabInterface& tab);
+   HeliumPinsTabController(const HeliumPinsTabController&) = delete;
+   HeliumPinsTabController& operator=(const HeliumPinsTabController&) = delete;
+-  ~HeliumPinsTabController();
++  ~HeliumPinsTabController() override;
+ 
+   DECLARE_USER_DATA(HeliumPinsTabController);
+ 
+@@ -65,11 +66,28 @@ class HeliumPinsTabController {
+   // Unlinks the tab from the pin list.
+   void ClearPin();
+ 
++  // Whether the tab loads its pinned URL instead of its last page when it's
++  // activated while hibernated.
++  bool return_on_activation() const { return return_on_activation_; }
++  void SetReturnOnActivation(bool return_on_activation);
++
++  // Navigates the tab to its pinned URL, unless it's already there, and
++  // clears return_on_activation().
++  void ReturnToPinnedUrl();
++
++  // Makes the pinned URL follow the first page the tab commits, for pins taken
++  // before it committed one, e.g. while it was redirecting.
++  void FollowFirstCommit();
++
+  private:
++  // content::WebContentsObserver:
++  void DidFinishNavigation(content::NavigationHandle* handle) override;
++
++  void OnDidActivate(tabs::TabInterface* tab);
+   void OnDidInsert(tabs::TabInterface* tab);
+   void OnPinnedStateChanged(tabs::TabInterface* tab, bool pinned);
+ 
+-  // Returns the pin state as session extra data. Values are empty for tabs
++  // Returns the pin state as session extra data. The pin id is empty for tabs
+   // without a pin, which clears previously persisted data.
+   std::map<std::string, std::string> GetExtraData() const;
+ 
+@@ -80,6 +98,7 @@ class HeliumPinsTabController {
+ 
+   std::string pin_id_;
+   GURL pinned_url_;
++  bool return_on_activation_ = false;
+ 
+   std::vector<base::CallbackListSubscription> tab_subscriptions_;
+   ui::ScopedUnownedUserData<HeliumPinsTabController> scoped_unowned_user_data_;
+--- a/chrome/browser/ui/tabs/helium_pins_tab_controller.cc
++++ b/chrome/browser/ui/tabs/helium_pins_tab_controller.cc
+@@ -8,14 +8,23 @@
+ 
+ #include "base/containers/map_util.h"
+ #include "base/functional/bind.h"
++#include "base/strings/to_string.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/tabs/helium_pins_service.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
++#include "chrome/browser/ui/tabs/pinned_tab_service_factory.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/sessions/core/session_id.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_user_data.h"
++#include "content/public/common/referrer.h"
++#include "ui/base/page_transition_types.h"
+ 
+ namespace helium_pins {
+ 
+@@ -24,6 +33,7 @@ namespace {
+ // Session extra data keys.
+ constexpr char kPinIdKey[] = "helium.pinned_tab_id";
+ constexpr char kPinnedUrlKey[] = "helium.pinned_tab_url";
++constexpr char kReturnKey[] = "helium.pinned_tab_return";
+ 
+ std::string FindValue(const std::map<std::string, std::string>& extra_data,
+                       const char* key) {
+@@ -67,9 +77,13 @@ HeliumPinsTabController::HeliumPinsTabCo
+           RestoredPinState::FromWebContents(contents)) {
+     pin_id_ = FindValue(state->extra_data(), kPinIdKey);
+     pinned_url_ = GURL(FindValue(state->extra_data(), kPinnedUrlKey));
++    return_on_activation_ =
++        FindValue(state->extra_data(), kReturnKey) == "true";
+     contents->RemoveUserData(RestoredPinState::UserDataKey());
+   }
+ 
++  tab_subscriptions_.push_back(tab.RegisterDidActivate(base::BindRepeating(
++      &HeliumPinsTabController::OnDidActivate, base::Unretained(this))));
+   tab_subscriptions_.push_back(tab.RegisterDidInsert(base::BindRepeating(
+       &HeliumPinsTabController::OnDidInsert, base::Unretained(this))));
+   tab_subscriptions_.push_back(tab.RegisterPinnedStateChanged(
+@@ -121,7 +135,17 @@ void HeliumPinsTabController::SetPinnedU
+   PersistSessionData();
+ }
+ 
++void HeliumPinsTabController::SetReturnOnActivation(bool return_on_activation) {
++  if (return_on_activation_ == return_on_activation) {
++    return;
++  }
++
++  return_on_activation_ = return_on_activation;
++  PersistSessionData();
++}
++
+ void HeliumPinsTabController::ClearPin() {
++  return_on_activation_ = false;
+   if (pin_id_.empty() && pinned_url_.is_empty()) {
+     return;
+   }
+@@ -131,6 +155,63 @@ void HeliumPinsTabController::ClearPin()
+   PersistSessionData();
+ }
+ 
++void HeliumPinsTabController::OnDidActivate(tabs::TabInterface* tab) {
++  if (!return_on_activation_) {
++    return;
++  }
++
++  content::NavigationController& controller =
++      tab->GetContents()->GetController();
++  if (controller.NeedsReload()) {
++    ReturnToPinnedUrl();
++  } else if (controller.GetPendingEntryIndex() == -1) {
++    // The tab was never hibernated, so it keeps its page.
++    SetReturnOnActivation(false);
++  }
++
++  // Otherwise HeliumPinsNavigationThrottle replaces the pending reload.
++}
++
++void HeliumPinsTabController::ReturnToPinnedUrl() {
++  SetReturnOnActivation(false);
++
++  content::WebContents* const contents = tab_->GetContents();
++  if (!IsPersistentPin(&tab()) || !pinned_url_.is_valid() ||
++      (GetPinnableUrl(contents) == pinned_url_ &&
++       !contents->GetController().GetLastCommittedEntry()->GetHasPostData())) {
++    return;
++  }
++
++  // This also cancels a pending reload of the last page.
++  contents->GetController().LoadURL(pinned_url_, content::Referrer(),
++                                    ui::PAGE_TRANSITION_AUTO_BOOKMARK,
++                                    std::string());
++}
++
++void HeliumPinsTabController::FollowFirstCommit() {
++  Observe(tab_->GetContents());
++}
++
++void HeliumPinsTabController::DidFinishNavigation(
++    content::NavigationHandle* handle) {
++  if (!handle->IsInPrimaryMainFrame() || !handle->HasCommitted() ||
++      handle->IsSameDocument()) {
++    return;
++  }
++
++  Observe(nullptr);
++  if (!IsLinkedPin()) {
++    return;
++  }
++
++  content::WebContents* const contents = handle->GetWebContents();
++  HeliumPinsService* const service = PinnedTabServiceFactory::GetForProfile(
++      Profile::FromBrowserContext(contents->GetBrowserContext()));
++  if (service) {
++    service->SetPinnedUrl(pin_id_, GetPinnableUrl(contents));
++  }
++}
++
+ void HeliumPinsTabController::OnDidInsert(tabs::TabInterface* tab) {
+   // The tab may have moved to a different window. Drags can insert a pin
+   // without pinning it first, so where a pin ends up is only decided once the
+@@ -154,6 +235,7 @@ std::map<std::string, std::string> Heliu
+   return {
+       {kPinIdKey, pin_id_},
+       {kPinnedUrlKey, pinned_url_.is_valid() ? pinned_url_.spec() : ""},
++      {kReturnKey, base::ToString(return_on_activation_)},
+   };
+ }
+ 
+--- a/chrome/browser/ui/tabs/helium_pins_service.h
++++ b/chrome/browser/ui/tabs/helium_pins_service.h
+@@ -60,6 +60,9 @@ class HeliumPinsService : public KeyedSe
+   // KeyedService:
+   void Shutdown() override;
+ 
++  // Replaces the URL of the pin id in the pin list and in all its tabs.
++  void SetPinnedUrl(const std::string& id, const GURL& url);
++
+  private:
+   // BrowserCollectionObserver:
+   void OnBrowserCreated(BrowserWindowInterface* browser) override;
+--- a/chrome/browser/ui/tabs/helium_pins_service.cc
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -166,6 +166,22 @@ void SetHibernatedTitle(tabs::TabHandle
+   }
+ }
+ 
++// Gives a copy of a pin the pinned URL url. A hibernated copy that's still at
++// its old pinned URL loads the new one once it's activated.
++void UpdateCopyPinnedUrl(HeliumPinsTabController* copy, const GURL& url) {
++  if (copy->pinned_url() == url) {
++    return;
++  }
++
++  content::WebContents* const contents = copy->tab().GetContents();
++  if (IsHibernated(contents) &&
++      GetPinnableUrl(contents) == copy->pinned_url()) {
++    copy->SetReturnOnActivation(true);
++  }
++
++  copy->SetPinnedUrl(url);
++}
++
+ }  // namespace
+ 
+ HeliumPinsService::HeliumPinsService(Profile* profile,
+@@ -206,6 +222,19 @@ void HeliumPinsService::Shutdown() {
+   weak_factory_.InvalidateWeakPtrs();
+ }
+ 
++void HeliumPinsService::SetPinnedUrl(const std::string& id, const GURL& url) {
++  const auto it = pins_.Find(id);
++  if (it == pins_.end() || it->url == url) {
++    return;
++  }
++
++  it->url = url;
++  SavePins();
++  for (HeliumPinsTabController* controller : GetPinCopies(id)) {
++    UpdateCopyPinnedUrl(controller, url);
++  }
++}
++
+ void HeliumPinsService::OnBrowserCreated(BrowserWindowInterface* browser) {
+   if (!IsSyncedBrowser(browser)) {
+     return;
+@@ -695,6 +724,15 @@ std::string HeliumPinsService::InsertNew
+   const Pin pin{CreatePinId(), GetNewPinUrl(tab->GetContents())};
+   pins_.insert(pins_.begin() + GetNewPinPosition(browser, tab), pin);
+   controller->SetPin(pin.id, pin.url);
++
++  // A tab without a committed page may still be redirecting, so its pin
++  // takes the first page it commits.
++  const content::NavigationEntry* const entry =
++      tab->GetContents()->GetController().GetLastCommittedEntry();
++  if (entry->IsInitialEntry()) {
++    controller->FollowFirstCommit();
++  }
++
+   return pin.id;
+ }
+ 
+@@ -822,10 +860,7 @@ void HeliumPinsService::Reconcile(Browse
+ 
+   // Tabs restored with their window can have an outdated pinned URL.
+   for (const auto& [id, controller] : present) {
+-    const GURL& url = pins_.Find(id)->url;
+-    if (controller->pinned_url() != url) {
+-      controller->SetPinnedUrl(url);
+-    }
++    UpdateCopyPinnedUrl(controller, pins_.Find(id)->url);
+   }
+ 
+   // Splits that the pin list no longer has are taken apart first, so that their
+--- a/chrome/browser/ui/tabs/helium_pins_util.h
++++ b/chrome/browser/ui/tabs/helium_pins_util.h
+@@ -15,6 +15,7 @@ class GURL;
+ class TabStripModel;
+ 
+ namespace content {
++class NavigationHandle;
+ class WebContents;
+ }  // namespace content
+ 
+@@ -62,7 +63,8 @@ std::vector<tabs::TabHandle> HandleUserC
+     std::vector<tabs::TabHandle> tab_handles);
+ 
+ // Hibernates the persistent pin tab once it's no longer visible, after the
+-// page's beforeunload handlers ran.
++// page's beforeunload handlers ran. Once hibernated, it returns to its pinned
++// URL when activated again.
+ void ScheduleHibernation(tabs::TabInterface* tab);
+ 
+ // Called when the beforeunload handlers of contents are done. Returns whether
+@@ -72,6 +74,20 @@ bool HandleBeforeUnloadFired(content::We
+                              bool proceed,
+                              bool closing_window);
+ 
++// Returns whether the persistent pin tab can be navigated back to its pinned
++// URL, and does so.
++bool CanReturnToPinnedUrl(tabs::TabInterface* tab);
++void ReturnToPinnedUrl(tabs::TabInterface* tab);
++
++// Returns whether the current URL of the persistent pin tab can become its
++// pinned URL, and makes it so in all windows.
++bool CanUseCurrentUrlAsPinnedUrl(tabs::TabInterface* tab);
++void UseCurrentUrlAsPinnedUrl(tabs::TabInterface* tab);
++
++// Returns the URL of the page that handle navigates to, as GetPinnableUrl()
++// would once it's shown, e.g. the view-source: URL of a source view.
++GURL GetPinnableUrlForNavigation(content::NavigationHandle& handle);
++
+ }  // namespace helium_pins
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_HELIUM_PINS_UTIL_H_
+--- a/chrome/browser/ui/tabs/helium_pins_util.cc
++++ b/chrome/browser/ui/tabs/helium_pins_util.cc
+@@ -20,7 +20,9 @@
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/helium_pins_service.h"
+ #include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
++#include "chrome/browser/ui/tabs/pinned_tab_service_factory.h"
+ #include "chrome/browser/ui/tabs/tab_close_types_data.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+@@ -30,6 +32,7 @@
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ #include "url/gurl.h"
+@@ -144,11 +147,16 @@ std::set<tabs::TabInterface*> GetPinsToH
+ // another tab takes the place of that pin and its split again first.
+ void HibernateTab(tabs::TabHandle handle) {
+   tabs::TabInterface* const tab = handle.Get();
+-  if (!IsPersistentPin(tab) || IsHibernated(tab->GetContents()) ||
++  HeliumPinsTabController* const controller = GetPersistentPinController(tab);
++  if (!controller || IsHibernated(tab->GetContents()) ||
+       !performance_manager::PerformanceManager::IsAvailable()) {
+     return;
+   }
+ 
++  // Activating the pin for its beforeunload dialog cancelled its return to the
++  // pinned URL, and another pin's dialog may have taken its place since.
++  controller->SetReturnOnActivation(true);
++
+   BrowserWindowInterface* const browser = tab->GetBrowserWindowInterface();
+   TabStripModel* const model = browser->GetTabStripModel();
+   if (model->IsTabInForeground(model->GetIndexOfTab(tab))) {
+@@ -356,6 +364,10 @@ std::vector<tabs::TabHandle> HandleUserC
+ }
+ 
+ void ScheduleHibernation(tabs::TabInterface* tab) {
++  if (HeliumPinsTabController* controller = GetPersistentPinController(tab)) {
++    controller->SetReturnOnActivation(true);
++  }
++
+   base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+       FROM_HERE, base::BindOnce(&RequestHibernation, tab->GetHandle()));
+ }
+@@ -381,6 +393,10 @@ bool HandleBeforeUnloadFired(content::We
+       tabs::TabInterface::MaybeGetFromContents(contents);
+   if (!proceed) {
+     CanceledHibernation::CreateForWebContents(contents);
++    if (HeliumPinsTabController* controller = GetPersistentPinController(tab)) {
++      controller->SetReturnOnActivation(false);
++    }
++
+     return true;
+   }
+ 
+@@ -392,4 +408,64 @@ bool HandleBeforeUnloadFired(content::We
+   return true;
+ }
+ 
++bool CanReturnToPinnedUrl(tabs::TabInterface* tab) {
++  HeliumPinsTabController* const controller = GetPersistentPinController(tab);
++  if (!controller || !controller->pinned_url().is_valid() ||
++      GetPinnableUrl(tab->GetContents()) == controller->pinned_url()) {
++    return false;
++  }
++
++  // A pin that was hibernated already returns when it's activated.
++  return !IsHibernated(tab->GetContents()) ||
++         !controller->return_on_activation();
++}
++
++void ReturnToPinnedUrl(tabs::TabInterface* tab) {
++  if (!CanReturnToPinnedUrl(tab)) {
++    return;
++  }
++
++  HeliumPinsTabController* const controller = GetPersistentPinController(tab);
++  if (IsHibernated(tab->GetContents())) {
++    // Don't load a hibernated tab in the background.
++    controller->SetReturnOnActivation(true);
++  } else {
++    controller->ReturnToPinnedUrl();
++  }
++}
++
++bool CanUseCurrentUrlAsPinnedUrl(tabs::TabInterface* tab) {
++  HeliumPinsTabController* const controller = GetPersistentPinController(tab);
++  if (!controller) {
++    return false;
++  }
++
++  const GURL url = GetPinnableUrl(tab->GetContents());
++  return url.is_valid() && url != controller->pinned_url();
++}
++
++void UseCurrentUrlAsPinnedUrl(tabs::TabInterface* tab) {
++  if (!CanUseCurrentUrlAsPinnedUrl(tab)) {
++    return;
++  }
++
++  HeliumPinsTabController* const controller = GetPersistentPinController(tab);
++  const GURL url = GetPinnableUrl(tab->GetContents());
++
++  // The tab is at its new pinned URL, so there's nothing to return to.
++  controller->SetReturnOnActivation(false);
++
++  if (HeliumPinsService* const pins_service =
++          PinnedTabServiceFactory::GetForProfile(
++              tab->GetBrowserWindowInterface()->GetProfile())) {
++    pins_service->SetPinnedUrl(controller->pin_id(), url);
++  }
++}
++
++GURL GetPinnableUrlForNavigation(content::NavigationHandle& handle) {
++  const content::NavigationEntry* const entry = handle.GetNavigationEntry();
++  return entry && entry->IsViewSourceMode() ? entry->GetVirtualURL()
++                                            : handle.GetURL();
++}
++
+ }  // namespace helium_pins
+--- /dev/null
++++ b/chrome/browser/ui/tabs/helium_pins_navigation_throttle.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_HELIUM_PINS_NAVIGATION_THROTTLE_H_
++#define CHROME_BROWSER_UI_TABS_HELIUM_PINS_NAVIGATION_THROTTLE_H_
++
++#include "content/public/browser/navigation_throttle.h"
++
++namespace content {
++class NavigationThrottleRegistry;
++}  // namespace content
++
++namespace helium_pins {
++
++// Replaces the reload of a reactivated persistent pin's last page with its
++// pinned URL.
++class HeliumPinsNavigationThrottle : public content::NavigationThrottle {
++ public:
++  static void MaybeCreateAndAdd(content::NavigationThrottleRegistry& registry);
++
++  explicit HeliumPinsNavigationThrottle(
++      content::NavigationThrottleRegistry& registry);
++  HeliumPinsNavigationThrottle(const HeliumPinsNavigationThrottle&) = delete;
++  HeliumPinsNavigationThrottle& operator=(const HeliumPinsNavigationThrottle&) =
++      delete;
++  ~HeliumPinsNavigationThrottle() override;
++
++  // content::NavigationThrottle:
++  ThrottleCheckResult WillStartRequest() override;
++  ThrottleCheckResult WillCommitWithoutUrlLoader() override;
++  const char* GetNameForLogging() override;
++};
++
++}  // namespace helium_pins
++
++#endif  // CHROME_BROWSER_UI_TABS_HELIUM_PINS_NAVIGATION_THROTTLE_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/helium_pins_navigation_throttle.cc
+@@ -0,0 +1,120 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/helium_pins_navigation_throttle.h"
++
++#include <memory>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/navigation_throttle_registry.h"
++#include "content/public/browser/reload_type.h"
++#include "content/public/browser/restore_type.h"
++#include "url/gurl.h"
++
++namespace helium_pins {
++
++namespace {
++
++// Returns the controller of the tab navigated by handle if it is a
++// persistent pin.
++HeliumPinsTabController* GetNavigatedPinController(
++    content::NavigationHandle& handle) {
++  return GetPersistentPinController(
++      tabs::TabInterface::MaybeGetFromContents(handle.GetWebContents()));
++}
++
++// Returns whether handle returns to a page that was already in the tab.
++bool IsNavigationToExistingEntry(content::NavigationHandle& handle) {
++  return handle.IsHistory() ||
++         handle.GetReloadType() != content::ReloadType::NONE ||
++         handle.GetRestoreType() == content::RestoreType::kRestored;
++}
++
++void ReturnTabToPinnedUrl(tabs::TabHandle handle) {
++  if (HeliumPinsTabController* controller =
++          HeliumPinsTabController::From(handle.Get())) {
++    controller->ReturnToPinnedUrl();
++  }
++}
++
++// Replaces handle with the pinned URL if it reloads the last page of a
++// reactivated pin. The return is used up even if that page is the pinned URL,
++// so later reloads stay on their page. Returns whether handle is replaced.
++bool ReplaceReloadWithReturn(content::NavigationHandle& handle,
++                             HeliumPinsTabController& controller) {
++  if (!controller.return_on_activation() ||
++      !IsNavigationToExistingEntry(handle)) {
++    return false;
++  }
++
++  controller.SetReturnOnActivation(false);
++
++  // A POST response can only be restored from the cache, so the pinned URL is
++  // loaded again even if it's the same page.
++  if (!handle.IsPost() &&
++      GetPinnableUrlForNavigation(handle) == controller.pinned_url()) {
++    return false;
++  }
++
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&ReturnTabToPinnedUrl, controller.tab().GetHandle()));
++  return true;
++}
++
++}  // namespace
++
++// static
++void HeliumPinsNavigationThrottle::MaybeCreateAndAdd(
++    content::NavigationThrottleRegistry& registry) {
++  content::NavigationHandle& handle = registry.GetNavigationHandle();
++  if (handle.IsInPrimaryMainFrame() && GetNavigatedPinController(handle)) {
++    registry.AddThrottle(
++        std::make_unique<HeliumPinsNavigationThrottle>(registry));
++  }
++}
++
++HeliumPinsNavigationThrottle::HeliumPinsNavigationThrottle(
++    content::NavigationThrottleRegistry& registry)
++    : content::NavigationThrottle(registry) {}
++
++HeliumPinsNavigationThrottle::~HeliumPinsNavigationThrottle() = default;
++
++content::NavigationThrottle::ThrottleCheckResult
++HeliumPinsNavigationThrottle::WillStartRequest() {
++  content::NavigationHandle& handle = *navigation_handle();
++  HeliumPinsTabController* const controller = GetNavigatedPinController(handle);
++  if (!controller || !controller->pinned_url().is_valid()) {
++    return PROCEED;
++  }
++
++  return ReplaceReloadWithReturn(handle, *controller) ? CANCEL_AND_IGNORE
++                                                      : PROCEED;
++}
++
++content::NavigationThrottle::ThrottleCheckResult
++HeliumPinsNavigationThrottle::WillCommitWithoutUrlLoader() {
++  // Pins can also be reactivated at pages that load without a request, e.g.
++  // about:blank.
++  content::NavigationHandle& handle = *navigation_handle();
++  HeliumPinsTabController* const controller = GetNavigatedPinController(handle);
++  if (!controller || !controller->pinned_url().is_valid()) {
++    return PROCEED;
++  }
++
++  return ReplaceReloadWithReturn(handle, *controller) ? CANCEL_AND_IGNORE
++                                                      : PROCEED;
++}
++
++const char* HeliumPinsNavigationThrottle::GetNameForLogging() {
++  return "HeliumPinsNavigationThrottle";
++}
++
++}  // namespace helium_pins
+--- a/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
++++ b/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
+@@ -104,6 +104,7 @@
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/lens/lens_overlay_side_panel_navigation_throttle.h"
+ #include "chrome/browser/ui/read_anything/read_anything_side_panel_navigation_throttle.h"
++#include "chrome/browser/ui/tabs/helium_pins_navigation_throttle.h"
+ #include "chrome/browser/ui/web_applications/tabbed_web_app_navigation_throttle.h"
+ #include "chrome/browser/ui/web_applications/webui_web_app_navigation_throttle.h"
+ #include "chrome/browser/ui/webui/image/image_navigation_throttle.h"
+@@ -494,6 +495,7 @@ void CreateAndAddChromeThrottlesForNavig
+ #endif
+ 
+ #if !BUILDFLAG(IS_ANDROID)
++  helium_pins::HeliumPinsNavigationThrottle::MaybeCreateAndAdd(registry);
+   web_app::TabbedWebAppNavigationThrottle::MaybeCreateAndAdd(registry);
+ 
+   web_app::WebUIWebAppNavigationThrottle::MaybeCreateAndAdd(registry);
+@@ -647,6 +649,10 @@ void CreateAndAddChromeThrottlesForCommi
+ 
+   glic::GlicGuestNavigationThrottle::MaybeCreateAndAdd(registry);
+ 
++#if !BUILDFLAG(IS_ANDROID)
++  helium_pins::HeliumPinsNavigationThrottle::MaybeCreateAndAdd(registry);
++#endif
++
+ #if !BUILDFLAG(ENABLE_EXTENSIONS_CORE) && BUILDFLAG(ENABLE_GUEST_VIEW)
+   guest_view::MaybeCreateAndAddSlimWebViewNavigationThrottle(registry);
+ #endif
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2960,6 +2960,13 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandCopyURL:
+       return GetWebContentsAt(context_index) != nullptr;
+ 
++    case CommandReturnToPinnedUrl:
++      return helium_pins::CanReturnToPinnedUrl(GetTabAtIndex(context_index));
++
++    case CommandUseCurrentUrlAsPinnedUrl:
++      return helium_pins::CanUseCurrentUrlAsPinnedUrl(
++          GetTabAtIndex(context_index));
++
+     case CommandGoBack:
+       CHECK(delegate()->IsForWebApp(), base::NotFatalUntil::M162);
+       return delegate()->CanGoBack(GetWebContentsAt(context_index));
+@@ -3181,6 +3188,14 @@ void TabStripModel::ExecuteContextMenuCo
+       break;
+     }
+ 
++    case CommandReturnToPinnedUrl:
++      helium_pins::ReturnToPinnedUrl(GetTabAtIndex(context_index));
++      break;
++
++    case CommandUseCurrentUrlAsPinnedUrl:
++      helium_pins::UseCurrentUrlAsPinnedUrl(GetTabAtIndex(context_index));
++      break;
++
+     case CommandToggleTabMuted: {
+       const bool mute = WillContextMenuMuteTabs(context_index);
+       for (int index : GetIndicesForCommand(context_index)) {
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/tab_menu_model.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ 
+@@ -35,6 +36,7 @@
+ #include "chrome/browser/ui/tabs/existing_window_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/glic_tab_sub_menu_model.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
+ #include "chrome/browser/ui/tabs/split_tab_menu_model.h"
+ #include "chrome/browser/ui/tabs/split_tab_mute_menu_model.h"
+ #include "chrome/browser/ui/tabs/split_tab_swap_menu_model.h"
+@@ -535,12 +537,6 @@ void TabMenuModel::Build(int index) {
+                                     : IDS_TAB_CXMENU_COPY_URLS);
+ 
+   AddSeparator(ui::NORMAL_SEPARATOR);
+-  AddItemWithStringId(TabStripModel::CommandReload, IDS_TAB_CXMENU_RELOAD);
+-
+-  AddItemWithStringId(TabStripModel::CommandDuplicate,
+-                      IDS_TAB_CXMENU_DUPLICATE);
+-  SetElementIdentifierAt(GetItemCount() - 1, kDuplicateMenuItem);
+-
+   bool will_pin = tab_strip_->WillContextMenuPin(index);
+   AddItemWithStringId(
+       TabStripModel::CommandTogglePinned,
+@@ -557,6 +553,27 @@ void TabMenuModel::Build(int index) {
+             ui::kColorMenuIcon, ui::SimpleMenuModel::kDefaultIconSize));
+   }
+ 
++  // Pinned URL actions for a single persistent pin. A pin in the active split
++  // is selected together with its partner.
++  tabs::TabInterface* const context_tab = tab_strip_->GetTabAtIndex(index);
++  if (helium_pins::IsPersistentPin(context_tab) &&
++      std::ranges::all_of(tabs, [context_tab](tabs::TabInterface* tab) {
++        return tab == context_tab ||
++               (tab->GetSplit() && tab->GetSplit() == context_tab->GetSplit());
++      })) {
++    AddItemWithStringId(TabStripModel::CommandReturnToPinnedUrl,
++                        IDS_TAB_CXMENU_RETURN_TO_PINNED_URL);
++    AddItemWithStringId(TabStripModel::CommandUseCurrentUrlAsPinnedUrl,
++                        IDS_TAB_CXMENU_USE_CURRENT_URL_AS_PINNED_URL);
++  }
++
++  AddSeparator(ui::NORMAL_SEPARATOR);
++  AddItemWithStringId(TabStripModel::CommandReload, IDS_TAB_CXMENU_RELOAD);
++
++  AddItemWithStringId(TabStripModel::CommandDuplicate,
++                      IDS_TAB_CXMENU_DUPLICATE);
++  SetElementIdentifierAt(GetItemCount() - 1, kDuplicateMenuItem);
++
+   const bool will_mute_tab = tab_strip_->WillContextMenuMuteTabs(index);
+   AddItem(TabStripModel::CommandToggleTabMuted,
+           l10n_util::GetPluralStringFUTF16(
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -438,6 +438,7 @@ if (!is_android) {
+   source_set("tabs") {
+     sources = [
+       "features.h",
++      "helium_pins_navigation_throttle.h",
+       "helium_pins_drag_tracker.h",
+       "helium_pins_list.h",
+       "helium_pins_service.h",
+@@ -516,6 +517,7 @@ if (!is_android) {
+     ]
+ 
+     sources = [
++      "helium_pins_navigation_throttle.cc",
+       "helium_pins_drag_tracker.cc",
+       "helium_pins_list.cc",
+       "helium_pins_service.cc",

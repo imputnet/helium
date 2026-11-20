@@ -1,0 +1,803 @@
+--- a/chrome/browser/ui/tabs/tab_utils.h
++++ b/chrome/browser/ui/tabs/tab_utils.h
+@@ -24,4 +24,8 @@ bool AreAllSitesMuted(const TabStripMode
+ // be loaded.
+ bool IsRestoredTabPendingLoad(content::WebContents* contents);
+ 
++// Returns whether windows stay open when their last tab is closed, which the
++// close-window-with-last-tab flag allows.
++bool KeepsWindowsWithoutTabs();
++
+ #endif  // CHROME_BROWSER_UI_TABS_TAB_UTILS_H_
+--- a/chrome/browser/ui/tabs/tab_utils.cc
++++ b/chrome/browser/ui/tabs/tab_utils.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+ 
++#include "base/command_line.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+@@ -56,3 +57,8 @@ bool IsRestoredTabPendingLoad(content::W
+   const content::NavigationEntry* entry = controller.GetLastCommittedEntry();
+   return controller.NeedsReload() && entry && entry->IsRestored();
+ }
++
++bool KeepsWindowsWithoutTabs() {
++  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++             "close-window-with-last-tab") == "never";
++}
+--- a/chrome/browser/ui/tabs/tab_strip_model_delegate.h
++++ b/chrome/browser/ui/tabs/tab_strip_model_delegate.h
+@@ -254,6 +254,11 @@ class TabStripModelDelegate {
+   void CloseTab(const tabs::TabInterface* tab, CloseTabSource source) {
+     CloseTab(tab, source, base::OnceCallback<void(CloseTabSource)>());
+   }
++
++  // Called before the user closes tab_handles. Returns the tabs that should
++  // still be closed.
++  virtual std::vector<tabs::TabHandle> HandleUserClosingTabs(
++      std::vector<tabs::TabHandle> tab_handles);
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_TAB_STRIP_MODEL_DELEGATE_H_
+--- a/chrome/browser/ui/tabs/tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model_delegate.cc
+@@ -14,3 +14,8 @@ TabStripModelDelegate::NewStripContents:
+ 
+ void TabStripModelDelegate::GlicUnpinTabsFromAllConversations(
+     base::span<const tabs::TabHandle> tab_handles) {}
++
++std::vector<tabs::TabHandle> TabStripModelDelegate::HandleUserClosingTabs(
++    std::vector<tabs::TabHandle> tab_handles) {
++  return tab_handles;
++}
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -477,8 +477,10 @@ class TabStripModel {
+   // Closes all tabs in the given `group`. If the group is focused, focus is
+   // unset before closing. If all tabs in the tabstrip are in `group`, a new
+   // fallback tab is added outside the group to prevent the browser window from
+-  // closing.
+-  void CloseAllTabsInGroup(const tab_groups::TabGroupId& group);
++  // closing. Only groups that the user closes, rather than e.g. sync, are
++  // handled by the delegate's HandleUserClosingTabs().
++  void CloseAllTabsInGroup(const tab_groups::TabGroupId& group,
++                           bool user_gesture = true);
+ 
+   // Returns true if there are any WebContentses that are currently loading
+   // and should be shown on the UI.
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -64,6 +64,7 @@
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+ #include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/tabs/tab_close_types_data.h"
+@@ -1344,7 +1345,8 @@ void TabStripModel::CloseAllTabs() {
+   CloseTabs(closing_tabs, TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+ }
+ 
+-void TabStripModel::CloseAllTabsInGroup(const tab_groups::TabGroupId& group) {
++void TabStripModel::CloseAllTabsInGroup(const tab_groups::TabGroupId& group,
++                                        bool user_gesture) {
+   if (!group_model_ || !group_model_->ContainsTabGroup(group)) {
+     return;
+   }
+@@ -1353,10 +1355,32 @@ void TabStripModel::CloseAllTabsInGroup(
+     ExitFocusMode(TabGroupFocusExitReason::kGroupClosed);
+   }
+ 
+-  const int num_tabs_in_group = group_model_->GetTabGroup(group)->tab_count();
+-  if (count() == num_tabs_in_group) {
+-    // If the group about to be closed has all of the tabs in the browser, add a
+-    // new tab outside the group to prevent the browser from closing.
++  const gfx::Range group_range = group_model_->GetTabGroup(group)->ListTabs();
++
++  // The delegate sees the group's tabs as closed by the user, so it can pick
++  // the next tab or close the window instead.
++  if (user_gesture) {
++    std::vector<tabs::TabHandle> group_tabs;
++    for (size_t index = group_range.start(); index < group_range.end();
++         ++index) {
++      group_tabs.push_back(GetTabAtIndex(index)->GetHandle());
++    }
++    if (delegate_->HandleUserClosingTabs(std::move(group_tabs)).empty()) {
++      return;
++    }
++  }
++
++  // If no tab outside the group about to be closed can take its place, e.g.
++  // because the group has all of the tabs in the browser or only hibernated
++  // pins are left, add a new tab outside the group to prevent the browser from
++  // closing or loading a pin.
++  bool has_replacement = false;
++  for (int index = 0; index < count() && !has_replacement; ++index) {
++    has_replacement = (index < static_cast<int>(group_range.start()) ||
++                       index >= static_cast<int>(group_range.end())) &&
++                      !helium_pins::WouldShowHibernatedPin(*this, index);
++  }
++  if (!has_replacement) {
+     delegate_->AddTabAt(GURL(), -1, /*foreground=*/true);
+   }
+ 
+@@ -1400,6 +1424,14 @@ void TabStripModel::CloseWebContents(con
+ 
+   CHECK(contents);
+   CHECK_NE(GetIndexOfWebContents(contents), kNoTab);
++
++  if ((close_types & TabCloseTypes::CLOSE_USER_GESTURE) && !closing_all_ &&
++      delegate_
++          ->HandleUserClosingTabs({GetTabForWebContents(contents)->GetHandle()})
++          .empty()) {
++    return;
++  }
++
+   CloseTabs({contents}, close_types);
+ }
+ 
+@@ -3634,9 +3666,17 @@ void TabStripModel::ExecuteCloseTabs(
+     base::RepeatingCallback<std::vector<tabs::TabHandle>()> get_tabs_to_close,
+     uint32_t close_types) {
+   ReentrancyCheck::ValidateNotReentrant(&reentrancy_guard_);
+-  const std::vector<tabs::TabHandle> tab_handles_to_close =
++  std::vector<tabs::TabHandle> tab_handles_to_close =
+       std::move(get_tabs_to_close).Run();
+ 
++  if ((close_types & TabCloseTypes::CLOSE_USER_GESTURE) && !closing_all_) {
++    tab_handles_to_close =
++        delegate()->HandleUserClosingTabs(std::move(tab_handles_to_close));
++    if (tab_handles_to_close.empty()) {
++      return;
++    }
++  }
++
+   std::vector<tabs::TabInterface*> tabs_to_close;
+   std::vector<content::WebContents*> web_contents_to_close;
+   for (tabs::TabHandle handle : tab_handles_to_close) {
+@@ -3645,9 +3685,7 @@ void TabStripModel::ExecuteCloseTabs(
+       web_contents_to_close.push_back(t->GetContents());
+     }
+   }
+-  if (base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+-          "close-window-with-last-tab") == "never" &&
+-      !tabs_to_close.empty() && !closing_all_ &&
++  if (KeepsWindowsWithoutTabs() && !tabs_to_close.empty() && !closing_all_ &&
+       static_cast<int>(tabs_to_close.size()) == count() &&
+       delegate()->IsNormalWindow()) {
+     delegate()->AddTabAt(GURL(), -1, true);
+@@ -6198,8 +6236,10 @@ std::optional<int> TabStripModel::Determ
+                  GetTabAtIndex(index), focused_group);
+     };
+ 
++    // Hibernated pins aren't loaded just to take the place of a closed tab.
+     auto is_eligible = [this, &is_valid_for_focus](int index) {
+-      return !IsTabCollapsed(index) && is_valid_for_focus(index);
++      return !IsTabCollapsed(index) && is_valid_for_focus(index) &&
++             !helium_pins::WouldShowHibernatedPin(*this, index);
+     };
+ 
+     // First preference is a tab the block opened.
+--- a/chrome/browser/ui/tabs/helium_pins_util.h
++++ b/chrome/browser/ui/tabs/helium_pins_util.h
+@@ -5,17 +5,19 @@
+ #ifndef CHROME_BROWSER_UI_TABS_HELIUM_PINS_UTIL_H_
+ #define CHROME_BROWSER_UI_TABS_HELIUM_PINS_UTIL_H_
+ 
++#include <set>
++#include <vector>
++
++#include "components/tabs/public/tab_interface.h"
++
+ class BrowserWindowInterface;
+ class GURL;
++class TabStripModel;
+ 
+ namespace content {
+ class WebContents;
+ }  // namespace content
+ 
+-namespace tabs {
+-class TabInterface;
+-}  // namespace tabs
+-
+ // Persistent pinned tabs: pins are shared by all normal windows of a profile,
+ // survive restarts, and are hibernated instead of closed.
+ namespace helium_pins {
+@@ -34,9 +36,42 @@ bool IsPersistentPin(tabs::TabInterface*
+ // loaded yet.
+ bool IsHibernated(content::WebContents* contents);
+ 
++// Returns whether activating the tab at index of model would show a hibernated
++// pin, which loads it: the tab itself, or another pane of its split.
++bool WouldShowHibernatedPin(const TabStripModel& model, int index);
++
++// Activates another loaded tab if the active one is among closing. Hibernated
++// pins are never loaded for this. Without such a tab, a New Tab is opened if
++// keep_window or a loaded pin is left, and otherwise the window is closed,
++// unless windows stay open without tabs. Returns false if the window is closed.
++bool ActivateReplacementTab(BrowserWindowInterface* browser,
++                            const std::set<tabs::TabInterface*>& closing,
++                            bool keep_window);
++
+ // Returns the URL that pinning the tab holding contents would capture.
+ GURL GetPinnableUrl(content::WebContents* contents);
+ 
++// Handles the user closing tab_handles in browser: persistent pins and
++// their split partners are hibernated instead. When the active tab goes away,
++// a loaded tab takes its place. If none is left, hibernating the last loaded
++// pin opens a New Tab, and closing the last unpinned tab closes the window,
++// unless windows stay open without tabs. Returns the tabs that should still be
++// closed.
++std::vector<tabs::TabHandle> HandleUserClosingTabs(
++    BrowserWindowInterface* browser,
++    std::vector<tabs::TabHandle> tab_handles);
++
++// Hibernates the persistent pin tab once it's no longer visible, after the
++// page's beforeunload handlers ran.
++void ScheduleHibernation(tabs::TabInterface* tab);
++
++// Called when the beforeunload handlers of contents are done. Returns whether
++// they ran to hibernate a pin, which then happens if proceed. Returns false
++// if the window is closing instead.
++bool HandleBeforeUnloadFired(content::WebContents* contents,
++                             bool proceed,
++                             bool closing_window);
++
+ }  // namespace helium_pins
+ 
+ #endif  // CHROME_BROWSER_UI_TABS_HELIUM_PINS_UTIL_H_
+--- a/chrome/browser/ui/tabs/helium_pins_util.cc
++++ b/chrome/browser/ui/tabs/helium_pins_util.cc
+@@ -4,17 +4,246 @@
+ 
+ #include "chrome/browser/ui/tabs/helium_pins_util.h"
+ 
++#include <algorithm>
++#include <optional>
++#include <set>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/devtools/devtools_window.h"
++#include "chrome/browser/performance_manager/public/user_tuning/user_tuning_utils.h"
++#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
++#include "chrome/browser/ui/tabs/tab_close_types_data.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_utils.h"
++#include "components/performance_manager/public/performance_manager.h"
++#include "components/split_tabs/split_tab_id.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_user_data.h"
+ #include "url/gurl.h"
+ 
+ namespace helium_pins {
+ 
++namespace {
++
++// Marks a pin whose beforeunload handlers run before it's hibernated.
++class PendingHibernation
++    : public content::WebContentsUserData<PendingHibernation> {
++ public:
++  ~PendingHibernation() override = default;
++
++ private:
++  friend class content::WebContentsUserData<PendingHibernation>;
++
++  explicit PendingHibernation(content::WebContents* contents)
++      : content::WebContentsUserData<PendingHibernation>(*contents) {}
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(PendingHibernation);
++
++// Marks a pin whose user chose to stay on its page instead of hibernating it,
++// until the pin is closed again.
++class CanceledHibernation
++    : public content::WebContentsUserData<CanceledHibernation> {
++ public:
++  ~CanceledHibernation() override = default;
++
++ private:
++  friend class content::WebContentsUserData<CanceledHibernation>;
++
++  explicit CanceledHibernation(content::WebContents* contents)
++      : content::WebContentsUserData<CanceledHibernation>(*contents) {}
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(CanceledHibernation);
++
++void MaybeCloseWindow(base::WeakPtr<BrowserWindowInterface> browser) {
++  if (browser) {
++    chrome::CloseWindow(browser.get());
++  }
++}
++
++// Returns the tab to activate instead of the closing ones: the most recently
++// used unpinned tab, else the most recently used loaded pin. Tabs that would
++// show a hibernated pin are skipped, as are foreground tabs, so the active
++// split doesn't stay in front.
++tabs::TabInterface* FindReplacementTab(
++    TabStripModel* model,
++    const std::set<tabs::TabInterface*>& closing) {
++  // Unpinned tabs rank above pins, more recently used tabs above others.
++  auto rank = [](tabs::TabInterface* tab) {
++    return std::pair(!tab->IsPinned(),
++                     tab->GetContents()->GetLastActiveTimeTicks());
++  };
++
++  tabs::TabInterface* best = nullptr;
++  for (int index = 0; index < model->count(); ++index) {
++    tabs::TabInterface* const tab = model->GetTabAtIndex(index);
++    if (closing.contains(tab) || model->IsTabInForeground(index) ||
++        model->IsTabCollapsed(index) ||
++        WouldShowHibernatedPin(*model, index)) {
++      continue;
++    }
++
++    if (!best || rank(tab) > rank(best)) {
++      best = tab;
++    }
++  }
++
++  return best;
++}
++
++// Returns whether a pin that isn't among closing is loaded, e.g. one that can't
++// take the place of the closing tabs because its split partner is hibernated.
++bool HasLoadedPin(TabStripModel* model,
++                  const std::set<tabs::TabInterface*>& closing) {
++  for (int index = 0; index < model->IndexOfFirstNonPinnedTab(); ++index) {
++    tabs::TabInterface* const tab = model->GetTabAtIndex(index);
++    if (!closing.contains(tab) && !IsHibernated(tab->GetContents())) {
++      return true;
++    }
++  }
++
++  return false;
++}
++
++// Returns pin along with the other pins of its split. Splits are pinned as a
++// whole, so they are also hibernated as a whole.
++std::set<tabs::TabInterface*> GetPinsToHibernate(TabStripModel* model,
++                                                 tabs::TabInterface* pin) {
++  std::set<tabs::TabInterface*> pins = {pin};
++  if (const std::optional<split_tabs::SplitTabId> split = pin->GetSplit()) {
++    for (tabs::TabInterface* split_tab :
++         model->GetSplitData(*split)->ListTabs()) {
++      if (IsPersistentPin(split_tab)) {
++        pins.insert(split_tab);
++      }
++    }
++  }
++
++  return pins;
++}
++
++// Hibernates a pin. A beforeunload dialog activates the pin it belongs to, so
++// another tab takes the place of that pin and its split again first.
++void HibernateTab(tabs::TabHandle handle) {
++  tabs::TabInterface* const tab = handle.Get();
++  if (!IsPersistentPin(tab) || IsHibernated(tab->GetContents()) ||
++      !performance_manager::PerformanceManager::IsAvailable()) {
++    return;
++  }
++
++  BrowserWindowInterface* const browser = tab->GetBrowserWindowInterface();
++  TabStripModel* const model = browser->GetTabStripModel();
++  if (model->IsTabInForeground(model->GetIndexOfTab(tab))) {
++    const std::set<tabs::TabInterface*> pins = GetPinsToHibernate(model, tab);
++    ActivateReplacementTab(browser, pins, /*keep_window=*/true);
++
++    // The rest of the split was shown along with the pin, which loads it.
++    // Partners whose user chose to stay on their page keep it.
++    for (tabs::TabInterface* pin : pins) {
++      if (pin != tab &&
++          !CanceledHibernation::FromWebContents(pin->GetContents())) {
++        ScheduleHibernation(pin);
++      }
++    }
++  }
++
++  // A crashed page can't be discarded, so the pin is closed instead, and its
++  // window gets a hibernated copy of it back.
++  if (tab->GetContents()->IsCrashed()) {
++    tab->Close();
++    return;
++  }
++
++  if (base::WeakPtr<performance_manager::PageNode> page_node =
++          performance_manager::PerformanceManager::
++              GetPrimaryPageNodeForWebContents(tab->GetContents())) {
++    performance_manager::user_tuning::DiscardPage(
++        page_node.get(), ::mojom::LifecycleUnitDiscardReason::EXTERNAL,
++        /*ignore_minimum_time_in_background=*/true);
++  }
++}
++
++// Hibernates a pin like HibernateTab(), but as when closing a tab, the page's
++// beforeunload handlers can ask the user first. The pin is then hibernated by
++// HandleBeforeUnloadFired().
++void RequestHibernation(tabs::TabHandle handle) {
++  tabs::TabInterface* const tab = handle.Get();
++  if (!IsPersistentPin(tab) || IsHibernated(tab->GetContents())) {
++    return;
++  }
++
++  // As when closing a tab, DevTools asks first, e.g. about unsaved files, and
++  // then runs the page's handlers. While it's still asking, e.g. when the
++  // pin's split partner was hibernated meanwhile, the pin waits for it.
++  content::WebContents* const contents = tab->GetContents();
++  if (PendingHibernation::FromWebContents(contents) &&
++      DevToolsWindow::GetInstanceForInspectedWebContents(contents) &&
++      !DevToolsWindow::NeedsToInterceptBeforeUnload(contents)) {
++    return;
++  }
++
++  if (DevToolsWindow::InterceptPageBeforeUnload(contents)) {
++    PendingHibernation::CreateForWebContents(contents);
++    return;
++  }
++
++  // While the handlers of a pin are still running, beforeunload isn't sent to
++  // the page again, so asking again doesn't show another dialog.
++  if (contents->NeedToFireBeforeUnloadOrUnloadEvents()) {
++    PendingHibernation::CreateForWebContents(contents);
++    contents->DispatchBeforeUnload(/*auto_cancel=*/false);
++    return;
++  }
++
++  // Handlers that never replied, e.g. because the renderer crashed, left their
++  // mark behind.
++  contents->RemoveUserData(PendingHibernation::UserDataKey());
++  HibernateTab(handle);
++}
++
++}  // namespace
++
++bool ActivateReplacementTab(BrowserWindowInterface* browser,
++                            const std::set<tabs::TabInterface*>& closing,
++                            bool keep_window) {
++  TabStripModel* const model = browser->GetTabStripModel();
++  tabs::TabInterface* const active = model->GetActiveTab();
++  if (!active || !closing.contains(active)) {
++    return true;
++  }
++
++  if (tabs::TabInterface* replacement = FindReplacementTab(model, closing)) {
++    model->ActivateTabAt(model->GetIndexOfTab(replacement));
++  } else if (keep_window || HasLoadedPin(model, closing) ||
++             KeepsWindowsWithoutTabs()) {
++    chrome::AddTabAt(browser, GURL(), /*index=*/-1, /*foreground=*/true);
++  } else {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&MaybeCloseWindow, browser->GetWeakPtr()));
++    return false;
++  }
++
++  return true;
++}
++
+ bool HasPersistentPins(BrowserWindowInterface* browser) {
+   return browser && browser->GetType() == BrowserWindowInterface::TYPE_NORMAL;
+ }
+@@ -36,6 +265,18 @@ bool IsHibernated(content::WebContents*
+   return contents->WasDiscarded() || IsRestoredTabPendingLoad(contents);
+ }
+ 
++bool WouldShowHibernatedPin(const TabStripModel& model, int index) {
++  tabs::TabInterface* const tab = model.GetTabAtIndex(index);
++  std::vector<tabs::TabInterface*> shown = {tab};
++  if (const std::optional<split_tabs::SplitTabId> split = tab->GetSplit()) {
++    shown = model.GetSplitData(*split)->ListTabs();
++  }
++
++  return std::ranges::any_of(shown, [](tabs::TabInterface* shown_tab) {
++    return shown_tab->IsPinned() && IsHibernated(shown_tab->GetContents());
++  });
++}
++
+ GURL GetPinnableUrl(content::WebContents* contents) {
+   const content::NavigationEntry* const entry =
+       contents->GetController().GetLastCommittedEntry();
+@@ -55,4 +296,100 @@ GURL GetPinnableUrl(content::WebContents
+   return contents->GetController().GetVisibleEntry()->GetURL();
+ }
+ 
++std::vector<tabs::TabHandle> HandleUserClosingTabs(
++    BrowserWindowInterface* browser,
++    std::vector<tabs::TabHandle> tab_handles) {
++  if (!HasPersistentPins(browser)) {
++    return tab_handles;
++  }
++
++  TabStripModel* const model = browser->GetTabStripModel();
++  std::set<tabs::TabInterface*> closing;
++  std::set<tabs::TabInterface*> pins;
++  for (tabs::TabHandle handle : tab_handles) {
++    tabs::TabInterface* const tab = handle.Get();
++    if (!tab) {
++      continue;
++    }
++
++    closing.insert(tab);
++    if (IsPersistentPin(tab)) {
++      pins.merge(GetPinsToHibernate(model, tab));
++    }
++  }
++
++  closing.insert(pins.begin(), pins.end());
++
++  // Check whether the last unpinned tabs are closed while pins stay.
++  const int first_unpinned = model->IndexOfFirstNonPinnedTab();
++  bool closes_last_unpinned =
++      first_unpinned > 0 && first_unpinned < model->count();
++  for (int index = first_unpinned; index < model->count(); ++index) {
++    closes_last_unpinned &= closing.contains(model->GetTabAtIndex(index));
++  }
++
++  // Otherwise, Chromium picks the next tab by itself, which skips hibernated
++  // pins.
++  if (pins.empty() && !closes_last_unpinned) {
++    return tab_handles;
++  }
++
++  std::erase_if(tab_handles, [&pins](tabs::TabHandle handle) {
++    return pins.contains(handle.Get());
++  });
++
++  // Activate another loaded tab before the other tabs close. If only pins
++  // close, HibernateTab() does that once their beforeunload handlers allowed
++  // it, so that staying on a pin doesn't leave a New Tab behind.
++  if (!tab_handles.empty() &&
++      !ActivateReplacementTab(browser, closing,
++                              /*keep_window=*/!pins.empty())) {
++    return {};
++  }
++
++  for (tabs::TabInterface* pin : pins) {
++    pin->GetContents()->RemoveUserData(CanceledHibernation::UserDataKey());
++    ScheduleHibernation(pin);
++  }
++
++  return tab_handles;
++}
++
++void ScheduleHibernation(tabs::TabInterface* tab) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&RequestHibernation, tab->GetHandle()));
++}
++
++bool HandleBeforeUnloadFired(content::WebContents* contents,
++                             bool proceed,
++                             bool closing_window) {
++  if (!PendingHibernation::FromWebContents(contents)) {
++    return false;
++  }
++
++  contents->RemoveUserData(PendingHibernation::UserDataKey());
++
++  // The window or the tab may be closing for real, e.g. after the pin was
++  // unpinned, which then goes on as usual.
++  if (closing_window || TabCloseTypesData::FromWebContents(contents)) {
++    return false;
++  }
++
++  // The pin keeps its page if the user stays on it. Otherwise, it's hibernated
++  // once the beforeunload handlers are done.
++  tabs::TabInterface* const tab =
++      tabs::TabInterface::MaybeGetFromContents(contents);
++  if (!proceed) {
++    CanceledHibernation::CreateForWebContents(contents);
++    return true;
++  }
++
++  if (tab) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&HibernateTab, tab->GetHandle()));
++  }
++
++  return true;
++}
++
+ }  // namespace helium_pins
+--- a/chrome/browser/ui/tabs/helium_pins_service.cc
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -125,6 +125,10 @@ void UnpinAndCloseCopy(HeliumPinsTabCont
+   UnpinCopy(copy);
+   tabs::TabInterface& tab = copy->tab();
+   if (tab.GetBrowserWindowInterface()->GetTabStripModel()->count() > 1) {
++    // Chromium would pick the next tab by itself, which can be a hibernated
++    // pin.
++    ActivateReplacementTab(tab.GetBrowserWindowInterface(), {&tab},
++                           /*keep_window=*/true);
+     tab.Close();
+   }
+ }
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.h
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.h
+@@ -98,6 +98,8 @@ class BrowserTabStripModelDelegate : pub
+   void CloseTab(const tabs::TabInterface* tab,
+                 CloseTabSource source,
+                 base::OnceCallback<void(CloseTabSource)> on_approved) override;
++  std::vector<tabs::TabHandle> HandleUserClosingTabs(
++      std::vector<tabs::TabHandle> tab_handles) override;
+ 
+   void CloseFrame();
+ 
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+@@ -36,6 +37,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_menu_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_utils.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/unload_controller.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+@@ -102,6 +104,12 @@ BrowserTabStripModelDelegate::BrowserTab
+ 
+ BrowserTabStripModelDelegate::~BrowserTabStripModelDelegate() = default;
+ 
++std::vector<tabs::TabHandle>
++BrowserTabStripModelDelegate::HandleUserClosingTabs(
++    std::vector<tabs::TabHandle> tab_handles) {
++  return helium_pins::HandleUserClosingTabs(browser_, std::move(tab_handles));
++}
++
+ void BrowserTabStripModelDelegate::GlicUnpinTabsFromAllConversations(
+     base::span<const tabs::TabHandle> tab_handles) {
+   auto* service = glic::GlicKeyedServiceFactory::GetGlicKeyedService(
+@@ -467,17 +475,17 @@ void BrowserTabStripModelDelegate::Close
+     }
+   }
+ 
+-  if (model->count() == 1 && IsNormalWindow() &&
+-      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+-          "close-window-with-last-tab") == "never") {
++  if (model->count() == 1 && IsNormalWindow() && KeepsWindowsWithoutTabs()) {
+     AddTabAt(GURL(), -1, true, std::nullopt, false);
+   }
+ 
+   auto [cb1, cb2] = base::SplitOnceCallback(std::move(on_approved));
+ 
+   // Only consider pausing the close operation if this is the last remaining
+-  // tab (since otherwise closing it won't close the browser window).
+-  if (model->count() <= 1) {
++  // tab (since otherwise closing it won't close the browser window). Closing a
++  // persistent pin keeps the window.
++  if (model->count() <= 1 &&
++      !helium_pins::IsPersistentPin(model->GetTabAtIndex(tab_index))) {
+     // Closing this tab will close the current window. See if the browser wants
+     // to prompt the user before the browser is allowed to close.
+     const UnloadController::WarnBeforeClosingResult result =
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -113,6 +113,7 @@
+ #include "chrome/browser/ui/tab_dialogs.h"
+ #include "chrome/browser/ui/tabs/back_to_opener/back_to_opener_controller.h"
+ #include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
+ #include "chrome/browser/ui/tabs/new_tab_grouping_user_data.h"
+ #include "chrome/browser/ui/tabs/organizer/organizer_panel_controller.h"
+ #include "chrome/browser/ui/tabs/organizer/organizer_panel_utils.h"
+@@ -1480,6 +1481,13 @@ void CloseTab(BrowserWindowInterface* br
+     return;
+   }
+ 
++  // Persistent pins are hibernated with their whole split, so the handling of
++  // splits below doesn't apply to them.
++  if (helium_pins::IsPersistentPin(active_tab)) {
++    CloseSelectedTabAndRecordTabCountMetric(browser);
++    return;
++  }
++
+   // If the selection model consists of only the indices of a single split tab,
+   // decide if just the active tab in the split is closed instead of all tabs in
+   // the split.
+--- a/chrome/browser/ui/unload_controller.cc
++++ b/chrome/browser/ui/unload_controller.cc
+@@ -29,6 +29,8 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/desktop_browser_window_capabilities.h"
+ #include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
++#include "chrome/browser/ui/tabs/tab_close_types_data.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -258,6 +260,16 @@ void UnloadController::BeforeUnloadFired
+     return;
+   }
+ 
++  // Pins that the user closes are hibernated instead.
++  if (helium_pins::HandleBeforeUnloadFired(web_contents, proceed,
++                                           is_attempting_to_close_browser())) {
++    if (!proceed) {
++      DevToolsWindow::OnPageCloseCanceled(web_contents);
++    }
++    *proceed_to_fire_unload = false;
++    return;
++  }
++
+   *proceed_to_fire_unload = BeforeUnloadFired(web_contents, proceed);
+ }
+ 
+@@ -424,6 +436,10 @@ bool UnloadController::BeforeUnloadFired
+   if (!proceed) {
+     DevToolsWindow::OnPageCloseCanceled(contents);
+ 
++    // The tab isn't closing anymore, so its close types mustn't carry over to
++    // a later close, or make hibernating a pin look like one.
++    contents->RemoveUserData(TabCloseTypesData::UserDataKey());
++
+     // Inform PerformanceManager that page close was aborted. Any priority boost
+     // will be removed.
+     performance_manager::priority::SetPageIsClosing(contents,
+--- a/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.cc
++++ b/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.cc
+@@ -176,8 +176,10 @@ void SavedTabGroupUtils::RemoveGroupFrom
+     return;
+   }
+ 
++  // E.g. sync removes groups that were deleted elsewhere, which mustn't close
++  // the window.
+   browser_with_local_group_id->GetTabStripModel()->CloseAllTabsInGroup(
+-      local_group);
++      local_group, /*user_gesture=*/false);
+ }
+ 
+ // static
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -577,6 +577,7 @@ if (!is_android) {
+       "//chrome/browser/content_settings:content_settings_factory",
+       "//chrome/browser/contextual_search:contextual_cueing",
+       "//chrome/browser/contextual_tasks",
++      "//chrome/browser/devtools",
+       "//chrome/browser/dictation:features",
+       "//chrome/browser/enterprise",
+       "//chrome/browser/external_protocol",
+@@ -617,6 +618,7 @@ if (!is_android) {
+       "//chrome/browser/profiles",
+       "//chrome/browser/profiles:profile",
+       "//chrome/browser/profiles:profile_manager",
++      "//chrome/browser/resource_coordinator",
+       "//chrome/browser/safe_browsing",
+       "//chrome/browser/search",
+       "//chrome/browser/sessions",
+@@ -643,6 +645,7 @@ if (!is_android) {
+       "//chrome/browser/ui:browser_live_tab_context",
+       "//chrome/browser/ui:browser_manager_service",
+       "//chrome/browser/ui:browser_tabrestore",
++      "//chrome/browser/ui:browser_tabstrip",
+       "//chrome/browser/ui:browser_window_header",
+       "//chrome/browser/ui:focus_tab_after_navigation_helper",
+       "//chrome/browser/ui:intent_picker_tab_helper",
