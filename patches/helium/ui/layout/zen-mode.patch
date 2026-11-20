@@ -8,7 +8,15 @@
  #include "chrome/browser/ui/toolbar/app_menu_model.h"
  #include "chrome/browser/ui/toolbar/chrome_labs/chrome_labs_utils.h"
  #include "chrome/browser/ui/toolbar/pinned_toolbar/tab_search_toolbar_button_controller.h"
-@@ -348,6 +349,7 @@
+@@ -152,6 +153,7 @@
+ #include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/accessibility/accessibility_focus_highlight.h"
+ #include "chrome/browser/ui/views/accessibility/caret_browsing_dialog_delegate.h"
++#include "chrome/browser/ui/views/animations/tab_strip_animations.h"
+ #include "chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.h"
+ #include "chrome/browser/ui/views/bookmarks/bookmark_bar_view.h"
+ #include "chrome/browser/ui/views/bookmarks/bookmark_bubble_view.h"
+@@ -348,6 +350,7 @@
  #include "ui/events/event_handler.h"
  #include "ui/events/event_utils.h"
  #include "ui/events/keycodes/keyboard_codes.h"
@@ -16,7 +24,7 @@
  #include "ui/gfx/animation/animation_runner.h"
  #include "ui/gfx/canvas.h"
  #include "ui/gfx/color_utils.h"
-@@ -441,6 +443,14 @@ namespace {
+@@ -441,6 +444,14 @@ namespace {
  // The visible height of the shadow above the tabs. Clicks in this area are
  // treated as clicks to the frame, rather than clicks to the tab.
  const int kTabShadowSize = 2;
@@ -31,7 +39,7 @@
  
  #if BUILDFLAG(IS_CHROMEOS)
  // UMA histograms that record animation smoothness for tab loading animation.
-@@ -691,7 +701,8 @@ class BrowserView::ExclusiveAccessContex
+@@ -691,7 +702,8 @@ class BrowserView::ExclusiveAccessContex
  
    void UpdateUIForTabFullscreen() override {
  #if BUILDFLAG(IS_MAC)
@@ -41,7 +49,7 @@
      browser_view_->multi_contents_view_->OnFullscreenStateChanged();
  #endif
      browser_view_->GetFrameView()->UpdateFullscreenTopUI();
-@@ -993,7 +1004,9 @@ BrowserView::BrowserView(BrowserWindowIn
+@@ -993,7 +1005,9 @@ BrowserView::BrowserView(BrowserWindowIn
      : views::ClientView(nullptr, nullptr),
        exclusive_access_context_(
            std::make_unique<ExclusiveAccessContextImpl>(*this)),
@@ -52,7 +60,7 @@
    if (auto* manager = InitialWebUIWindowMetricsManager::From(browser_.get())) {
      manager->OnBrowserWindowCreated();
    }
-@@ -1033,6 +1046,14 @@ BrowserView::BrowserView(BrowserWindowIn
+@@ -1033,6 +1047,14 @@ BrowserView::BrowserView(BrowserWindowIn
    }
  
    SetProperty(views::kElementIdentifierKey, kBrowserViewElementId);
@@ -67,7 +75,7 @@
  
    browser_->GetTabStripModel()->AddObserver(this);
  
-@@ -1138,6 +1159,14 @@ BrowserView::BrowserView(BrowserWindowIn
+@@ -1138,6 +1160,14 @@ BrowserView::BrowserView(BrowserWindowIn
        prefs::kFullscreenAllowed,
        base::BindRepeating(&BrowserView::UpdateFullscreenAllowedFromPolicy,
                            base::Unretained(this), CanFullscreen()));
@@ -82,12 +90,11 @@
    UpdateFullscreenAllowedFromPolicy(CanFullscreen());
  
    WebUIContentsPreloadManager::GetInstance()->WarmupForBrowser(browser_.get());
-@@ -1227,6 +1256,9 @@ BrowserView::~BrowserView() {
+@@ -1227,6 +1257,8 @@ BrowserView::~BrowserView() {
    // Stop the animation timer explicitly here to avoid running it in a nested
    // message loop, which may run by Browser destructor.
    loading_animation_timer_.Stop();
 +  zen_mode_event_monitor_.reset();
-+  zen_expand_on_hover_lock_.reset();
 +  app_menu_control_observation_.Reset();
  
    // Reset autofill bubble handler to make sure it does not out-live toolbar,
@@ -175,11 +182,11 @@
      vertical_tab_strip_region_view_->ResetTabStrip();
      horizontal_tab_strip_region_view_->InitializeTabStrip();
    }
-+  UpdateZenModeExpandOnHoverLock();
++  UpdateZenModeTabStripCollapse();
  
    GetFrameView()->OnTabStripStateChanged();
  
-@@ -1763,10 +1854,442 @@ void BrowserView::OnToolbarTabStripState
+@@ -1763,10 +1854,464 @@ void BrowserView::OnToolbarTabStripState
      toolbar_->UpdateToolbarLayout();
    }
  
@@ -193,10 +200,17 @@
 +    return;
 +  }
 +
-+  UpdateZenModeExpandOnHoverLock();
++  UpdateZenModeTabStripCollapse();
 +  if (IsZenModeSideChromePinned()) {
 +    zen_side_chrome_animation_.Reset(1);
 +  } else {
++    // Unpinning hides the sidebar right away unless the cursor is over it.
++    gfx::Point cursor;
++    if (!GetCursorLocationInBrowserView(&cursor) ||
++        (!IsPointInZenSideTrigger(cursor) &&
++         !IsPointInZenSideChromeBounds(cursor))) {
++      zen_side_chrome_animation_.Reset(0);
++    }
 +    UpdateZenModeRevealFromCursor();
 +  }
 +
@@ -235,23 +249,38 @@
 +}
 +
 +// Unpinned sidebar floats in zen mode, so we make sure that VTS is usable
-+// in that state by keeping it expanded on hover while it floats. This leaves
-+// the collapsed state alone for when the sidebar is pinned again.
-+void BrowserView::UpdateZenModeExpandOnHoverLock() {
-+  const bool vertical_initialized =
-+      vertical_tab_strip_region_view_ &&
-+      vertical_tab_strip_region_view_->GetTabStripView() != nullptr;
-+  if (!zen_mode_enabled_ || IsZenModeSideChromePinned() ||
-+      !ShouldDrawVerticalTabStrip() || !vertical_initialized) {
-+    zen_expand_on_hover_lock_.reset();
++// in that state by uncollapsing it while it floats. It collapses again once
++// the sidebar is pinned or zen mode is turned off.
++void BrowserView::UpdateZenModeTabStripCollapse() {
++  // Collapse requests only take effect while the tab strip exists.
++  auto* controller = tabs::VerticalTabStripStateController::From(browser_);
++  if (!controller || !vertical_tab_strip_region_view_ ||
++      !vertical_tab_strip_region_view_->GetTabStripView()) {
 +    return;
 +  }
 +
-+  if (!zen_expand_on_hover_lock_) {
-+    zen_expand_on_hover_lock_ =
-+        vertical_tab_strip_region_view_->GetExpandOnHoverLock(
-+            ExpandOnHoverLockType::kKeepExpanded);
++  const bool floating = zen_mode_enabled_ && !IsZenModeSideChromePinned() &&
++                        ShouldDrawVerticalTabStrip();
++  if (floating == zen_uncollapsed_tab_strip_) {
++    return;
 +  }
++
++  // An expanded tab strip can float as it is.
++  const bool expanded = controller->GetCollapseState() ==
++                        tabs::VerticalTabStripCollapseState::kExpanded;
++  if (floating && expanded) {
++    return;
++  }
++
++  zen_uncollapsed_tab_strip_ = floating;
++  auto* animations = BrowserAnimationController::From(browser_);
++  if (floating) {
++    // Otherwise, the hover expansion comes back once the tab strip collapses.
++    animations->Reset(TabStripAnimations::kVerticalTabStrip,
++                      TabStripAnimations::kCollapseOnHover);
++  }
++  controller->RequestCollapse(!floating);
++  animations->Reset(TabStripAnimations::kVerticalTabStrip);
 +}
 +
 +void BrowserView::UpdateZenModeState() {
@@ -284,7 +313,7 @@
 +    UpdateZenModeReveal(/*reveal_top=*/false, /*reveal_side=*/false);
 +  }
 +
-+  UpdateZenModeExpandOnHoverLock();
++  UpdateZenModeTabStripCollapse();
 +  UpdateZenCollapseButtonVisibility();
 +
 +  if (!zen_mode_enabled_) {
@@ -622,7 +651,7 @@
  ///////////////////////////////////////////////////////////////////////////////
  // BrowserView, BrowserWindow implementation:
  
-@@ -2490,6 +3013,8 @@ void BrowserView::FullscreenStateChanged
+@@ -2490,6 +3035,8 @@ void BrowserView::FullscreenStateChanged
                      !GetFocusManager()->GetFocusedView());
      }
    }
@@ -631,7 +660,7 @@
  }
  
  ToolbarButtonProvider* BrowserView::toolbar_button_provider() {
-@@ -2533,6 +3058,13 @@ void BrowserView::SetFocusToLocationBar(
+@@ -2533,6 +3080,13 @@ void BrowserView::SetFocusToLocationBar(
      return;
    }
  
@@ -645,7 +674,7 @@
    LocationBar* location_bar = GetLocationBar();
    location_bar->FocusLocation(is_user_initiated,
                                /*clear_focus_if_failed=*/true);
-@@ -3235,7 +3767,7 @@ bool BrowserView::IsToolbarVisible() con
+@@ -3235,7 +3789,7 @@ bool BrowserView::IsToolbarVisible() con
    // kShowFullscreenToolbar is not set.
    if (!WindowFeatureController::From(browser())
             ->UsesImmersiveFullscreenMode()) {
@@ -654,7 +683,7 @@
          !fullscreen_utils::IsAlwaysShowToolbarEnabled(browser())) {
        return false;
      }
-@@ -3253,7 +3785,7 @@ bool BrowserView::IsToolbarVisible() con
+@@ -3253,7 +3807,7 @@ bool BrowserView::IsToolbarVisible() con
  }
  
  bool BrowserView::IsToolbarShowing() const {
@@ -663,7 +692,7 @@
  }
  
  bool BrowserView::IsLocationBarVisible() const {
-@@ -4366,6 +4898,11 @@ void BrowserView::OnWidgetActivationChan
+@@ -4366,6 +4920,11 @@ void BrowserView::OnWidgetActivationChan
      }
    }
  
@@ -675,7 +704,7 @@
    ExtensionKeybindingRegistryViews::From(browser_)->OnHostActivationChanged(
        active);
  
-@@ -5283,6 +5820,8 @@ void BrowserView::AddedToWidget() {
+@@ -5283,6 +5842,8 @@ void BrowserView::AddedToWidget() {
              base::BindRepeating(&BrowserView::OnToolbarTabStripStateChanged,
                                  base::Unretained(this)));
      OnToolbarTabStripStateChanged(helium_layout_controller);
@@ -684,7 +713,7 @@
    }
  
    UpdateTabSearchBubbleHost();
-@@ -5370,6 +5909,9 @@ void BrowserView::AddedToWidget() {
+@@ -5370,6 +5931,9 @@ void BrowserView::AddedToWidget() {
    // once per browser instance.
    auto* toolbar_button_provider = ToolbarButtonProvider::From(browser_);
    CHECK(toolbar_button_provider);
@@ -694,15 +723,15 @@
  
    // `AutofillBubbleHandlerImpl` depends on the ToolbarButtonProvider so it must
    // be constructed following the check above.
-@@ -5405,6 +5947,7 @@ void BrowserView::AddedToWidget() {
+@@ -5405,6 +5969,7 @@ void BrowserView::AddedToWidget() {
            tabs::VerticalTabStripStateController::From(browser_)) {
      if (vertical_tab_strip_state_controller->ShouldDisplayVerticalTabs()) {
        vertical_tab_strip_region_view_->InitializeTabStrip();
-+      UpdateZenModeExpandOnHoverLock();
++      UpdateZenModeTabStripCollapse();
      } else {
        horizontal_tab_strip_region_view_->InitializeTabStrip();
      }
-@@ -5417,6 +5960,8 @@ void BrowserView::AddedToWidget() {
+@@ -5417,6 +5982,8 @@ void BrowserView::AddedToWidget() {
  }
  
  void BrowserView::RemovedFromWidget() {
@@ -711,7 +740,7 @@
    CHECK(GetFocusManager());
  #if BUILDFLAG(IS_WIN)
    pip_exclusion_observer_.reset();
-@@ -5449,6 +5994,14 @@ void BrowserView::OnThemeChanged() {
+@@ -5449,6 +6016,14 @@ void BrowserView::OnThemeChanged() {
    }
  
    FrameColorsChanged();
@@ -726,7 +755,7 @@
  }
  
  bool BrowserView::GetDropFormats(
-@@ -5715,6 +6268,9 @@ void BrowserView::UpdateFastResizeForCon
+@@ -5715,6 +6290,9 @@ void BrowserView::UpdateFastResizeForCon
  }
  
  int BrowserView::GetClientAreaTop() {
@@ -736,7 +765,7 @@
    views::View* top_view = toolbar_;
  
    // Get the top of the top view in browser view coordinates.
-@@ -6333,6 +6889,56 @@ void BrowserView::OnWillChangeFocus(View
+@@ -6333,6 +6911,56 @@ void BrowserView::OnWillChangeFocus(View
  }
  void BrowserView::OnDidChangeFocus(View* focused_before, View* focused_now) {
    UpdateAccessibleNameForRootView();
@@ -821,15 +850,7 @@
  class BookmarkBarController;
  class BookmarkBarView;
  class BrowserWindowInterface;
-@@ -85,6 +90,7 @@ class CustomFloatingCorner;
- struct DropData;
- class ExclusiveAccessBubbleViews;
- class ExclusiveAccessBubbleViewsContext;
-+class ExpandOnHoverLock;
- class GlobalErrorService;
- class HeliumLayoutStateController;
- class InfoBarContainerView;
-@@ -124,6 +130,7 @@ enum class Channel;
+@@ -124,6 +129,7 @@ enum class Channel;
  }
  
  namespace views {
@@ -837,7 +858,7 @@
  class LabelButton;
  class NativeViewHost;
  class WebView;
-@@ -147,10 +154,17 @@ class BrowserView : public BrowserWindow
+@@ -147,10 +153,17 @@ class BrowserView : public BrowserWindow
                      public browser_shortcuts::BrowserShortcutService::Observer,
                      public GlobalErrorObserver,
                      public views::FocusChangeListener,
@@ -856,7 +877,7 @@
    // The name of a key to store on the window handle so that other code can
    // locate this object using just the handle.
    static constexpr char kBrowserViewKey[] = "__BROWSER_VIEW__";
-@@ -424,6 +438,17 @@ class BrowserView : public BrowserWindow
+@@ -424,6 +437,17 @@ class BrowserView : public BrowserWindow
    // Returns the current shown ratio of the top browser controls.
    float GetTopControlsSlideBehaviorShownRatio() const;
  
@@ -874,7 +895,7 @@
    // Returns the widget for anchoring bubbles and dialogs.
    // This returns BrowserWidget except on fullscreen macOS where the toolbar is
    // hosted in an OverlayWidget.
-@@ -779,6 +804,17 @@ class BrowserView : public BrowserWindow
+@@ -779,6 +803,17 @@ class BrowserView : public BrowserWindow
        BookmarkBar::AnimateChangeType change_type) override;
    void OnFocusBookmarksToolbar() override;
  
@@ -892,7 +913,7 @@
    // Testing interface:
    BrowserViewLayout* GetBrowserViewLayoutForTesting() {
      return GetBrowserViewLayout();
-@@ -921,6 +957,27 @@ class BrowserView : public BrowserWindow
+@@ -921,6 +956,27 @@ class BrowserView : public BrowserWindow
  
    void OnToolbarTabStripStateChanged(HeliumLayoutStateController* controller);
  
@@ -900,7 +921,7 @@
 +  void OnZenModeSideChromePinnedPrefChanged();
 +  void OnZenModeTopChromePinnedPrefChanged();
 +  void UpdateZenModeState();
-+  void UpdateZenModeExpandOnHoverLock();
++  void UpdateZenModeTabStripCollapse();
 +  void UpdateZenCollapseButtonVisibility();
 +  void UpdateZenModeEventMonitor();
 +  void StartZenCollapseTimer(base::TimeDelta delay);
@@ -920,7 +941,7 @@
    // Callback for the loading animation(s) associated with this view.
    void LoadingAnimationTimerCallback();
    void LoadingAnimationCallback(base::TimeTicks timestamp);
-@@ -1379,6 +1436,9 @@ class BrowserView : public BrowserWindow
+@@ -1379,6 +1435,9 @@ class BrowserView : public BrowserWindow
    base::ScopedObservation<GlobalErrorService, GlobalErrorObserver>
        global_error_observation_{this};
  
@@ -930,13 +951,14 @@
    bool interactive_resize_in_progress_ = false;
  
    // The last bounds we notified about in TryNotifyWindowBoundsChanged().
-@@ -1439,6 +1499,15 @@ class BrowserView : public BrowserWindow
+@@ -1439,6 +1498,16 @@ class BrowserView : public BrowserWindow
  
    std::unique_ptr<TabCyclingEventHandler> tab_cycling_event_handler_;
  
 +  // Zen mode state.
 +  std::unique_ptr<views::EventMonitor> zen_mode_event_monitor_;
-+  std::unique_ptr<ExpandOnHoverLock> zen_expand_on_hover_lock_;
++  // Whether zen mode uncollapsed the vertical tab strip for floating.
++  bool zen_uncollapsed_tab_strip_ = false;
 +  gfx::SlideAnimation zen_top_chrome_animation_;
 +  gfx::SlideAnimation zen_side_chrome_animation_;
 +  base::OneShotTimer zen_cursor_exit_timer_;
@@ -2494,7 +2516,15 @@
      ":browser_view_layout_params",
      ":browser_widget",
      ":contents_container_view",
-@@ -3049,6 +3050,7 @@ source_set("browser_view_tabbed_layout_i
+@@ -882,6 +883,7 @@ source_set("browser_view") {
+     "//chrome/browser/ui/views:theme_copying_widget",
+     "//chrome/browser/ui/views:update_recommended_message_box",
+     "//chrome/browser/ui/views/accessibility",
++    "//chrome/browser/ui/views/animations",
+     "//chrome/browser/ui/views/autofill:autofill_bubble_handler_impl",
+     "//chrome/browser/ui/views/bookmarks",
+     "//chrome/browser/ui/views/download",
+@@ -3049,6 +3051,7 @@ source_set("browser_view_tabbed_layout_i
      "//chrome/browser/ui/tabs:tab_strip",
      "//chrome/browser/ui/views/animations",
      "//chrome/browser/ui/views/bookmarks",
@@ -2502,3 +2532,15 @@
      "//chrome/browser/ui/views/infobars",
      "//chrome/browser/ui/views/side_panel",
      "//chrome/browser/ui/views/tabs/organizer",
+--- a/chrome/browser/ui/animation/browser_animation_controller.cc
++++ b/chrome/browser/ui/animation/browser_animation_controller.cc
+@@ -509,6 +509,9 @@ class BrowserAnimationController::GroupD
+       OnCancel(params);
+       current_motion_ = motion;
+       current_motion_info_ = std::move(motion_info);
++    } else if (animator_) {
++      // Fast-forwarding the current motion must stop it from progressing.
++      animator_->Stop();
+     }
+     OnAnimationEnded(params);
+   }
