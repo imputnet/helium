@@ -1,0 +1,245 @@
+--- a/content/browser/browsing_data/browsing_data_remover_impl.cc
++++ b/content/browser/browsing_data/browsing_data_remover_impl.cc
+@@ -736,7 +736,8 @@ void BrowsingDataRemoverImpl::RemoveImpl
+   if (remove_mask & DATA_TYPE_COOKIES &&
+       base::FeatureList::IsEnabled(blink::features::kHeliumNoise) &&
+       filter_builder->MatchesMostOriginsAndDomains()) {
+-    content::HeliumNoiseTokenData::RegenerateTokens(browser_context_);
++    content::HeliumNoiseTokenData::RegenerateTokens(
++        browser_context_, filter_builder->GetStoragePartitionConfig());
+   }
+ 
+   // Embedder data.
+--- a/content/browser/helium_noise/noise_token_data.cc
++++ b/content/browser/helium_noise/noise_token_data.cc
+@@ -59,14 +59,7 @@ blink::HeliumNoiseToken DeriveTokenFromS
+ }
+ }  // namespace
+ 
+-HeliumNoiseTokenData::HeliumNoiseTokenData() {
+-  session_tokens_[blink::HeliumNoiseFeature::kCanvas] =
+-      blink::HeliumNoiseToken(base::RandUint64());
+-  session_tokens_[blink::HeliumNoiseFeature::kAudio] =
+-      blink::HeliumNoiseToken(base::RandUint64());
+-  session_tokens_[blink::HeliumNoiseFeature::kHardware] =
+-      blink::HeliumNoiseToken(base::RandUint64());
+-}
++HeliumNoiseTokenData::HeliumNoiseTokenData() = default;
+ 
+ // static
+ HeliumNoiseTokenData* HeliumNoiseTokenData::GetBrowserTokens(
+@@ -78,12 +71,31 @@ HeliumNoiseTokenData* HeliumNoiseTokenDa
+     return data;
+   }
+ 
+-  return RegenerateTokens(context);
++  auto new_data = std::make_unique<HeliumNoiseTokenData>();
++  data = new_data.get();
++  context->SetUserData(&kBrowserContextNoiseTokenKeys, std::move(new_data));
++  return data;
++}
++
++const blink::HeliumNoiseTokenMap& HeliumNoiseTokenData::GetSessionTokens(
++    const StoragePartitionConfig& storage_partition_config) {
++  auto [it, inserted] =
++      session_tokens_.try_emplace(storage_partition_config);
++  if (inserted) {
++    it->second[blink::HeliumNoiseFeature::kCanvas] =
++        blink::HeliumNoiseToken(base::RandUint64());
++    it->second[blink::HeliumNoiseFeature::kAudio] =
++        blink::HeliumNoiseToken(base::RandUint64());
++    it->second[blink::HeliumNoiseFeature::kHardware] =
++        blink::HeliumNoiseToken(base::RandUint64());
++  }
++  return it->second;
+ }
+ 
+ // static
+ blink::HeliumNoiseTokenMap HeliumNoiseTokenData::GetTokens(
+     BrowserContext* context,
++    const StoragePartitionConfig& storage_partition_config,
+     const net::SchemefulSite& top_level_site) {
+   HeliumNoiseTokenData* data = GetBrowserTokens(context);
+ 
+@@ -92,7 +104,8 @@ blink::HeliumNoiseTokenMap HeliumNoiseTo
+                          : base::UnguessableToken::Create().ToString();
+ 
+   blink::HeliumNoiseTokenMap result;
+-  for (const auto& [feature, session_token] : data->session_tokens_) {
++  for (const auto& [feature, session_token] :
++       data->GetSessionTokens(storage_partition_config)) {
+     result.insert({feature, DeriveTokenFromSite(session_token, site)});
+   }
+ 
+@@ -102,6 +115,7 @@ blink::HeliumNoiseTokenMap HeliumNoiseTo
+ // static
+ blink::HeliumNoiseTokenMap HeliumNoiseTokenData::GetTokensForMainFrame(
+     BrowserContext* context,
++    const StoragePartitionConfig& storage_partition_config,
+     const url::Origin& origin) {
+   // An origin without a precursor results in an opaque origin, which falls
+   // back to a random token in GetTokens().
+@@ -112,12 +126,14 @@ blink::HeliumNoiseTokenMap HeliumNoiseTo
+     return blink::HeliumNoiseTokenMap();
+   }
+ 
+-  return GetTokens(context, net::SchemefulSite(site_origin));
++  return GetTokens(context, storage_partition_config,
++                   net::SchemefulSite(site_origin));
+ }
+ 
+ // static
+ blink::HeliumNoiseTokenMap HeliumNoiseTokenData::GetTokensForWorker(
+     BrowserContext* context,
++    const StoragePartitionConfig& storage_partition_config,
+     const blink::StorageKey& storage_key) {
+   // Use the StorageKey that third-party storage partitioning would produce, so
+   // that third-party workers stay keyed by the embedding site even when
+@@ -138,18 +154,21 @@ blink::HeliumNoiseTokenMap HeliumNoiseTo
+     return blink::HeliumNoiseTokenMap();
+   }
+ 
+-  return GetTokens(context, partitioned_key.top_level_site());
++  return GetTokens(context, storage_partition_config,
++                   partitioned_key.top_level_site());
+ }
+ 
+ // static
+-HeliumNoiseTokenData* HeliumNoiseTokenData::RegenerateTokens(
+-    BrowserContext* context) {
+-  auto new_data = std::make_unique<HeliumNoiseTokenData>();
+-  HeliumNoiseTokenData* result = new_data.get();
+-  context->SetUserData(&kBrowserContextNoiseTokenKeys,
+-                       std::move(new_data));
+-
+-  return result;
++void HeliumNoiseTokenData::RegenerateTokens(
++    BrowserContext* context,
++    const std::optional<StoragePartitionConfig>& storage_partition_config) {
++  // Tokens are created again the next time they're needed.
++  HeliumNoiseTokenData* data = GetBrowserTokens(context);
++  if (storage_partition_config) {
++    data->session_tokens_.erase(*storage_partition_config);
++  } else {
++    data->session_tokens_.clear();
++  }
+ }
+ 
+ }  // namespace content
+--- a/content/browser/helium_noise/noise_token_data.h
++++ b/content/browser/helium_noise/noise_token_data.h
+@@ -9,9 +9,12 @@
+ #ifndef CONTENT_BROWSER_HELIUM_NOISE_NOISE_TOKEN_DATA_H_
+ #define CONTENT_BROWSER_HELIUM_NOISE_NOISE_TOKEN_DATA_H_
+ 
++#include <optional>
++
+ #include "base/containers/flat_map.h"
+ #include "base/supports_user_data.h"
+ #include "content/common/content_export.h"
++#include "content/public/browser/storage_partition_config.h"
+ #include "third_party/blink/public/common/helium_noise/noise_token.h"
+ 
+ namespace blink {
+@@ -31,19 +34,21 @@ namespace content {
+ class BrowserContext;
+ 
+ // A user data class that generates and stores BrowserContext-associated noise
+-// tokens used for noising fingerprintable data.
++// tokens used for noising fingerprintable data. Each StoragePartition gets its
++// own tokens, so that a site can't link its noise across partitions.
+ class CONTENT_EXPORT HeliumNoiseTokenData
+     : public base::SupportsUserData::Data {
+  public:
+   HeliumNoiseTokenData();
+ 
+-  // Gets a map of BrowserContext-associated & feature-specific noise tokens
++  // Gets a map of StoragePartition-associated & feature-specific noise tokens
+   // derived from `top_level_site`. Deriving from the site rather than the
+   // origin keeps tokens consistent between pages and workers, which only know
+   // the top-level site through their StorageKey. If the site is opaque, a
+   // random value will be used instead.
+   static blink::HeliumNoiseTokenMap GetTokens(
+       BrowserContext* context,
++      const StoragePartitionConfig& storage_partition_config,
+       const net::SchemefulSite& top_level_site);
+ 
+   // Gets the noise tokens for a main frame document with `origin`. Opaque
+@@ -52,6 +57,7 @@ class CONTENT_EXPORT HeliumNoiseTokenDat
+   // noising is disabled for the origin.
+   static blink::HeliumNoiseTokenMap GetTokensForMainFrame(
+       BrowserContext* context,
++      const StoragePartitionConfig& storage_partition_config,
+       const url::Origin& origin);
+ 
+   // Gets the noise tokens for a service worker with `storage_key`. Service
+@@ -60,18 +66,26 @@ class CONTENT_EXPORT HeliumNoiseTokenDat
+   // map if noising is disabled for the worker's top-level context.
+   static blink::HeliumNoiseTokenMap GetTokensForWorker(
+       BrowserContext* context,
++      const StoragePartitionConfig& storage_partition_config,
+       const blink::StorageKey& storage_key);
+ 
+-  // Regenerates all noise tokens, returning a HeliumNoiseTokenData instance.
+-  static HeliumNoiseTokenData* RegenerateTokens(BrowserContext* context);
++  // Regenerates the noise tokens of the StoragePartition with
++  // `storage_partition_config`, or of all of them if it's not set.
++  static void RegenerateTokens(
++      BrowserContext* context,
++      const std::optional<StoragePartitionConfig>& storage_partition_config);
+ 
+  private:
+   // Helper to get or create HeliumNoiseTokenData for a BrowserContext.
+   static HeliumNoiseTokenData* GetBrowserTokens(
+       BrowserContext* context);
+ 
+-  // Map of noise tokens per feature for a BrowserContext.
+-  base::flat_map<blink::HeliumNoiseFeature, blink::HeliumNoiseToken>
++  // Gets or creates the noise tokens of a StoragePartition.
++  const blink::HeliumNoiseTokenMap& GetSessionTokens(
++      const StoragePartitionConfig& storage_partition_config);
++
++  // Map of noise tokens per feature for each StoragePartition.
++  base::flat_map<StoragePartitionConfig, blink::HeliumNoiseTokenMap>
+       session_tokens_;
+ };
+ 
+--- a/content/browser/renderer_host/navigation_request.cc
++++ b/content/browser/renderer_host/navigation_request.cc
+@@ -10300,6 +10300,7 @@ void NavigationRequest::ReadyToCommitNav
+   if (IsInMainFrame()) {
+     noise_tokens_ = HeliumNoiseTokenData::GetTokensForMainFrame(
+         frame_tree_node()->navigator().controller().GetBrowserContext(),
++        GetRenderFrameHost()->GetStoragePartition()->GetConfig(),
+         origin_to_commit.value());
+   }
+ 
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -11085,7 +11085,9 @@ void RenderFrameHostImpl::CreateNewWindo
+   // content::Page so that subframes inherit them.
+   const blink::HeliumNoiseTokenMap noise_tokens =
+       HeliumNoiseTokenData::GetTokensForMainFrame(
+-          GetBrowserContext(), new_main_rfh->GetLastCommittedOrigin());
++          GetBrowserContext(),
++          new_main_rfh->GetStoragePartition()->GetConfig(),
++          new_main_rfh->GetLastCommittedOrigin());
+   new_main_rfh->GetPage().set_noise_tokens(noise_tokens);
+ 
+   mojom::CreateNewWindowReplyPtr reply = mojom::CreateNewWindowReply::New(
+--- a/content/browser/service_worker/service_worker_version.cc
++++ b/content/browser/service_worker/service_worker_version.cc
+@@ -2872,8 +2872,11 @@ void ServiceWorkerVersion::StartWorkerIn
+   // shutting down.
+   if (BrowserContext* browser_context =
+           context_->wrapper()->browser_context()) {
+-    params->noise_tokens =
+-        HeliumNoiseTokenData::GetTokensForWorker(browser_context, key_);
++    if (StoragePartitionImpl* storage_partition =
++            context_->wrapper()->storage_partition()) {
++      params->noise_tokens = HeliumNoiseTokenData::GetTokensForWorker(
++          browser_context, storage_partition->GetConfig(), key_);
++    }
+   }
+ 
+   // policy_container_host could be null for registration restored from old DB
