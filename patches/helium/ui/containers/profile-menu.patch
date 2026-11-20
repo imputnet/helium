@@ -1,0 +1,630 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -496,6 +496,12 @@ are declared in tools/grit/grit_args.gni
+       <message name="IDS_HOVER_CARD_DOMAIN_IN_CONTAINER" desc="The source line of a hover card for a tab in a container: its domain, then the name of the container.">
+         <ph name="DOMAIN">$1<ex>example.com</ex></ph> · <ph name="CONTAINER">$2<ex>Work</ex></ph>
+       </message>
++      <message name="IDS_AVATAR_BUTTON_CONTAINER_TOOLTIP" desc="Line in the tooltip of the profile button naming the container of the active tab.">
++        <ph name="CONTAINER">$1<ex>Work</ex></ph> container
++      </message>
++      <message name="IDS_PROFILE_MENU_PROFILES_TITLE" desc="Title in the profile menu for the list of profiles, which starts with the current profile and its containers.">
++        Profiles
++      </message>
+       <message name="IDS_HOVER_CARD_FILE_URL_SOURCE" desc="The text to be displayed in the source line of a hover card when viewing a local file.">
+         local or shared file
+       </message>
+--- a/chrome/browser/ui/containers/BUILD.gn
++++ b/chrome/browser/ui/containers/BUILD.gn
+@@ -5,6 +5,8 @@
+ # Helium's containers UI, built on Brave's containers code in //brave.
+ source_set("containers") {
+   sources = [
++    "active_tab_container_tracker.cc",
++    "active_tab_container_tracker.h",
+     "containers_open_menu.cc",
+     "containers_open_menu.h",
+   ]
+@@ -24,6 +26,7 @@ source_set("containers") {
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/navigator",
++    "//chrome/browser/ui/tabs:tab_strip",
+     "//content/public/browser",
+     "//ui/base",
+   ]
+--- /dev/null
++++ b/chrome/browser/ui/containers/active_tab_container_tracker.cc
+@@ -0,0 +1,63 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/containers/active_tab_container_tracker.h"
++
++#include <string>
++#include <utility>
++
++#include "brave/browser/containers/containers_service_factory.h"
++#include "brave/components/containers/content/browser/storage_partition_utils.h"
++#include "brave/components/containers/core/common/features.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++
++ActiveTabContainerTracker::ActiveTabContainerTracker(
++    BrowserWindowInterface& browser,
++    base::RepeatingClosure on_changed)
++    : browser_(browser), on_changed_(std::move(on_changed)) {
++  if (!base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    return;
++  }
++  auto* service = ContainersServiceFactory::GetForProfile(browser.GetProfile());
++  if (!service) {
++    return;
++  }
++  service_observation_.Observe(service);
++  browser.GetTabStripModel()->AddObserver(this);
++  Update();
++}
++
++ActiveTabContainerTracker::~ActiveTabContainerTracker() = default;
++
++void ActiveTabContainerTracker::Update() {
++  content::WebContents* contents =
++      browser_->GetTabStripModel()->GetActiveWebContents();
++  const std::string id =
++      contents ? containers::GetContainerIdForWebContents(contents)
++               : std::string();
++  containers::mojom::ContainerPtr container =
++      id.empty() ? nullptr
++                 : service_observation_.GetSource()->GetRuntimeContainerById(id);
++  if (container == container_) {
++    return;
++  }
++  container_ = std::move(container);
++  on_changed_.Run();
++}
++
++void ActiveTabContainerTracker::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  if (selection.active_tab_changed() ||
++      change.type() == TabStripModelChange::kReplaced) {
++    Update();
++  }
++}
++
++void ActiveTabContainerTracker::OnContainersListChanged() {
++  Update();
++}
+--- /dev/null
++++ b/chrome/browser/ui/containers/active_tab_container_tracker.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_CONTAINERS_ACTIVE_TAB_CONTAINER_TRACKER_H_
++#define CHROME_BROWSER_UI_CONTAINERS_ACTIVE_TAB_CONTAINER_TRACKER_H_
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ref.h"
++#include "base/scoped_observation.h"
++#include "brave/components/containers/core/browser/containers_service.h"
++#include "brave/components/containers/core/browser/containers_service_observer.h"
++#include "brave/components/containers/core/mojom/containers.mojom.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++
++class BrowserWindowInterface;
++
++// Follows the container of the active tab of a browser window, for UI that
++// shows it.
++class ActiveTabContainerTracker : public TabStripModelObserver,
++                                  public containers::ContainersServiceObserver {
++ public:
++  // Runs |on_changed| when the container, or its name, icon or color,
++  // changes.
++  ActiveTabContainerTracker(BrowserWindowInterface& browser,
++                            base::RepeatingClosure on_changed);
++  ActiveTabContainerTracker(const ActiveTabContainerTracker&) = delete;
++  ActiveTabContainerTracker& operator=(const ActiveTabContainerTracker&) =
++      delete;
++  ~ActiveTabContainerTracker() override;
++
++  // The container of the active tab, or null if it isn't in one.
++  const containers::mojom::ContainerPtr& container() const {
++    return container_;
++  }
++
++ private:
++  void Update();
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(TabStripModel* tab_strip_model,
++                              const TabStripModelChange& change,
++                              const TabStripSelectionChange& selection) override;
++
++  // containers::ContainersServiceObserver:
++  void OnContainersListChanged() override;
++
++  const raw_ref<BrowserWindowInterface> browser_;
++  const base::RepeatingClosure on_changed_;
++  containers::mojom::ContainerPtr container_;
++  base::ScopedObservation<containers::ContainersService,
++                          containers::ContainersServiceObserver>
++      service_observation_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_CONTAINERS_ACTIVE_TAB_CONTAINER_TRACKER_H_
+--- a/chrome/browser/ui/views/profiles/BUILD.gn
++++ b/chrome/browser/ui/views/profiles/BUILD.gn
+@@ -273,6 +273,9 @@ if (toolkit_views) {
+     deps = [
+       ":avatar_toolbar_button",
+       ":profile_menu_coordinator",
++      "//brave/browser/ui/containers",
++      "//brave/components/containers/core/mojom",
++      "//chrome/app:generated_resources",
+       "//chrome/app/vector_icons",
+       "//chrome/browser:browser_process",
+       "//chrome/browser/enterprise",
+@@ -288,6 +291,7 @@ if (toolkit_views) {
+       "//chrome/browser/ui:ui_features",
+       "//chrome/browser/ui:view_ids",
+       "//chrome/browser/ui/browser_window",
++      "//chrome/browser/ui/containers",
+       "//chrome/browser/ui/profiles",
+       "//chrome/browser/ui/user_education",
+       "//chrome/browser/ui/views/toolbar:impl",
+@@ -406,6 +410,12 @@ if (is_win || is_mac || is_linux) {
+       "//ui/views",
+     ]
+     deps = [
++      "//brave/browser/containers",
++      "//brave/browser/ui/containers",
++      "//brave/components/containers/content/browser",
++      "//brave/components/containers/core/browser",
++      "//brave/components/containers/core/common",
++      "//brave/components/containers/core/mojom",
+       "//build:branding_buildflags",
+       "//chrome/app:branded_strings",
+       "//chrome/app:command_ids",
+@@ -422,6 +432,7 @@ if (is_win || is_mac || is_linux) {
+       "//chrome/browser/sync",
+       "//chrome/browser/ui:browser_commands",
+       "//chrome/browser/ui:managed_ui",
++      "//chrome/browser/ui/containers",
+       "//chrome/browser/ui/dialogs:browser_dialogs",
+       "//chrome/browser/ui/hats",
+       "//chrome/browser/ui/navigator",
+@@ -429,6 +440,7 @@ if (is_win || is_mac || is_linux) {
+       "//chrome/browser/ui/profiles",
+       "//chrome/browser/ui/signin",
+       "//chrome/browser/ui/sync",
++      "//chrome/browser/ui/tabs:tab_strip",
+       "//chrome/browser/ui/user_education",
+       "//chrome/browser/ui/views:color_provider_browser_helper",
+       "//chrome/browser/ui/views/controls",
+--- a/chrome/browser/ui/views/profiles/avatar_toolbar_button.cc
++++ b/chrome/browser/ui/views/profiles/avatar_toolbar_button.cc
+@@ -10,12 +10,16 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/time/time.h"
++#include "brave/browser/ui/containers/containers_icon_generator.h"
++#include "brave/components/containers/core/mojom/containers.mojom.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_avatar_icon_util.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/containers/active_tab_container_tracker.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/profiles/profile_colors_util.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -23,8 +27,10 @@
+ #include "chrome/browser/ui/views/profiles/avatar_toolbar_button_state_manager.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_button.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
++#include "chrome/grit/generated_resources.h"
+ #include "components/user_education/common/user_education_class_properties.h"
+ #include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/models/image_model_utils.h"
+ #include "ui/color/color_provider.h"
+@@ -58,6 +64,13 @@ AvatarToolbarButton::AvatarToolbarButton
+       state_manager_(*this, browser),
+       slide_animation_(this) {
+   state_manager_.InitializeStates();
++  container_tracker_ = std::make_unique<ActiveTabContainerTracker>(
++      *browser, base::BindRepeating(
++                    [](AvatarToolbarButton* button) {
++                      button->UpdateIcon();
++                      button->UpdateText();
++                    },
++                    base::Unretained(this)));
+ #if BUILDFLAG(IS_CHROMEOS)
+   // On CrOS this button should only show as badging for Incognito, Guest and
+   // captivie portal signin. It's only enabled for non captive portal Incognito
+@@ -115,6 +128,12 @@ void AvatarToolbarButton::UpdateIcon() {
+   auto [icon, icon_type] = state_provider->GetAvatarIcon(
+       icon_size, GetForegroundColor(ButtonState::STATE_NORMAL),
+       *color_provider);
++  if (const auto& container = container_tracker_->container()) {
++    icon = ui::ImageModel::FromImageSkia(
++        containers::GenerateContainerForegroundIcon(
++            container->id, container->icon, icon_size, /*scale_factor=*/1.0f,
++            container->background_color));
++  }
+ 
+   SetImageModel(ButtonState::STATE_NORMAL, icon);
+   SetImageModel(ButtonState::STATE_DISABLED,
+@@ -255,7 +274,13 @@ void AvatarToolbarButton::UpdateText() {
+ 
+   AnimateTextChange(state_provider, color_provider);
+ 
+-  SetTooltipText(state_provider->GetAvatarTooltipText());
++  std::u16string tooltip = state_provider->GetAvatarTooltipText();
++  if (const auto& container = container_tracker_->container()) {
++    tooltip += u"\n" +
++               l10n_util::GetStringFUTF16(IDS_AVATAR_BUTTON_CONTAINER_TOOLTIP,
++                                          base::UTF8ToUTF16(container->name));
++  }
++  SetTooltipText(tooltip);
+   UpdateAccessibilityLabel();
+   // Update the layout insets after `SetHighlight()` since
+   // text might be updated by setting the highlight.
+--- a/chrome/browser/ui/views/profiles/avatar_toolbar_button.h
++++ b/chrome/browser/ui/views/profiles/avatar_toolbar_button.h
+@@ -19,6 +19,7 @@
+ #include "ui/events/event.h"
+ 
+ class AccountInfo;
++class ActiveTabContainerTracker;
+ class AvatarToolbarButtonTestAccessor;
+ class BrowserWindowInterface;
+ class StateProvider;
+@@ -123,6 +124,9 @@ class AvatarToolbarButton : public Toolb
+ 
+   AvatarToolbarButtonStateManager state_manager_;
+ 
++  // Shows the container of the active tab instead of the profile.
++  std::unique_ptr<ActiveTabContainerTracker> container_tracker_;
++
+   // Cached icons for the placeholder avatar in forced-colors mode, to avoid
+   // recomputing on every ink drop highlight change. Empty when not in
+   // forced-colors mode or when the icon is not a placeholder.
+--- a/chrome/browser/ui/views/profiles/profile_menu_view.cc
++++ b/chrome/browser/ui/views/profiles/profile_menu_view.cc
+@@ -17,6 +17,12 @@
+ #include "base/metrics/histogram_functions.h"
+ #include "base/notreached.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "brave/browser/containers/containers_service_factory.h"
++#include "brave/browser/ui/containers/containers_icon_generator.h"
++#include "brave/components/containers/content/browser/storage_partition_utils.h"
++#include "brave/components/containers/core/browser/containers_service.h"
++#include "brave/components/containers/core/common/features.h"
++#include "brave/components/containers/core/mojom/containers.mojom.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -49,6 +55,8 @@
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/containers/containers_open_menu.h"
+ #include "chrome/browser/ui/dialogs/browser_dialogs.h"
+ #include "chrome/browser/ui/hats/survey_config.h"
+ #include "chrome/browser/ui/managed_ui.h"
+@@ -60,6 +68,7 @@
+ #include "chrome/browser/ui/signin/account_preview_utils.h"
+ #include "chrome/browser/ui/signin/signin_view_controller.h"
+ #include "chrome/browser/ui/sync/sync_passphrase_dialog.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+ #include "chrome/browser/ui/views/color_provider_browser_helper.h"
+ #include "chrome/browser/ui/views/controls/hover_button.h"
+@@ -203,7 +212,11 @@ void ProfileMenuView::BuildMenu() {
+   std::vector<ProfileAttributesEntry*> available_profiles;
+   GetProfilesForOtherProfilesSection(available_profiles);
+ 
+-  if (!available_profiles.empty()) {
++  if (!is_web_app && GetContainersService()) {
++    SetProfileManagementHeading(
++        l10n_util::GetStringUTF16(IDS_PROFILE_MENU_PROFILES_TITLE));
++    BuildCurrentProfileTree();
++  } else if (!available_profiles.empty()) {
+     SetProfileManagementHeading(
+         l10n_util::GetStringUTF16(IDS_PROFILE_MENU_PROFILES_LIST_TITLE));
+   }
+@@ -500,6 +513,90 @@ void ProfileMenuView::OnEditProfileButto
+   chrome::ShowSettingsSubPage(&browser(), chrome::kManageProfileSubPage);
+ }
+ 
++containers::ContainersService* ProfileMenuView::GetContainersService() {
++  auto* service = ContainersServiceFactory::GetForProfile(&profile());
++  return base::FeatureList::IsEnabled(containers::features::kContainers) &&
++                 service && service->ShouldShowContainerControls() &&
++                 browser().GetTabStripModel()->GetActiveWebContents()
++             ? service
++             : nullptr;
++}
++
++void ProfileMenuView::BuildCurrentProfileTree() {
++  ProfileAttributesEntry* entry =
++      g_browser_process->profile_manager()
++          ->GetProfileAttributesStorage()
++          .GetProfileAttributesWithPath(profile().GetPath());
++  if (!entry) {
++    return;
++  }
++  const std::string current_id = containers::GetContainerIdForWebContents(
++      browser().GetTabStripModel()->GetActiveWebContents());
++
++  // The profile itself stands for no container.
++  AddCurrentProfileRow(
++      ProfileMenuViewBase::GetCircularSizedImage(
++          ui::ImageModel::FromImage(entry->GetAvatarIcon(
++              kOtherProfileImageSize, /*use_high_res_file=*/true,
++              GetPlaceholderAvatarIconParamsVisibleAgainstColor(
++                  ColorProviderBrowserHelper::From(&browser())
++                      ->color_provider_source()
++                      ->GetColorProvider()
++                      ->GetColor(ui::kColorMenuBackground)))),
++          kOtherProfileImageSize),
++      entry->GetName(), /*is_container=*/false,
++      /*is_active=*/current_id.empty(),
++      base::BindRepeating(&ProfileMenuView::OnContainerButtonClicked,
++                          base::Unretained(this), std::string()));
++  for (const auto& container : GetContainersService()->GetContainers()) {
++    AddCurrentProfileRow(
++        ui::ImageModel::FromImageSkia(
++            containers::GenerateContainerForegroundIcon(
++                container->id, container->icon, kOtherProfileImageSize,
++                /*scale_factor=*/1.0f, container->background_color)),
++        base::UTF8ToUTF16(container->name), /*is_container=*/true,
++        /*is_active=*/container->id == current_id,
++        base::BindRepeating(&ProfileMenuView::OnContainerButtonClicked,
++                            base::Unretained(this), container->id));
++  }
++  AddCurrentProfileRow(
++      ui::ImageModel::FromVectorIcon(kAddIcon, ui::kColorMenuIcon,
++                                     kOtherProfileImageSize),
++      l10n_util::GetStringUTF16(IDS_CXMENU_NEW_TEMPORARY_CONTAINER),
++      /*is_container=*/true, /*is_active=*/false,
++      base::BindRepeating(&ProfileMenuView::OnTemporaryContainerButtonClicked,
++                          base::Unretained(this)));
++}
++
++void ProfileMenuView::OnContainerButtonClicked(
++    const std::string& container_id) {
++  if (!perform_menu_actions()) {
++    return;
++  }
++  content::WebContents* contents =
++      browser().GetTabStripModel()->GetActiveWebContents();
++  // Nothing to do when the page is already there.
++  if (contents &&
++      container_id != containers::GetContainerIdForWebContents(contents)) {
++    containers::OpenInContainer(&browser(), {contents->GetLastCommittedURL()},
++                                container_id);
++  }
++  GetWidget()->CloseWithReason(views::Widget::ClosedReason::kUnspecified);
++}
++
++void ProfileMenuView::OnTemporaryContainerButtonClicked() {
++  if (auto* service = ContainersServiceFactory::GetForProfile(&profile())) {
++    OnContainerButtonClicked(service->CreateAndPersistTemporaryContainer()->id);
++  }
++}
++
++void ProfileMenuView::OnManageContainersButtonClicked() {
++  if (!perform_menu_actions()) {
++    return;
++  }
++  chrome::ShowSettingsSubPage(&browser(), "containers");
++}
++
+ void ProfileMenuView::OnYourSavedInfoSettingsButtonClicked() {
+   OnActionableItemClicked(ActionableItem::kAutofillSettingsButton);
+   if (!perform_menu_actions()) {
+@@ -1338,4 +1435,12 @@ void ProfileMenuView::BuildProfileManage
+       l10n_util::GetStringUTF16(IDS_PROFILE_MENU_MANAGE_PROFILES),
+       base::BindRepeating(&ProfileMenuView::OnManageProfilesButtonClicked,
+                           base::Unretained(this)));
++
++  if (GetContainersService()) {
++    AddProfileManagementFeatureButton(
++        vector_icons::kSettingsIcon,
++        l10n_util::GetStringUTF16(IDS_CXMENU_OPEN_CONTAINERS_SETTINGS),
++        base::BindRepeating(&ProfileMenuView::OnManageContainersButtonClicked,
++                            base::Unretained(this)));
++  }
+ }
+--- a/chrome/browser/ui/views/profiles/profile_menu_view.h
++++ b/chrome/browser/ui/views/profiles/profile_menu_view.h
+@@ -25,6 +25,10 @@
+ #include "ui/views/bubble/bubble_anchor.h"
+ #include "ui/views/controls/styled_label.h"
+ 
++namespace containers {
++class ContainersService;
++}  // namespace containers
++
+ namespace signin_metrics {
+ enum class AccessPoint;
+ }
+@@ -125,6 +129,13 @@ class ProfileMenuView : public ProfileMe
+ #endif  // BUILDFLAG(ENABLE_DICE_SUPPORT)
+   void MaybeBuildSignoutButton();
+   void BuildFeatureButtons();
++  // Containers, which reopen the current page in another container, are in a
++  // tree under the current profile at the top of the profiles list.
++  containers::ContainersService* GetContainersService();
++  void BuildCurrentProfileTree();
++  void OnContainerButtonClicked(const std::string& container_id);
++  void OnTemporaryContainerButtonClicked();
++  void OnManageContainersButtonClicked();
+   IdentitySectionParams GetIdentitySectionParams(
+       const ProfileAttributesEntry& entry);
+   void BuildIdentityWithCallToAction();
+--- a/chrome/browser/ui/views/profiles/profile_menu_view_base.cc
++++ b/chrome/browser/ui/views/profiles/profile_menu_view_base.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/ui/profiles/profile_colors_util.h"
+ #include "chrome/browser/ui/profiles/profile_view_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/chrome_layout_provider.h"
+ #include "chrome/browser/ui/views/controls/hover_button.h"
+ #include "chrome/browser/ui/views/profiles/avatar_badge_view.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -62,15 +63,18 @@
+ #include "ui/views/controls/button/label_button.h"
+ #include "ui/views/controls/button/md_text_button.h"
+ #include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/image_view.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/controls/separator.h"
+ #include "ui/views/controls/styled_label.h"
+ #include "ui/views/interaction/element_tracker_views.h"
++#include "ui/views/layout/box_layout.h"
+ #include "ui/views/layout/fill_layout.h"
+ #include "ui/views/layout/flex_layout.h"
+ #include "ui/views/layout/flex_layout_types.h"
+ #include "ui/views/layout/layout_manager.h"
+ #include "ui/views/layout/table_layout.h"
++#include "ui/views/vector_icons.h"
+ #include "ui/views/metadata/view_factory.h"
+ #include "ui/views/style/typography.h"
+ #include "ui/views/view.h"
+@@ -277,12 +281,14 @@ class MenuButtonRowView : public HoverBu
+                     std::unique_ptr<views::View> icon_view,
+                     const std::u16string& title_text,
+                     int icon_offset,
+-                    user_education::DisplayNewBadge display_new_badge = {})
++                    user_education::DisplayNewBadge display_new_badge = {},
++                    std::unique_ptr<views::View> secondary_view = nullptr)
+       : HoverButton(std::move(callback), [&]() {
+           HoverButton::Params params;
+           params.icon_view = std::move(icon_view);
+           params.title = title_text;
+           params.display_new_badge = display_new_badge;
++          params.secondary_view = std::move(secondary_view);
+           params.add_vertical_label_spacing = false;
+           params.icon_vertical_offset = -icon_offset;
+           params.icon_label_spacing -= icon_offset;
+@@ -751,6 +757,46 @@ void ProfileMenuViewBase::AddAvailablePr
+   }
+ }
+ 
++void ProfileMenuViewBase::AddCurrentProfileRow(
++    const ui::ImageModel& image_model,
++    const std::u16string& name,
++    bool is_container,
++    bool is_active,
++    base::RepeatingClosure action) {
++  if (!current_profile_container_->GetLayoutManager()) {
++    current_profile_container_->SetLayoutManager(
++        std::make_unique<views::BoxLayout>(
++            views::BoxLayout::Orientation::kVertical));
++    current_profile_container_->GetViewAccessibility().SetRole(
++        ax::mojom::Role::kGroup);
++    current_profile_container_->GetViewAccessibility().SetName(
++        profile_mgmt_heading_, ax::mojom::NameFrom::kAttribute);
++  }
++
++  std::unique_ptr<views::View> check;
++  if (is_active) {
++    check = std::make_unique<views::ImageView>(ui::ImageModel::FromVectorIcon(
++        views::kCheckIcon, ui::kColorMenuIcon, kOtherProfileImageSize));
++  }
++  const int icon_offset =
++      (image_model.Size().width() - kOtherProfileImageSize) / 2;
++  std::unique_ptr<HoverButton> button = CreateMenuRowButton(
++      std::move(action), std::make_unique<views::ImageView>(image_model), name,
++      icon_offset, {}, std::move(check));
++  if (is_container) {
++    // Line up the container's icon with the profile's name.
++    button->SetIconHorizontalMargins(
++        kMenuItemLeftInternalPadding - icon_offset + kOtherProfileImageSize +
++            ChromeLayoutProvider::Get()->GetDistanceMetric(
++                views::DISTANCE_RELATED_LABEL_HORIZONTAL),
++        /*right=*/0);
++  }
++  if (is_active) {
++    button->GetViewAccessibility().SetIsSelected(true);
++  }
++  current_profile_container_->AddChildView(std::move(button));
++}
++
+ void ProfileMenuViewBase::AddProfileManagementFeaturesSeparator() {
+   // Add separator before profile management features.
+   profile_mgmt_features_separator_container_->RemoveAllChildViews();
+@@ -847,6 +893,8 @@ void ProfileMenuViewBase::Reset() {
+                                              1);
+   components->AddChildView(std::move(profile_mgmt_header));
+   // Third, add the profile management buttons.
++  current_profile_container_ =
++      components->AddChildView(std::make_unique<views::View>());
+   selectable_profiles_container_ =
+       components->AddChildView(std::make_unique<views::View>());
+   profile_mgmt_features_separator_container_ =
+@@ -919,12 +967,14 @@ std::unique_ptr<HoverButton> ProfileMenu
+     std::unique_ptr<views::View> icon_view,
+     const std::u16string& text,
+     int icon_offset,
+-    user_education::DisplayNewBadge display_new_badge) {
++    user_education::DisplayNewBadge display_new_badge,
++    std::unique_ptr<views::View> secondary_view) {
+   CHECK(icon_view);
+   return std::make_unique<MenuButtonRowView>(
+       base::BindRepeating(&ProfileMenuViewBase::ButtonPressed,
+                           base::Unretained(this), std::move(action)),
+-      std::move(icon_view), text, icon_offset, display_new_badge);
++      std::move(icon_view), text, icon_offset, display_new_badge,
++      std::move(secondary_view));
+ }
+ 
+ BEGIN_METADATA(ProfileMenuViewBase)
+--- a/chrome/browser/ui/views/profiles/profile_menu_view_base.h
++++ b/chrome/browser/ui/views/profiles/profile_menu_view_base.h
+@@ -190,6 +190,15 @@ class ProfileMenuViewBase : public conte
+                         user_education::DisplayNewBadge display_new_badge = {});
+   void SetProfileManagementHeading(const std::u16string& heading);
+ 
++  // Helium: adds a row to the tree of the current profile and its containers,
++  // at the top of the profiles list. Container rows are indented under the
++  // profile, and the active row has a check mark.
++  void AddCurrentProfileRow(const ui::ImageModel& image_model,
++                            const std::u16string& name,
++                            bool is_container,
++                            bool is_active,
++                            base::RepeatingClosure action);
++
+   // Does not resize the image.
+   void AddAvailableProfile(
+       const ui::ImageModel& image_model,
+@@ -257,7 +266,8 @@ class ProfileMenuViewBase : public conte
+       std::unique_ptr<views::View> icon_view,
+       const std::u16string& text,
+       int icon_offset = 0,
+-      user_education::DisplayNewBadge display_new_badge = {});
++      user_education::DisplayNewBadge display_new_badge = {},
++      std::unique_ptr<views::View> secondary_view = nullptr);
+ 
+   const raw_ref<Profile> profile_;
+ 
+@@ -270,6 +280,7 @@ class ProfileMenuViewBase : public conte
+   raw_ptr<views::View> features_container_ = nullptr;
+   raw_ptr<views::View> profile_mgmt_separator_container_ = nullptr;
+   raw_ptr<views::View> profile_mgmt_heading_container_ = nullptr;
++  raw_ptr<views::View> current_profile_container_ = nullptr;
+   raw_ptr<views::View> selectable_profiles_container_ = nullptr;
+   raw_ptr<views::View> profile_mgmt_features_separator_container_ = nullptr;
+   raw_ptr<views::View> profile_mgmt_features_container_ = nullptr;

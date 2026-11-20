@@ -1,0 +1,209 @@
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -45,6 +45,7 @@ enum TabContextMenuCommand {
+   CommandToggleFocusGroup,
+   CommandDiscard,
+   CommandToggleTabMuted,
++  CommandOpenInContainer,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -180,6 +180,7 @@ if (!is_android) {
+       ":tab_model",
+       ":tab_strip",
+       ":tabs",
++      "//brave/components/containers/content/browser",
+       "//chrome/app/vector_icons",
+       "//chrome/browser/commerce",
+       "//chrome/browser/contextual_tasks",
+@@ -189,6 +190,7 @@ if (!is_android) {
+       "//chrome/browser/profiles:profile",
+       "//chrome/browser/send_tab_to_self",
+       "//chrome/browser/ui:ui_features",
++      "//chrome/browser/ui/containers",
+       "//chrome/browser/ui/immersive:immersive_mode_controller",
+       "//chrome/browser/ui/send_tab_to_self",
+       "//chrome/browser/ui/web_applications",
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -13,6 +13,7 @@
+ #include "base/functional/bind.h"
+ #include "base/i18n/rtl.h"
+ #include "base/metrics/user_metrics.h"
++#include "brave/components/containers/content/browser/storage_partition_utils.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
+@@ -28,6 +29,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/containers/containers_open_menu.h"
+ #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/contextual_tasks_tab_sub_menu_model.h"
+@@ -529,6 +531,24 @@ void TabMenuModel::Build(int index) {
+     }
+   }
+ 
++  // Reopening the tabs in another container.
++  containers::ContainersOpenMenu::Params containers_params;
++  for (tabs::TabInterface* tab : tabs) {
++    content::WebContents* contents = tab->GetContents();
++    containers_params.urls.push_back(contents->GetLastCommittedURL());
++    if (std::string id = containers::GetContainerIdForWebContents(contents);
++        !id.empty()) {
++      containers_params.current_container_ids.insert(std::move(id));
++    }
++  }
++  containers_menu_ = containers::ContainersOpenMenu::MaybeCreate(
++      tabs.front()->GetBrowserWindowInterface(), std::move(containers_params));
++  if (containers_menu_) {
++    AddSubMenuWithStringId(TabStripModel::CommandOpenInContainer,
++                           IDS_CXMENU_OPEN_IN_CONTAINER,
++                           containers_menu_->model());
++  }
++
+   AddSeparator(ui::NORMAL_SEPARATOR);
+   AddItemWithStringId(TabStripModel::CommandCopyURL,
+                       num_tabs == 1 ? IDS_TAB_CXMENU_COPY_URL
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -19,6 +19,10 @@ class ContextMenuMatcher;
+ }
+ #endif
+ 
++namespace containers {
++class ContainersOpenMenu;
++}
++
+ namespace tabs {
+ class TabInterface;
+ }
+@@ -106,6 +110,7 @@ class TabMenuModel : public ui::SimpleMe
+   std::unique_ptr<ui::SimpleMenuModel> glic_tab_sub_menu_model_;
+   std::unique_ptr<ui::SimpleMenuModel> contextual_tasks_tab_sub_menu_model_;
+   std::unique_ptr<ui::SimpleMenuModel> send_tab_to_self_submenu_;
++  std::unique_ptr<containers::ContainersOpenMenu> containers_menu_;
+ 
+   // `tab_strip_` needs to outlive this class.
+   raw_ptr<TabStripModel> tab_strip_;
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2935,6 +2935,7 @@ bool TabStripModel::IsContextMenuCommand
+       return true;
+ 
+     case CommandToggleVertical:
++    case CommandOpenInContainer:
+       return true;
+   }
+   SCOPED_CRASH_KEY_NUMBER("TabStripModel", "command_id", command_id);
+@@ -3146,6 +3147,10 @@ void TabStripModel::ExecuteContextMenuCo
+       break;
+     }
+ 
++    case CommandOpenInContainer:
++      // Only the items of its submenu do something.
++      break;
++
+     case CommandToggleTabMuted: {
+       const bool mute = WillContextMenuMuteTabs(context_index);
+       for (int index : GetIndicesForCommand(context_index)) {
+--- a/chrome/browser/ui/views/tabs/shared/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/shared/BUILD.gn
+@@ -43,10 +43,12 @@ source_set("impl") {
+     "//chrome/browser:primitives",
+     "//chrome/browser/ui:browser_actions",
+     "//chrome/browser/ui:browser_commands",
++    "//chrome/browser/ui:browser_tabstrip",
+     "//chrome/browser/ui:browser_window_header",
+     "//chrome/browser/ui:layout_constants",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/color:color_headers",
++    "//chrome/browser/ui/containers",
+     "//chrome/browser/ui/tabs",
+     "//chrome/browser/ui/tabs:tab_group",
+     "//chrome/browser/ui/tabs:tab_strip",
+--- a/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.cc
++++ b/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.cc
+@@ -10,8 +10,10 @@
+ #include "base/metrics/user_metrics.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/containers/containers_open_menu.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -39,6 +41,16 @@ NewTabButtonMenuModel::NewTabButtonMenuM
+   AddItemWithStringId(IDC_NEW_TAB, IDS_NEW_TAB_BUTTON_CXMENU_NEW_TAB);
+   SetElementIdentifierAt(GetIndexOfCommandId(IDC_NEW_TAB).value(), kNewTab);
+ 
++  containers::ContainersOpenMenu::Params containers_params;
++  containers_params.urls = {chrome::GetNewTabURL(browser_)};
++  containers_menu_ = containers::ContainersOpenMenu::MaybeCreate(
++      browser_, std::move(containers_params));
++  if (containers_menu_) {
++    AddSubMenuWithStringId(IDC_OPEN_IN_CONTAINER,
++                           IDS_NEW_TAB_BUTTON_CXMENU_NEW_TAB_IN_CONTAINER,
++                           containers_menu_->model());
++  }
++
+   if (tab_strip_model->SupportsTabGroups()) {
+     AddNewTabInGroupItem();
+ 
+--- a/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.h
++++ b/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.h
+@@ -5,12 +5,18 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_SHARED_NEW_TAB_BUTTON_MENU_MODEL_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_SHARED_NEW_TAB_BUTTON_MENU_MODEL_H_
+ 
++#include <memory>
++
+ #include "base/memory/raw_ptr.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/menus/simple_menu_model.h"
+ 
+ class BrowserWindowInterface;
+ 
++namespace containers {
++class ContainersOpenMenu;
++}
++
+ class NewTabButtonMenuModel : public ui::SimpleMenuModel,
+                               public ui::SimpleMenuModel::Delegate {
+  public:
+@@ -33,6 +39,7 @@ class NewTabButtonMenuModel : public ui:
+   void AddNewSplitTabItem();
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
++  std::unique_ptr<containers::ContainersOpenMenu> containers_menu_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_SHARED_NEW_TAB_BUTTON_MENU_MODEL_H_
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -13141,6 +13141,9 @@ Check your passwords anytime in <ph name
+         <message name="IDS_NEW_TAB_BUTTON_CXMENU_NEW_TAB" desc="The label of a context menu item for opening a new tab.">
+           New tab
+         </message>
++        <message name="IDS_NEW_TAB_BUTTON_CXMENU_NEW_TAB_IN_CONTAINER" desc="The label of a context menu item for choosing a container to open a new tab in.">
++          New tab in container
++        </message>
+         <message name="IDS_NEW_TAB_GROUP" desc="The label of a context menu item for creating a new tab group.">
+           New tab group
+         </message>
+@@ -13164,6 +13167,9 @@ Check your passwords anytime in <ph name
+         <message name="IDS_NEW_TAB_BUTTON_CXMENU_NEW_TAB" desc="In Title Case: The label of a context menu item for opening a new tab.">
+           New Tab
+         </message>
++        <message name="IDS_NEW_TAB_BUTTON_CXMENU_NEW_TAB_IN_CONTAINER" desc="In Title Case: The label of a context menu item for choosing a container to open a new tab in.">
++          New Tab in Container
++        </message>
+         <message name="IDS_NEW_TAB_GROUP" desc="The label of a context menu item for creating a new tab group.">
+           New Tab Group
+         </message>
