@@ -1,0 +1,364 @@
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2025-2026, The Brave Authors
+Copyright (c) 2026, The Helium Authors
+--- a/components/sessions/BUILD.gn
++++ b/components/sessions/BUILD.gn
+@@ -43,6 +43,8 @@ if (use_blink && !(is_ios && target_plat
+ 
+     deps = [
+       "//base",
++      "//brave/components/containers/content/browser",
++      "//brave/components/containers/core/common",
+       "//content/public/common",
+       "//ui/base",
+       "//url",
+--- a/components/sync_sessions/synced_session.cc
++++ b/components/sync_sessions/synced_session.cc
+@@ -103,7 +103,7 @@ sync_pb::TabNavigation SessionNavigation
+   // local storage: SessionStore does not enforce this so it is necessary to
+   // handle empty or invalid URLs here.
+   sync_data.set_virtual_url(navigation.virtual_url().is_valid()
+-                                ? navigation.virtual_url().spec()
++                                ? navigation.GetPrefixedVirtualURLSpec()
+                                 : std::string());
+   sync_data.set_referrer(navigation.referrer_url().is_valid()
+                              ? navigation.referrer_url().spec()
+--- a/chrome/browser/sessions/chrome_serialized_navigation_driver.cc
++++ b/chrome/browser/sessions/chrome_serialized_navigation_driver.cc
+@@ -50,6 +50,7 @@ ChromeSerializedNavigationDriver::GetIns
+ 
+ void ChromeSerializedNavigationDriver::Sanitize(
+     sessions::SerializedNavigationEntry* navigation) const {
++  ContentSerializedNavigationDriver::Sanitize(navigation);
+   content::Referrer old_referrer(
+       navigation->referrer_url(),
+       content::Referrer::ConvertToPolicy(navigation->referrer_policy()));
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "base/containers/span.h"
++#include "brave/components/containers/content/browser/tab_restore_utils.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
+ #include "chrome/browser/contextual_tasks/contextual_tasks_tab_restore_data.h"
+@@ -36,7 +37,9 @@
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/restore_type.h"
+ #include "content/public/browser/session_storage_namespace_handle.h"
++#include "content/public/browser/site_instance.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/common/url_utils.h"
+ #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/range/range.h"
+@@ -72,6 +75,20 @@ std::unique_ptr<WebContents> CreateResto
+       content::CreateMapWithDefaultSessionStorageNamespace(
+           browser->GetProfile(), session_storage_namespace);
+   WebContents::CreateParams create_params(browser->GetProfile());
++  // Tabs from a container go back into it. WebUI gets its SiteInstance when
++  // it navigates, see https://crrev.com/c/8287626.
++  if (auto storage_partition_config =
++          containers::GetStoragePartitionConfigToRestore(
++              browser->GetProfile(), navigations, selected_navigation)) {
++    const GURL& url = navigations[selected_navigation].virtual_url();
++    if (!content::HasWebUIScheme(url)) {
++      create_params.site_instance =
++          content::SiteInstance::CreateForFixedStoragePartition(
++              browser->GetProfile(),
++              content::SiteInstance::ShouldAssignSiteForURL(url) ? url : GURL(),
++              *storage_partition_config);
++    }
++  }
+   create_params.initially_hidden = initially_hidden;
+   create_params.desired_renderer_state =
+       WebContents::CreateParams::kNoRendererProcess;
+--- a/components/sessions/content/content_serialized_navigation_builder.cc
++++ b/components/sessions/content/content_serialized_navigation_builder.cc
+@@ -8,6 +8,9 @@
+ 
+ #include "base/check_op.h"
+ #include "base/containers/span.h"
++#include "base/feature_list.h"
++#include "brave/components/containers/content/browser/session_utils.h"
++#include "brave/components/containers/core/common/features.h"
+ #include "components/sessions/content/content_record_password_state.h"
+ #include "components/sessions/content/content_serialized_navigation_driver.h"
+ #include "components/sessions/content/extended_info_handler.h"
+@@ -65,6 +68,17 @@ ContentSerializedNavigationBuilder::From
+       navigation.extended_info_map_[handler_entry.first] = value;
+   }
+ 
++  // Container tabs are saved with their container in the URL, see
++  // containers/content/browser/session_utils.h.
++  if (base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    if (auto key = entry->GetStoragePartitionKeyToRestore()) {
++      if (auto prefix = containers::StoragePartitionKeyToUrlPrefix(*key)) {
++        navigation.virtual_url_prefix_ = std::move(*prefix);
++        navigation.storage_partition_key_ = std::move(*key);
++      }
++    }
++  }
++
+   return navigation;
+ }
+ 
+@@ -208,6 +222,10 @@ ContentSerializedNavigationBuilder::ToNa
+   DCHECK_EQ(SerializedNavigationEntry::STATE_INVALID,
+             navigation->blocked_state_);
+ 
++  if (navigation->storage_partition_key_) {
++    entry->SetStoragePartitionKeyToRestore(*navigation->storage_partition_key_);
++  }
++
+   return entry;
+ }
+ 
+--- a/components/sessions/content/content_serialized_navigation_driver.cc
++++ b/components/sessions/content/content_serialized_navigation_driver.cc
+@@ -6,7 +6,10 @@
+ 
+ #include <utility>
+ 
++#include "base/feature_list.h"
+ #include "base/memory/singleton.h"
++#include "brave/components/containers/content/browser/session_utils.h"
++#include "brave/components/containers/core/common/features.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "services/network/public/mojom/referrer_policy.mojom.h"
+ #include "third_party/blink/public/common/page_state/page_state.h"
+@@ -57,16 +60,40 @@ int ContentSerializedNavigationDriver::G
+ std::string
+ ContentSerializedNavigationDriver::GetSanitizedPageStateForPickle(
+     const SerializedNavigationEntry* navigation) const {
+-  if (!navigation->has_post_data())
+-    return navigation->encoded_page_state();
+-
+   blink::PageState page_state =
+       blink::PageState::CreateFromEncodedData(navigation->encoded_page_state());
+-  return page_state.RemovePasswordData().ToEncodedData();
++  if (navigation->has_post_data()) {
++    page_state = page_state.RemovePasswordData();
++  }
++  // Blink restores the page from the URL in PageState, so it needs the
++  // container prefix as well for a restore without Containers to fail.
++  if (!navigation->virtual_url_prefix().empty()) {
++    page_state = page_state.PrefixTopURL(navigation->virtual_url_prefix());
++  }
++  return page_state.ToEncodedData();
+ }
+ 
+ void ContentSerializedNavigationDriver::Sanitize(
+     SerializedNavigationEntry* navigation) const {
++  if (!base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    return;
++  }
++  auto result =
++      containers::RestoreStoragePartitionKeyFromUrl(navigation->virtual_url());
++  if (!result) {
++    return;
++  }
++  navigation->set_virtual_url_prefix(
++      navigation->virtual_url().spec().substr(0, result->url_prefix_length));
++  navigation->set_virtual_url(result->url);
++  navigation->set_storage_partition_key(result->storage_partition_key);
++  if (!navigation->encoded_page_state().empty()) {
++    navigation->set_encoded_page_state(
++        blink::PageState::CreateFromEncodedData(
++            navigation->encoded_page_state())
++            .RemoveTopURLPrefix(result->url_prefix_length)
++            .ToEncodedData());
++  }
+ }
+ 
+ std::string ContentSerializedNavigationDriver::StripReferrerFromPageState(
+--- a/components/sessions/core/serialized_navigation_entry.cc
++++ b/components/sessions/core/serialized_navigation_entry.cc
+@@ -120,7 +120,7 @@ void SerializedNavigationEntry::WriteToP
+   int bytes_written = 0;
+ 
+   WriteStringToPickle(pickle, &bytes_written, max_size,
+-                      virtual_url_.spec());
++                      GetPrefixedVirtualURLSpec());
+ 
+   WriteString16ToPickle(pickle, &bytes_written, max_size, title_);
+ 
+--- a/components/sessions/core/serialized_navigation_entry.h
++++ b/components/sessions/core/serialized_navigation_entry.h
+@@ -9,7 +9,9 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/time/time.h"
+@@ -101,6 +103,23 @@ class SESSIONS_EXPORT SerializedNavigati
+   const GURL& virtual_url() const { return virtual_url_; }
+   void set_virtual_url(const GURL& virtual_url) { virtual_url_ = virtual_url; }
+ 
++  // The StoragePartition of a container tab, and the "containers+<id>:"
++  // prefix its virtual URL is persisted with. Neither is persisted itself.
++  const std::optional<std::pair<std::string, std::string>>&
++  storage_partition_key() const {
++    return storage_partition_key_;
++  }
++  void set_storage_partition_key(std::pair<std::string, std::string> key) {
++    storage_partition_key_ = std::move(key);
++  }
++  const std::string& virtual_url_prefix() const { return virtual_url_prefix_; }
++  void set_virtual_url_prefix(std::string prefix) {
++    virtual_url_prefix_ = std::move(prefix);
++  }
++  std::string GetPrefixedVirtualURLSpec() const {
++    return virtual_url_prefix_ + virtual_url_.spec();
++  }
++
+   const std::string& encoded_page_state() const { return encoded_page_state_; }
+   void set_encoded_page_state(const std::string& encoded_page_state) {
+     encoded_page_state_ = encoded_page_state;
+@@ -171,6 +190,8 @@ class SESSIONS_EXPORT SerializedNavigati
+   int http_status_code_ = 0;
+   bool is_restored_ = false;          // Not persisted.
+   std::vector<GURL> redirect_chain_;  // Not persisted.
++  std::optional<std::pair<std::string, std::string>> storage_partition_key_;
++  std::string virtual_url_prefix_;
+ 
+   // Additional information.
+   BlockedState blocked_state_ = STATE_INVALID;
+--- a/content/browser/renderer_host/navigation_entry_impl.cc
++++ b/content/browser/renderer_host/navigation_entry_impl.cc
+@@ -847,6 +847,23 @@ int64_t NavigationEntryImpl::GetMainFram
+   return frame_tree_->frame_entry->document_sequence_number();
+ }
+ 
++void NavigationEntryImpl::SetStoragePartitionKeyToRestore(
++    std::pair<std::string, std::string> storage_partition_key) {
++  storage_partition_key_to_restore_ = std::move(storage_partition_key);
++}
++
++std::optional<std::pair<std::string, std::string>>
++NavigationEntryImpl::GetStoragePartitionKeyToRestore() const {
++  // A restored entry only has the saved key until it gets a SiteInstance.
++  if (SiteInstanceImpl* site_instance =
++          frame_tree_->frame_entry->site_instance()) {
++    const StoragePartitionConfig& config =
++        site_instance->GetSecurityPrincipal().GetStoragePartitionConfig();
++    return std::make_pair(config.partition_domain(), config.partition_name());
++  }
++  return storage_partition_key_to_restore_;
++}
++
+ void NavigationEntryImpl::SetCanLoadLocalResources(bool allow) {
+   can_load_local_resources_ = allow;
+ }
+--- a/content/browser/renderer_host/navigation_entry_impl.h
++++ b/content/browser/renderer_host/navigation_entry_impl.h
+@@ -185,6 +185,10 @@ class CONTENT_EXPORT NavigationEntryImpl
+   bool GetRemoveExtraHeadersOnCrossOriginRedirect() const override;
+   void SetRemoveExtraHeadersOnCrossOriginRedirect(bool value) override;
+   int64_t GetMainFrameDocumentSequenceNumber() const override;
++  void SetStoragePartitionKeyToRestore(
++      std::pair<std::string, std::string> storage_partition_key) override;
++  std::optional<std::pair<std::string, std::string>>
++  GetStoragePartitionKeyToRestore() const override;
+ 
+   // Creates a copy of this NavigationEntryImpl that can be modified
+   // independently from the original, but that shares FrameNavigationEntries.
+@@ -724,6 +728,10 @@ class CONTENT_EXPORT NavigationEntryImpl
+   // Information about a navigation transition. See the comments on the class
+   // for details.
+   NavigationTransitionData navigation_transition_data_;
++
++  // See SetStoragePartitionKeyToRestore(). Not copied by clones.
++  std::optional<std::pair<std::string, std::string>>
++      storage_partition_key_to_restore_;
+ };
+ 
+ }  // namespace content
+--- a/content/public/browser/navigation_entry.h
++++ b/content/public/browser/navigation_entry.h
+@@ -10,6 +10,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <utility>
+ 
+ #include "base/memory/ref_counted_memory.h"
+ #include "base/supports_user_data.h"
+@@ -266,6 +267,14 @@ class NavigationEntry : public base::Sup
+   // This persists across same-document navigations and stays the same after
+   // a history navigation to an already visited document.
+   virtual int64_t GetMainFrameDocumentSequenceNumber() const = 0;
++
++  // The StoragePartition (domain, name) this entry is saved with in session
++  // history. Set when restoring an entry, before it has a SiteInstance;
++  // otherwise taken from its SiteInstance. Used by Containers.
++  virtual void SetStoragePartitionKeyToRestore(
++      std::pair<std::string, std::string> storage_partition_key) = 0;
++  virtual std::optional<std::pair<std::string, std::string>>
++  GetStoragePartitionKeyToRestore() const = 0;
+ };
+ 
+ }  // namespace content
+--- a/third_party/blink/common/page_state/page_state.cc
++++ b/third_party/blink/common/page_state/page_state.cc
+@@ -163,6 +163,28 @@ PageState PageState::RemoveScrollOffset(
+   return ToPageState(state);
+ }
+ 
++PageState PageState::PrefixTopURL(const std::string& prefix) const {
++  ExplodedPageState state;
++  if (data_.empty() || !DecodePageState(data_, &state) ||
++      !state.top.url_string) {
++    return *this;
++  }
++
++  state.top.url_string = base::UTF8ToUTF16(prefix) + *state.top.url_string;
++  return ToPageState(state);
++}
++
++PageState PageState::RemoveTopURLPrefix(size_t prefix_length) const {
++  ExplodedPageState state;
++  if (data_.empty() || !DecodePageState(data_, &state) ||
++      !state.top.url_string || prefix_length > state.top.url_string->size()) {
++    return *this;
++  }
++
++  state.top.url_string = state.top.url_string->substr(prefix_length);
++  return ToPageState(state);
++}
++
+ PageState PageState::RemoveReferrer() const {
+   if (data_.empty())
+     return *this;
+--- a/third_party/blink/public/common/page_state/page_state.h
++++ b/third_party/blink/public/common/page_state/page_state.h
+@@ -60,6 +60,11 @@ class BLINK_COMMON_EXPORT PageState {
+   PageState RemoveScrollOffset() const;
+   PageState RemoveReferrer() const;
+ 
++  // Add or remove a prefix of the top frame's URL. Used to store the
++  // container of a session entry in its URL.
++  PageState PrefixTopURL(const std::string& prefix) const;
++  PageState RemoveTopURLPrefix(size_t prefix_length) const;
++
+   // Support DCHECK_EQ(a, b), etc.
+   bool operator==(const PageState& other) const { return this->Equals(other); }
+ 
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -501,6 +501,7 @@ if (!is_android) {
+       ":browser_window_header",
+       ":tab_ui_helper",
+       "//base",
++      "//brave/components/containers/content/browser:tab_restore",
+       "//chrome/browser/apps/app_service",
+       "//chrome/browser/contextual_tasks:tab_restore",
+       "//chrome/browser/glic",
