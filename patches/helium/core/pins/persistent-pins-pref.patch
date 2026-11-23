@@ -1,0 +1,395 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -321,6 +321,12 @@
+     <message name="IDS_SETTINGS_CYCLE_TABS_IN_MRU_ORDER" desc="Label for the checkbox which enables or disables cycling through tabs in MRU order when using Ctrl+Tab.">
+       Cycle through tabs in most recently used order with Ctrl+Tab
+     </message>
++    <message name="IDS_SETTINGS_KEEP_PINS" desc="Label for the toggle which makes all windows and sessions keep the same pinned tabs.">
++      Keep pinned tabs across windows and sessions
++    </message>
++    <message name="IDS_SETTINGS_KEEP_PINS_DESCRIPTION" desc="Description for the toggle which makes all windows and sessions keep the same pinned tabs.">
++      Pinned tabs show up in every window and stay pinned when closed. When disabled, each window keeps its own pinned tabs.
++    </message>
+     <message name="IDS_SETTINGS_SHIFT_RIGHT_CLICK_CONTEXT_MENU" desc="Label for the checkbox which makes Shift+right click show the browser context menu even when a page blocks it.">
+       Force context menu with Shift+Right Click
+     </message>
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -890,6 +890,11 @@ inline constexpr char kPartitionPerHostZ
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+ inline constexpr char kPinnedTabs[] = "pinned_tabs";
++
++// A boolean pref set to true if all windows share their pinned tabs, which are
++// hibernated instead of closed. When false, each window has its own.
++inline constexpr char kHeliumPersistentPins[] =
++    "helium.browser.persistent_pins";
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
+ // Preference to disable 3D APIs (WebGL).
+--- a/chrome/browser/ui/tabs/helium_pins_service.cc
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/ui/tabs/helium_pins_list.h"
+ #include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
+ #include "chrome/browser/ui/tabs/helium_pins_util.h"
++#include "chrome/browser/ui/tabs/pinned_tab_service.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/common/pref_names.h"
+@@ -188,7 +189,7 @@ HeliumPinsService::HeliumPinsService(Pro
+                                      PrefService* prefs,
+                                      history::HistoryService* history)
+     : profile_(profile), prefs_(prefs), history_(history) {
+-  if (prefs_) {
++  if (prefs_ && ArePersistentPinsEnabled(profile_)) {
+     pins_ = PinList::FromPref(prefs_->GetList(prefs::kPinnedTabs));
+     unclaimed_migrated_pins_ = pins_.migrated_ids();
+ 
+@@ -205,6 +206,13 @@ HeliumPinsService::HeliumPinsService(Pro
+     return true;
+   });
+   browser_collection_observation_.Observe(browsers);
++
++  pref_change_registrar_.Init(profile_->GetPrefs());
++  pref_change_registrar_.Add(
++      prefs::kHeliumPersistentPins,
++      base::BindRepeating(&HeliumPinsService::OnPersistentPinsChanged,
++                          base::Unretained(this)));
++  UpdatePinnedTabService();
+ }
+ 
+ HeliumPinsService::~HeliumPinsService() = default;
+@@ -224,6 +232,8 @@ void HeliumPinsService::Shutdown() {
+   // change the pin list.
+   browser_collection_observation_.Reset();
+   TabStripModelObserver::StopObservingAll(this);
++  pref_change_registrar_.RemoveAll();
++  pinned_tab_service_.reset();
+   history_tasks_.TryCancelAll();
+   weak_factory_.InvalidateWeakPtrs();
+ }
+@@ -458,6 +468,81 @@ void HeliumPinsService::OnSplitTabChange
+   }
+ }
+ 
++void HeliumPinsService::OnPersistentPinsChanged() {
++  TabStripModelObserver::StopObservingAll(this);
++  UpdatePinnedTabService();
++  ProfileBrowserCollection* const browsers =
++      ProfileBrowserCollection::GetForProfile(profile_);
++
++  if (ArePersistentPinsEnabled(profile_)) {
++    browsers->ForEach([this](BrowserWindowInterface* browser) {
++      if (IsSyncedBrowser(browser)) {
++        AdoptPins(browser);
++      }
++      return true;
++    });
++
++    // Replaces PinnedTabService's snapshot even if no window has pins.
++    SavePins();
++    browsers->ForEach([this](BrowserWindowInterface* browser) {
++      OnBrowserCreated(browser);
++      return true;
++    });
++    return;
++  }
++
++  pins_ = PinList();
++  SavePins();
++}
++
++void HeliumPinsService::AdoptPins(BrowserWindowInterface* browser) {
++  const std::vector<HeliumPinsTabController*> controllers =
++      GetPinnedTabControllers(browser);
++
++  // Pins keep their ids while sharing is off, so the ones that are still open
++  // come back as they were.
++  std::set<std::string> present;
++  for (HeliumPinsTabController* controller : controllers) {
++    const std::string& id = controller->pin_id();
++    if (id.empty()) {
++      continue;
++    }
++
++    if (pins_.Find(id) == pins_.end()) {
++      pins_.insert(pins_.end(), {.id = id, .url = controller->pinned_url()});
++    }
++    present.insert(id);
++  }
++
++  // Tabs pinned meanwhile need ids before their splits are taken in.
++  for (HeliumPinsTabController* controller : controllers) {
++    if (!controller->pin_id().empty()) {
++      continue;
++    }
++
++    const GURL url = GetPinnableUrl(controller->tab().GetContents());
++    const auto match = std::ranges::find_if(pins_, [&](const Pin& pin) {
++      return pin.url == url && !present.contains(pin.id);
++    });
++    if (match != pins_.end()) {
++      controller->SetPin(match->id, match->url);
++    } else {
++      InsertNewPin(browser, controller);
++    }
++    present.insert(controller->pin_id());
++  }
++
++  UpdateSplits(browser);
++}
++
++void HeliumPinsService::UpdatePinnedTabService() {
++  if (prefs_ && !ArePersistentPinsEnabled(profile_)) {
++    pinned_tab_service_ = std::make_unique<PinnedTabService>(profile_);
++  } else {
++    pinned_tab_service_.reset();
++  }
++}
++
+ bool HeliumPinsService::IsSyncedBrowser(BrowserWindowInterface* browser) const {
+   return HasPersistentPins(browser) && browser->GetProfile() == profile_;
+ }
+@@ -662,7 +747,7 @@ void HeliumPinsService::CloseWindowsEmpt
+       drag_tracker_.TakeWindowsEmptiedByDrags();
+   for (const PinDragTracker::WindowEmptiedByDrag& window : windows) {
+     BrowserWindowInterface* const browser = window.browser.get();
+-    if (!browser || browser->IsDeleteScheduled()) {
++    if (!browser || browser->IsDeleteScheduled() || !IsSyncedBrowser(browser)) {
+       continue;
+     }
+ 
+--- a/chrome/browser/ui/tabs/helium_pins_service.h
++++ b/chrome/browser/ui/tabs/helium_pins_service.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_TABS_HELIUM_PINS_SERVICE_H_
+ #define CHROME_BROWSER_UI_TABS_HELIUM_PINS_SERVICE_H_
+ 
++#include <memory>
+ #include <optional>
+ #include <set>
+ #include <string>
+@@ -20,10 +21,12 @@
+ #include "chrome/browser/ui/tabs/helium_pins_list.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "url/gurl.h"
+ 
+ class BrowserWindowInterface;
++class PinnedTabService;
+ class PrefService;
+ class Profile;
+ class ProfileBrowserCollection;
+@@ -77,6 +80,13 @@ class HeliumPinsService : public KeyedSe
+   void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
+   void OnSplitTabChanged(const SplitTabChange& change) override;
+ 
++  void OnPersistentPinsChanged();
++
++  // Takes the pins of browser into the pin list when sharing is turned on.
++  void AdoptPins(BrowserWindowInterface* browser);
++
++  void UpdatePinnedTabService();
++
+   // Returns whether browser is a normal window of the profile.
+   bool IsSyncedBrowser(BrowserWindowInterface* browser) const;
+   std::vector<BrowserWindowInterface*> GetSyncedBrowsers() const;
+@@ -202,6 +212,9 @@ class HeliumPinsService : public KeyedSe
+   base::ScopedObservation<ProfileBrowserCollection, BrowserCollectionObserver>
+       browser_collection_observation_{this};
+ 
++  PrefChangeRegistrar pref_change_registrar_;
++  std::unique_ptr<PinnedTabService> pinned_tab_service_;
++
+   // History lookups of hibernated pins' titles.
+   base::CancelableTaskTracker history_tasks_;
+ 
+--- a/chrome/browser/ui/tabs/helium_pins_util.cc
++++ b/chrome/browser/ui/tabs/helium_pins_util.cc
+@@ -16,6 +16,7 @@
+ #include "base/time/time.h"
+ #include "chrome/browser/devtools/devtools_window.h"
+ #include "chrome/browser/performance_manager/public/user_tuning/user_tuning_utils.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+@@ -26,7 +27,9 @@
+ #include "chrome/browser/ui/tabs/tab_close_types_data.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_utils.h"
++#include "chrome/common/pref_names.h"
+ #include "components/performance_manager/public/performance_manager.h"
++#include "components/prefs/pref_service.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -254,8 +257,13 @@ bool ActivateReplacementTab(BrowserWindo
+   return true;
+ }
+ 
++bool ArePersistentPinsEnabled(Profile* profile) {
++  return profile->GetPrefs()->GetBoolean(prefs::kHeliumPersistentPins);
++}
++
+ bool HasPersistentPins(BrowserWindowInterface* browser) {
+-  return browser && browser->GetType() == BrowserWindowInterface::TYPE_NORMAL;
++  return browser && browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++         ArePersistentPinsEnabled(browser->GetProfile());
+ }
+ 
+ HeliumPinsTabController* GetPersistentPinController(tabs::TabInterface* tab) {
+@@ -283,7 +291,7 @@ bool WouldShowHibernatedPin(const TabStr
+   }
+ 
+   return std::ranges::any_of(shown, [](tabs::TabInterface* shown_tab) {
+-    return shown_tab->IsPinned() && IsHibernated(shown_tab->GetContents());
++    return IsPersistentPin(shown_tab) && IsHibernated(shown_tab->GetContents());
+   });
+ }
+ 
+--- a/chrome/browser/ui/tabs/helium_pins_util.h
++++ b/chrome/browser/ui/tabs/helium_pins_util.h
+@@ -12,6 +12,7 @@
+ 
+ class BrowserWindowInterface;
+ class GURL;
++class Profile;
+ class TabStripModel;
+ 
+ namespace content {
+@@ -25,6 +26,8 @@ namespace helium_pins {
+ 
+ class HeliumPinsTabController;
+ 
++bool ArePersistentPinsEnabled(Profile* profile);
++
+ // Returns whether browser keeps persistent pins: only normal windows do.
+ bool HasPersistentPins(BrowserWindowInterface* browser);
+ 
+--- a/chrome/browser/ui/tabs/pinned_tab_codec.cc
++++ b/chrome/browser/ui/tabs/pinned_tab_codec.cc
+@@ -6,12 +6,16 @@
+ 
+ #include <stddef.h>
+ 
++#include <set>
++#include <string>
+ #include <utility>
+ 
+ #include "base/values.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/tabs/helium_pins_tab_controller.h"
++#include "chrome/browser/ui/tabs/helium_pins_util.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+@@ -37,18 +41,28 @@ base::DictValue EncodeTab(const GURL& ur
+ 
+ // Encodes all the pinned tabs from `browser` into `serialized_tabs`.
+ void EncodePinnedTabs(BrowserWindowInterface* browser,
+-                      base::ListValue& serialized_tabs) {
++                      base::ListValue& serialized_tabs,
++                      std::set<std::string>& pin_ids) {
+   const TabStripModel* const tab_model = browser->GetTabStripModel();
+-  for (const tabs::TabInterface* tab : *tab_model) {
++  for (tabs::TabInterface* tab : *tab_model) {
+     if (!tab->IsPinned()) {
+       break;
+     }
+ 
++    // Copies of a persistent pin in several windows are only reopened once.
++    const helium_pins::HeliumPinsTabController* const controller =
++        helium_pins::HeliumPinsTabController::From(tab);
++    if (controller && controller->IsLinkedPin() &&
++        !pin_ids.insert(controller->pin_id()).second) {
++      continue;
++    }
++
+     content::WebContents* web_contents = tab->GetContents();
+     NavigationEntry* entry =
+         web_contents->GetController().GetLastCommittedEntry();
+     if (entry) {
+-      serialized_tabs.Append(EncodeTab(entry->GetURL()));
++      serialized_tabs.Append(
++          EncodeTab(helium_pins::GetPinnableUrl(web_contents)));
+     }
+   }
+ }
+@@ -68,6 +82,7 @@ std::optional<StartupTab> DecodeTab(cons
+ void PinnedTabCodec::RegisterProfilePrefs(
+     user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterListPref(prefs::kPinnedTabs);
++  registry->RegisterBooleanPref(prefs::kHeliumPersistentPins, true);
+ }
+ 
+ // static
+@@ -78,11 +93,12 @@ void PinnedTabCodec::WritePinnedTabs(Pro
+   }
+ 
+   base::ListValue values;
++  std::set<std::string> pin_ids;
+   ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
+-      [profile, &values](BrowserWindowInterface* browser) {
++      [profile, &values, &pin_ids](BrowserWindowInterface* browser) {
+         if (browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+             browser->GetProfile() == profile) {
+-          EncodePinnedTabs(browser, values);
++          EncodePinnedTabs(browser, values, pin_ids);
+         }
+         return true;
+       });
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -308,6 +308,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kTabCyclingMRU] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumPersistentPins] =
++      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kShiftRightClickContextMenu] =
+       settings_api::PrefType::kBoolean;
+ 
+--- a/chrome/browser/resources/settings/appearance_page/appearance_behavior_page.html
++++ b/chrome/browser/resources/settings/appearance_page/appearance_behavior_page.html
+@@ -31,4 +31,10 @@
+       label="$i18n{allowSplitViewDragAndDrop}">
+   </settings-toggle-button>
+ 
++  <settings-toggle-button class="hr" id="persistentPins"
++      pref-key="helium.browser.persistent_pins"
++      label="$i18n{keepPins}"
++      sub-label="$i18n{keepPinsDescription}">
++  </settings-toggle-button>
++
+ </settings-section>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -603,6 +603,9 @@ void AddAppearanceStrings(content::WebUI
+       {"appearancePageTitle", IDS_SETTINGS_APPEARANCE},
+       {"appearanceBehaviorPageTitle", IDS_SETTINGS_APPEARANCE_AND_BEHAVIOR},
+       {"behaviorPageTitle", IDS_SETTINGS_BEHAVIOR},
++      {"keepPins", IDS_SETTINGS_KEEP_PINS},
++      {"keepPinsDescription",
++       IDS_SETTINGS_KEEP_PINS_DESCRIPTION},
+       {"ctrlTabMru", IDS_SETTINGS_CTRL_TAB_MRU},
+       {"glassEffect", IDS_SETTINGS_TAB_STYLING},
+       {"glassEffectClassic", IDS_SETTINGS_TAB_STYLING_CLASSIC},
+--- a/chrome/browser/ui/tabs/helium_pins_tab_controller.cc
++++ b/chrome/browser/ui/tabs/helium_pins_tab_controller.cc
+@@ -227,6 +227,10 @@ void HeliumPinsTabController::OnPinnedSt
+   // e.g. during a drag, writes it again.
+   if (pinned) {
+     PersistSessionData();
++  } else if (!ArePersistentPinsEnabled(Profile::FromBrowserContext(
++                 tab->GetContents()->GetBrowserContext()))) {
++    // With sharing on, the service unlinks unpinned tabs once drags are done.
++    ClearPin();
+   }
+ }
+ 
