@@ -1,0 +1,805 @@
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2018-2022, The Brave Authors
+Copyright (c) 2025-2026, The Helium Authors
+--- a/brave/browser/importer/brave_external_process_importer_client.cc
++++ b/brave/browser/importer/brave_external_process_importer_client.cc
+@@ -20,6 +20,9 @@ bool ShouldUseBraveImporter(user_data_im
+     case user_data_importer::TYPE_OPERA:
+     case user_data_importer::TYPE_YANDEX:
+     case user_data_importer::TYPE_WHALE:
++    case user_data_importer::TYPE_ARC:
++    case user_data_importer::TYPE_DIA:
++    case user_data_importer::TYPE_PERPLEXITY_COMET:
+     case user_data_importer::TYPE_BRAVE:
+       return true;
+     default:
+@@ -64,10 +67,8 @@ void BraveExternalProcessImporterClient:
+       base::BindOnce(&ExternalProcessImporterClient::OnProcessCrashed, this));
+ 
+   base::flat_map<uint32_t, std::string> localized_strings;
+-  brave_profile_import_->StartImport(
+-      source_profile_, items_, localized_strings,
+-      receiver_.BindNewPipeAndPassRemote(),
+-      brave_receiver_.BindNewPipeAndPassRemote());
++  brave_profile_import_->StartImport(source_profile_, items_, localized_strings,
++                                     receiver_.BindNewPipeAndPassRemote());
+ }
+ 
+ void BraveExternalProcessImporterClient::Cancel() {
+@@ -92,7 +93,6 @@ void BraveExternalProcessImporterClient:
+   }
+ 
+   brave_profile_import_.reset();
+-  brave_receiver_.reset();
+   receiver_.reset();
+ }
+ 
+@@ -109,20 +109,3 @@ void BraveExternalProcessImporterClient:
+   bridge_->NotifyItemEnded(import_item);
+   brave_profile_import_->ReportImportItemFinished(import_item);
+ }
+-
+-void BraveExternalProcessImporterClient::OnCreditCardImportReady(
+-    const std::u16string& name_on_card,
+-    const std::u16string& expiration_month,
+-    const std::u16string& expiration_year,
+-    const std::u16string& decrypted_card_number,
+-    const std::string& origin) {
+-  if (cancelled_)
+-    return;
+-
+-  static_cast<BraveInProcessImporterBridge*>(
+-      bridge_.get())->SetCreditCard(name_on_card,
+-                                    expiration_month,
+-                                    expiration_year,
+-                                    decrypted_card_number,
+-                                    origin);
+-}
+--- a/brave/browser/importer/brave_external_process_importer_client.h
++++ b/brave/browser/importer/brave_external_process_importer_client.h
+@@ -11,14 +11,12 @@
+ #include "base/memory/weak_ptr.h"
+ #include "brave/common/importer/profile_import.mojom.h"
+ #include "chrome/browser/importer/external_process_importer_client.h"
+-#include "mojo/public/cpp/bindings/receiver.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ 
+ bool ShouldUseBraveImporter(user_data_importer::ImporterType type);
+ 
+ class BraveExternalProcessImporterClient
+-    : public ExternalProcessImporterClient,
+-      public brave::mojom::ProfileImportObserver {
++    : public ExternalProcessImporterClient {
+  public:
+   BraveExternalProcessImporterClient(
+       base::WeakPtr<ExternalProcessImporterHost> importer_host,
+@@ -38,13 +36,6 @@ class BraveExternalProcessImporterClient
+   void OnImportItemFinished(
+       user_data_importer::ImportItem import_item) override;
+ 
+-  // brave::mojom::ProfileImportObserver overrides:
+-  void OnCreditCardImportReady(const std::u16string& name_on_card,
+-                               const std::u16string& expiration_month,
+-                               const std::u16string& expiration_year,
+-                               const std::u16string& decrypted_card_number,
+-                               const std::string& origin) override;
+-
+  protected:
+   ~BraveExternalProcessImporterClient() override;
+ 
+@@ -52,9 +43,6 @@ class BraveExternalProcessImporterClient
+   // Used to start and stop the actual brave importer running in a different
+   // process.
+   mojo::Remote<brave::mojom::ProfileImport> brave_profile_import_;
+-
+-  // Used to receive progress updates from the brave importer.
+-  mojo::Receiver<brave::mojom::ProfileImportObserver> brave_receiver_{this};
+ };
+ 
+ #endif  // BRAVE_BROWSER_IMPORTER_BRAVE_EXTERNAL_PROCESS_IMPORTER_CLIENT_H_
+--- a/brave/browser/importer/brave_external_process_importer_host.cc
++++ b/brave/browser/importer/brave_external_process_importer_host.cc
+@@ -8,12 +8,10 @@
+ #include <utility>
+ 
+ #include "base/check.h"
+-#include "base/logging.h"
+-#include "brave/browser/importer/brave_importer_p3a.h"
+ #include "brave/browser/importer/extensions_import_helpers.h"
+-#include "brave/grit/brave_generated_resources.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/importer/importer_lock_dialog.h"
++#include "chrome/grit/generated_resources.h"
+ #include "components/user_data_importer/common/importer_data_types.h"
+ #include "components/user_data_importer/common/importer_type.h"
+ 
+@@ -22,29 +20,6 @@ BraveExternalProcessImporterHost::BraveE
+ BraveExternalProcessImporterHost::~BraveExternalProcessImporterHost() = default;
+ 
+ void BraveExternalProcessImporterHost::NotifyImportEnded() {
+-  // Guard against re-recording: this method is re-entered to continue the
+-  // import lifecycle after browser-process steps (password and extension
+-  // import), and P3A must be recorded only once per import.
+-  if (!cancelled_ && !p3a_recorded_) {
+-    p3a_recorded_ = true;
+-    RecordImporterP3A(source_profile_.importer_type);
+-  }
+-
+-  // Passwords are imported in the browser process (not the utility process) so
+-  // OSCryptAsync can decrypt the source's `Login Data`. `password_importer_` is
+-  // created lazily here and reset in OnPasswordsImported(), which re-enters
+-  // this method to continue the lifecycle.
+-  if (NeedToImportPasswords() && !password_import_started_) {
+-    password_import_started_ = true;
+-    password_importer_ = std::make_unique<BravePasswordImporter>();
+-    NotifyImportItemStarted(user_data_importer::PASSWORDS);
+-    password_importer_->StartImport(
+-        source_profile_.source_path, profile_,
+-        base::BindOnce(&BraveExternalProcessImporterHost::OnPasswordsImported,
+-                       weak_ptr_factory_.GetWeakPtr()));
+-    return;
+-  }
+-
+   // If user chooses extension importing, start importing extensions.
+   // and NotifyImportEnded() will be called from OnGetChromeExtensionsList().
+   // Handling extensions importing after finishing all other properties makes
+@@ -67,42 +42,6 @@ void BraveExternalProcessImporterHost::N
+   ExternalProcessImporterHost::NotifyImportEnded();
+ }
+ 
+-bool BraveExternalProcessImporterHost::NeedToImportPasswords() const {
+-#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX)
+-  // Only Brave-to-Brave imports share the OS keychain entry needed to decrypt
+-  // the source's `Login Data`.
+-  return !cancelled_ &&
+-         (items_ & user_data_importer::PASSWORDS) ==
+-             user_data_importer::PASSWORDS &&
+-         source_profile_.importer_type == user_data_importer::TYPE_BRAVE;
+-#else
+-  return false;
+-#endif
+-}
+-
+-void BraveExternalProcessImporterHost::OnPasswordsImported(
+-    BravePasswordImporter::Result result,
+-    size_t /*submitted*/) {
+-  password_importer_.reset();
+-
+-  if (result == BravePasswordImporter::Result::kSuccess) {
+-    // Only report the item as ended on success; reporting it on failure would
+-    // mark the overall import as succeeded. A successful import of zero
+-    // credentials just means the source had no saved passwords.
+-    NotifyImportItemEnded(user_data_importer::PASSWORDS);
+-  } else {
+-    // Failures are logged so they are not lost, since the import UI has no
+-    // per-item failure state.
+-    LOG(ERROR) << "Brave password import failed, result="
+-               << static_cast<int>(result);
+-  }
+-
+-  // Continue the remainder of the import lifecycle (extensions, if any, then
+-  // the final "ended" notification) by re-entering NotifyImportEnded() now
+-  // that `password_importer_` has been cleared.
+-  NotifyImportEnded();
+-}
+-
+ void BraveExternalProcessImporterHost::LaunchImportIfReady() {
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+   if (NeedToImportExtensions()) {
+--- a/brave/browser/importer/brave_external_process_importer_host.h
++++ b/brave/browser/importer/brave_external_process_importer_host.h
+@@ -6,13 +6,11 @@
+ #ifndef BRAVE_BROWSER_IMPORTER_BRAVE_EXTERNAL_PROCESS_IMPORTER_HOST_H_
+ #define BRAVE_BROWSER_IMPORTER_BRAVE_EXTERNAL_PROCESS_IMPORTER_HOST_H_
+ 
+-#include <cstddef>
+ #include <memory>
+ #include <string>
+ 
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/weak_ptr.h"
+-#include "brave/browser/importer/brave_password_importer.h"
+ #include "chrome/browser/importer/external_process_importer_host.h"
+ #include "extensions/buildflags/buildflags.h"
+ 
+@@ -48,18 +46,6 @@ class BraveExternalProcessImporterHost :
+   void NotifyImportEnded() override;
+   void LaunchImportIfReady() override;
+ 
+-  // Passwords from another Brave installation are imported in the browser
+-  // process (not the utility process) so we can use OSCryptAsync to decrypt
+-  // the source's `Login Data`. Supported on macOS and Linux only; see
+-  // `BravePasswordImporter`.
+-  bool NeedToImportPasswords() const;
+-  void OnPasswordsImported(BravePasswordImporter::Result result,
+-                           size_t submitted);
+-
+-  std::unique_ptr<BravePasswordImporter> password_importer_;
+-  bool password_import_started_ = false;
+-  bool p3a_recorded_ = false;
+-
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+   bool NeedToImportExtensions() const;
+ 
+--- a/brave/browser/importer/brave_in_process_importer_bridge.cc
++++ b/brave/browser/importer/brave_in_process_importer_bridge.cc
+@@ -8,16 +8,3 @@
+ #include "chrome/browser/importer/profile_writer.h"
+ 
+ BraveInProcessImporterBridge::~BraveInProcessImporterBridge() = default;
+-
+-void BraveInProcessImporterBridge::SetCreditCard(
+-    const std::u16string& name_on_card,
+-    const std::u16string& expiration_month,
+-    const std::u16string& expiration_year,
+-    const std::u16string& decrypted_card_number,
+-    const std::string& origin) {
+-  writer_->AddCreditCard(name_on_card,
+-                         expiration_month,
+-                         expiration_year,
+-                         decrypted_card_number,
+-                         origin);
+-}
+--- a/brave/browser/importer/brave_in_process_importer_bridge.h
++++ b/brave/browser/importer/brave_in_process_importer_bridge.h
+@@ -8,11 +8,9 @@
+ 
+ #include <string>
+ 
+-#include "brave/common/importer/brave_importer_bridge.h"
+ #include "chrome/browser/importer/in_process_importer_bridge.h"
+ 
+-class BraveInProcessImporterBridge : public InProcessImporterBridge,
+-                                     public BraveImporterBridge {
++class BraveInProcessImporterBridge : public InProcessImporterBridge {
+  public:
+   using InProcessImporterBridge::InProcessImporterBridge;
+ 
+@@ -20,13 +18,6 @@ class BraveInProcessImporterBridge : pub
+   BraveInProcessImporterBridge operator=(
+       const BraveInProcessImporterBridge&) = delete;
+ 
+-  // BraveImporterBridge overrides:
+-  void SetCreditCard(const std::u16string& name_on_card,
+-                     const std::u16string& expiration_month,
+-                     const std::u16string& expiration_year,
+-                     const std::u16string& decrypted_card_number,
+-                     const std::string& origin) override;
+-
+  private:
+   ~BraveInProcessImporterBridge() override;
+ };
+--- a/brave/browser/importer/sources.gni
++++ b/brave/browser/importer/sources.gni
+@@ -13,7 +13,6 @@ brave_browser_importer_impl_deps = []
+ if (!is_android) {
+   brave_browser_importer_sources += [
+     "//brave/browser/importer/brave_external_process_importer_host.h",
+-    "//brave/browser/importer/brave_password_importer.h",
+   ]
+   brave_browser_importer_public_deps += [
+     "//base",
+@@ -26,7 +25,6 @@ if (!is_android) {
+     "//brave/browser/importer/brave_external_process_importer_host.cc",
+     "//brave/browser/importer/brave_in_process_importer_bridge.cc",
+     "//brave/browser/importer/brave_in_process_importer_bridge.h",
+-    "//brave/browser/importer/brave_password_importer.cc",
+   ]
+   if (enable_extensions) {
+     brave_browser_importer_impl_sources += [
+@@ -44,18 +42,9 @@ if (!is_android) {
+   }
+   brave_browser_importer_impl_deps += [
+     "//base",
+-    "//brave/app:brave_generated_resources_grit_grit",
+-    "//brave/browser/importer",
+     "//brave/common/importer",
+     "//brave/common/importer:interfaces",
+-    "//brave/components/brave_origin/buildflags",
+-    "//chrome/browser:browser_process",
+-    "//chrome/browser/password_manager/factories",
+-    "//components/keyed_service/core",
+-    "//components/os_crypt/async/browser",
+-    "//components/os_crypt/async/common",
+-    "//components/password_manager/core/browser/password_store:password_store_impl",
+-    "//components/password_manager/core/browser/password_store:password_store_interface",
++    "//chrome/app:generated_resources",
+     "//content/public/browser",
+     "//extensions/buildflags",
+     "//mojo/public/cpp/bindings",
+--- a/brave/common/importer/BUILD.gn
++++ b/brave/common/importer/BUILD.gn
+@@ -19,7 +19,6 @@ mojom("interfaces") {
+ 
+ source_set("importer") {
+   sources = [
+-    "brave_importer_bridge.h",
+     "chrome_importer_utils.cc",
+     "chrome_importer_utils.h",
+     "importer_constants.h",
+--- a/brave/common/importer/chrome_importer_utils.h
++++ b/brave/common/importer/chrome_importer_utils.h
+@@ -25,6 +25,18 @@ base::FilePath GetChromeDevUserDataFolde
+ // Canary is not available on Linux
+ base::FilePath GetCanaryUserDataFolder();
+ #endif
++
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC)
++// Arc only has Windows/Mac builds
++base::FilePath GetArcUserDataFolder();
++base::FilePath GetCometUserDataFolder();
++#endif
++
++#if BUILDFLAG(IS_MAC)
++// Dia only has Windows/Mac builds
++base::FilePath GetDiaUserDataFolder();
++#endif
++
+ base::FilePath GetChromiumUserDataFolder();
+ 
+ base::FilePath GetEdgeUserDataFolder();
+--- a/brave/common/importer/chrome_importer_utils_mac.mm
++++ b/brave/common/importer/chrome_importer_utils_mac.mm
+@@ -60,6 +60,21 @@ base::FilePath GetWhaleUserDataFolder()
+   return result.Append("Application Support").Append("Naver").Append("Whale");
+ }
+ 
++base::FilePath GetArcUserDataFolder() {
++  base::FilePath result = base::apple::GetUserLibraryPath();
++  return result.Append("Application Support").Append("Arc").Append("User Data");
++}
++
++base::FilePath GetDiaUserDataFolder() {
++  base::FilePath result = base::apple::GetUserLibraryPath();
++  return result.Append("Application Support").Append("Dia").Append("User Data");
++}
++
++base::FilePath GetCometUserDataFolder() {
++  base::FilePath result = base::apple::GetUserLibraryPath();
++  return result.Append("Application Support").Append("Comet");
++}
++
+ base::FilePath GetBraveUserDataFolder() {
+   base::FilePath result = base::apple::GetUserLibraryPath();
+   return result.Append("Application Support")
+--- a/brave/common/importer/chrome_importer_utils_win.cc
++++ b/brave/common/importer/chrome_importer_utils_win.cc
+@@ -122,6 +122,30 @@ base::FilePath GetWhaleUserDataFolder()
+       .AppendASCII("User Data");
+ }
+ 
++base::FilePath GetArcUserDataFolder() {
++  base::FilePath result;
++  if (!base::PathService::Get(base::DIR_LOCAL_APP_DATA, &result)) {
++    return base::FilePath();
++  }
++
++  return result.AppendASCII("Packages")
++      .AppendASCII("TheBrowserCompany.Arc_ttt1ap7aakyb4")
++      .AppendASCII("LocalCache")
++      .AppendASCII("Local")
++      .AppendASCII("User Data");
++}
++
++base::FilePath GetCometUserDataFolder() {
++  base::FilePath result;
++  if (!base::PathService::Get(base::DIR_LOCAL_APP_DATA, &result)) {
++    return base::FilePath();
++  }
++
++  return result.AppendASCII("Perplexity")
++      .AppendASCII("Comet")
++      .AppendASCII("User Data");
++}
++
+ base::FilePath GetBraveUserDataFolder() {
+   base::FilePath result =
+       base::PathService::CheckedGet(base::DIR_LOCAL_APP_DATA);
+--- a/brave/common/importer/importer_constants.h
++++ b/brave/common/importer/importer_constants.h
+@@ -29,6 +29,9 @@ inline constexpr char kVivaldiBrowser[]
+ inline constexpr char kOperaBrowser[] = "Opera";
+ inline constexpr char kYandexBrowser[] = "Yandex";
+ inline constexpr char kWhaleBrowser[] = "NAVER Whale";
++inline constexpr char kArcBrowser[] = "Arc";
++inline constexpr char kDiaBrowser[] = "Dia";
++inline constexpr char kPerplexityCometBrowser[] = "Perplexity Comet";
+ inline constexpr char kBraveBrowser[] = "Brave";
+ // End of browser names section
+ 
+--- a/brave/common/importer/profile_import.mojom
++++ b/brave/common/importer/profile_import.mojom
+@@ -8,23 +8,6 @@ module brave.mojom;
+ import "chrome/common/importer/profile_import.mojom";
+ import "mojo/public/mojom/base/string16.mojom";
+ 
+-[Native]
+-struct SourceProfile;
+-
+-[Native]
+-enum ImportItem;
+-
+-// These are messages sent from the profile import process to the browser.
+-// These messages send information about the status of the import and individual
+-// import tasks.
+-interface ProfileImportObserver {
+-  OnCreditCardImportReady(mojo_base.mojom.String16 name_on_card,
+-                          mojo_base.mojom.String16 expiration_month,
+-                          mojo_base.mojom.String16 expiration_year,
+-                          mojo_base.mojom.String16 decrypted_card_number,
+-                          string origin);
+-};
+-
+ // This interface is used to control the import process.
+ interface ProfileImport {
+   // Start the importer. |items| is a bitmask of user_data_importer::ImportItem of items
+@@ -33,8 +16,7 @@ interface ProfileImport {
+       chrome.mojom.SourceProfile source_profile,
+       uint16 items,
+       map<uint32, string> localized_strings,
+-      pending_remote<chrome.mojom.ProfileImportObserver> observer,
+-      pending_remote<ProfileImportObserver> brave_observer);
++      pending_remote<chrome.mojom.ProfileImportObserver> observer);
+ 
+   // Stop the importer.
+   CancelImport();
+--- a/brave/utility/importer/brave_external_process_importer_bridge.cc
++++ b/brave/utility/importer/brave_external_process_importer_bridge.cc
+@@ -9,23 +9,9 @@
+ 
+ BraveExternalProcessImporterBridge::BraveExternalProcessImporterBridge(
+     const base::flat_map<uint32_t, std::string>& localized_strings,
+-    mojo::SharedRemote<chrome::mojom::ProfileImportObserver> observer,
+-    mojo::SharedRemote<brave::mojom::ProfileImportObserver> brave_observer)
++    mojo::SharedRemote<chrome::mojom::ProfileImportObserver> observer)
+     : ExternalProcessImporterBridge(std::move(localized_strings),
+-                                         std::move(observer)),
+-      brave_observer_(std::move(brave_observer)) {}
++                                    std::move(observer)) {}
+ 
+ BraveExternalProcessImporterBridge::
+     ~BraveExternalProcessImporterBridge() = default;
+-
+-void BraveExternalProcessImporterBridge::SetCreditCard(
+-    const std::u16string& name_on_card,
+-    const std::u16string& expiration_month,
+-    const std::u16string& expiration_year,
+-    const std::u16string& decrypted_card_number,
+-    const std::string& origin) {
+-  brave_observer_->OnCreditCardImportReady(
+-      name_on_card, expiration_month,
+-      expiration_year, decrypted_card_number,
+-      origin);
+-}
+--- a/brave/utility/importer/brave_external_process_importer_bridge.h
++++ b/brave/utility/importer/brave_external_process_importer_bridge.h
+@@ -8,33 +8,22 @@
+ 
+ #include <string>
+ 
+-#include "brave/common/importer/brave_importer_bridge.h"
+-#include "brave/common/importer/profile_import.mojom.h"
+ #include "chrome/utility/importer/external_process_importer_bridge.h"
+ 
+-class BraveExternalProcessImporterBridge : public ExternalProcessImporterBridge,
+-                                           public BraveImporterBridge {
++class BraveExternalProcessImporterBridge
++    : public ExternalProcessImporterBridge {
+  public:
+   BraveExternalProcessImporterBridge(
+       const base::flat_map<uint32_t, std::string>& localized_strings,
+-      mojo::SharedRemote<chrome::mojom::ProfileImportObserver> observer,
+-      mojo::SharedRemote<brave::mojom::ProfileImportObserver> brave_observer);
++      mojo::SharedRemote<chrome::mojom::ProfileImportObserver> observer);
+ 
+   BraveExternalProcessImporterBridge(
+       const BraveExternalProcessImporterBridge&) = delete;
+   BraveExternalProcessImporterBridge& operator=(
+       const BraveExternalProcessImporterBridge&) = delete;
+ 
+-  void SetCreditCard(const std::u16string& name_on_card,
+-                     const std::u16string& expiration_month,
+-                     const std::u16string& expiration_year,
+-                     const std::u16string& decrypted_card_number,
+-                     const std::string& origin) override;
+-
+  private:
+   ~BraveExternalProcessImporterBridge() override;
+-
+-  mojo::SharedRemote<brave::mojom::ProfileImportObserver> brave_observer_;
+ };
+ 
+ #endif  // BRAVE_UTILITY_IMPORTER_BRAVE_EXTERNAL_PROCESS_IMPORTER_BRIDGE_H_
+--- a/brave/utility/importer/brave_profile_import_impl.cc
++++ b/brave/utility/importer/brave_profile_import_impl.cc
+@@ -9,7 +9,6 @@
+ #include <utility>
+ 
+ #include "base/check.h"
+-#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "base/notreached.h"
+@@ -43,6 +42,12 @@ scoped_refptr<Importer> CreateImporterBy
+       return new ChromeImporter();
+     case user_data_importer::TYPE_WHALE:
+       return new ChromeImporter();
++    case user_data_importer::TYPE_ARC:
++      return new ChromeImporter();
++    case user_data_importer::TYPE_DIA:
++      return new ChromeImporter();
++    case user_data_importer::TYPE_PERPLEXITY_COMET:
++      return new ChromeImporter();
+     case user_data_importer::TYPE_BRAVE:
+       return new ChromeImporter();
+     default:
+@@ -63,29 +68,7 @@ void BraveProfileImportImpl::StartImport
+     const user_data_importer::SourceProfile& source_profile,
+     uint16_t items,
+     const base::flat_map<uint32_t, std::string>& localized_strings,
+-    mojo::PendingRemote<chrome::mojom::ProfileImportObserver> observer,
+-    mojo::PendingRemote<brave::mojom::ProfileImportObserver> brave_observer) {
+-  // Signal change to OSCrypt password for importing from Chrome/Chromium
+-  base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+-  if (source_profile.importer_name.starts_with(u"Chrome")) {
+-    command_line->AppendSwitch("import-chrome");
+-  } else if (source_profile.importer_type ==
+-             user_data_importer::TYPE_EDGE_CHROMIUM) {
+-    command_line->AppendSwitch("import-edge");
+-  } else if (source_profile.importer_name.starts_with(u"Chromium")) {
+-    command_line->AppendSwitch("import-chromium");
+-  } else if (source_profile.importer_type == user_data_importer::TYPE_OPERA) {
+-    command_line->AppendSwitch("import-opera");
+-  } else if (source_profile.importer_type == user_data_importer::TYPE_YANDEX) {
+-    command_line->AppendSwitch("import-yandex");
+-  } else if (source_profile.importer_type == user_data_importer::TYPE_WHALE) {
+-    command_line->AppendSwitch("import-whale");
+-  } else if (source_profile.importer_type == user_data_importer::TYPE_VIVALDI) {
+-    command_line->AppendSwitch("import-vivaldi");
+-  } else if (source_profile.importer_type == user_data_importer::TYPE_BRAVE) {
+-    command_line->AppendSwitch("import-brave");
+-  }
+-
++    mojo::PendingRemote<chrome::mojom::ProfileImportObserver> observer) {
+   content::UtilityThread::Get()->EnsureBlinkInitialized();
+   importer_ = CreateImporterByType(source_profile.importer_type);
+   if (!importer_.get()) {
+@@ -105,9 +88,7 @@ void BraveProfileImportImpl::StartImport
+   bridge_ = new BraveExternalProcessImporterBridge(
+       localized_strings,
+       mojo::SharedRemote<chrome::mojom::ProfileImportObserver>(
+-          std::move(observer)),
+-      mojo::SharedRemote<brave::mojom::ProfileImportObserver>(
+-          std::move(brave_observer)));
++          std::move(observer)));
+   import_thread_->task_runner()->PostTask(
+       FROM_HERE,
+       base::BindOnce(&Importer::StartImport, importer_, source_profile, items,
+--- a/brave/utility/importer/brave_profile_import_impl.h
++++ b/brave/utility/importer/brave_profile_import_impl.h
+@@ -40,8 +40,7 @@ class BraveProfileImportImpl : public br
+       const user_data_importer::SourceProfile& source_profile,
+       uint16_t items,
+       const base::flat_map<uint32_t, std::string>& localized_strings,
+-      mojo::PendingRemote<chrome::mojom::ProfileImportObserver> observer,
+-      mojo::PendingRemote<brave::mojom::ProfileImportObserver> brave_observer)
++      mojo::PendingRemote<chrome::mojom::ProfileImportObserver> observer)
+       override;
+   void CancelImport() override;
+   void ReportImportItemFinished(user_data_importer::ImportItem item) override;
+--- a/brave/utility/importer/chrome_importer.cc
++++ b/brave/utility/importer/chrome_importer.cc
+@@ -16,10 +16,10 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/values.h"
+ #include "brave/common/importer/scoped_copy_file.h"
+-#include "brave/grit/brave_generated_resources.h"
+ #include "brave/utility/importer/brave_external_process_importer_bridge.h"
+ #include "build/build_config.h"
+ #include "chrome/common/importer/importer_bridge.h"
++#include "chrome/grit/generated_resources.h"
+ #include "components/prefs/json_pref_store.h"
+ #include "components/prefs/pref_filter.h"
+ #include "components/user_data_importer/common/imported_bookmark_entry.h"
+--- a/brave/utility/importer/sources.gni
++++ b/brave/utility/importer/sources.gni
+@@ -3,9 +3,6 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ # You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-import("//brave/components/brave_rewards/core/buildflags/buildflags.gni")
+-import("//brave/components/tor/buildflags/buildflags.gni")
+-
+ brave_utility_importer_sources = []
+ brave_utility_importer_deps = []
+ brave_utility_importer_public_deps = []
+@@ -22,19 +19,10 @@ if (!is_android) {
+ 
+   brave_utility_importer_deps += [
+     "//base",
+-    "//brave/app:brave_generated_resources_grit",
+     "//brave/common/importer",
+     "//brave/common/importer:interfaces",
+     "//chrome/app:branded_strings",
++    "//chrome/app:generated_resources",
+     "//components/user_data_importer/common",
+   ]
+ }
+-
+-if (enable_brave_rewards) {
+-  brave_utility_importer_public_deps +=
+-      [ "//brave/components/services/bat_rewards:lib" ]
+-}
+-
+-if (enable_tor) {
+-  brave_utility_importer_deps += [ "//brave/components/services/tor" ]
+-}
+--- a/brave/browser/ui/webui/settings/brave_full_disk_access_confirm_dialog_delegate_mac.mm
++++ b/brave/browser/ui/webui/settings/brave_full_disk_access_confirm_dialog_delegate_mac.mm
+@@ -9,7 +9,6 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/values.h"
+-#include "brave/components/constants/url_constants.h"
+ #include "chrome/browser/importer/external_process_importer_host.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -23,6 +22,11 @@
+ #include "ui/base/ui_base_types.h"
+ #include "url/gurl.h"
+ 
++namespace {
++constexpr char kImportDataHelpURL[] =
++    "https://github.com/imputnet/helium-macos/wiki/Import-data-from-Safari";
++}  // namespace
++
+ FullDiskAccessConfirmDialogDelegate::FullDiskAccessConfirmDialogDelegate(
+     content::WebContents* web_contents,
+     BrowserWindowInterface* browser)
+@@ -32,21 +36,20 @@ FullDiskAccessConfirmDialogDelegate::~Fu
+     default;
+ 
+ std::u16string FullDiskAccessConfirmDialogDelegate::GetTitle() {
+-  return l10n_util::GetStringUTF16(IDS_FULL_DISK_ACCESS_CONFIRM_DIALOG_TITLE);
++  return l10n_util::GetStringUTF16(IDS_IMPORT_FULL_DISK_ACCESS_DIALOG_TITLE);
+ }
+ 
+ std::u16string FullDiskAccessConfirmDialogDelegate::GetDialogMessage() {
+-  return l10n_util::GetStringUTF16(IDS_FULL_DISK_ACCESS_CONFIRM_DIALOG_MESSAGE);
++  return l10n_util::GetStringUTF16(IDS_IMPORT_FULL_DISK_ACCESS_DIALOG_MESSAGE);
+ }
+ 
+ std::u16string FullDiskAccessConfirmDialogDelegate::GetLinkText() const {
+-  return l10n_util::GetStringUTF16(
+-      IDS_FULL_DISK_ACCESS_CONFIRM_DIALOG_LINK_TEXT);
++  return l10n_util::GetStringUTF16(IDS_IMPORT_FULL_DISK_ACCESS_DIALOG_LINK);
+ }
+ 
+ std::u16string FullDiskAccessConfirmDialogDelegate::GetAcceptButtonTitle() {
+   return l10n_util::GetStringUTF16(
+-      IDS_FULL_DISK_ACCESS_CONFIRM_DIALOG_OPEN_PREFS_BUTTON_TEXT);
++      IDS_IMPORT_FULL_DISK_ACCESS_DIALOG_OPEN_SETTINGS);
+ }
+ 
+ void FullDiskAccessConfirmDialogDelegate::OnAccepted() {
+--- a/brave/chromium_src/chrome/browser/importer/importer_list.cc
++++ b/brave/chromium_src/chrome/browser/importer/importer_list.cc
+@@ -13,8 +13,6 @@
+ #include "base/values.h"
+ #include "brave/common/importer/chrome_importer_utils.h"
+ #include "brave/common/importer/importer_constants.h"
+-#include "brave/components/brave_origin/buildflags/buildflags.h"
+-#include "brave/grit/brave_generated_resources.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/user_data_importer/common/importer_type.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -43,11 +41,12 @@ void AddChromeToProfiles(
+       continue;
+     }
+     user_data_importer::SourceProfile chrome;
+-    chrome.importer_name = base::UTF8ToUTF16(base::StrCat({brand, " ", *name}));
++    chrome.importer_name = base::UTF8ToUTF16(brand);
+     chrome.importer_type = type;
+     chrome.services_supported = items;
+     chrome.source_path = user_data_folder.Append(
+         base::FilePath::StringType(profile->begin(), profile->end()));
++    chrome.profile = base::UTF8ToUTF16(*name);
+     profiles->push_back(chrome);
+   }
+ }
+@@ -81,6 +80,27 @@ void DetectChromeProfiles(
+           base::FilePath::StringType(FILE_PATH_LITERAL("Local State")))),
+       GetCanaryUserDataFolder(), kGoogleChromeBrowserCanary,
+       user_data_importer::TYPE_CHROME);
++
++  AddChromeToProfiles(
++      profiles,
++      GetChromeSourceProfiles(GetArcUserDataFolder().Append(
++          base::FilePath::StringType(FILE_PATH_LITERAL("Local State")))),
++      GetArcUserDataFolder(), kArcBrowser, user_data_importer::TYPE_ARC);
++#endif
++#if BUILDFLAG(IS_MAC)
++  AddChromeToProfiles(
++      profiles,
++      GetChromeSourceProfiles(GetDiaUserDataFolder().Append(
++          base::FilePath::StringType(FILE_PATH_LITERAL("Local State")))),
++      GetDiaUserDataFolder(), kDiaBrowser, user_data_importer::TYPE_DIA);
++#endif
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC)
++  AddChromeToProfiles(
++      profiles,
++      GetChromeSourceProfiles(GetCometUserDataFolder().Append(
++          base::FilePath::StringType(FILE_PATH_LITERAL("Local State")))),
++      GetCometUserDataFolder(), kPerplexityCometBrowser,
++      user_data_importer::TYPE_PERPLEXITY_COMET);
+ #endif
+   AddChromeToProfiles(
+       profiles,
+@@ -132,17 +152,11 @@ void DetectChromeProfiles(
+       user_data_importer::TYPE_OPERA);
+ #endif
+ 
+-#if BUILDFLAG(IS_BRAVE_ORIGIN_BRANDED)
+   AddChromeToProfiles(
+       profiles,
+       GetChromeSourceProfiles(GetBraveUserDataFolder().Append(
+           base::FilePath::StringType(FILE_PATH_LITERAL("Local State")))),
+       GetBraveUserDataFolder(), kBraveBrowser, user_data_importer::TYPE_BRAVE);
+-#endif
+ }
+ 
+ }  // namespace
+-
+-// IDS_BRAVE_IMPORT_FROM_EDGE (substituted into the upstream source by plaster)
+-// is defined in brave/grit/brave_generated_resources.h, included above.
+-#include <chrome/browser/importer/importer_list.cc>
+--- a/third_party/brave/README.chromium
++++ b/third_party/brave/README.chromium
+@@ -7,8 +7,8 @@ Shipped: yes
+ Security Critical: yes
+ 
+ Description:
+-Brave's Containers feature, vendored into //brave with
+-devutils/import_brave.py from helium-chromium.
++Brave's Containers feature and profile importer, vendored into //brave
++with devutils/import_brave.py from helium-chromium.
+ 
+ Local Modifications:
+-See the brave/containers patches in helium-chromium.
++See the brave/containers and brave/importer patches in helium-chromium.
+--- a/brave/common/importer/chrome_importer_utils.cc
++++ b/brave/common/importer/chrome_importer_utils.cc
+@@ -16,7 +16,6 @@
+ #include "base/values.h"
+ #include "brave/common/importer/importer_constants.h"
+ #include "components/user_data_importer/common/importer_data_types.h"
+-#include "components/webdata/common/webdata_constants.h"
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ #include "extensions/common/extension.h"
+@@ -117,12 +116,6 @@ std::optional<base::DictValue> GetChrome
+ }
+ #endif
+ 
+-bool HasPaymentMethods(const base::FilePath& payments_path) {
+-  // We can't import payment from Chrome due to encryption. See
+-  // https://github.com/brave/brave-browser/issues/55377
+-  return false;
+-}
+-
+ bool IsLastActiveProfile(const std::string& profile,
+                          const base::ListValue& last_active_profiles) {
+   for (const auto& it : last_active_profiles) {
+@@ -254,9 +247,6 @@ bool ChromeImporterCanImport(const base:
+     }
+   }
+ 
+-  if (HasPaymentMethods(profile.Append(kWebDataFilename)))
+-    *services_supported |= user_data_importer::PAYMENTS;
+-
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+   if (HasImportableExtensions(profile))
+     *services_supported |= user_data_importer::EXTENSIONS;
