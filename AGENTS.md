@@ -86,3 +86,122 @@ same PR that updates or removes the statement itself.
   Helium wherever practical, so rebasing onto upstream stays possible.
 - Spectra and everything unique to it or to Helium in this repo is
   GPL-3.0. Keep the license file and all upstream credits intact.
+
+## Branches stay clean
+
+- main is always releasable. Nobody pushes to main directly; every
+  change arrives by PR, with CI green and the Codex review checked
+  (see above) before merge.
+- One branch per change, named for what it does, with a short prefix
+  for the kind of work: feat/, fix/, docs/, agents/, chore/,
+  rebrand/ are the established prefixes.
+- Branches are short lived. A branch exists to land one change, not
+  to become a second home for work. If a branch is still open and
+  untouched after about two weeks, it needs a decision: finish it,
+  or close it and record what is left to do as an issue (see
+  "Nothing gets forgotten" below). Never let it quietly rot.
+- Delete branches when their PR merges or closes. A merged branch
+  that still exists is clutter, not a backup; the history is in main.
+- Keep an open branch current with main while it lives, so merges
+  never arrive as a pile of stale conflicts.
+- Never force push over someone else's work, and never rewrite
+  history on main.
+
+## Releases are deliberate
+
+- Spectra follows the version scheme of the Helium and Chromium base
+  it ships, with its own release notes. Do not invent a competing
+  version story.
+- A release is cut from main only, with CI green on the exact commit
+  being released, and only through the release workflow or process
+  documented at the time. No hand built one off releases.
+- Every release gets notes: what changed, what is known broken, and
+  which Helium and Chromium versions it is based on.
+- The PR or change that cuts the first release, and every release
+  after it, must sweep the README watch list above in the same work:
+  release related statements are updated when the release happens,
+  not later.
+- Never edit, move, or delete a published release or its tag to make
+  it look different. Fixes ship as a new release.
+- If a release fails partway, say so plainly in the PR or issue
+  tracking it. A half published release left silent is a stale fact
+  waiting to mislead someone.
+
+## CI workflows stay healthy
+
+- The workflows under .github/workflows are part of the product.
+  Treat a workflow change with the same care as a code change: its
+  own branch, its own PR, Codex review checked.
+- Never merge with red CI. A failing check is information, not an
+  obstacle to route around. Do not disable, skip, or weaken a check
+  to make a PR pass; fix the cause, or record the problem as an
+  issue and leave the PR unmerged.
+- Workflow edits are tested by the workflow itself running on the
+  branch before merge wherever the trigger allows. A workflow that
+  has never run successfully does not merge.
+- Keep the third party actions used by the workflows current. Action
+  versions age silently; they are on the maintenance sweep list
+  below, and a version bump is a normal small PR, never a someday
+  task.
+- Secrets never appear in workflow files, logs, or artifacts. A
+  workflow that needs a new secret stops and asks Lu; it does not
+  invent a workaround.
+- Cancel or supersede runs that no longer matter instead of letting
+  the queue fill with stale builds. Long Chromium builds especially:
+  one current build per branch is enough.
+
+## Nothing gets forgotten
+
+Lu's standing rule for this project: nothing is left to go stale,
+unmaintained, or forgotten about. That only works if deferred work
+lives somewhere an agent will actually see it again.
+
+- Every deferred item, follow up, known issue, and "do this later"
+  goes in exactly one durable place before the PR that created it
+  closes: a GitHub issue in this repo, or an entry on the watch list
+  in this file. A follow up mentioned only in a PR description, a
+  review comment, or a chat message does not exist.
+- Issues carry enough context to be picked up cold: what, why, and
+  what done looks like. Close issues in the PR that resolves them,
+  with the closing keyword, so nothing lingers as done but open.
+- When you notice something stale while doing other work (an old
+  branch, a red workflow nobody owns, a doc claim that drifted, a
+  pin that aged), either fix it in scope or file the issue in the
+  same session. Noticing and walking past is the failure this
+  section exists to prevent.
+
+### The maintenance sweep
+
+On a regular pass, and whenever Lu asks for a tidy up, check each of
+these and act on what you find. This list is the memory of the repo;
+keep it complete. When something new starts aging (a new workflow, a
+new pin, a new platform repo), add it here in the same change.
+
+- Upstream: imputnet/helium releases and changes Spectra should
+  absorb, and the state of Spectra's patch layer against them.
+- Platform repos: luinbytes/spectra-linux exists and has its own
+  AGENTS.md. Rule changes here should be considered for it, and
+  vice versa, in the same piece of work, so the two never drift
+  apart unnoticed. Any future platform repo joins this list when it
+  is created.
+- Workflows and the versions of the actions they use.
+- Open branches and PRs: anything untouched for about two weeks
+  gets a decision, per the branch rules above.
+- Open issues: anything with no activity and no owner gets triaged,
+  closed with a reason, or picked up.
+- The README watch list above: every statement still true, every
+  trigger still ahead of us rather than behind us.
+- Pins and inputs that age: Chromium version references, GN flags,
+  and any version pinned anywhere in the repo.
+
+## Repository hygiene
+
+- No build output, archives, or generated artifacts get committed.
+  If a build product needs keeping, it belongs on a release, not in
+  git. If something generated does belong in the repo, its PR says
+  why and how it is regenerated.
+- Keep the patch series tidy and ordered; a patch that no longer
+  applies is fixed or removed in the change that breaks it, never
+  left failing for the next person.
+- Big or binary additions need a reason stated in the PR. Repo size
+  is a cost every clone pays forever.
