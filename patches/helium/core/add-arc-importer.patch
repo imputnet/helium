@@ -1,3 +1,76 @@
+--- a/chrome/utility/BUILD.gn
++++ b/chrome/utility/BUILD.gn
+@@ -95,6 +95,8 @@ static_library("utility") {
+ 
+   if (!is_android) {
+     sources += [
++      "importer/arc_sidebar_importer.cc",
++      "importer/arc_sidebar_importer.h",
+       "importer/bookmarks_file_importer.cc",
+       "importer/bookmarks_file_importer.h",
+       "importer/external_process_importer_bridge.cc",
+--- a/brave/common/importer/chrome_importer_utils.cc
++++ b/brave/common/importer/chrome_importer_utils.cc
+@@ -229,6 +229,16 @@ bool ChromeImporterCanImport(const base:
+     *services_supported |= user_data_importer::FAVORITES;
+   }
+ 
++  // Arc stores sidebar items (pinned tabs, top apps, folders) in
++  // StorableSidebar.json at the Arc root, two levels above the profile dir.
++  if (type == user_data_importer::TYPE_ARC) {
++    base::FilePath sidebar = profile.DirName().DirName().Append(
++        base::FilePath::StringType(FILE_PATH_LITERAL("StorableSidebar.json")));
++    if (base::PathExists(sidebar)) {
++      *services_supported |= user_data_importer::FAVORITES;
++    }
++  }
++
+   base::FilePath history =
+       profile.Append(base::FilePath::StringType(FILE_PATH_LITERAL("History")));
+   if (base::PathExists(history)) {
+--- a/brave/utility/importer/brave_profile_import_impl.cc
++++ b/brave/utility/importer/brave_profile_import_impl.cc
+@@ -18,6 +18,7 @@
+ #include "brave/utility/importer/chrome_importer.h"
+ #include "build/build_config.h"
+ #include "chrome/common/importer/profile_import.mojom.h"
++#include "chrome/utility/importer/arc_sidebar_importer.h"
+ #include "chrome/utility/importer/external_process_importer_bridge.h"
+ #include "chrome/utility/importer/importer.h"
+ #include "components/user_data_importer/common/importer_type.h"
+@@ -43,7 +44,7 @@ scoped_refptr<Importer> CreateImporterBy
+     case user_data_importer::TYPE_WHALE:
+       return new ChromeImporter();
+     case user_data_importer::TYPE_ARC:
+-      return new ChromeImporter();
++      return new ArcSidebarImporter();
+     case user_data_importer::TYPE_DIA:
+       return new ChromeImporter();
+     case user_data_importer::TYPE_PERPLEXITY_COMET:
+--- a/brave/utility/importer/chrome_importer.h
++++ b/brave/utility/importer/chrome_importer.h
+@@ -46,10 +46,11 @@ class ChromeImporter : public Importer {
+  protected:
+   ~ChromeImporter() override;
+ 
+-  void ImportBookmarks();
++  virtual void ImportBookmarks();
+   void ImportHistory();
+ 
+   base::FilePath source_path_;
++  std::u16string importer_name_;
+ 
+  private:
+   // Multiple URLs can share the same favicon; this is a map
+@@ -70,8 +71,6 @@ class ChromeImporter : public Importer {
+       const std::vector<std::u16string>& parent_path,
+       bool is_in_toolbar,
+       std::vector<user_data_importer::ImportedBookmarkEntry>* bookmarks);
+-
+-  std::u16string importer_name_;
+ };
+ 
+ #endif  // BRAVE_UTILITY_IMPORTER_CHROME_IMPORTER_H_
 --- /dev/null
 +++ b/chrome/utility/importer/arc_sidebar_importer.cc
 @@ -0,0 +1,350 @@
@@ -364,7 +437,7 @@
 +#include <string>
 +#include <vector>
 +
-+#include "chrome/utility/importer/chrome_importer.h"
++#include "brave/utility/importer/chrome_importer.h"
 +
 +namespace user_data_importer {
 +struct ImportedBookmarkEntry;
@@ -388,84 +461,3 @@
 +};
 +
 +#endif  // CHROME_UTILITY_IMPORTER_ARC_SIDEBAR_IMPORTER_H_
---- a/chrome/common/importer/chrome_importer_utils.cc
-+++ b/chrome/common/importer/chrome_importer_utils.cc
-@@ -201,6 +201,16 @@ bool ChromeImporterCanImport(const base:
-     *services_supported |= user_data_importer::FAVORITES;
-   }
- 
-+  // Arc stores sidebar items (pinned tabs, top apps, folders) in
-+  // StorableSidebar.json at the Arc root, two levels above the profile dir.
-+  if (type == user_data_importer::TYPE_ARC) {
-+    base::FilePath sidebar = profile.DirName().DirName().Append(
-+        base::FilePath::StringType(FILE_PATH_LITERAL("StorableSidebar.json")));
-+    if (base::PathExists(sidebar)) {
-+      *services_supported |= user_data_importer::FAVORITES;
-+    }
-+  }
-+
-   base::FilePath history =
-       profile.Append(base::FilePath::StringType(FILE_PATH_LITERAL("History")));
-   if (base::PathExists(history)) {
---- a/chrome/utility/BUILD.gn
-+++ b/chrome/utility/BUILD.gn
-@@ -100,6 +100,8 @@ static_library("utility") {
-       "importer/brave_external_process_importer_bridge.h",
-       "importer/brave_profile_import_impl.cc",
-       "importer/brave_profile_import_impl.h",
-+      "importer/arc_sidebar_importer.cc",
-+      "importer/arc_sidebar_importer.h",
-       "importer/chrome_importer.cc",
-       "importer/chrome_importer.h",
-       "importer/external_process_importer_bridge.cc",
---- a/chrome/utility/importer/brave_profile_import_impl.cc
-+++ b/chrome/utility/importer/brave_profile_import_impl.cc
-@@ -15,10 +15,11 @@
- #include "base/notreached.h"
- #include "base/task/single_thread_task_runner.h"
- #include "base/threading/thread.h"
--#include "chrome/utility/importer/brave_external_process_importer_bridge.h"
--#include "chrome/utility/importer/chrome_importer.h"
- #include "build/build_config.h"
- #include "chrome/common/importer/profile_import.mojom.h"
-+#include "chrome/utility/importer/arc_sidebar_importer.h"
-+#include "chrome/utility/importer/brave_external_process_importer_bridge.h"
-+#include "chrome/utility/importer/chrome_importer.h"
- #include "chrome/utility/importer/external_process_importer_bridge.h"
- #include "chrome/utility/importer/importer.h"
- #include "components/user_data_importer/common/importer_type.h"
-@@ -44,7 +45,7 @@ scoped_refptr<Importer> CreateImporterBy
-     case user_data_importer::TYPE_WHALE:
-       return new ChromeImporter();
-     case user_data_importer::TYPE_ARC:
--      return new ChromeImporter();
-+      return new ArcSidebarImporter();
-     case user_data_importer::TYPE_DIA:
-       return new ChromeImporter();
-     case user_data_importer::TYPE_PERPLEXITY_COMET:
---- a/chrome/utility/importer/chrome_importer.h
-+++ b/chrome/utility/importer/chrome_importer.h
-@@ -43,12 +43,13 @@ class ChromeImporter : public Importer {
-  protected:
-   ~ChromeImporter() override;
- 
--  void ImportBookmarks();
-+  virtual void ImportBookmarks();
-   void ImportHistory();
- 
-   double chromeTimeToDouble(int64_t time);
- 
-   base::FilePath source_path_;
-+  std::u16string importer_name_;
- 
-  private:
-   // Multiple URLs can share the same favicon; this is a map
-@@ -69,8 +70,6 @@ class ChromeImporter : public Importer {
-       const std::vector<std::u16string>& parent_path,
-       bool is_in_toolbar,
-       std::vector<user_data_importer::ImportedBookmarkEntry>* bookmarks);
--
--  std::u16string importer_name_;
- };
- 
- #endif  // BRAVE_UTILITY_IMPORTER_CHROME_IMPORTER_H_
