@@ -98,7 +98,7 @@ same PR that updates or removes the statement itself.
 - Branches are short lived. A branch exists to land one change, not
   to become a second home for work. If a branch is still open and
   untouched after about two weeks, it needs a decision: finish it,
-  or close it and record what is left to do as an issue (see
+  or close it and record what is left to do on the watch list (see
   "Nothing gets forgotten" below). Never let it quietly rot.
 - Delete branches when their PR merges or closes. A merged branch
   that still exists is clutter, not a backup; the history is in main.
@@ -158,12 +158,21 @@ lives somewhere an agent will actually see it again.
 
 - Every deferred item, follow up, known issue, and "do this later"
   goes in exactly one durable place before the PR that created it
-  closes: a GitHub issue in this repo, or an entry on the watch list
-  in this file. A follow up mentioned only in a PR description, a
-  review comment, or a chat message does not exist.
-- Issues carry enough context to be picked up cold: what, why, and
-  what done looks like. Close issues in the PR that resolves them,
-  with the closing keyword, so nothing lingers as done but open.
+  closes: an entry on the watch list in this file, by default. A
+  follow up mentioned only in a PR description, a review comment,
+  or a chat message does not exist.
+- GitHub issues in Lu's repositories are work orders for his agent
+  swarms: an opened issue is picked up by the swarm, worked through
+  to a PR, and left for Lu to review. That is a global rule of Lu's,
+  not a habit of this repo. So open an issue only when the item is
+  meant to be solved by the swarm, never as passive tracking,
+  parking, or a note to self. Tracking that is not for the swarm
+  lives on the watch list or in the docs.
+- When an issue is opened for the swarm, it must be descriptive and
+  actually helpful, because the swarm works from the issue text
+  alone: what is wanted, why, and what done looks like. Close
+  issues in the PR that resolves them, with the closing keyword,
+  so nothing lingers as done but open.
 - When you notice something stale while doing other work (an old
   branch, a red workflow nobody owns, a doc claim that drifted, a
   pin that aged), either fix it in scope or file the issue in the
