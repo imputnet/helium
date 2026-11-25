@@ -1,6 +1,6 @@
 --- a/components/sync/engine/BUILD.gn
 +++ b/components/sync/engine/BUILD.gn
-@@ -194,6 +194,7 @@ static_library("engine") {
+@@ -196,6 +196,7 @@ static_library("engine") {
      "//base:i18n",
      "//build:branding_buildflags",
      "//components/autofill/core/browser:payments_sync_utils",
@@ -107,61 +107,49 @@
 +}  // namespace history
 +
 +#endif  // COMPONENTS_HISTORY_CORE_COMMON_HISTORY_EXPIRATION_H_
---- a/components/sync/engine/loopback_server/loopback_server.cc
-+++ b/components/sync/engine/loopback_server/loopback_server.cc
-@@ -5,7 +5,6 @@
- #include "components/sync/engine/loopback_server/loopback_server.h"
+--- a/components/sync/engine/loopback_server/loopback_server_state_delta.cc
++++ b/components/sync/engine/loopback_server/loopback_server_state_delta.cc
+@@ -140,6 +140,23 @@ LoopbackServerVaultState::LoopbackServer
  
- #include <algorithm>
--#include <limits>
- #include <map>
- #include <set>
- #include <string_view>
-@@ -1131,6 +1130,26 @@ size_t LoopbackServer::GetEntityCount()
-   return entities_.size();
- }
+ LoopbackServerVaultState::~LoopbackServerVaultState() = default;
  
-+bool LoopbackServer::GarbageCollectHistoryBefore(base::Time cutoff) {
-+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  const int64_t cutoff_windows_micros =
-+      cutoff.ToDeltaSinceWindowsEpoch().InMicroseconds();
-+  const size_t removed =
-+      std::erase_if(entities_, [&](const auto& id_and_entity) {
-+        const LoopbackServerEntity& entity = *id_and_entity.second;
-+        if (entity.GetDataType() != syncer::HISTORY || entity.IsDeleted()) {
-+          return false;
-+        }
-+        const std::optional<int64_t> visit_time = entity.GetHistoryVisitTime();
-+        return !visit_time || *visit_time < cutoff_windows_micros;
-+      });
-+  if (removed == 0) {
-+    return false;
-+  }
-+  ScheduleSaveStateToFile();
-+  return true;
++void LoopbackServerVaultState::CollectGarbage(base::Time history_cutoff) {
++  const int64_t cutoff_micros =
++      history_cutoff.ToDeltaSinceWindowsEpoch().InMicroseconds();
++  std::erase_if(server_.entities_, [&](const auto& entry) {
++    const LoopbackServerEntity& entity = *entry.second;
++    if (entity.GetDataType() != HISTORY || entity.IsDeleted()) {
++      return false;
++    }
++    const std::optional<int64_t> visit_time = entity.GetHistoryVisitTime();
++    if (visit_time && *visit_time >= cutoff_micros) {
++      return false;
++    }
++    removed_entity_ids_.insert(entry.first);
++    return true;
++  });
 +}
 +
- bool LoopbackServer::ScheduleSaveStateToFile() {
-   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-   if (!writer_) {
---- a/components/sync/engine/loopback_server/loopback_server.h
-+++ b/components/sync/engine/loopback_server/loopback_server.h
-@@ -20,6 +20,7 @@
- #include "base/functional/callback.h"
- #include "base/memory/raw_ptr.h"
- #include "base/sequence_checker.h"
-+#include "base/time/time.h"
- #include "base/values.h"
- #include "components/sync/base/data_type.h"
- #include "components/sync/engine/loopback_server/loopback_server_entity.h"
-@@ -131,6 +132,10 @@ class LoopbackServer : public base::Impo
-                             int64_t last_version_assigned);
-   size_t GetEntityCount() const;
+ bool LoopbackServerVaultState::HasChanges() const {
+   return RequiresSnapshot() || server_.version_ != written_version_ ||
+          !removed_entity_ids_.empty();
+--- a/components/sync/engine/loopback_server/loopback_server_state_delta.h
++++ b/components/sync/engine/loopback_server/loopback_server_state_delta.h
+@@ -12,6 +12,7 @@
  
-+  // Removes history visits older than |cutoff|.
-+  // Returns true if the server state changed.
-+  bool GarbageCollectHistoryBefore(base::Time cutoff);
+ #include "base/containers/span.h"
+ #include "base/functional/function_ref.h"
++#include "base/time/time.h"
+ #include "components/sync/engine/loopback_server/loopback_server.h"
+ 
+ namespace syncer {
+@@ -41,6 +42,9 @@ class LoopbackServerVaultState {
+   LoopbackServer& server() { return server_; }
+   size_t entity_count() const { return server_.entities_.size(); }
+ 
++  // Removes history older than `history_cutoff`.
++  void CollectGarbage(base::Time history_cutoff);
 +
-   const std::vector<std::vector<uint8_t>>& GetKeystoreKeysForTesting() const {
-     return keystore_keys_;
-   }
+   // Whether the server changed since the last payload was read or written.
+   bool HasChanges() const;
+   // Whether the changes must be written as a snapshot.
