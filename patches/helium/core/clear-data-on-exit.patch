@@ -1,0 +1,108 @@
+--- a/components/browsing_data/core/pref_names.cc
++++ b/components/browsing_data/core/pref_names.cc
+@@ -36,6 +36,12 @@ void RegisterBrowserUserPrefs(user_prefs
+   registry->RegisterBooleanPref(kDeleteHostedAppsData, false);
+   registry->RegisterBooleanPref(kDeleteSiteSettings, false);
+   registry->RegisterBooleanPref(kDeleteSkills, false);
++  registry->RegisterBooleanPref(kDeleteBrowsingHistoryOnExit, false);
++  registry->RegisterBooleanPref(kDeleteDownloadHistoryOnExit, false);
++  registry->RegisterBooleanPref(kDeleteCacheOnExit, false);
++  registry->RegisterBooleanPref(kDeleteCookiesOnExit, false);
++  registry->RegisterBooleanPref(kDeleteHostedAppsDataOnExit, false);
++  registry->RegisterBooleanPref(kDeleteSiteSettingsOnExit, false);
+ #else
+   registry->RegisterInt64Pref(prefs::kLastClearBrowsingDataTime, 0);
+ #endif  // !BUILDFLAG(IS_IOS)
+--- a/components/browsing_data/core/pref_names.h
++++ b/components/browsing_data/core/pref_names.h
+@@ -51,6 +51,20 @@ inline constexpr char kDeleteSiteSetting
+ inline constexpr char kDeleteSkills[] = "browser.clear_data.skills";
+ inline constexpr char kCloseTabs[] = "browser.clear_data.close_tabs";
+ 
++// Data types to delete when the last window of the profile is closed. Each name
++// is the matching dialog datatype preference above followed by "_on_exit".
++inline constexpr char kDeleteBrowsingHistoryOnExit[] =
++    "browser.clear_data.browsing_history_on_exit";
++inline constexpr char kDeleteDownloadHistoryOnExit[] =
++    "browser.clear_data.download_history_on_exit";
++inline constexpr char kDeleteCacheOnExit[] = "browser.clear_data.cache_on_exit";
++inline constexpr char kDeleteCookiesOnExit[] =
++    "browser.clear_data.cookies_on_exit";
++inline constexpr char kDeleteHostedAppsDataOnExit[] =
++    "browser.clear_data.hosted_apps_data_on_exit";
++inline constexpr char kDeleteSiteSettingsOnExit[] =
++    "browser.clear_data.site_settings_on_exit";
++
+ // Other Clear Browsing Data preferences.
+ inline constexpr char kLastClearBrowsingDataTime[] =
+     "browser.last_clear_browsing_data_time";
+--- a/chrome/browser/browsing_data/chrome_browsing_data_lifetime_manager.cc
++++ b/chrome/browser/browsing_data/chrome_browsing_data_lifetime_manager.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/common/pref_names.h"
+ #include "components/browsing_data/core/browsing_data_policies_utils.h"
+ #include "components/browsing_data/core/pref_names.h"
++#include "components/history/core/common/pref_names.h"
+ #include "components/keep_alive_registry/keep_alive_types.h"
+ #include "components/keep_alive_registry/scoped_keep_alive.h"
+ #include "components/prefs/pref_service.h"
+@@ -62,6 +63,26 @@ constexpr int kInitialCleanupDelayInSeco
+ constexpr int kTestCleanupPeriodInMinutes = 5;
+ constexpr int kDefaultCleanupPeriodInMinutes = 30;
+ 
++// A delete-on-exit pref and the ClearBrowsingDataOnExitList data type it
++// corresponds to.
++struct OnExitPrefDataType {
++  const char* pref;
++  const char* data_type;
++  // Whether prefs::kAllowDeletingBrowserHistory applies to the data type.
++  bool is_history = false;
++};
++
++constexpr OnExitPrefDataType kOnExitPrefsDataTypes[] = {
++    {browsing_data::prefs::kDeleteBrowsingHistoryOnExit, "browsing_history",
++     /*is_history=*/true},
++    {browsing_data::prefs::kDeleteDownloadHistoryOnExit, "download_history",
++     /*is_history=*/true},
++    {browsing_data::prefs::kDeleteCacheOnExit, "cached_images_and_files"},
++    {browsing_data::prefs::kDeleteCookiesOnExit, "cookies_and_other_site_data"},
++    {browsing_data::prefs::kDeleteSiteSettingsOnExit, "site_settings"},
++    {browsing_data::prefs::kDeleteHostedAppsDataOnExit, "hosted_app_data"},
++};
++
+ using ScheduledRemovalSettings =
+     ChromeBrowsingDataLifetimeManager::ScheduledRemovalSettings;
+ 
+@@ -344,8 +365,19 @@ void ChromeBrowsingDataLifetimeManager::
+ 
+ void ChromeBrowsingDataLifetimeManager::ClearBrowsingDataForOnExitPolicy(
+     bool keep_browser_alive) {
+-  const base::ListValue& data_types = profile_->GetPrefs()->GetList(
+-      browsing_data::prefs::kClearBrowsingDataOnExitList);
++  base::ListValue data_types =
++      profile_->GetPrefs()
++          ->GetList(browsing_data::prefs::kClearBrowsingDataOnExitList)
++          .Clone();
++
++  const bool may_delete_history =
++      profile_->GetPrefs()->GetBoolean(prefs::kAllowDeletingBrowserHistory);
++  for (const auto& [pref, data_type, is_history] : kOnExitPrefsDataTypes) {
++    if (profile_->GetPrefs()->GetBoolean(pref) &&
++        (may_delete_history || !is_history)) {
++      data_types.Append(data_type);
++    }
++  }
+ 
+   bool cdoe = base::FeatureList::IsEnabled(features::kClearDataOnExit);
+   if (cdoe || (!data_types.empty() &&
+--- a/chrome/browser/profiles/profile_manager.cc
++++ b/chrome/browser/profiles/profile_manager.cc
+@@ -2329,7 +2329,7 @@ void ProfileManager::OnBrowserClosed(Bro
+   base::FilePath path = profile->GetPath();
+   if (IsProfileDirectoryMarkedForDeletion(path)) {
+     // Do nothing if the profile is already being deleted.
+-  } else if (!profile->IsOffTheRecord()) {
++  } else if (!profile->IsGuestSession()) {
+     auto* browsing_data_lifetime_manager =
+         ChromeBrowsingDataLifetimeManagerFactory::GetForProfile(
+             original_profile);
