@@ -268,7 +268,7 @@
 +        return GetDummyURL();
 +    }
 +
-+    return GetServicesBaseURL(prefs).Resolve("/ext");
++    return GetServicesBaseURL(prefs).Resolve("/ext/");
 +}
 +
 +GURL GetWebstoreSnippetURL(const PrefService& prefs, std::string_view id) {
@@ -370,17 +370,7 @@
  #include "components/update_client/update_query_params.h"
  #include "content/public/browser/browser_context.h"
  #include "content/public/browser/browser_task_traits.h"
-@@ -214,9 +217,6 @@ void ExtensionUpdater::EnsureDownloaderC
-   if (!downloader_.get()) {
-     downloader_ = downloader_factory_.Run(this);
-   }
--  if (!update_service_) {
--    update_service_ = UpdateService::Get(profile_);
--  }
- }
- 
- void ExtensionUpdater::Start() {
-@@ -235,6 +235,15 @@ void ExtensionUpdater::Start() {
+@@ -235,6 +238,15 @@ void ExtensionUpdater::Start() {
      CheckSoon();
      ScheduleNextCheck();
    }
@@ -396,26 +386,36 @@
  }
  
  void ExtensionUpdater::Stop() {
-@@ -566,7 +575,7 @@ void ExtensionUpdater::CheckNow(CheckPar
-   // OnExtensionDownloadFinished for each extension that was checked.
-   downloader_->StartAllPending(extension_cache_);
- 
--  if (awaiting_update_service) {
-+  if (awaiting_update_service && update_service_) {
-     update_service_->StartUpdateCheck(
-         update_check_params, params.update_found_callback,
-         base::BindOnce(&ExtensionUpdater::OnUpdateServiceFinished,
-@@ -789,8 +798,8 @@ void ExtensionUpdater::CleanUpCrxFileIfN
- bool ExtensionUpdater::CanUseUpdateService(
-     const Extension* extension,
-     const PendingExtensionInfo* info) const {
--  if (g_force_use_update_service_for_tests) {
--    return true;
-+  if ((true)) {
-+    return false;
+@@ -800,11 +812,24 @@ bool ExtensionUpdater::CanUseUpdateServi
+     return false;
    }
  
-   // UpdateService can only update extensions that have been installed on the
+-  // UpdateService can only update extensions from the store. If `update_url`
+-  // is empty, we default to checking from the store.
+-  GURL update_url = GetEffectiveUpdateURL(*extension);
+-  return update_url.is_empty() ||
+-         extension_urls::IsWebstoreUpdateUrl(update_url);
++  // UpdateService can only update extensions from the store, which are
++  // checked through Helium services. update_client only talks HTTPS, so
++  // services on an http loopback origin stay with ExtensionDownloader.
++  const GURL store_url = helium::GetExtensionUpdateURL(*prefs_);
++  if (!store_url.SchemeIsCryptographic()) {
++    return false;
++  }
++
++  // An extension that's also pending, e.g. for a repair, is checked at the
++  // URL it was queued with. When that isn't the store, like a policy's own
++  // server, leave it to ExtensionDownloader.
++  if (info && !info->update_url().is_empty() &&
++      info->update_url() != store_url &&
++      !extension_urls::IsWebstoreUpdateUrl(info->update_url())) {
++    return false;
++  }
++
++  return GetEffectiveUpdateURL(*extension) == store_url;
+ }
+ 
+ void ExtensionUpdater::InstallCRXFile(FetchedCRXFile crx_file) {
 --- a/extensions/browser/webstore_installer.cc
 +++ b/extensions/browser/webstore_installer.cc
 @@ -29,7 +29,9 @@
@@ -618,3 +618,102 @@
      "//content/public/browser",
      "//extensions/buildflags",
      "//extensions/common",
+--- a/chrome/browser/extensions/updater/chrome_update_client_config.cc
++++ b/chrome/browser/extensions/updater/chrome_update_client_config.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/update_client/chrome_update_query_params_delegate.h"
+ #include "chrome/common/channel_info.h"
+ #include "chrome/common/chrome_paths.h"
++#include "components/helium_services/helium_services_helpers.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/services/patch/content/patch_service.h"
+ #include "components/services/unzip/content/unzip_service.h"
+@@ -41,7 +42,11 @@
+ #include "components/update_client/patch/patch_impl.h"
+ #include "components/update_client/patcher.h"
+ #include "components/update_client/persisted_data.h"
++#include "components/update_client/protocol_definition.h"
+ #include "components/update_client/protocol_handler.h"
++#include "components/update_client/protocol_parser_json.h"
++#include "components/update_client/protocol_serializer.h"
++#include "components/update_client/protocol_serializer_json.h"
+ #include "components/update_client/unzip/unzip_impl.h"
+ #include "components/update_client/unzipper.h"
+ #include "components/update_client/update_query_params.h"
+@@ -173,6 +178,43 @@ void ExtensionActivityDataService::OnExt
+   extension_prefs_ = nullptr;
+ }
+ 
++// Store extensions are checked through Helium services, which only need to
++// know which extensions to check. Rebuild each request from their ids,
++// versions and update check flags, leaving out everything else that
++// update_client would say about the device, browser, profile, and how the
++// extensions are used.
++class MinimalProtocolSerializer final
++    : public update_client::ProtocolSerializer {
++ public:
++  std::string Serialize(
++      const update_client::protocol_request::Request& request) const override {
++    update_client::protocol_request::Request minimal;
++    minimal.protocol_version = request.protocol_version;
++    minimal.session_id = request.session_id;
++    minimal.request_id = request.request_id;
++    minimal.updatername = request.updatername;
++    for (const auto& app : request.apps) {
++      auto& minimal_app = minimal.apps.emplace_back();
++      minimal_app.app_id = app.app_id;
++      minimal_app.version = app.version;
++      minimal_app.update_check = app.update_check;
++    }
++    return update_client::ProtocolSerializerJSON().Serialize(minimal);
++  }
++};
++
++class MinimalProtocolHandlerFactory final
++    : public update_client::ProtocolHandlerFactory {
++ public:
++  std::unique_ptr<update_client::ProtocolParser> CreateParser() const override {
++    return std::make_unique<update_client::ProtocolParserJSON>();
++  }
++  std::unique_ptr<update_client::ProtocolSerializer> CreateSerializer()
++      const override {
++    return std::make_unique<MinimalProtocolSerializer>();
++  }
++};
++
+ }  // namespace
+ 
+ // For privacy reasons, requires encryption of the component updater
+@@ -224,7 +266,11 @@ std::vector<GURL> ChromeUpdateClientConf
+   if (url_override_.has_value()) {
+     return {*url_override_};
+   }
+-  return impl_.UpdateUrl();
++  PrefService* prefs = GetPrefService();
++  if (!prefs) {
++    return {};
++  }
++  return {helium::GetExtensionUpdateURL(*prefs)};
+ }
+ 
+ std::vector<GURL> ChromeUpdateClientConfig::PingUrl() const {
+@@ -243,7 +289,9 @@ std::string ChromeUpdateClientConfig::Ge
+ 
+ base::Version ChromeUpdateClientConfig::GetBrowserVersion() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return impl_.GetBrowserVersion();
++  // Requests leave this out, but update check headers still carry it, so
++  // don't be more specific than the user agent.
++  return base::Version({impl_.GetBrowserVersion().components()[0], 0, 0, 0});
+ }
+ 
+ std::string ChromeUpdateClientConfig::GetChannel() const {
+@@ -366,7 +414,7 @@ bool ChromeUpdateClientConfig::IsPerUser
+ std::unique_ptr<update_client::ProtocolHandlerFactory>
+ ChromeUpdateClientConfig::GetProtocolHandlerFactory() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  return impl_.GetProtocolHandlerFactory();
++  return std::make_unique<MinimalProtocolHandlerFactory>();
+ }
+ 
+ std::optional<bool> ChromeUpdateClientConfig::IsMachineExternallyManaged()
