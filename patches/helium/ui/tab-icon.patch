@@ -56,7 +56,7 @@
  #include "ui/base/metadata/metadata_impl_macros.h"
  #include "ui/base/resource/resource_bundle.h"
  #include "ui/base/theme_provider.h"
-@@ -50,11 +52,12 @@
+@@ -50,6 +52,8 @@
  namespace {
  
  constexpr int kAttentionIndicatorRadius = 3;
@@ -64,15 +64,44 @@
 +constexpr float kDiscardedFaviconOpacity = 0.5f;
  constexpr int kLoadingAnimationStrokeWidthDp = 2;
  
--bool NetworkStateIsAnimated(tabs::TabNetworkState network_state) {
--  return network_state != tabs::TabNetworkState::kNone &&
--         network_state != tabs::TabNetworkState::kError;
-+bool NetworkStateIsAnimated(tabs::TabNetworkState) {
-+  return false;
+ bool NetworkStateIsAnimated(tabs::TabNetworkState network_state) {
+@@ -57,6 +61,35 @@ bool NetworkStateIsAnimated(tabs::TabNet
+          network_state != tabs::TabNetworkState::kError;
  }
  
++// Fades the favicon to a partially transparent grayscale version as the tab is
++// discarded. Opacity and saturation follow the same animation.
++cc::PaintFlags GetDiscardedFaviconFlags(double discard_fraction,
++                                        const views::Widget* widget) {
++  cc::PaintFlags flags;
++  if (discard_fraction == 0.0) {
++    return flags;
++  }
++
++  flags.setAlphaf(gfx::Tween::FloatValueBetween(discard_fraction, 1.0f,
++                                                kDiscardedFaviconOpacity));
++
++  SkColorMatrix color_matrix;
++  color_matrix.setSaturation(
++      gfx::Tween::FloatValueBetween(discard_fraction, 1.0f, 0.0f));
++  if (widget &&
++      widget->GetColorMode() == ui::ColorProviderKey::ColorMode::kDark) {
++    // Lift dark grayscale tones for contrast against dark tab backgrounds.
++    const float brightness = gfx::Tween::FloatValueBetween(
++        discard_fraction, 0.0f, kDiscardedFaviconDarkModeBrightness);
++    color_matrix.postTranslate(brightness, brightness, brightness, 0.0f);
++  }
++  // 4x5 matrix expected by cc::ColorFilter
++  float matrix_data[20];
++  color_matrix.getRowMajor(matrix_data);
++  flags.setColorFilter(cc::ColorFilter::MakeMatrix(matrix_data));
++  return flags;
++}
++
  }  // namespace
-@@ -126,7 +129,7 @@ void TabIcon::SetData(const tabs::TabDat
+ 
+ DEFINE_CUSTOM_ELEMENT_EVENT_TYPE(kDiscardAnimationFinishes);
+@@ -126,7 +159,7 @@ void TabIcon::SetData(const tabs::TabDat
    SetIcon(data.favicon, data.should_themify_favicon);
    SetNetworkState(data.network_state);
    SetCrashed(data.is_crashed);
@@ -81,7 +110,7 @@
    has_tab_data_ = true;
  
    UpdateThrobber();
-@@ -194,12 +197,7 @@ void TabIcon::StepLoadingAnimation(const
+@@ -194,12 +227,7 @@ void TabIcon::StepLoadingAnimation(const
    }
  }
  
@@ -95,7 +124,7 @@
  
  void TabIcon::OnDiscardRingTreatmentEnabledChanged() {
    discard_ring_treatment_enabled_ =
-@@ -212,13 +210,8 @@ void TabIcon::OnDiscardRingTreatmentEnab
+@@ -212,13 +240,8 @@ void TabIcon::OnDiscardRingTreatmentEnab
      was_discard_indicator_shown_ = show_discard_indicator;
  
      // Directly set animations to their end states and do not animate.
@@ -111,19 +140,16 @@
      SchedulePaint();
    }
  }
-@@ -242,8 +235,9 @@ void TabIcon::OnPaint(gfx::Canvas* canva
+@@ -242,8 +265,6 @@ void TabIcon::OnPaint(gfx::Canvas* canva
    if (!GetShowingLoadingAnimation() && GetShowingAttentionIndicator() &&
        !should_display_crashed_favicon_) {
      PaintAttentionIndicatorAndIcon(canvas, GetIconToPaint(), icon_bounds);
 -  } else if (was_discard_indicator_shown_) {
 -    PaintDiscardRingAndIcon(canvas, GetIconToPaint(), icon_bounds);
-+  } else if (was_discard_indicator_shown_ ||
-+             tab_discard_animation_.is_animating()) {
-+    PaintDiscardedFavicon(canvas, GetIconToPaint(), icon_bounds);
    } else {
      MaybePaintFavicon(canvas, GetIconToPaint(), icon_bounds);
    }
-@@ -310,30 +304,46 @@ void TabIcon::PaintAttentionIndicatorAnd
+@@ -310,32 +331,6 @@ void TabIcon::PaintAttentionIndicatorAnd
    canvas->DrawCircle(circle_center, kAttentionIndicatorRadius, indicator_flags);
  }
  
@@ -151,75 +177,42 @@
 -  PaintRingDottedPath(
 -      canvas, discard_ring_bounds, ring_color,
 -      /*opacity_ratio=*/tab_discard_animation_.GetCurrentValue());
-+void TabIcon::PaintDiscardedFavicon(gfx::Canvas* canvas,
-+                                    const gfx::ImageSkia& icon,
-+                                    const gfx::Rect& bounds) {
-+  TRACE_EVENT0("views", "TabIcon::PaintDiscardedFavicon");
-+
-+  if (icon.isNull()) {
-+    return;
-+  }
-+
-+  const double discard_fraction = tab_discard_animation_.GetCurrentValue();
-+
-+  // Fade the favicon to a partially transparent grayscale version while the
-+  // tab is discarded. Opacity and saturation follow the same animation.
-+  cc::PaintFlags flags;
-+  flags.setAlphaf(gfx::Tween::FloatValueBetween(
-+      discard_fraction, 1.0f, kDiscardedFaviconOpacity));
-+
-+  SkColorMatrix color_matrix;
-+  color_matrix.setSaturation(
-+      gfx::Tween::FloatValueBetween(discard_fraction, 1.0f, 0.0f));
-+  if (GetWidget() &&
-+      GetWidget()->GetColorMode() == ui::ColorProviderKey::ColorMode::kDark) {
-+    // Lift dark grayscale tones for contrast against dark tab backgrounds.
-+    const float brightness = gfx::Tween::FloatValueBetween(
-+        discard_fraction, 0.0f, kDiscardedFaviconDarkModeBrightness);
-+    color_matrix.postTranslate(brightness, brightness, brightness, 0.0f);
-+  }
-+  // 4x5 matrix expected by cc::ColorFilter
-+  float matrix_data[20];
-+  color_matrix.getRowMajor(matrix_data);
-+  flags.setColorFilter(cc::ColorFilter::MakeMatrix(matrix_data));
-+
-+  canvas->DrawImageInt(icon, 0, 0, bounds.width(), bounds.height(), bounds.x(),
-+                       bounds.y(), bounds.width(), bounds.height(),
-+                       /*filter=*/true, flags);
-+
-+  if (discard_fraction == 1.0) {
-+    views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
-+        kDiscardAnimationFinishes, this);
-+  }
- }
- 
+-}
+-
  void TabIcon::PaintLoadingAnimation(gfx::Canvas* canvas, gfx::Rect bounds) {
-@@ -389,8 +399,7 @@ void TabIcon::MaybePaintFavicon(gfx::Can
+   TRACE_EVENT0("views", "TabIcon::PaintLoadingAnimation");
+ 
+@@ -389,8 +384,7 @@ void TabIcon::MaybePaintFavicon(gfx::Can
  
    std::unique_ptr<gfx::ScopedCanvas> scoped_canvas;
  
 -  if (GetShowingLoadingAnimation() || favicon_size_animation_.is_animating() ||
 -      was_discard_indicator_shown_) {
-+  if ((false)) {
++  if (GetShowingLoadingAnimation() || favicon_size_animation_.is_animating()) {
      scoped_canvas = std::make_unique<gfx::ScopedCanvas>(canvas);
      // The favicon is initially inset with the width of the loading-animation
      // stroke + an additional dp to create some visual separation.
-@@ -435,14 +444,6 @@ void TabIcon::MaybePaintFavicon(gfx::Can
+@@ -432,14 +426,14 @@ void TabIcon::MaybePaintFavicon(gfx::Can
+     canvas->Translate(gfx::Vector2d(-bounds.x(), -bounds.y()));
+   }
+ 
++  const double discard_fraction = tab_discard_animation_.GetCurrentValue();
    canvas->DrawImageInt(icon, 0, 0, bounds.width(), bounds.height(), bounds.x(),
                         bounds.y(), bounds.width(), bounds.height(),
-                        /*filter=*/true);
--
+-                       /*filter=*/true);
++                       /*filter=*/true,
++                       GetDiscardedFaviconFlags(discard_fraction, GetWidget()));
+ 
 -  // Emits a custom event when the favicon finishes shrinking and the discard
 -  // ring gets painted
 -  if (favicon_size_animation_.GetCurrentValue() == 0.0 &&
 -      tab_discard_animation_.GetCurrentValue() == 1.0) {
--    views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
--        kDiscardAnimationFinishes, this);
--  }
- }
- 
- bool TabIcon::GetNonDefaultFavicon() const {
-@@ -469,31 +470,12 @@ void TabIcon::SetDiscarded(bool discarde
++  // Emits a custom event when the favicon finishes fading out.
++  if (discard_fraction == 1.0) {
+     views::ElementTrackerViews::GetInstance()->NotifyCustomEvent(
+         kDiscardAnimationFinishes, this);
+   }
+@@ -469,39 +463,21 @@ void TabIcon::SetDiscarded(bool discarde
        is_discarded_ && discard_ring_treatment_enabled_;
    if (was_discard_indicator_shown_ != show_discard_indicator) {
      was_discard_indicator_shown_ = show_discard_indicator;
@@ -254,20 +247,20 @@
      }
    }
  }
-@@ -549,6 +531,10 @@ bool TabIcon::GetCrashed() const {
- }
  
- void TabIcon::UpdateThrobber() {
-+  if (!tab_discard_animation_.is_animating() && !layer()) {
-+    return;
-+  }
-+
-   TRACE_EVENT0("ui", "TabIcon::UpdateThrobber");
-   base::ScopedUmaHistogramTimer timer(
-       "Tab.Icon.UpdateThrobber.Time",
+ void TabIcon::SetNetworkState(tabs::TabNetworkState network_state) {
+-  const bool was_animated = NetworkStateIsAnimated(network_state_);
++  // Only resize the favicon around a visible loading animation.
++  const bool was_animated = GetShowingLoadingAnimation();
+   network_state_ = network_state;
+-  const bool is_animated = NetworkStateIsAnimated(network_state_);
++  const bool is_animated = GetShowingLoadingAnimation();
+   if (was_animated != is_animated) {
+     favicon_size_animation_.SetSlideDuration(
+         gfx::Animation::RichAnimationDuration(base::Milliseconds(250)));
 --- a/chrome/browser/ui/views/tabs/tab/tab_icon.h
 +++ b/chrome/browser/ui/views/tabs/tab/tab_icon.h
-@@ -113,10 +113,11 @@ class TabIcon : public views::View, publ
+@@ -113,11 +113,6 @@ class TabIcon : public views::View, publ
                                        const gfx::ImageSkia& icon,
                                        const gfx::Rect& bounds);
  
@@ -275,15 +268,11 @@
 -  void PaintDiscardRingAndIcon(gfx::Canvas* canvas,
 -                               const gfx::ImageSkia& icon,
 -                               const gfx::Rect& bounds);
-+  // Paints the favicon with grayscale and opacity reflecting the discard
-+  // animation.
-+  void PaintDiscardedFavicon(gfx::Canvas* canvas,
-+                             const gfx::ImageSkia& icon,
-+                             const gfx::Rect& bounds);
- 
+-
    // Paint either the indeterimate throbber or progress indicator according to
    // current tab state.
-@@ -192,7 +193,7 @@ class TabIcon : public views::View, publ
+   void PaintLoadingAnimation(gfx::Canvas* canvas, gfx::Rect bounds);
+@@ -192,7 +187,7 @@ class TabIcon : public views::View, publ
  
    // Animation used when a tab is discarded so the favicon will partially
    // fade out
