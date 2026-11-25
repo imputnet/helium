@@ -114,7 +114,39 @@
  }
  
  void HorizontalTabStripRegionViewOld::AdjustViewBoundsRect(View* view,
-@@ -1016,7 +1045,7 @@ void HorizontalTabStripRegionViewNew::Up
+@@ -744,7 +773,7 @@ HorizontalTabStripRegionViewNew::Horizon
+     }
+   }
+ 
+-  if (browser && ShouldShowNewTabButton(browser)) {
++  if (browser && CanCreateNewTabButton(browser)) {
+     auto new_tab_button = std::make_unique<shared::NewTabButton>(
+         browser, TabStripControlButton::GetButtonSize().width(),
+         TabStripControlButton::kIconSize);
+@@ -752,6 +781,7 @@ HorizontalTabStripRegionViewNew::Horizon
+     // The new tab button overlaps the tab strip, so it is positioned manually
+     // in Layout().
+     new_tab_button_->SetProperty(views::kViewIgnoredByLayoutKey, true);
++    new_tab_button_->SetVisible(ShouldShowNewTabButton(browser));
+   }
+ 
+   reserved_grab_handle_space_ =
+@@ -843,6 +873,14 @@ bool HorizontalTabStripRegionViewNew::Ha
+ }
+ 
+ void HorizontalTabStripRegionViewNew::Layout(PassKey) {
++  if (new_tab_button_) {
++    const bool should_show_new_tab_button =
++        ShouldShowNewTabButton(browser_view()->browser());
++    if (new_tab_button_->GetVisible() != should_show_new_tab_button) {
++      new_tab_button_->SetVisible(should_show_new_tab_button);
++    }
++  }
++
+   UpdateTabStripMargin();
+   LayoutSuperclass<BaseTabStripRegionView>(this);
+ 
+@@ -1024,7 +1062,7 @@ void HorizontalTabStripRegionViewNew::Up
    const int extra_vertical_space =
        GetLayoutConstant(LayoutConstant::kTabStripHeight) -
        GetLayoutConstant(LayoutConstant::kTabstripToolbarOverlap) -
@@ -196,3 +228,662 @@
      "//chrome/browser:primitives",
      "//chrome/browser/dictation",
      "//chrome/browser/glic",
+--- a/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.cc
+@@ -139,7 +139,8 @@ void TabCollectionAnimatingLayoutManager
+   }
+ 
+   constexpr double kResetAnimationThreshold = 0.8;
+-  if (!HasAnimatingManagers() || current_offset_ > kResetAnimationThreshold) {
++  if (!HasAnimatingManagers() || restart_on_update_ ||
++      current_offset_ > kResetAnimationThreshold) {
+     // Either no managers are currently animating, or we are far enough along
+     // that we should start a "fresh" animation from 0% to avoid awkward
+     // slow-downs at the end of the curve. Re-baseline all active managers to
+@@ -195,6 +196,11 @@ TabCollectionAnimatingLayoutManager::Ani
+   return std::clamp(percent, 0.0, 1.0);
+ }
+ 
++void TabCollectionAnimatingLayoutManager::AnimationCoordinator::SetTweenType(
++    gfx::Tween::Type tween_type) {
++  animation_.SetTweenType(tween_type);
++}
++
+ void TabCollectionAnimatingLayoutManager::AnimationCoordinator::
+     AnimationProgressed(const gfx::Animation* animation) {
+   if (current_offset_ == animation->GetCurrentValue()) {
+@@ -945,7 +951,7 @@ void TabCollectionAnimatingLayoutManager
+   // For each contiguous range of adding views, set the target x of those
+   // adding views based on the bounds of the surrounding non-adding views, if
+   // they exist.
+-  std::optional<int> prev_start_bounds_right = std::nullopt;
++  std::optional<int> prev_bounds_offset = std::nullopt;
+   std::vector<std::pair<views::View*, int>> adding_views_x;
+   auto assign_adding_views_start_x = [this, &adding_views_x](int start_x) {
+     for (auto [adding_view, _] : adding_views_x) {
+@@ -962,26 +968,25 @@ void TabCollectionAnimatingLayoutManager
+       const int curr_start_bounds_x =
+           start_view_layout_map_.at(curr_view).bounds.x();
+       // When there is a next view in the start layout, use the start x of the
+-      // next view. If there is also a previous view, use the midpoint
+-      // between the x of the next view and the right of the previous view.
++      // next view. If there is also a previous view, offset the target x by
++      // how far the previous view moves.
+       assign_adding_views_start_x(
+-          prev_start_bounds_right.has_value()
+-              ? (prev_start_bounds_right.value() + curr_start_bounds_x) / 2
++          prev_bounds_offset.has_value() && !adding_views_x.empty()
++              ? adding_views_x[0].second + prev_bounds_offset.value()
+               : curr_start_bounds_x);
+ 
+-      prev_start_bounds_right =
+-          start_view_layout_map_.at(curr_view).bounds.right();
++      prev_bounds_offset = start_view_layout_map_.at(curr_view).bounds.right() -
++                           target_layout.bounds.right();
+     } else {
+       adding_views_x.emplace_back(curr_view, target_layout.bounds.x());
+     }
+   }
+   if (!adding_views_x.empty()) {
+     // When there is no next view in the start layout, use the x of the
+-    // first adding view. If there is a previous view, use the previous
+-    // view's right.
++    // first adding view, offset by how far the previous view moves.
+     const auto [_, first_adding_view_x] = adding_views_x[0];
+-    assign_adding_views_start_x(
+-        prev_start_bounds_right.value_or(first_adding_view_x));
++    assign_adding_views_start_x(first_adding_view_x +
++                                prev_bounds_offset.value_or(0));
+   }
+ }
+ 
+@@ -993,7 +998,7 @@ void TabCollectionAnimatingLayoutManager
+   // For each contiguous range of closing views, set the target x of those
+   // closing views based on the bounds of the surrounding non-closing views, if
+   // they exist.
+-  std::optional<int> prev_target_bounds_right = std::nullopt;
++  std::optional<int> prev_bounds_offset = std::nullopt;
+   std::vector<std::pair<views::View*, int>> closing_views_x;
+   auto assign_closing_views_target_x = [this, &closing_views_x](int target_x) {
+     for (auto [closing_view, _] : closing_views_x) {
+@@ -1010,26 +1015,26 @@ void TabCollectionAnimatingLayoutManager
+       const int curr_target_bounds_x =
+           target_view_layout_map_.at(curr_view).bounds.x();
+       // When there is a next view in the target layout, target the x of the
+-      // next view. If there is also a previous view, target the midpoint
+-      // between the x of the next view and the right of the previous view.
++      // next view. If there is also a previous view, offset the start x by how
++      // far the previous view moves.
+       assign_closing_views_target_x(
+-          prev_target_bounds_right.has_value()
+-              ? (prev_target_bounds_right.value() + curr_target_bounds_x) / 2
++          prev_bounds_offset.has_value() && !closing_views_x.empty()
++              ? closing_views_x[0].second + prev_bounds_offset.value()
+               : curr_target_bounds_x);
+ 
+-      prev_target_bounds_right =
+-          target_view_layout_map_.at(curr_view).bounds.right();
++      prev_bounds_offset =
++          target_view_layout_map_.at(curr_view).bounds.right() -
++          start_layout.bounds.right();
+     } else {
+       closing_views_x.emplace_back(curr_view, start_layout.bounds.x());
+     }
+   }
+   if (!closing_views_x.empty()) {
+     // When there is no next view in the target layout, target the x of the
+-    // first closing view. If there is a previous view, target the previous
+-    // view's right.
++    // first closing view, offset by how far the previous view moves.
+     const auto [_, first_closing_view_x] = closing_views_x[0];
+-    assign_closing_views_target_x(
+-        prev_target_bounds_right.value_or(first_closing_view_x));
++    assign_closing_views_target_x(first_closing_view_x +
++                                  prev_bounds_offset.value_or(0));
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h
++++ b/chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h
+@@ -52,6 +52,13 @@ class TabCollectionAnimatingLayoutManage
+     double starting_offset() const { return starting_offset_; }
+     double GetCurrentProgress() const;
+ 
++    void SetTweenType(gfx::Tween::Type tween_type);
++    // Restarts the full animation from the current layout whenever a new
++    // target layout arrives mid-animation.
++    void set_restart_on_update(bool restart_on_update) {
++      restart_on_update_ = restart_on_update;
++    }
++
+     // views::AnimationDelegateViews:
+     void AnimationProgressed(const gfx::Animation* animation) override;
+     void AnimationEnded(const gfx::Animation* animation) override;
+@@ -65,6 +72,7 @@ class TabCollectionAnimatingLayoutManage
+     double starting_offset_ = 0.0;
+     // The current animation progress.
+     double current_offset_ = 1.0;
++    bool restart_on_update_ = false;
+   };
+ 
+   // Controls along which axis view bounds are animated during animate-in and
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -82,6 +82,9 @@ TabStripCollectionController::TabStripCo
+   if (orientation == TabStripOrientation::kHorizontal) {
+     tab_closing_helper_ =
+         std::make_unique<HorizontalTabClosingHelper>(root_node);
++    // Match the tab animations of the classic horizontal tab strip.
++    animation_coordinator_.SetTweenType(gfx::Tween::EASE_OUT);
++    animation_coordinator_.set_restart_on_update(true);
+   }
+ 
+   if (GlassFrameService* service = GlassFrameService::GetInstance()) {
+--- a/chrome/browser/ui/views/tabs/tab_strip_control_button.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_control_button.cc
+@@ -188,13 +188,21 @@ void TabStripControlButton::SetVectorIco
+   UpdateIcon();
+ }
+ 
++void TabStripControlButton::SetIconSize(int icon_size) {
++  if (icon_size_ == icon_size) {
++    return;
++  }
++  icon_size_ = icon_size;
++  UpdateIcon();
++}
++
+ void TabStripControlButton::UpdateIcon() {
+   if (icon_->is_empty()) {
+     return;
+   }
+ 
+   const ui::ImageModel icon_image_model = ui::ImageModel::FromVectorIcon(
+-      icon_.get(), GetForegroundColor(), kIconSize);
++      icon_.get(), GetForegroundColor(), icon_size_);
+ 
+   SetImageModel(views::Button::STATE_NORMAL, icon_image_model);
+   SetImageModel(views::Button::STATE_HOVERED, icon_image_model);
+--- a/chrome/browser/ui/views/tabs/tab_strip_control_button.h
++++ b/chrome/browser/ui/views/tabs/tab_strip_control_button.h
+@@ -74,6 +74,9 @@ class TabStripControlButton : public vie
+   // Updates the icon model.
+   void SetVectorIcon(const gfx::VectorIcon& icon);
+ 
++  // Sets the size of the icon, `kIconSize` by default.
++  void SetIconSize(int icon_size);
++
+   // Updates the styling and icons for the button. Should be called when colors
+   // change.
+   virtual void UpdateIcon();
+@@ -155,6 +158,7 @@ class TabStripControlButton : public vie
+ 
+   // Optional icon for the label button.
+   raw_ref<const gfx::VectorIcon> icon_;
++  int icon_size_ = kIconSize;
+ 
+   bool paint_transparent_for_custom_image_theme_ = false;
+   bool paint_transparent_for_glass_ = false;
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_layout_utils.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_layout_utils.cc
+@@ -141,8 +141,10 @@ int GetChildCrossoverWidth(const views::
+       return tab_view->tab_styling()->tab_style()->GetPinnedWidth(
+           tab_view->split());
+     }
+-    return tab_view->tab_styling()->tab_style()->GetMinimumActiveWidth(
+-        tab_view->split());
++    return std::max(
++        tab_view->tab_styling()->tab_style()->GetMinimumActiveWidth(
++            tab_view->split()),
++        child->GetMinimumSize().width());
+   }
+   if (const auto* split_view = views::AsViewClass<SplitTabView>(child)) {
+     return split_view->GetCrossoverWidth();
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
+@@ -585,20 +585,10 @@ void TabStripView::SetScrollViewProperti
+     scroll_view->SetVerticalScrollBarMode(
+         views::ScrollView::ScrollBarMode::kDisabled);
+     scroll_view->SetTreatAllScrollEventsAsHorizontal(true);
+-
+-    scroll_view->SetCustomOverflowIndicator(
+-        views::OverflowIndicatorAlignment::kLeft,
+-        std::make_unique<HorizontalTabStripOverflowIndicatorView>(
+-            views::OverflowIndicatorAlignment::kLeft),
+-        HorizontalTabStripOverflowIndicatorView::kTotalThickness,
+-        /*fills_opaquely=*/false);
+-
+-    scroll_view->SetCustomOverflowIndicator(
+-        views::OverflowIndicatorAlignment::kRight,
+-        std::make_unique<HorizontalTabStripOverflowIndicatorView>(
+-            views::OverflowIndicatorAlignment::kRight),
+-        HorizontalTabStripOverflowIndicatorView::kTotalThickness,
+-        /*fills_opaquely=*/false);
++    // Fade out overflowing tabs like the vertical tab strip, instead of
++    // drawing shadows or separators over them.
++    scroll_view->SetOverflowGradientMask(
++        views::ScrollView::GradientDirection::kHorizontal);
+   }
+   callback_subscriptions_.emplace_back(
+       scroll_view->AddContentsScrolledCallback(base::BindRepeating(
+@@ -716,6 +706,9 @@ void TabStripView::EnsureViewsVisibleInV
+   // may not apply depending on view position.
+   gfx::Rect overflow_adjusted_bounds = combined_bounds;
+   overflow_adjusted_bounds.AdjustToFit(scroll_view->GetOpaqueVisibleRect());
++  if (overflow_adjusted_bounds.size() != adjusted_bounds.size()) {
++    overflow_adjusted_bounds = adjusted_bounds;
++  }
+   const int diff_avoid_overflow_gradient =
+       is_vertical ? combined_bounds.y() - overflow_adjusted_bounds.y()
+                   : combined_bounds.x() - overflow_adjusted_bounds.x();
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view_layout.cc
+@@ -221,6 +221,11 @@ views::ProposedLayout TabStripViewLayout
+         views::SizeBounds(available_unpinned_width, container_height);
+     unpinned_width = std::min(unpinned_width, available_unpinned_width);
+   }
++  // The start scroll button is placed before the scrollable area, and the end
++  // scroll button after it. Both have the same width.
++  const int scroll_button_leading_width =
++      show_scroll_buttons ? scroll_button_container_preferred_width / 2 : 0;
++  x += scroll_button_leading_width;
+   gfx::Rect unpinned_bounds(x, 0, unpinned_width, container_height);
+   x += unpinned_width;
+ 
+@@ -229,11 +234,16 @@ views::ProposedLayout TabStripViewLayout
+   // `unpinned_tabs_scroll_view` is laid out and executes post-layout callbacks.
+   if (scroll_button_container) {
+     if (show_scroll_buttons) {
++      // The container spans the scrollable area, see
++      // `TabScrollButtonContainer::DoesIntersectRect()`.
+       gfx::Rect scroll_container_bounds(
+-          x, 0, scroll_button_container_preferred_width, container_height);
++          unpinned_bounds.x() - scroll_button_leading_width, 0,
++          unpinned_width + scroll_button_container_preferred_width,
++          container_height);
+       layouts.child_layouts.emplace_back(scroll_button_container, true,
+                                          scroll_container_bounds);
+-      x += scroll_button_container_preferred_width;
++      x += scroll_button_container_preferred_width -
++           scroll_button_leading_width;
+     } else {
+       layouts.child_layouts.emplace_back(scroll_button_container, false,
+                                          gfx::Rect());
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ 
++#include <algorithm>
+ #include <optional>
+ #include <string>
+ 
+@@ -909,9 +910,13 @@ gfx::Size TabView::GetMinimumSize() cons
+       return gfx::Size(tab_styling()->tab_style()->GetPinnedWidth(split_),
+                        tab_styling()->tab_style()->GetStandardHeight());
+     }
+-    const int min_width =
++    // Stop shrinking unpinned tabs while their close button still fits, the
++    // tab strip scrolls instead.
++    const int min_width = std::max(
+         active_ ? tab_styling()->tab_style()->GetMinimumActiveWidth(split_)
+-                : tab_styling()->tab_style()->GetMinimumInactiveWidth();
++                : tab_styling()->tab_style()->GetMinimumInactiveWidth(),
++        TabViewHorizontalLayout::kMinimumContentsWidthForCloseButtons +
++            tab_styling()->tab_style()->GetContentsInsets().width());
+     return gfx::Size(min_width,
+                      tab_styling()->tab_style()->GetStandardHeight());
+   }
+--- a/chrome/browser/ui/views/tabs/common/tab_view_horizontal_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_horizontal_layout.cc
+@@ -81,11 +81,7 @@ views::ProposedLayout TabViewHorizontalL
+     const int preferred_width =
+         TabView().tab_styling()->tab_style()->GetStandardWidth(
+             TabView().split());
+-    const int minimum_width =
+-        TabView().active_
+-            ? TabView().tab_styling()->tab_style()->GetMinimumActiveWidth(
+-                  TabView().split())
+-            : TabView().tab_styling()->tab_style()->GetMinimumInactiveWidth();
++    const int minimum_width = TabView().GetMinimumSize().width();
+     width =
+         std::clamp(size_bounds.width().value_or(preferred_width),
+                    TabView().IsClosing() ? 0 : minimum_width, preferred_width);
+--- a/chrome/browser/ui/views/tabs/horizontal/tab_scroll_button_container.cc
++++ b/chrome/browser/ui/views/tabs/horizontal/tab_scroll_button_container.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/horizontal_tab_strip_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+@@ -30,9 +31,10 @@
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/controls/scrollbar/scroll_bar.h"
+-#include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/flex_layout.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_observer.h"
++#include "ui/views/view_targeter.h"
+ 
+ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(TabScrollButtonContainer,
+                                       kTabScrollButtonContainer);
+@@ -44,9 +46,11 @@ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(Ta
+ 
+ namespace {
+ // TODO(b/523328731): Validate animation parameters with design.
+-constexpr base::TimeDelta kScrollAnimationTime = base::Milliseconds(300);
+-constexpr int kScrollButtonSpacing = 1;
+-constexpr int kScrollButtonHorizontalPadding = 4;
++constexpr base::TimeDelta kScrollAnimationTime = base::Milliseconds(350);
++constexpr int kScrollButtonWidth = 20;
++constexpr int kScrollButtonIconSize = 20;
++// The fraction of a page scrolled by a press of a scroll button.
++constexpr float kScrollPageFraction = 0.3f;
+ constexpr base::TimeDelta kIPHDisplayDelay = base::Seconds(3);
+ }  // namespace
+ 
+@@ -133,19 +137,17 @@ void TabScrollButtonContainer::TabScroll
+ 
+ TabScrollButtonContainer::TabScrollButtonContainer(
+     BrowserWindowInterface* browser_window_interface)
+-    : browser_window_interface_(browser_window_interface) {
++    : views::AnimationDelegateViews(this),
++      browser_window_interface_(browser_window_interface) {
+   set_context_menu_controller(this);
+   SetProperty(views::kElementIdentifierKey, kTabScrollButtonContainer);
+ 
+-  std::unique_ptr<views::BoxLayout> box_layout =
+-      std::make_unique<views::BoxLayout>(
+-          views::BoxLayout::Orientation::kHorizontal,
+-          /*inside_border_insets=*/
+-          gfx::Insets::VH(0, kScrollButtonHorizontalPadding),
+-          /*between_child_spacing_=*/kScrollButtonSpacing,
+-          /*collapse_margins_spacing=*/false);
+-  box_layout->set_cross_axis_alignment(views::LayoutAlignment::kCenter);
+-  SetLayoutManager(std::move(box_layout));
++  // The start and end scroll buttons are placed on either side of the
++  // scrollable area, which the container spans.
++  SetLayoutManager(std::make_unique<views::FlexLayout>())
++      ->SetOrientation(views::LayoutOrientation::kHorizontal)
++      .SetCrossAxisAlignment(views::LayoutAlignment::kCenter);
++  SetEventTargeter(std::make_unique<views::ViewTargeter>(this));
+   SetMirrored(false);
+ 
+   start_scroll_button_ = AddChildView(std::make_unique<TabStripControlButton>(
+@@ -171,6 +173,12 @@ TabScrollButtonContainer::TabScrollButto
+       kColorTabStripScrollButtonBackground);
+   start_scroll_button_->set_paint_transparent_for_glass(true);
+ 
++  AddChildView(std::make_unique<views::View>())
++      ->SetProperty(views::kFlexBehaviorKey,
++                    views::FlexSpecification(
++                        views::MinimumFlexSizeRule::kScaleToZero,
++                        views::MaximumFlexSizeRule::kUnbounded));
++
+   end_scroll_button_ = AddChildView(std::make_unique<TabStripControlButton>(
+       browser_window_interface,
+       views::Button::PressedCallback(base::BindRepeating(
+@@ -194,6 +202,13 @@ TabScrollButtonContainer::TabScrollButto
+   end_scroll_button_->set_paint_transparent_for_glass(true);
+   start_scroll_button_->SetBorder(views::CreateEmptyBorder(gfx::Insets()));
+   end_scroll_button_->SetBorder(views::CreateEmptyBorder(gfx::Insets()));
++  for (TabStripControlButton* button :
++       {start_scroll_button_.get(), end_scroll_button_.get()}) {
++    // As tall as the other tab strip buttons, but narrower.
++    button->SetPreferredSize(gfx::Size(
++        kScrollButtonWidth, TabStripControlButton::GetButtonSize().height()));
++    button->SetIconSize(kScrollButtonIconSize);
++  }
+   animation_.SetDuration(kScrollAnimationTime);
+ 
+   if (auto* user_education =
+@@ -234,6 +249,21 @@ void TabScrollButtonContainer::ShowConte
+       views::MenuAnchorPosition::kTopLeft, source_type);
+ }
+ 
++gfx::Size TabScrollButtonContainer::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  // The spacer between the scroll buttons fills any available width, so only
++  // measure the buttons.
++  gfx::Size size = views::View::CalculatePreferredSize(views::SizeBounds());
++  // The buttons overlap the empty edges of the scrollable area, to be as close
++  // to the tabs as the new tab button.
++  const int overlap =
++      TabStyle::Get()->GetBottomExtensionWidth() -
++      GetLayoutConstant(LayoutConstant::kTabStripPadding) -
++      GetLayoutConstant(LayoutConstant::kNewTabButtonLeadingMargin);
++  size.Enlarge(-2 * overlap, 0);
++  return size;
++}
++
+ void TabScrollButtonContainer::VisibilityChanged(views::View* starting_from,
+                                                  bool is_visible) {
+   if (starting_from != this) {
+@@ -276,6 +306,15 @@ bool TabScrollButtonContainer::IsPositio
+              ConvertPointToTarget(this, end_scroll_button_, p));
+ }
+ 
++bool TabScrollButtonContainer::DoesIntersectRect(const views::View* target,
++                                                 const gfx::Rect& rect) const {
++  CHECK_EQ(target, this);
++  // Only target the scroll buttons, so that events over the scrollable area
++  // between them reach the tabs.
++  return start_scroll_button_->bounds().Intersects(rect) ||
++         end_scroll_button_->bounds().Intersects(rect);
++}
++
+ void TabScrollButtonContainer::SetScrollView(views::ScrollView* scroll_view) {
+   scroll_view_ = scroll_view;
+ 
+@@ -288,25 +327,31 @@ void TabScrollButtonContainer::BeginScro
+   CHECK(scroll_view_);
+   views::ScrollBar* scroll_bar = scroll_view_->horizontal_scroll_bar();
+ 
++  // Continue from the target of an ongoing scroll, so repeated presses add up.
++  std::optional<float> previous_target_offset;
+   if (animation_.is_animating()) {
++    previous_target_offset = animation_params_->target_offset;
+     animation_.Stop();
+   }
+ 
+   const float page_scroll_amount =
+       scroll_view_->GetScrollIncrement(scroll_bar, /*is_page=*/true,
+                                        /*is_positive=*/true);
+-  const float min_inactive_tab_width =
+-      TabStyle::Get()->GetMinimumInactiveWidth();
+-
+-  // When pagination scrolling, decrease the scroll distance by the minimum
+-  // tab width so that at least one of the tabs from before the scroll
+-  // remains visible.
+-  const float full_scroll_amount =
+-      std::max(0.0f, page_scroll_amount - min_inactive_tab_width);
++  // Scroll by part of a page, so that tabs from before the scroll remain
++  // visible.
++  const float full_scroll_amount = page_scroll_amount * kScrollPageFraction;
+   const float current_offset = scroll_view_->CurrentOffset().x();
+-  float target_offset = current_offset + (base::i18n::IsRTL() ? -1 : 1) *
+-                                             (scroll_to_start ? -1 : 1) *
+-                                             full_scroll_amount;
++  const float scroll_delta = (base::i18n::IsRTL() ? -1 : 1) *
++                             (scroll_to_start ? -1 : 1) * full_scroll_amount;
++  const bool is_reversing =
++      previous_target_offset &&
++      (*previous_target_offset - current_offset) * scroll_delta <= 0;
++  if (is_reversing) {
++    previous_target_offset.reset();
++  }
++
++  float target_offset =
++      previous_target_offset.value_or(current_offset) + scroll_delta;
+   target_offset = std::clamp<float>(target_offset, scroll_bar->GetMinPosition(),
+                                     scroll_bar->GetMaxPosition());
+ 
+@@ -318,8 +363,12 @@ void TabScrollButtonContainer::BeginScro
+   tabs::RecordHorizontalTabStripScrollSource(
+       tabs::HorizontalTabStripScrollSource::kButtons);
+ 
+-  animation_params_ = AnimationParams{.start_offset = current_offset,
+-                                      .target_offset = target_offset};
++  // Keep moving without slowing down when interrupting an ongoing scroll.
++  animation_params_ = AnimationParams{
++      .start_offset = current_offset,
++      .target_offset = target_offset,
++      .tween_type = previous_target_offset ? gfx::Tween::Type::EASE_OUT
++                                           : gfx::Tween::Type::EASE_IN_OUT};
+ 
+   animation_.Start();
+ }
+@@ -329,7 +378,7 @@ void TabScrollButtonContainer::Animation
+   CHECK(scroll_view_);
+   CHECK(animation_params_.has_value());
+ 
+-  float progress = gfx::Tween::CalculateValue(gfx::Tween::Type::EASE_OUT,
++  float progress = gfx::Tween::CalculateValue(animation_params_->tween_type,
+                                               animation_.GetCurrentValue());
+   const float current_x =
+       gfx::Tween::FloatValueBetween(progress, animation_params_->start_offset,
+--- a/chrome/browser/ui/views/tabs/horizontal/tab_scroll_button_container.h
++++ b/chrome/browser/ui/views/tabs/horizontal/tab_scroll_button_container.h
+@@ -6,12 +6,14 @@
+ 
+ #include "chrome/browser/ui/views/tabs/tab_strip_control_button.h"
+ #include "ui/base/interaction/element_identifier.h"
+-#include "ui/gfx/animation/animation_delegate.h"
+ #include "ui/gfx/animation/linear_animation.h"
++#include "ui/gfx/animation/tween.h"
+ #include "ui/menus/simple_menu_model.h"
++#include "ui/views/animation/animation_delegate_views.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_targeter_delegate.h"
+ 
+ class BrowserWindowInterface;
+ 
+@@ -27,9 +29,10 @@ class MenuRunner;
+ // container in the horizontal tab strip. It is responsible for pagination
+ // style scrolling.
+ class TabScrollButtonContainer : public views::View,
+-                                 public gfx::AnimationDelegate,
++                                 public views::AnimationDelegateViews,
+                                  public views::ContextMenuController,
+-                                 public ui::SimpleMenuModel::Delegate {
++                                 public ui::SimpleMenuModel::Delegate,
++                                 public views::ViewTargeterDelegate {
+   METADATA_HEADER(TabScrollButtonContainer, views::View)
+  public:
+   DECLARE_CLASS_ELEMENT_IDENTIFIER_VALUE(kTabScrollButtonContainer);
+@@ -45,6 +48,8 @@ class TabScrollButtonContainer : public
+   void SetScrollView(views::ScrollView* scroll_view);
+ 
+   // views::View:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
+   void VisibilityChanged(views::View* starting_from, bool is_visible) override;
+ 
+   // views::ContextMenuController:
+@@ -56,12 +61,17 @@ class TabScrollButtonContainer : public
+   // ui::SimpleMenuModel::Delegate:
+   void ExecuteCommand(int command_id, int event_flags) override;
+ 
++  // views::ViewTargeterDelegate:
++  bool DoesIntersectRect(const views::View* target,
++                         const gfx::Rect& rect) const override;
++
+  private:
+   class TabScrollButtonIPHController;
+ 
+   struct AnimationParams {
+     float start_offset;
+     float target_offset;
++    gfx::Tween::Type tween_type;
+   };
+ 
+   void BeginScrollAnimation(bool scroll_to_start);
+--- a/ui/views/controls/scroll_view.cc
++++ b/ui/views/controls/scroll_view.cc
+@@ -648,13 +648,6 @@ void ScrollView::UpdateGradientMask() {
+         CurrentOffset().x() < horiz_sb_->GetMaxPosition();
+   }
+ 
+-  // Nothing to do if the state of leading and trailing gradients hasn't
+-  // changed.
+-  if (is_leading_gradient_visible_ == should_show_leading &&
+-      is_trailing_gradient_visible_ == should_show_trailing) {
+-    return;
+-  }
+-
+   is_leading_gradient_visible_ = should_show_leading;
+   is_trailing_gradient_visible_ = should_show_trailing;
+ 
+@@ -665,8 +658,11 @@ void ScrollView::UpdateGradientMask() {
+     return;
+   }
+ 
++  // A hidden but enabled horizontal scroll bar is never visible, e.g. in the
++  // horizontal tab strip.
+   if (gradient_direction_ == GradientDirection::kNone ||
+-      (is_horizontal && !horiz_sb_->GetVisible()) ||
++      (is_horizontal && !horiz_sb_->GetVisible() &&
++       horizontal_scroll_bar_mode_ != ScrollBarMode::kHiddenButEnabled) ||
+       (is_vertical && !vert_sb_->GetVisible())) {
+     if (layer() && layer()->HasGradientMask()) {
+       layer()->SetGradientMask(gfx::LinearGradient::GetEmpty());
+@@ -675,7 +671,7 @@ void ScrollView::UpdateGradientMask() {
+   }
+ 
+   gfx::LinearGradient gradient_mask;
+-  gradient_mask.set_angle(is_vertical ? 270 : 0);
++  gradient_mask.set_angle(is_vertical ? 270 : (base::i18n::IsRTL() ? 180 : 0));
+   gradient_mask.AddStep(kGradientLeadingFadeStart,
+                         should_show_leading ? 0 : 255);
+ 
+@@ -1589,13 +1585,16 @@ void ScrollView::UpdateOverflowIndicator
+       !draw_border_ && IsHorizontalScrollEnabled() &&
+       offset.x() > horiz_sb_->GetMinPosition() && draw_overflow_indicator_ &&
+       !suppress_leading;
+-  SetControlVisibility(more_content_left_.get(), should_draw_horiz_leading);
++  const bool has_horiz_gradient = IsHorizontal(gradient_direction_);
++  SetControlVisibility(more_content_left_.get(),
++                       should_draw_horiz_leading && !has_horiz_gradient);
+ 
+   bool should_draw_horiz_trailing =
+       !draw_border_ && IsHorizontalScrollEnabled() && !vert_sb_->GetVisible() &&
+       offset.x() < horiz_sb_->GetMaxPosition() && draw_overflow_indicator_ &&
+       !suppress_trailing;
+-  SetControlVisibility(more_content_right_.get(), should_draw_horiz_trailing);
++  SetControlVisibility(more_content_right_.get(),
++                       should_draw_horiz_trailing && !has_horiz_gradient);
+ 
+   if (should_draw_vert_top || should_draw_vert_bottom ||
+       should_draw_horiz_leading || should_draw_horiz_trailing) {
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -45,6 +45,8 @@ constexpr const char kDisableEchCommandL
+ constexpr const char kHeliumSplitClientHelloCommandLine[] =
+     "helium-split-clienthello";
+ 
++constexpr const char kHeliumUnifiedTabStripCommandLine[] = "unified-tab-strip";
++
+ }  // namespace helium
+ 
+ #endif /* CHROME_BROWSER_HELIUM_FLAG_CHOICES_H_ */
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -85,5 +85,11 @@
+      "prevent access to networks that require a proxy. Helium flag.",
+      kOsAll, SINGLE_VALUE_TYPE(switches::kNoProxyServer)},
+     // ui
++    {helium::kHeliumUnifiedTabStripCommandLine,
++     "Scrollable horizontal tab strip",
++     "Enables the unified tab strip, which scrolls horizontal tabs when they "
++     "overflow instead of shrinking them further. Also lets you pin and unpin "
++     "tabs by dragging them. Helium flag.",
++     kOsDesktop, FEATURE_VALUE_TYPE(tabs::kTabStripUnification)},
+     // platform
+ #endif  // CHROME_BROWSER_HELIUM_FLAG_ENTRIES_H_
