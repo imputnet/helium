@@ -83,7 +83,7 @@
  // AIPageContent.
 --- /dev/null
 +++ b/third_party/blink/renderer/core/helium_noise/canvas_noising_helper.cc
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,632 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -101,7 +101,6 @@
 +#include <cstdint>
 +#include <limits>
 +#include <optional>
-+#include <vector>
 +
 +#include "base/check_op.h"
 +#include "base/containers/span.h"
@@ -114,6 +113,7 @@
 +#include "third_party/blink/renderer/core/html/canvas/image_data.h"
 +#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
 +#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
++#include "third_party/blink/renderer/platform/wtf/vector.h"
 +#include "third_party/skia/include/core/SkBitmap.h"
 +#include "third_party/skia/include/core/SkImageInfo.h"
 +#include "third_party/skia/src/core/SkHalf.h"
@@ -138,6 +138,8 @@
 +
 +// Pixel layout and derived constants.
 +constexpr uint8_t kChannelsPerPixel = 4u;
++constexpr size_t kHalfFloatPixelBytes = kChannelsPerPixel * sizeof(SkHalf);
++constexpr size_t kFloatPixelBytes = kChannelsPerPixel * sizeof(float);
 +constexpr size_t kRgbChannelsPerPixel = 3u;
 +using RgbBytes = std::array<uint8_t, kRgbChannelsPerPixel>;
 +using RgbNoise = std::array<int, kRgbChannelsPerPixel>;
@@ -304,21 +306,26 @@
 +  }
 +}
 +
-+// Returns the pixel at |index| of a buffer with 4 channels per pixel.
-+template <typename T>
-+base::span<T, kChannelsPerPixel> GetPixel(base::span<T> pixels, size_t index) {
-+  return pixels.subspan(index * kChannelsPerPixel)
-+      .template first<kChannelsPerPixel>();
++// Returns the bytes of the pixel at |index| of a buffer of |kPixelBytes|-sized
++// pixels.
++template <size_t kPixelBytes>
++base::span<uint8_t, kPixelBytes> GetPixel(base::span<uint8_t> pixels,
++                                          size_t index) {
++  return pixels.subspan(index * kPixelBytes).first<kPixelBytes>();
 +}
 +
++// skvx loads and stores whole vectors with an unaligned memcpy, so a pixel's
++// bytes can be read and written in place.
++static_assert(sizeof(skvx::half4) == kHalfFloatPixelBytes);
++static_assert(sizeof(skvx::float4) == kFloatPixelBytes);
++
 +std::array<float, kChannelsPerPixel> LoadHalfFloatPixel(
-+    base::span<const SkHalf, kChannelsPerPixel> pixel) {
-+  skvx::half4 half_pixel = {pixel[0], pixel[1], pixel[2], pixel[3]};
-+  skvx::float4 float_pixel = skvx::from_half(half_pixel);
++    base::span<const uint8_t, kHalfFloatPixelBytes> bytes) {
++  skvx::float4 float_pixel = skvx::from_half(skvx::half4::Load(bytes.data()));
 +  return {float_pixel[0], float_pixel[1], float_pixel[2], float_pixel[3]};
 +}
 +
-+void StoreHalfFloatPixel(base::span<SkHalf, kChannelsPerPixel> destination,
++void StoreHalfFloatPixel(base::span<uint8_t, kHalfFloatPixelBytes> destination,
 +                         const std::array<float, kChannelsPerPixel>& pixel) {
 +  skvx::float4 float_pixel = {std::isnan(pixel[0]) ? 0.0f : pixel[0],
 +                              std::isnan(pixel[1]) ? 0.0f : pixel[1],
@@ -326,48 +333,59 @@
 +                              std::isnan(pixel[3]) ? 0.0f : pixel[3]};
 +  skvx::half4 half_pixel = skvx::to_half(float_pixel);
 +  for (int i = 0; i < kChannelsPerPixel; ++i) {
-+    destination[i] = std::isnan(pixel[i]) ? SK_HalfNaN : half_pixel[i];
++    if (std::isnan(pixel[i])) {
++      half_pixel[i] = SK_HalfNaN;
++    }
 +  }
++  half_pixel.store(destination.data());
++}
++
++std::array<float, kChannelsPerPixel> LoadFloatPixel(
++    base::span<const uint8_t, kFloatPixelBytes> bytes) {
++  skvx::float4 float_pixel = skvx::float4::Load(bytes.data());
++  return {float_pixel[0], float_pixel[1], float_pixel[2], float_pixel[3]};
++}
++
++void StoreFloatPixel(base::span<uint8_t, kFloatPixelBytes> destination,
++                     const std::array<float, kChannelsPerPixel>& pixel) {
++  skvx::float4(pixel[0], pixel[1], pixel[2], pixel[3])
++      .store(destination.data());
 +}
 +
 +// Quantizes |pixels| of |color_type|, tightly packed with 4 channels per
 +// pixel, to RGBA8 values, so that noise is computed the same way for every
 +// format.
-+std::vector<uint32_t> QuantizePixels(SkColorType color_type,
-+                                     base::span<const uint8_t> pixels) {
-+  std::vector<uint32_t> quantized;
++Vector<uint32_t> QuantizePixels(SkColorType color_type,
++                                base::span<const uint8_t> pixels) {
++  Vector<uint32_t> quantized;
 +  switch (color_type) {
 +    case kRGBA_8888_SkColorType:
 +    case kBGRA_8888_SkColorType:
-+      quantized.reserve(pixels.size() / kChannelsPerPixel);
++      quantized.reserve(
++          base::checked_cast<wtf_size_t>(pixels.size() / kChannelsPerPixel));
 +      for (size_t i = 0; i < pixels.size(); i += kChannelsPerPixel) {
 +        quantized.push_back(base::U32FromLittleEndian(
 +            pixels.subspan(i).first<kChannelsPerPixel>()));
 +      }
 +      break;
-+    case kRGBA_F16_SkColorType: {
-+      auto half_pixels =
-+          base::span(reinterpret_cast<const SkHalf*>(pixels.data()),
-+                     pixels.size() / sizeof(SkHalf));
-+      quantized.reserve(half_pixels.size() / kChannelsPerPixel);
-+      for (size_t i = 0; i < half_pixels.size(); i += kChannelsPerPixel) {
-+        std::array<float, kChannelsPerPixel> pixel = LoadHalfFloatPixel(
-+            half_pixels.subspan(i).first<kChannelsPerPixel>());
++    case kRGBA_F16_SkColorType:
++      quantized.reserve(
++          base::checked_cast<wtf_size_t>(pixels.size() / kHalfFloatPixelBytes));
++      for (size_t i = 0; i < pixels.size(); i += kHalfFloatPixelBytes) {
++        std::array<float, kChannelsPerPixel> pixel =
++            LoadHalfFloatPixel(pixels.subspan(i).first<kHalfFloatPixelBytes>());
 +        quantized.push_back(QuantizedFloatPixelValue(base::span(pixel)));
 +      }
 +      break;
-+    }
-+    case kRGBA_F32_SkColorType: {
-+      auto float_pixels =
-+          base::span(reinterpret_cast<const float*>(pixels.data()),
-+                     pixels.size() / sizeof(float));
-+      quantized.reserve(float_pixels.size() / kChannelsPerPixel);
-+      for (size_t i = 0; i < float_pixels.size(); i += kChannelsPerPixel) {
-+        quantized.push_back(QuantizedFloatPixelValue(
-+            float_pixels.subspan(i).first<kChannelsPerPixel>()));
++    case kRGBA_F32_SkColorType:
++      quantized.reserve(
++          base::checked_cast<wtf_size_t>(pixels.size() / kFloatPixelBytes));
++      for (size_t i = 0; i < pixels.size(); i += kFloatPixelBytes) {
++        std::array<float, kChannelsPerPixel> pixel =
++            LoadFloatPixel(pixels.subspan(i).first<kFloatPixelBytes>());
++        quantized.push_back(QuantizedFloatPixelValue(base::span(pixel)));
 +      }
 +      break;
-+    }
 +    default:
 +      NOTREACHED() << "Unsupported canvas color type for noising: "
 +                   << static_cast<int>(color_type);
@@ -380,10 +398,10 @@
 +// so a pixel gets the same noise no matter which part of the canvas is read.
 +// Returns the index of the pixel at |x|, |y| in canvas coordinates within a
 +// buffer that covers |rect|.
-+size_t PixelIndex(const gfx::Rect& rect, int x, int y) {
++wtf_size_t PixelIndex(const gfx::Rect& rect, int x, int y) {
 +  DCHECK(rect.Contains(x, y));
-+  return base::checked_cast<size_t>((x - rect.x()) +
-+                                    (y - rect.y()) * rect.width());
++  return base::checked_cast<wtf_size_t>((x - rect.x()) +
++                                        (y - rect.y()) * rect.width());
 +}
 +
 +struct NoiseSource {
@@ -395,7 +413,7 @@
 +  gfx::Rect rect;
 +  gfx::Rect canvas;
 +  // Quantized pixels of |rect|, see QuantizePixels().
-+  std::vector<uint32_t> pixels;
++  Vector<uint32_t> pixels;
 +};
 +
 +bool UpdateHashAndCheckSmoothNeighborhood(HeliumNoiseHash& hash,
@@ -492,42 +510,41 @@
 +      HeliumNoisePixels(token_hash, source, rect,
 +                        [pixels](size_t index, HeliumNoiseHash& coordinate_hash,
 +                                 const RgbNoise& rgb_noise) {
-+                          HeliumNoisePixel(GetPixel(pixels, index),
-+                                           coordinate_hash, rgb_noise);
++                          HeliumNoisePixel(
++                              GetPixel<kChannelsPerPixel>(pixels, index),
++                              coordinate_hash, rgb_noise);
 +                        });
 +      return;
-+    case kRGBA_F16_SkColorType: {
++    case kRGBA_F16_SkColorType:
 +      CHECK_EQ(pixels.size(), CheckedPixelStorageSize(
 +                                  rect.width(), rect.height(), sizeof(SkHalf)));
-+      auto half_pixels = base::span(reinterpret_cast<SkHalf*>(pixels.data()),
-+                                    pixels.size() / sizeof(SkHalf));
-+      HeliumNoisePixels(
-+          token_hash, source, rect,
-+          [half_pixels](size_t index, HeliumNoiseHash& coordinate_hash,
-+                        const RgbNoise& rgb_noise) {
-+            auto half_pixel = GetPixel(half_pixels, index);
-+            std::array<float, kChannelsPerPixel> pixel =
-+                LoadHalfFloatPixel(half_pixel);
-+            HeliumNoiseFloatPixel(base::span(pixel), coordinate_hash,
-+                                  rgb_noise);
-+            StoreHalfFloatPixel(half_pixel, pixel);
-+          });
++      HeliumNoisePixels(token_hash, source, rect,
++                        [pixels](size_t index, HeliumNoiseHash& coordinate_hash,
++                                 const RgbNoise& rgb_noise) {
++                          auto half_pixel =
++                              GetPixel<kHalfFloatPixelBytes>(pixels, index);
++                          std::array<float, kChannelsPerPixel> pixel =
++                              LoadHalfFloatPixel(half_pixel);
++                          HeliumNoiseFloatPixel(base::span(pixel),
++                                                coordinate_hash, rgb_noise);
++                          StoreHalfFloatPixel(half_pixel, pixel);
++                        });
 +      return;
-+    }
-+    case kRGBA_F32_SkColorType: {
++    case kRGBA_F32_SkColorType:
 +      CHECK_EQ(pixels.size(), CheckedPixelStorageSize(
 +                                  rect.width(), rect.height(), sizeof(float)));
-+      auto float_pixels = base::span(reinterpret_cast<float*>(pixels.data()),
-+                                     pixels.size() / sizeof(float));
-+      HeliumNoisePixels(
-+          token_hash, source, rect,
-+          [float_pixels](size_t index, HeliumNoiseHash& coordinate_hash,
-+                         const RgbNoise& rgb_noise) {
-+            HeliumNoiseFloatPixel(GetPixel(float_pixels, index),
-+                                  coordinate_hash, rgb_noise);
-+          });
++      HeliumNoisePixels(token_hash, source, rect,
++                        [pixels](size_t index, HeliumNoiseHash& coordinate_hash,
++                                 const RgbNoise& rgb_noise) {
++                          auto float_pixel =
++                              GetPixel<kFloatPixelBytes>(pixels, index);
++                          std::array<float, kChannelsPerPixel> pixel =
++                              LoadFloatPixel(float_pixel);
++                          HeliumNoiseFloatPixel(base::span(pixel),
++                                                coordinate_hash, rgb_noise);
++                          StoreFloatPixel(float_pixel, pixel);
++                        });
 +      return;
-+    }
 +    default:
 +      NOTREACHED() << "Unsupported canvas color type for noising: "
 +                   << static_cast<int>(color_type);
@@ -674,7 +691,7 @@
 +    // GPU readbacks can fail without reporting it, so only take the pixels
 +    // around the readback from this read. The readback's own pixels decide
 +    // what gets noised, and a failed read can't make them look empty.
-+    const std::vector<uint32_t> readback = QuantizePixels(color_type, pixels);
++    const Vector<uint32_t> readback = QuantizePixels(color_type, pixels);
 +    const gfx::Rect readback_rect =
 +        gfx::IntersectRects(image_data_rect, canvas_rect);
 +    for (int y = readback_rect.y(); y < readback_rect.bottom(); ++y) {
