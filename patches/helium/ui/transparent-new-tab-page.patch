@@ -1,0 +1,571 @@
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -49,6 +49,8 @@ constexpr const char kHeliumUnifiedTabSt
+ 
+ constexpr const char kHeliumNativeFrameMaterialsCommandLine[] =
+     "helium-native-frame-materials";
++constexpr const char kHeliumTransparentNewTabPageCommandLine[] =
++    "helium-transparent-new-tab-page";
+ }  // namespace helium
+ 
+ #endif /* CHROME_BROWSER_HELIUM_FLAG_CHOICES_H_ */
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -90,6 +90,11 @@
+      "Enables an option to apply native frame materials to the entire browser "
+      "frame. It also needs to be enabled in Appearance settings. Helium flag.",
+      kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumNativeFrameMaterials)},
++    {helium::kHeliumTransparentNewTabPageCommandLine,
++     "Transparent new tab page",
++     "Shows the frosted glass window frame through the new tab page. Has no "
++     "effect unless the frosted glass window frame is enabled. Helium flag.",
++     kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumTransparentNewTabPage)},
+     {helium::kHeliumUnifiedTabStripCommandLine,
+      "Scrollable horizontal tab strip",
+      "Enables the unified tab strip, which scrolls horizontal tabs when they "
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -32,6 +32,8 @@ bool HeliumNativeFrameAvailable() {
+   return base::FeatureList::IsEnabled(kHeliumNativeFrameMaterials);
+ }
+ 
++BASE_FEATURE(kHeliumTransparentNewTabPage, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ // Enables the use of WGC for the Eye Dropper screen capture.
+ BASE_FEATURE(kAllowEyeDropperWGCScreenCapture,
+ #if BUILDFLAG(IS_WIN)
+--- a/chrome/browser/ui/ui_features.h
++++ b/chrome/browser/ui/ui_features.h
+@@ -27,6 +27,8 @@ bool ShouldUseActionsForBrowserCommands(
+ BASE_DECLARE_FEATURE(kHeliumNativeFrameMaterials);
+ bool HeliumNativeFrameAvailable();
+ 
++BASE_DECLARE_FEATURE(kHeliumTransparentNewTabPage);
++
+ BASE_DECLARE_FEATURE(kAllowEyeDropperWGCScreenCapture);
+ 
+ BASE_DECLARE_FEATURE(kCtrlTabMru);
+--- a/chrome/browser/resources/new_tab_page/app.css
++++ b/chrome/browser/resources/new_tab_page/app.css
+@@ -576,5 +576,6 @@ ntp-lens-upload-dialog {
+ }
+ 
+ :host(:not([show-background-image_])) #rhsContent {
+-  background-color: var(--color-new-tab-page-background);
++  background-color: var(--helium-ntp-background-color,
++      var(--color-new-tab-page-background));
+ }
+--- a/chrome/browser/resources/new_tab_page/background_manager.ts
++++ b/chrome/browser/resources/new_tab_page/background_manager.ts
+@@ -85,6 +85,8 @@ export class BackgroundManager {
+   /** Sets the background color. */
+   setBackgroundColor(color: SkColor) {
+     document.body.style.backgroundColor = skColorToRgba(color);
++    document.body.style.setProperty(
++        '--helium-ntp-background-color', skColorToRgba(color));
+   }
+ 
+   /** Sets the background image. */
+--- a/chrome/browser/resources/new_tab_page/new_tab_page.html
++++ b/chrome/browser/resources/new_tab_page/new_tab_page.html
+@@ -5,6 +5,7 @@
+     <title>$i18n{title}</title>
+     <style>
+       body {
++        --helium-ntp-background-color: $i18n{backgroundColor};
+         background: $i18n{backgroundColor};
+         margin: 0;
+       }
+--- a/chrome/browser/ui/views/frame/contents_web_view.cc
++++ b/chrome/browser/ui/views/frame/contents_web_view.cc
+@@ -6,23 +6,33 @@
+ 
+ #include "base/debug/dump_without_crashing.h"
+ #include "build/build_config.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/search/background/ntp_custom_background_service.h"
++#include "chrome/browser/search/background/ntp_custom_background_service_factory.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/views/animations/common_animation_values.h"
+ #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
+ #include "chrome/browser/ui/views/frame/web_contents_close_handler.h"
+ #include "chrome/browser/ui/views/status_bubble_views.h"
++#include "chrome/common/webui_url_constants.h"
++#include "chrome/grit/theme_resources.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/web_modal/web_contents_modal_dialog_manager.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/common/url_constants.h"
+ #include "third_party/blink/public/common/input/web_input_event.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/theme_provider.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/compositor/layer_solid_color.h"
+ #include "ui/compositor/layer_tree_owner.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/widget/widget.h"
++#include "url/gurl.h"
+ 
+ #if defined(USE_AURA)
+ #include "ui/aura/window.h"
+@@ -169,6 +179,11 @@ void ContentsWebView::SetWebContents(con
+ 
+   UpdateIsBlockedByModal();
+ 
++  // Whether the background shows depends on the page the contents are on.
++  if (GetWidget()) {
++    UpdateBackgroundColor();
++  }
++
+   if (!status_bubble_) {
+     status_bubble_ = std::make_unique<StatusBubbleViews>(this);
+     status_bubble_->Reposition();
+@@ -221,14 +236,66 @@ void ContentsWebView::UpdateBackgroundCo
+     }
+   }
+ 
++  const bool show_background =
++      background_visible_ && !ShowsNativeFrameMaterial();
+   auto* background_layer = layer()->AsSolidColor();
+   background_layer->SetColor(
+-      SkColor4f::FromColor(background_visible_ ? color : SK_ColorTRANSPARENT));
++      SkColor4f::FromColor(show_background ? color : SK_ColorTRANSPARENT));
+ 
+   SafeInvoke(web_contents())
+       .Then(&content::WebContents::GetRenderWidgetHostView)
+       .Then(&content::RenderWidgetHostView::SetBackgroundColor,
+-            background_visible_ ? color : SK_ColorTRANSPARENT);
++            show_background ? color : SK_ColorTRANSPARENT);
++}
++
++void ContentsWebView::SetCanShowNativeFrameMaterial(bool can_show) {
++  if (can_show_native_frame_material_ == can_show) {
++    return;
++  }
++
++  can_show_native_frame_material_ = can_show;
++  if (GetWidget()) {
++    UpdateBackgroundColor();
++  }
++}
++
++bool ContentsWebView::ShowsNativeFrameMaterial() const {
++  if (!web_contents() || !can_show_native_frame_material_) {
++    return false;
++  }
++
++  // The visible entry, so a new tab is transparent before its page commits.
++  // Its actual URL, as an extension that replaces the page keeps the shown one,
++  // and only the page that can be transparent, not the incognito one.
++  const content::NavigationEntry* const entry =
++      web_contents()->GetController().GetVisibleEntry();
++  if (!entry) {
++    return false;
++  }
++  const GURL& url = entry->GetURL();
++  if (!url.SchemeIs(content::kChromeUIScheme) ||
++      url.host() != chrome::kChromeUINewTabPageHost) {
++    return false;
++  }
++
++  // Like the page itself, unless it shows an image over its background.
++  const ui::ThemeProvider* const theme_provider = GetThemeProvider();
++  if (theme_provider &&
++      theme_provider->HasCustomImage(IDR_THEME_NTP_BACKGROUND)) {
++    return false;
++  }
++  NtpCustomBackgroundService* const custom_background_service =
++      NtpCustomBackgroundServiceFactory::GetForProfile(
++          Profile::FromBrowserContext(web_contents()->GetBrowserContext()));
++  return !custom_background_service ||
++         !custom_background_service->GetCustomBackground().has_value();
++}
++
++void ContentsWebView::PrimaryPageChanged(content::Page& page) {
++  views::WebView::PrimaryPageChanged(page);
++  if (GetWidget()) {
++    UpdateBackgroundColor();
++  }
+ }
+ 
+ std::unique_ptr<ui::Layer> ContentsWebView::RecreateLayer() {
+--- a/chrome/browser/ui/views/frame/contents_web_view.h
++++ b/chrome/browser/ui/views/frame/contents_web_view.h
+@@ -42,6 +42,13 @@ class ContentsWebView : public views::We
+   // Toggles whether the background is visible.
+   void SetBackgroundVisible(bool background_visible);
+ 
++  // Whether the window lets the new tab page show the native frame material
++  // through itself.
++  void SetCanShowNativeFrameMaterial(bool can_show);
++  // Whether the contents show the native frame material through themselves,
++  // as the new tab page does where it can.
++  bool ShowsNativeFrameMaterial() const;
++
+   const gfx::RoundedCornersF& GetBackgroundRadii() const;
+   void SetBackgroundRadii(const gfx::RoundedCornersF& radii);
+ 
+@@ -59,6 +66,7 @@ class ContentsWebView : public views::We
+   void SetWebContents(content::WebContents* web_contents) override;
+ 
+   // content::WebContentsObserver overrides:
++  void PrimaryPageChanged(content::Page& page) override;
+   // Overridden to track physical interactions (mouse/touch) on the WebContents.
+   // This allows the browser to force focus synchronization in split view even
+   // when native OS focus gets stuck on a different window (like a permission
+@@ -80,6 +88,7 @@ class ContentsWebView : public views::We
+   std::unique_ptr<WebContentsCloseHandler> web_contents_close_handler_;
+ 
+   bool background_visible_ = true;
++  bool can_show_native_frame_material_ = false;
+   bool is_animating_bounds_ = false;
+   const bool use_default_deadline_when_animating_;
+ 
+--- a/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
++++ b/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.cc
+@@ -60,6 +60,9 @@
+ #include "chrome/browser/ui/hats/hats_service.h"
+ #include "chrome/browser/ui/hats/hats_service_factory.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/browser/ui/views/new_tab_footer/footer_controller.h"
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX)
+ #include "chrome/browser/ui/views/scheduled_restart/scheduled_restart_bubble_controller.h"
+@@ -91,6 +94,7 @@
+ #include "components/segmentation_platform/public/prediction_options.h"
+ #include "components/segmentation_platform/public/segmentation_platform_service.h"
+ #include "components/sync/service/sync_service.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/user_education/common/feature_promo/feature_promo_controller.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+@@ -186,7 +190,6 @@ new_tab_page::mojom::ThemePtr MakeTheme(
+       ntp_custom_background_service
+           ? ntp_custom_background_service->GetCustomBackground()
+           : std::nullopt;
+-  theme->background_color = color_provider.GetColor(kColorNewTabPageBackground);
+   theme->is_baseline = theme_service->GetIsBaseline();
+   // Theme is GM3 if there is a GM3 color set or the theme is baseline and no
+   // CWS theme is set.
+@@ -200,6 +203,31 @@ new_tab_page::mojom::ThemePtr MakeTheme(
+       theme_provider &&
+       theme_provider->HasCustomImage(IDR_THEME_NTP_BACKGROUND);
+ #endif
++  // On its own in a window with the native frame material, the page shows it
++  // through itself, unless it shows an image over its background.
++  const tabs::TabInterface* const tab =
++      tabs::TabInterface::MaybeGetFromContents(web_contents);
++  const bool shows_native_frame_material =
++      base::FeatureList::IsEnabled(features::kHeliumTransparentNewTabPage) &&
++      !custom_background.has_value() && !theme_has_custom_image && tab &&
++      !tab->IsSplit() &&
++      helium::ShouldUseNativeFrameMaterials(tab->GetBrowserWindowInterface());
++  theme->background_color =
++      shows_native_frame_material
++          ? SK_ColorTRANSPARENT
++          : color_provider.GetColor(kColorNewTabPageBackground);
++  // Themes pick the text for their background, which the material shows in
++  // place of.
++  SkColor themed_text_color = color_provider.GetColor(kColorNewTabPageText);
++  if (shows_native_frame_material) {
++    const SkColor material_color =
++        SkColorSetA(helium::GetNativeFrameMaterialTintColor(
++                        color_provider.GetColor(kColorToolbar)),
++                    SK_AlphaOPAQUE);
++    themed_text_color =
++        color_utils::BlendForMinContrast(themed_text_color, material_color)
++            .color;
++  }
+   SkColor text_color;
+   if (custom_background.has_value()) {
+     text_color = color_provider.GetColor(kColorNewTabPageTextUnthemed);
+@@ -214,7 +242,7 @@ new_tab_page::mojom::ThemePtr MakeTheme(
+     most_visited->background_color =
+         color_provider.GetColor(kColorNewTabPageMostVisitedTileBackground);
+   } else {
+-    text_color = color_provider.GetColor(kColorNewTabPageText);
++    text_color = themed_text_color;
+     bool use_alternate_logo =
+         theme_provider && theme_provider->GetDisplayProperty(
+                               ThemeProperties::NTP_LOGO_ALTERNATE) == 1;
+@@ -233,8 +261,7 @@ new_tab_page::mojom::ThemePtr MakeTheme(
+       color_utils::IsDark(most_visited->background_color);
+   most_visited->is_dark = !color_utils::IsDark(text_color);
+   theme->text_color = text_color;
+-  theme->is_dark =
+-      !color_utils::IsDark(color_provider.GetColor(kColorNewTabPageText));
++  theme->is_dark = !color_utils::IsDark(themed_text_color);
+   new_tab_page::mojom::BackgroundImagePtr background_image;
+ #if !BUILDFLAG(IS_ANDROID)
+   if (theme_has_custom_image) {
+@@ -524,6 +551,22 @@ NewTabPageHandler::NewTabPageHandler(
+       base::BindRepeating(&NewTabPageHandler::UpdateActionChipsVisibility,
+                           base::Unretained(this)));
+ 
++  if (base::FeatureList::IsEnabled(features::kHeliumTransparentNewTabPage)) {
++    // The page shows the frosted glass window frame through itself, where its
++    // window and split let it.
++    pref_change_registrar_.Add(
++        prefs::kHeliumNativeFrameMaterials,
++        base::BindRepeating(&NewTabPageHandler::OnThemeChanged,
++                            base::Unretained(this)));
++    ObserveSplitTabs();
++    native_frame_material_window_subscription_ =
++        webui::RegisterBrowserWindowInterfaceChanged(
++            web_contents_,
++            base::BindRepeating(
++                &NewTabPageHandler::OnNativeFrameMaterialWindowChanged,
++                base::Unretained(this)));
++  }
++
+ #if !BUILDFLAG(IS_ANDROID)
+   // `kSeedColorChangeCount` is registered by ThemeColorPickerHandler, which is
+   // desktop-only, and the toast it drives points at the Chrome Web Store.
+@@ -1188,6 +1231,35 @@ void NewTabPageHandler::OnLogoAvailable(
+   std::move(callback).Run(std::move(doodle));
+ }
+ 
++void NewTabPageHandler::OnSplitTabChanged(const SplitTabChange& change) {
++  // The page is solid in a split, so its theme changes with its own.
++  const std::vector<std::pair<tabs::TabInterface*, int>>* tabs = nullptr;
++  if (change.type == SplitTabChange::Type::kAdded) {
++    tabs = &change.GetAddedChange()->tabs();
++  } else if (change.type == SplitTabChange::Type::kRemoved) {
++    tabs = &change.GetRemovedChange()->tabs();
++  }
++
++  tabs::TabInterface* const tab =
++      tabs::TabInterface::MaybeGetFromContents(web_contents_);
++  if (tabs && std::ranges::contains(
++                  *tabs, tab, &std::pair<tabs::TabInterface*, int>::first)) {
++    OnThemeChanged();
++  }
++}
++
++void NewTabPageHandler::ObserveSplitTabs() {
++  TabStripModelObserver::StopObservingAll(this);
++  if (auto* const browser = webui::GetBrowserWindowInterface(web_contents_)) {
++    browser->GetTabStripModel()->AddObserver(this);
++  }
++}
++
++void NewTabPageHandler::OnNativeFrameMaterialWindowChanged() {
++  ObserveSplitTabs();
++  OnThemeChanged();
++}
++
+ void NewTabPageHandler::OnBrowserWindowInterfaceChanged() {
+ // TODO(b/502297163): Implement for Android.
+ #if !BUILDFLAG(IS_ANDROID)
+--- a/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.cc
++++ b/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.cc
+@@ -51,6 +51,7 @@
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/search/ntp_user_data_logger.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+ #include "chrome/browser/ui/webui/browser_command/browser_command_handler.h"
+@@ -1122,6 +1123,13 @@ bool NewTabPageUI::IsNewTabPageOrigin(co
+ }
+ 
+ // static
++bool NewTabPageUI::CanShowNativeFrameMaterial(Profile* profile) {
++  return base::FeatureList::IsEnabled(features::kHeliumTransparentNewTabPage) &&
++         features::HeliumNativeFrameAvailable() &&
++         profile->GetPrefs()->GetBoolean(prefs::kHeliumNativeFrameMaterials);
++}
++
++// static
+ void NewTabPageUI::RegisterProfilePrefs(PrefRegistrySimple* registry) {
+   registry->RegisterTimePref(kPrevNavigationTimePrefName, base::Time());
+   registry->RegisterTimePref(ntp_prefs::kNtpLastModuleStalenessUpdate,
+@@ -1464,7 +1472,10 @@ void NewTabPageUI::OnColorProviderChange
+   }
+   const ui::ColorProvider& color_provider = web_contents()->GetColorProvider();
+   auto background_color = color_provider.GetColor(kColorNewTabPageBackground);
+-  update.Set("backgroundColor", skia::SkColorToHexString(background_color));
++  update.Set("backgroundColor",
++             CanShowNativeFrameMaterial(Profile::FromWebUI(web_ui()))
++                 ? "transparent"
++                 : skia::SkColorToHexString(background_color));
+   content::WebUIDataSource::Update(Profile::FromWebUI(web_ui()),
+                                    chrome::kChromeUINewTabPageHost,
+                                    std::move(update));
+--- a/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.h
++++ b/chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.h
+@@ -128,6 +128,9 @@ class NewTabPageUI
+   DECLARE_CLASS_ELEMENT_IDENTIFIER_VALUE(kRealboxContextualEntrypointElementId);
+ 
+   static bool IsNewTabPageOrigin(const GURL& url);
++  // Whether the new tab pages of |profile| start out transparent, to show the
++  // native frame material through themselves.
++  static bool CanShowNativeFrameMaterial(Profile* profile);
+   static void RegisterProfilePrefs(PrefRegistrySimple* registry);
+   static void ResetProfilePrefs(PrefService* prefs);
+   static void MigrateDeprecatedUseMostVisitedTilesPref(PrefService* prefs);
+--- a/chrome/browser/ui/views/frame/BUILD.gn
++++ b/chrome/browser/ui/views/frame/BUILD.gn
+@@ -1404,17 +1404,23 @@ source_set("contents_web_view") {
+   deps = [
+     ":safe_invoke",
+     ":web_contents_close_handler",
++    "//chrome/app/theme:theme_resources",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/search/background",
+     "//chrome/browser/ui/color:color_headers",
+     "//chrome/browser/ui/views:status_bubble",
+     "//chrome/browser/ui/views/animations",
++    "//chrome/common:constants",
+     "//components/tabs:public",
+     "//components/web_modal",
+     "//content/public/browser",
++    "//content/public/common",
+     "//skia:skia_core_public_headers",
+     "//third_party/blink/public/common:headers",
+     "//ui/color:color_headers",
+     "//ui/compositor",
+     "//ui/views",
++    "//url",
+   ]
+   if (use_aura) {
+     deps += [
+@@ -3247,10 +3253,12 @@ source_set("multi_contents_view_impl") {
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/ui:browser_element_identifiers",
+     "//chrome/browser/ui:sad_tab",
++    "//chrome/browser/ui:ui_features",
+     "//chrome/browser/ui:view_ids",
+     "//chrome/browser/ui/color:color_headers",
+     "//chrome/browser/ui/read_anything:views",
+     "//chrome/browser/ui/tabs:tab_strip",
++    "//chrome/browser/ui/views/helium:native_frame_materials",
+     "//chrome/browser/ui/views/new_tab_footer",
+     "//chrome/browser/ui/views/toolbar",
+     "//chrome/common:constants",
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "base/check_deref.h"
++#include "base/feature_list.h"
+ #include "base/notreached.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/actor/ui/actor_overlay_web_view.h"
+@@ -19,6 +20,7 @@
+ #include "chrome/browser/ui/read_anything/read_anything_immersive_overlay_view.h"
+ #include "chrome/browser/ui/sad_tab_helper.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
+@@ -32,6 +34,7 @@
+ #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
+ #include "chrome/browser/ui/views/frame/scrim_view.h"
+ #include "chrome/browser/ui/views/frame/themed_background.h"
++#include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "chrome/browser/ui/views/new_tab_footer/footer_web_view.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/common/pref_names.h"
+@@ -922,6 +925,17 @@ void MultiContentsView::UpdateContentsBo
+   const bool is_drop_target_on_bottom =
+       is_drop_target_visible &&
+       drop_target_view_->side() == MultiContentsDropTargetView::DropSide::BOTTOM;
++
++  // The new tab page is solid in a split, like the contents next to it.
++  const bool can_show_native_frame_material =
++      !is_in_split &&
++      base::FeatureList::IsEnabled(features::kHeliumTransparentNewTabPage) &&
++      helium::ShouldUseNativeFrameMaterials(browser_view_);
++  for (const auto& contents_container_view : contents_container_views_) {
++    contents_container_view->contents_view()->SetCanShowNativeFrameMaterial(
++        can_show_native_frame_material);
++  }
++
+   const AttachedChromeEdges attached_chrome = GetAttachedChromeEdges();
+   const bool top_edge_is_window_edge = !attached_chrome.top;
+   const bool can_use_system_corners =
+--- a/chrome/browser/ui/webui/new_tab_page/BUILD.gn
++++ b/chrome/browser/ui/webui/new_tab_page/BUILD.gn
+@@ -190,7 +190,11 @@ source_set("impl") {
+   if (!is_android) {
+     deps += [
+       "//chrome/browser/ui:browser_window_header",
++      "//chrome/browser/ui:ui_features",
++      "//chrome/browser/ui/tabs:tab_strip",
++      "//chrome/browser/ui/tabs:tab_strip_model_observer",
+       "//chrome/browser/ui/user_education",
++      "//chrome/browser/ui/views/helium:native_frame_materials",
+       "//chrome/browser/ui/views/new_tab_footer",
+       "//chrome/browser/ui/views/side_panel",
+       "//chrome/browser/ui/views/side_panel/customize_chrome",
+--- a/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.h
++++ b/chrome/browser/ui/webui/new_tab_page/new_tab_page_handler.h
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/themes/theme_service_observer.h"
+ #include "chrome/browser/ui/search/ntp_user_data_logger.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/views/new_tab_footer/footer_controller_observer.h"
+ #include "chrome/browser/ui/webui/new_tab_page/new_tab_page.mojom.h"
+ #include "chrome/common/search/ntp_logging_events.h"
+@@ -81,7 +82,8 @@ class NewTabPageHandler
+       public NtpCustomBackgroundServiceObserver,
+       public optimization_guide::SettingsEnabledObserver,
+       public MicrosoftAuthServiceObserver,
+-      public new_tab_footer::NewTabFooterControllerObserver {
++      public new_tab_footer::NewTabFooterControllerObserver,
++      public TabStripModelObserver {
+  public:
+   NewTabPageHandler(mojo::PendingReceiver<new_tab_page::mojom::PageHandler>
+                         pending_page_handler,
+@@ -183,6 +185,14 @@ class NewTabPageHandler
+   // new_tab_footer::NewTabFooterControllerObserver:
+   void OnFooterVisibilityUpdated(bool visible) override;
+ 
++  // TabStripModelObserver:
++  void OnSplitTabChanged(const SplitTabChange& change) override;
++
++  // Observes the splits of the window the page is in, which it is solid in.
++  void ObserveSplitTabs();
++  // Whether the page shows the native frame material depends on its window.
++  void OnNativeFrameMaterialWindowChanged();
++
+   void OnLogoAvailable(
+       GetDoodleCallback callback,
+       search_provider_logos::LogoCallbackReason type,
+@@ -294,6 +304,7 @@ class NewTabPageHandler
+ #endif
+   // Notifies this when the browser window context changes.
+   base::CallbackListSubscription browser_window_changed_subscription_;
++  base::CallbackListSubscription native_frame_material_window_subscription_;
+   // Triggered when the searchbox's contextual menu entrypoint is displayed.
+   base::CallbackListSubscription searchbox_shown_subscription_;
+ 
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -483,8 +483,13 @@ void VerticalTabStripRegionView::UpdateN
+         contents_reflections_[i].get();
+     reflection->SetFloating(floating_style_ != FloatingStyle::kNone);
+     // A vibrant material takes a tinted copy in full, a plain blur only a
+-    // faint one.
+-    reflection->SetCopyOpacity(vibrant ? 1.0f : kClippedContentsCopyOpacity);
++    // faint one. A new tab page that shows the material through itself has
++    // nothing to copy, so it stays attached but hidden.
++    const bool shows_material =
++        i < contents.size() && contents[i]->ShowsNativeFrameMaterial();
++    reflection->SetCopyOpacity(shows_material ? 0.0f
++                               : vibrant      ? 1.0f
++                                              : kClippedContentsCopyOpacity);
+     reflection->SetCopyTint(vibrant ? material_color : std::nullopt);
+     reflection->SetContents(i < contents.size() ? contents[i]->holder()
+                                                 : nullptr);
