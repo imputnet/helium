@@ -1,0 +1,409 @@
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2025-2026, The Brave Authors
+Copyright (c) 2026, The Helium Authors
+--- a/components/components_strings.grd
++++ b/components/components_strings.grd
+@@ -345,6 +345,7 @@
+       <part file="collaboration_strings.grdp" />
+       <part file="contextual_cueing_strings.grdp" />
+       <part file="contextual_tasks_strings.grdp" />
++      <part file="../brave/components/resources/containers_strings.grdp" />
+       <if expr="is_android">
+         <part file="android_system_error_page_strings.grdp" />
+         <part file="external_intents_strings.grdp" />
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1090,6 +1090,8 @@ source_set("core") {
+     ":unexpire_flags",
+     ":universal_web_contents_observers",
+     "//base/allocator:buildflags",
++    "//brave/components/containers/content/browser",
++    "//brave/components/containers/core/common",
+     "//build/config/linux/dbus:buildflags",
+     "//chrome/browser/accessibility",
+     "//chrome/browser/actor",
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -53,6 +53,8 @@
+ #include "base/types/expected_macros.h"
+ #include "base/types/optional_ref.h"
+ #include "base/values.h"
++#include "brave/components/containers/content/browser/storage_partition_utils.h"
++#include "brave/components/containers/core/common/features.h"
+ #include "build/android_buildflags.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+@@ -1863,6 +1865,17 @@ ChromeContentBrowserClient::GetStoragePa
+   return default_storage_partition_config;
+ }
+ 
++bool ChromeContentBrowserClient::ShouldInheritStoragePartition(
++    const content::StoragePartitionConfig& partition_config) {
++  return base::FeatureList::IsEnabled(containers::features::kContainers) &&
++         containers::IsContainersStoragePartition(partition_config);
++}
++
++bool ChromeContentBrowserClient::ShouldUseDefaultHostZoomMapForStoragePartition(
++    const content::StoragePartitionConfig& partition_config) {
++  return ShouldInheritStoragePartition(partition_config);
++}
++
+ std::unique_ptr<content::WebContentsViewDelegate>
+ ChromeContentBrowserClient::GetWebContentsViewDelegate(
+     content::WebContents* web_contents) {
+--- a/chrome/browser/chrome_content_browser_client.h
++++ b/chrome/browser/chrome_content_browser_client.h
+@@ -205,6 +205,10 @@ class ChromeContentBrowserClient : publi
+   content::StoragePartitionConfig GetStoragePartitionConfigForSite(
+       content::BrowserContext* browser_context,
+       const GURL& site) override;
++  bool ShouldInheritStoragePartition(
++      const content::StoragePartitionConfig& partition_config) override;
++  bool ShouldUseDefaultHostZoomMapForStoragePartition(
++      const content::StoragePartitionConfig& partition_config) override;
+   std::unique_ptr<content::WebContentsViewDelegate> GetWebContentsViewDelegate(
+       content::WebContents* web_contents) override;
+   void RenderProcessWillLaunch(content::RenderProcessHost* host) override;
+--- a/content/browser/host_zoom_map_impl.cc
++++ b/content/browser/host_zoom_map_impl.cc
+@@ -16,6 +16,7 @@
+ #include "content/browser/renderer_host/navigation_entry_impl.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/renderer_host/render_process_host_impl.h"
++#include "content/browser/storage_partition_impl.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -122,6 +123,15 @@ HostZoomMap* HostZoomMap::GetForStorageP
+     StoragePartition* storage_partition) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M160);
+   CHECK(storage_partition);
++  if (GetContentClient()
++          ->browser()
++          ->ShouldUseDefaultHostZoomMapForStoragePartition(
++              storage_partition->GetConfig())) {
++    return static_cast<StoragePartitionImpl*>(storage_partition)
++        ->browser_context()
++        ->GetDefaultStoragePartition()
++        ->GetHostZoomMap();
++  }
+   return storage_partition->GetHostZoomMap();
+ }
+ 
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/feature_list.h"
+ #include "base/no_destructor.h"
++#include "brave/browser/containers/containers_service_factory.h"
+ #include "build/build_config.h"
+ #include "build/chromeos_buildflags.h"
+ #include "chrome/browser/accessibility/accessibility_labels_service_factory.h"
+@@ -908,6 +909,7 @@ void ChromeBrowserMainExtraPartsProfiles
+   contextual_tasks::ContextualTasksUiServiceFactory::GetInstance();
+   contextual_tasks::SearchJourneyTrackerFactory::GetInstance();
+ 
++  ContainersServiceFactory::GetInstance();
+   ContentIndexProviderFactory::GetInstance();
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+   glic::ContextualCueingServiceFactory::GetInstance();
+--- a/chrome/browser/tab_contents/tab_util.cc
++++ b/chrome/browser/tab_contents/tab_util.cc
+@@ -19,8 +19,10 @@ using content::SiteInstance;
+ 
+ namespace tab_util {
+ 
+-scoped_refptr<SiteInstance> GetSiteInstanceForNewTab(Profile* profile,
+-                                                     GURL url) {
++scoped_refptr<SiteInstance> GetSiteInstanceForNewTab(
++    Profile* profile,
++    GURL url,
++    std::optional<content::StoragePartitionConfig> storage_partition_config) {
+   // Rewrite the |url| if necessary, to ensure that the SiteInstance is
+   // associated with a |url| that will actually be loaded.  For example,
+   // |url| set to chrome://newtab/ might actually result in a navigation to a
+@@ -28,6 +30,14 @@ scoped_refptr<SiteInstance> GetSiteInsta
+   content::BrowserURLHandler::GetInstance()->RewriteURLIfNecessary(&url,
+                                                                    profile);
+ 
++  // Tabs in a container have to start in its StoragePartition, whatever
++  // they load first.
++  if (storage_partition_config) {
++    return SiteInstance::CreateForFixedStoragePartition(
++        profile, SiteInstance::ShouldAssignSiteForURL(url) ? url : GURL(),
++        *storage_partition_config);
++  }
++
+   // If |url| is a WebUI or extension, we set the SiteInstance up front so that
+   // we don't end up with an extra process swap on the first navigation.
+   if (ChromeWebUIControllerFactory::GetInstance()->UseWebUIForURL(profile, url))
+--- a/chrome/browser/tab_contents/tab_util.h
++++ b/chrome/browser/tab_contents/tab_util.h
+@@ -5,16 +5,23 @@
+ #ifndef CHROME_BROWSER_TAB_CONTENTS_TAB_UTIL_H_
+ #define CHROME_BROWSER_TAB_CONTENTS_TAB_UTIL_H_
+ 
++#include <optional>
++
+ #include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition_config.h"
+ #include "url/gurl.h"
+ 
+ class Profile;
+ 
+ namespace tab_util {
+ 
+-// Returns a new SiteInstance for WebUI and app URLs. Returns NULL otherwise.
+-scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(Profile* profile,
+-                                                              GURL url);
++// Returns a new SiteInstance for WebUI and app URLs, or for any URL when
++// |storage_partition_config| is set. Returns NULL otherwise.
++scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(
++    Profile* profile,
++    GURL url,
++    std::optional<content::StoragePartitionConfig> storage_partition_config =
++        std::nullopt);
+ 
+ }  // namespace tab_util
+ 
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -5807,6 +5807,10 @@ FrameTree* WebContentsImpl::CreateNewWin
+       // as long as they preserve the guest's StoragePartition.
+       site_instance =
+           SiteInstance::CreateForGuest(GetBrowserContext(), partition_config);
++    } else if (GetContentClient()->browser()->ShouldInheritStoragePartition(
++                   partition_config)) {
++      site_instance = SiteInstance::CreateForFixedStoragePartition(
++          GetBrowserContext(), GURL(), partition_config);
+     } else {
+       site_instance = SiteInstance::Create(GetBrowserContext());
+     }
+--- a/content/public/browser/content_browser_client.cc
++++ b/content/public/browser/content_browser_client.cc
+@@ -801,6 +801,16 @@ StoragePartitionConfig ContentBrowserCli
+   return StoragePartitionConfig::CreateDefault(browser_context);
+ }
+ 
++bool ContentBrowserClient::ShouldInheritStoragePartition(
++    const StoragePartitionConfig& partition_config) {
++  return false;
++}
++
++bool ContentBrowserClient::ShouldUseDefaultHostZoomMapForStoragePartition(
++    const StoragePartitionConfig& partition_config) {
++  return false;
++}
++
+ MediaObserver* ContentBrowserClient::GetMediaObserver() {
+   return nullptr;
+ }
+--- a/content/public/browser/content_browser_client.h
++++ b/content/public/browser/content_browser_client.h
+@@ -1193,6 +1193,16 @@ class CONTENT_EXPORT ContentBrowserClien
+       BrowserContext* browser_context,
+       const GURL& site);
+ 
++  // Whether windows opened with noopener from a page in |partition_config|
++  // should stay in that StoragePartition.
++  virtual bool ShouldInheritStoragePartition(
++      const StoragePartitionConfig& partition_config);
++
++  // Whether pages in |partition_config| should share zoom levels with the
++  // default StoragePartition.
++  virtual bool ShouldUseDefaultHostZoomMapForStoragePartition(
++      const StoragePartitionConfig& partition_config);
++
+   // Allows the embedder to provide settings that determine if generated code
+   // can be cached and the amount of disk space used for caching generated code.
+   virtual GeneratedCodeCacheSettings GetGeneratedCodeCacheSettings(
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -18,6 +18,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_event.h"
++#include "brave/browser/containers/containers_navigator_utils.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
+ #include "chrome/browser/apps/link_capturing/link_capturing_tab_data.h"
+@@ -578,7 +579,9 @@ std::unique_ptr<content::WebContents> Cr
+   scoped_refptr<content::SiteInstance> initial_site_instance_for_new_contents =
+       params.opener ? params.opener->GetSiteInstance()
+                     : tab_util::GetSiteInstanceForNewTab(
+-                          params.browser->GetProfile(), url);
++                          params.browser->GetProfile(), url,
++                          containers::GetStoragePartitionConfigToInherit(
++                              params));
+ 
+   WebContents::CreateParams create_params(
+       params.browser->GetProfile(), initial_site_instance_for_new_contents);
+--- a/chrome/browser/ui/navigator/browser_navigator_params.h
++++ b/chrome/browser/ui/navigator/browser_navigator_params.h
+@@ -24,6 +24,7 @@
+ #include "content/public/browser/reload_type.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition_config.h"
+ #include "content/public/common/referrer.h"
+ #include "services/network/public/cpp/resource_request_body.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+@@ -335,6 +336,10 @@ struct NavigateParams {
+   // an about:blank or a data url navigation.
+   scoped_refptr<content::SiteInstance> source_site_instance;
+ 
++  // StoragePartition of the container to open a new tab in, if any. Without
++  // it, new tabs inherit the container of |source_site_instance|.
++  std::optional<content::StoragePartitionConfig> storage_partition_config;
++
+   // Optional URLLoaderFactory to facilitate blob URL loading.
+   scoped_refptr<network::SharedURLLoaderFactory> blob_url_loader_factory;
+ 
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -549,6 +549,8 @@ if (!is_android) {
+       ":tab_strip",
+       ":tabs",
+       ":utils",
++      "//brave/browser/containers",
++      "//brave/components/containers/core/common",
+       "//chrome/app:command_ids",
+       "//chrome/app/vector_icons",
+       "//chrome/browser:browser_process",
+--- a/chrome/browser/ui/tabs/tab_features.cc
++++ b/chrome/browser/ui/tabs/tab_features.cc
+@@ -14,6 +14,8 @@
+ #include "base/no_destructor.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/default_tick_clock.h"
++#include "brave/browser/containers/container_tab_tracker.h"
++#include "brave/components/containers/core/common/features.h"
+ #include "chrome/browser/actor/actor_keyed_service.h"
+ #include "chrome/browser/actor/actor_surface_tab_helper.h"
+ #include "chrome/browser/actor/actor_tab_data.h"
+@@ -1035,6 +1037,10 @@ void TabFeatures::Init(TabInterface& tab
+         std::make_unique<dictation::DictationIphController>(tab);
+   }
+ 
++  if (base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    container_tab_tracker_ = containers::ContainerTabTracker::MaybeCreate(tab);
++  }
++
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN) || \
+     BUILDFLAG(IS_CHROMEOS)
+   if (base::FeatureList::IsEnabled(enterprise_reporting::kSaasUsageReporting)) {
+--- a/chrome/browser/ui/tabs/public/tab_features.h
++++ b/chrome/browser/ui/tabs/public/tab_features.h
+@@ -185,6 +185,10 @@ namespace content {
+ class WebContents;
+ }  // namespace content
+ 
++namespace containers {
++class ContainerTabTracker;
++}  // namespace containers
++
+ namespace contextual_cueing {
+ class ContextualCueingController;
+ class ContextualCueingWebContentsObserver;
+@@ -1062,6 +1066,8 @@ class TabFeatures {
+   std::unique_ptr<policy::DlpContentTabHelper> dlp_content_tab_helper_;
+ #endif
+ 
++  std::unique_ptr<containers::ContainerTabTracker> container_tab_tracker_;
++
+   // Must be the last member.
+   base::WeakPtrFactory<TabFeatures> weak_factory_{this};
+ };
+--- a/components/components_strings.grd.gritdeps
++++ b/components/components_strings.grd.gritdeps
+@@ -1,5 +1,6 @@
+ # Generated by running:
+ #   tools/grit/grit_info.py --all-inputs components/components_strings.grd > components/components_strings.grd.gritdeps
++brave/components/resources/containers_strings.grdp
+ components/android_system_error_page_strings.grdp
+ components/arc_strings.grdp
+ components/autofill_payments_strings.grdp
+--- a/components/sync_preferences/BUILD.gn
++++ b/components/sync_preferences/BUILD.gn
+@@ -55,6 +55,7 @@ source_set("common_syncable_prefs_databa
+   deps = [
+     ":sync_preferences",
+     "//base",
++    "//brave/components/containers/core/browser",
+     "//components/autofill/core/common",
+     "//components/bookmarks/common",
+     "//components/browsing_data/core",
+--- a/components/sync_preferences/common_syncable_prefs_database.cc
++++ b/components/sync_preferences/common_syncable_prefs_database.cc
+@@ -9,6 +9,7 @@
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/containers/fixed_flat_set.h"
+ #include "base/feature_list.h"
++#include "brave/components/containers/core/browser/pref_names.h"
+ #include "build/build_config.h"
+ #include "components/autofill/core/common/autofill_prefs.h"
+ #include "components/bookmarks/common/bookmark_pref_names.h"
+@@ -186,6 +187,8 @@ enum {
+   // New entries should be added above this line.
+   kSubscriptionEligibilityAiSubscriptionTier =
+       100338,  // (different ID as it's a move from //chrome)
++  // Helium prefs, far from Chromium's ids.
++  kContainersList = 950000,
+   // See components/sync_preferences/README.md about adding new entries here.
+   // vvvvv IMPORTANT! vvvvv
+   // Note to the reviewer: IT IS YOUR RESPONSIBILITY to ensure that new syncable
+@@ -587,6 +590,10 @@ constexpr auto kCommonSyncablePrefsAllow
+          {syncable_prefs_ids::kReaderForAccessibility, syncer::PREFERENCES,
+           PrefSensitivity::kNone, MergeBehavior::kNone,
+           WriteBehavior::kWriteToBoth}},
++        {containers::prefs::kContainersList,
++         {syncable_prefs_ids::kContainersList, syncer::PREFERENCES,
++          PrefSensitivity::kNone, MergeBehavior::kNone,
++          WriteBehavior::kWriteToBoth}},
+     });
+ 
+ }  // namespace
+--- a/chrome/browser/profiles/BUILD.gn
++++ b/chrome/browser/profiles/BUILD.gn
+@@ -750,6 +750,7 @@ source_set("profiles_extra_parts_impl")
+     ":profiles_extra_parts",
+     ":renderer_updater",
+     "//base",
++    "//brave/browser/containers",
+     "//chrome/browser:browser_process",
+     "//chrome/browser:chrome_browser_main",
+     "//chrome/browser:font_pref",
+--- a/chrome/browser/ui/navigator/BUILD.gn
++++ b/chrome/browser/ui/navigator/BUILD.gn
+@@ -87,6 +87,7 @@ source_set("impl") {
+     ]
+ 
+     deps += [
++      "//brave/browser/containers:navigator",
+       "//chrome/browser/apps/app_service",
+       "//chrome/browser/apps/link_capturing",
+       "//chrome/browser/ui:browser_init_state",
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -363,6 +363,8 @@ are declared in tools/grit/grit_args.gni
+       <!-- Skills specific strings -->
+       <part file="skills_strings.grdp" />
+ 
++      <part file="../../brave/app/containers_strings.grdp" />
++
+       <!-- Strings that are only used when VR devices are supported -->
+       <if expr="enable_vr">
+         <part file="vr_strings.grdp" />
+--- a/chrome/app/generated_resources.grd.gritdeps
++++ b/chrome/app/generated_resources.grd.gritdeps
+@@ -1,5 +1,6 @@
+ # Generated by running:
+ #   tools/grit/grit_info.py --all-inputs chrome/app/generated_resources.grd > chrome/app/generated_resources.grd.gritdeps
++brave/app/containers_strings.grdp
+ chrome/app/access_code_cast_strings.grdp
+ chrome/app/actor_strings.grdp
+ chrome/app/app_management_strings.grdp
