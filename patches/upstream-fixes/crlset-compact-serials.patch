@@ -1,0 +1,436 @@
+From f5c0f9c637c971ee8ad01ea666867d1db45076d8 Mon Sep 17 00:00:00 2001
+From: Yaron Friedman <yfriedman@google.com>
+Date: Tue, 17 Nov 2026 10:55:41 -0800
+Subject: [PATCH] Store CRLSet serials compactly behind a feature flag
+
+CRLSet keeps revoked serials as unordered_map<string,
+vector<vector<uint8_t>>>: one heap allocation per serial, and
+CheckSerial() does a linear scan over an issuer's serials. That was fine
+while CRLSets held ~80k serials (1.3 MB on disk). The current component
+(sequence 10890) holds 514,896 serials across 419 issuers, 9.6 MB on
+disk, with four issuers of 107k-115k serials each.
+
+Measured with that file (linux, net_unittests, release):
+  legacy:  parse 65 ms, +35.8 MB RSS, 3.8 ms per CheckSerial miss
+           against a 115k-serial issuer
+  compact: parse 30 ms, +10.8 MB RSS, 0.2 us per miss
+On a Pixel 7 Pro the same swap of crl-set (1.3 MB -> 9.6 MB) moved
+CRLSet::Parse live heap from 3.2 MB to 21.2 MB and browser process
+PrivateMemoryFootprint by about +20 MB. With compact serials enabled,
+Android browser process PrivateMemoryFootprint drops by ~18.3 MB.
+
+This CL adds CRLSet::CompactSerials: serials of up to 20 bytes are
+stored as sorted fixed-width 21-byte entries ([length][bytes, zero
+padded]) in one vector and looked up by binary search; longer serials go
+to a small overflow list. The layout is selected at parse time by
+net::features::kCRLSetCompactSerials (disabled by default) so it can be
+rolled out as an experiment on Memory.Browser.PrivateMemoryFootprint and
+Net.CertVerifier_Job_Latency. The legacy path is unchanged;
+CrlsForTesting() keeps returning the legacy map. Tests run in both
+layouts.
+
+(cherry picked from commit 83b96e7ff3417ef4a8c8bb6df69f3b279621f79c)
+
+Bug: 583554684
+Fixed: 586471270
+Change-Id: I2c90431916a1485550082b727c26c47617d687ce
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/8775591
+Reviewed-by: Matt Mueller <mattm@chromium.org>
+Commit-Queue: Yaron Friedman <yfriedman@chromium.org>
+Cr-Original-Commit-Position: refs/heads/main@{#1744958}
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/8822065
+Auto-Submit: Yaron Friedman <yfriedman@chromium.org>
+Commit-Queue: Matt Mueller <mattm@chromium.org>
+Cr-Commit-Position: refs/branch-heads/8154@{#821}
+Cr-Branched-From: 5abc82b75a12aba2070f008c93349d463e81dc10-refs/heads/main@{#1739869}
+---
+
+--- a/net/base/features.cc
++++ b/net/base/features.cc
+@@ -569,6 +569,8 @@ BASE_FEATURE(kNoVarySearchIgnoreUnrecogn
+ 
+ BASE_FEATURE(kEnforceOneRfc6962CtPolicy, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++BASE_FEATURE(kCRLSetCompactSerials, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ BASE_FEATURE(kDiskCacheBackendExperiment, base::FEATURE_DISABLED_BY_DEFAULT);
+ constexpr base::FeatureParam<DiskCacheBackend>::Option
+     kDiskCacheBackendOptions[] = {
+--- a/net/base/features.h
++++ b/net/base/features.h
+@@ -627,6 +627,10 @@ NET_EXPORT BASE_DECLARE_FEATURE(kNoVaryS
+ // disabled, Chrome does not distinguish between SCTs based on log type.
+ NET_EXPORT BASE_DECLARE_FEATURE(kEnforceOneRfc6962CtPolicy);
+ 
++// When enabled, CRLSet stores blocked serials in a compact representation
++// instead of std::vector<std::vector<uint8_t>> per issuer.
++NET_EXPORT BASE_DECLARE_FEATURE(kCRLSetCompactSerials);
++
+ // Finch experiment to select a disk cache backend.
+ enum class DiskCacheBackend {
+   kDefault,
+--- a/net/cert/crl_set.cc
++++ b/net/cert/crl_set.cc
+@@ -8,8 +8,11 @@
+ #include <string_view>
+ 
+ #include "base/base64.h"
++#include "base/check.h"
++#include "base/check_op.h"
+ #include "base/containers/span.h"
+ #include "base/containers/to_vector.h"
++#include "base/feature_list.h"
+ #include "base/json/json_reader.h"
+ #include "base/strings/string_view_util.h"
+ #include "base/time/time.h"
+@@ -17,6 +20,7 @@
+ #include "base/values.h"
+ #include "crypto/hash.h"
+ #include "crypto/openssl_util.h"
++#include "net/base/features.h"
+ #include "net/base/trace_constants.h"
+ #include "third_party/boringssl/src/include/openssl/bytestring.h"
+ #include "third_party/boringssl/src/include/openssl/mem.h"
+@@ -88,41 +92,64 @@ std::optional<base::Value> ReadHeader(st
+ // currently implement.
+ static const int kCurrentFileVersion = 0;
+ 
++// ReadCRL reads one (parent SPKI hash, serials) record from |data|. |reserve|
++// is told the inline and overflow serial counts up front (after verifying that
++// all records fit in |data|) and |add_serial| is called once per serial, in
++// file order.
++template <typename ReserveFn, typename AddSerialFn>
+ bool ReadCRL(std::string_view* data,
+-             std::string* out_parent_spki_hash,
+-             std::vector<std::vector<uint8_t>>* out_serials) {
+-  if (data->size() < crypto::hash::kSha256Size) {
++             size_t max_inline_serial_length,
++             SHA256HashValue* out_parent_spki_hash,
++             ReserveFn reserve,
++             AddSerialFn add_serial) {
++  if (data->size() < sizeof(SHA256HashValue)) {
+     return false;
+   }
+-  *out_parent_spki_hash =
+-      std::string(data->substr(0, crypto::hash::kSha256Size));
+-  data->remove_prefix(crypto::hash::kSha256Size);
++  base::span(*out_parent_spki_hash)
++      .copy_from(base::as_byte_span(*data).first<sizeof(SHA256HashValue)>());
++  data->remove_prefix(sizeof(SHA256HashValue));
+ 
+   uint32_t num_serials;
+-  if (data->size() < sizeof(num_serials))
++  if (data->size() < sizeof(num_serials)) {
+     return false;
++  }
+   // Assumes little endian.
+   base::byte_span_from_ref(num_serials)
+-      .copy_from(base::as_byte_span(*data).first(sizeof(num_serials)));
++      .copy_from(base::as_byte_span(*data).first<sizeof(num_serials)>());
+   data->remove_prefix(sizeof(num_serials));
+ 
+-  if (num_serials > 32 * 1024 * 1024)  // Sanity check.
++  if (num_serials > 32 * 1024 * 1024) {  // Sanity check.
+     return false;
++  }
+ 
+-  out_serials->reserve(num_serials);
+-
++  // Verify that all |num_serials| records are present in |data| before
++  // reserving space for them.
++  std::string_view cursor = *data;
++  size_t inline_serials = 0;
++  size_t overflow_serials = 0;
+   for (uint32_t i = 0; i < num_serials; ++i) {
+-    if (data->size() < sizeof(uint8_t))
++    if (cursor.empty()) {
+       return false;
+-
+-    uint8_t serial_length = (*data)[0];
+-    data->remove_prefix(sizeof(uint8_t));
+-
+-    if (data->size() < serial_length)
++    }
++    uint8_t serial_length = static_cast<uint8_t>(cursor[0]);
++    cursor.remove_prefix(sizeof(uint8_t));
++    if (cursor.size() < serial_length) {
+       return false;
++    }
++    cursor.remove_prefix(serial_length);
++    if (serial_length > max_inline_serial_length) {
++      ++overflow_serials;
++    } else {
++      ++inline_serials;
++    }
++  }
+ 
+-    out_serials->push_back(
+-        base::ToVector(base::as_byte_span(data->substr(0, serial_length))));
++  reserve(inline_serials, overflow_serials);
++
++  for (uint32_t i = 0; i < num_serials; ++i) {
++    uint8_t serial_length = static_cast<uint8_t>((*data)[0]);
++    data->remove_prefix(sizeof(uint8_t));
++    add_serial(base::as_byte_span(data->substr(0, serial_length)));
+     data->remove_prefix(serial_length);
+   }
+ 
+@@ -249,16 +276,53 @@ bool CRLSet::Parse(std::string_view data
+   auto crl_set = base::WrapRefCounted(new CRLSet());
+   crl_set->sequence_ = static_cast<uint32_t>(*sequence);
+   crl_set->not_after_ = static_cast<uint64_t>(not_after);
+-  crl_set->crls_.reserve(64);  // Value observed experimentally.
++  if (!data.empty()) {
++    crl_set->use_compact_serials_ =
++        base::FeatureList::IsEnabled(features::kCRLSetCompactSerials);
++    if (crl_set->use_compact_serials_) {
++      crl_set->compact_crls_.reserve(64);  // Value observed experimentally.
++    } else {
++      crl_set->crls_.reserve(64);  // Value observed experimentally.
++    }
++  }
+ 
+   while (!data.empty()) {
+-    std::string spki_hash;
+-    std::vector<std::vector<uint8_t>> blocked_serials;
+-
+-    if (!ReadCRL(&data, &spki_hash, &blocked_serials)) {
+-      return false;
++    SHA256HashValue spki_hash;
++    if (crl_set->use_compact_serials_) {
++      std::vector<CompactSerials::Entry> entries;
++      std::vector<std::vector<uint8_t>> overflow;
++      if (!ReadCRL(
++              &data, kMaxInlineSerialLength, &spki_hash,
++              [&](size_t inline_count, size_t overflow_count) {
++                entries.reserve(inline_count);
++                overflow.reserve(overflow_count);
++              },
++              [&](base::span<const uint8_t> serial) {
++                if (serial.size() > kMaxInlineSerialLength) {
++                  overflow.push_back(base::ToVector(serial));
++                } else {
++                  entries.push_back(CompactSerials::MakeEntry(serial));
++                }
++              })) {
++        return false;
++      }
++      crl_set->compact_crls_[spki_hash] =
++          CompactSerials(std::move(entries), std::move(overflow));
++    } else {
++      std::vector<std::vector<uint8_t>> blocked_serials;
++      if (!ReadCRL(
++              &data, kMaxInlineSerialLength, &spki_hash,
++              [&](size_t inline_count, size_t overflow_count) {
++                blocked_serials.reserve(inline_count + overflow_count);
++              },
++              [&](base::span<const uint8_t> serial) {
++                blocked_serials.push_back(base::ToVector(serial));
++              })) {
++        return false;
++      }
++      crl_set->crls_[std::string(base::as_string_view(spki_hash))] =
++          std::move(blocked_serials);
+     }
+-    crl_set->crls_[std::move(spki_hash)] = std::move(blocked_serials);
+   }
+ 
+   std::vector<std::string> blocked_interception_spkis;
+@@ -344,6 +408,19 @@ CRLSet::Result CRLSet::CheckSerial(base:
+     serial = serial.subspan(1u);
+   }
+ 
++  if (use_compact_serials_) {
++    if (issuer_spki_hash.size() != sizeof(SHA256HashValue)) {
++      return UNKNOWN;
++    }
++    SHA256HashValue spki_hash;
++    base::span(spki_hash).copy_from(base::as_byte_span(issuer_spki_hash));
++    auto it = compact_crls_.find(spki_hash);
++    if (it == compact_crls_.end()) {
++      return UNKNOWN;
++    }
++    return it->second.Contains(serial) ? REVOKED : GOOD;
++  }
++
+   auto it = crls_.find(std::string(issuer_spki_hash));
+   if (it == crls_.end())
+     return UNKNOWN;
+@@ -375,9 +452,61 @@ uint32_t CRLSet::sequence() const {
+ }
+ 
+ const CRLSet::CRLList& CRLSet::CrlsForTesting() const {
++  CHECK(!use_compact_serials_);
+   return crls_;
+ }
+ 
++size_t CRLSet::NumSerialsForTesting(std::string_view issuer_spki_hash) const {
++  if (use_compact_serials_) {
++    if (issuer_spki_hash.size() != sizeof(SHA256HashValue)) {
++      return 0;
++    }
++    SHA256HashValue spki_hash;
++    base::span(spki_hash).copy_from(base::as_byte_span(issuer_spki_hash));
++    auto it = compact_crls_.find(spki_hash);
++    return it == compact_crls_.end() ? 0 : it->second.size();
++  }
++  auto it = crls_.find(std::string(issuer_spki_hash));
++  return it == crls_.end() ? 0 : it->second.size();
++}
++
++CRLSet::CompactSerials::CompactSerials() = default;
++CRLSet::CompactSerials::CompactSerials(
++    std::vector<Entry> entries_vec,
++    std::vector<std::vector<uint8_t>> overflow)
++    : overflow(std::move(overflow)) {
++  // Sort and deduplicate with std::ranges::sort (O(N log N) introsort) before
++  // moving into base::flat_set with base::sorted_unique, avoiding flat_tree's
++  // O(N log^2 N) in-place rotate-merge sort.
++  std::ranges::sort(entries_vec);
++  auto repeated = std::ranges::unique(entries_vec);
++  entries_vec.erase(repeated.begin(), repeated.end());
++  entries = base::flat_set<Entry>(base::sorted_unique, std::move(entries_vec));
++}
++CRLSet::CompactSerials::CompactSerials(CompactSerials&&) = default;
++CRLSet::CompactSerials& CRLSet::CompactSerials::operator=(CompactSerials&&) =
++    default;
++CRLSet::CompactSerials::~CompactSerials() = default;
++
++// static
++CRLSet::CompactSerials::Entry CRLSet::CompactSerials::MakeEntry(
++    base::span<const uint8_t> serial) {
++  DCHECK_LE(serial.size(), kMaxInlineSerialLength);
++  Entry entry = {};
++  entry[0] = static_cast<uint8_t>(serial.size());
++  base::span(entry).subspan(1u, serial.size()).copy_from(serial);
++  return entry;
++}
++
++bool CRLSet::CompactSerials::Contains(base::span<const uint8_t> serial) const {
++  if (serial.size() > kMaxInlineSerialLength) {
++    return std::ranges::any_of(overflow, [&](const std::vector<uint8_t>& s) {
++      return base::span(s) == serial;
++    });
++  }
++  return entries.contains(MakeEntry(serial));
++}
++
+ // static
+ scoped_refptr<CRLSet> CRLSet::BuiltinCRLSet() {
+   constexpr char kCRLSet[] =
+@@ -434,9 +563,10 @@ scoped_refptr<CRLSet> CRLSet::ForTesting
+   crl_set->sequence_ = 0;
+   if (is_expired)
+     crl_set->not_after_ = 1;
++  crl_set->use_compact_serials_ =
++      base::FeatureList::IsEnabled(features::kCRLSetCompactSerials);
+ 
+   if (issuer_spki) {
+-    std::string spki(base::as_string_view(*issuer_spki));
+     std::vector<std::vector<uint8_t>> serials;
+     if (!serial_number.empty()) {
+       serials.push_back(base::ToVector(serial_number));
+@@ -455,7 +585,23 @@ scoped_refptr<CRLSet> CRLSet::ForTesting
+       }
+     }
+ 
+-    crl_set->crls_.emplace(std::move(spki), std::move(serials));
++    if (crl_set->use_compact_serials_) {
++      std::vector<CompactSerials::Entry> entries;
++      std::vector<std::vector<uint8_t>> overflow;
++      for (const auto& s : serials) {
++        if (s.size() > kMaxInlineSerialLength) {
++          overflow.push_back(s);
++        } else {
++          entries.push_back(CompactSerials::MakeEntry(s));
++        }
++      }
++      crl_set->compact_crls_.emplace(
++          *issuer_spki,
++          CompactSerials(std::move(entries), std::move(overflow)));
++    } else {
++      crl_set->crls_.emplace(std::string(base::as_string_view(*issuer_spki)),
++                             std::move(serials));
++    }
+   }
+ 
+   if (!subject_hash.empty())
+--- a/net/cert/crl_set.h
++++ b/net/cert/crl_set.h
+@@ -8,16 +8,19 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ 
++#include <array>
+ #include <string>
+ #include <string_view>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
++#include "base/containers/flat_set.h"
+ #include "base/containers/span.h"
+ #include "base/memory/ref_counted.h"
+ #include "net/base/hash_value.h"
+ #include "net/base/net_export.h"
++#include "third_party/abseil-cpp/absl/container/flat_hash_map.h"
+ 
+ namespace net {
+ 
+@@ -75,9 +78,14 @@ class NET_EXPORT CRLSet : public base::R
+       std::unordered_map<std::string, std::vector<std::vector<uint8_t>>>;
+ 
+   // crls returns the internal state of this CRLSet. It should only be used in
+-  // testing.
++  // testing, and is only valid when features::kCRLSetCompactSerials is
++  // disabled.
+   const CRLList& CrlsForTesting() const;
+ 
++  // Returns the number of revoked serial numbers recorded for
++  // |issuer_spki_hash| regardless of the storage representation. For tests.
++  size_t NumSerialsForTesting(std::string_view issuer_spki_hash) const;
++
+   // BuiltinCRLSet() returns the default CRLSet, to be used when no CRLSet is
+   // available from the network.  The default CRLSet includes a statically-
+   // configured block list.
+@@ -114,9 +122,40 @@ class NET_EXPORT CRLSet : public base::R
+   // not_after_ contains the time, in UNIX epoch seconds, after which the
+   // CRLSet should be considered stale, or 0 if no such time was given.
+   uint64_t not_after_ = 0;
++  // Revoked serial numbers of one issuer, stored compactly: serials of up to
++  // kMaxInlineSerialLength bytes are kept as sorted, fixed-width entries of
++  // [length byte][serial bytes, zero padded] and looked up by binary search;
++  // longer serials (rare) live in |overflow|. Used instead of |crls_| when
++  // features::kCRLSetCompactSerials is enabled.
++  static constexpr size_t kMaxInlineSerialLength = 20;
++  struct CompactSerials {
++    using Entry = std::array<uint8_t, kMaxInlineSerialLength + 1>;
++
++    CompactSerials();
++    CompactSerials(std::vector<Entry> entries,
++                   std::vector<std::vector<uint8_t>> overflow);
++    CompactSerials(CompactSerials&&);
++    CompactSerials& operator=(CompactSerials&&);
++    ~CompactSerials();
++
++    static Entry MakeEntry(base::span<const uint8_t> serial);
++    bool Contains(base::span<const uint8_t> serial) const;
++    size_t size() const { return entries.size() + overflow.size(); }
++
++    base::flat_set<Entry> entries;
++    std::vector<std::vector<uint8_t>> overflow;
++  };
++  using CompactCRLList = absl::flat_hash_map<SHA256HashValue, CompactSerials>;
++
++  // Whether this set stores serials in |compact_crls_| (true) or |crls_|
++  // (false). Decided once, at parse time, from kCRLSetCompactSerials.
++  bool use_compact_serials_ = false;
+   // crls_ is a map from the SHA-256 hash of an X.501 subject name to a list
+   // of revoked serial numbers.
+   CRLList crls_;
++  // compact_crls_ holds the same information as |crls_| when
++  // |use_compact_serials_| is true.
++  CompactCRLList compact_crls_;
+   // blocked_spkis_ contains the SHA256 hashes of SPKIs which are to be blocked
+   // no matter where in a certificate chain they might appear.
+   std::vector<std::string> blocked_spkis_;
