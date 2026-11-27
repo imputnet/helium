@@ -1,0 +1,223 @@
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -330,15 +330,23 @@ WebContents* AddRestoredTab(
+       from_session_restore, is_active_browser, load_policy);
+ }
+ 
+-WebContents* AddDeferredTab(BrowserWindowInterface* browser,
+-                            const GURL& url,
+-                            const std::u16string& title,
+-                            int tab_index,
+-                            bool pin) {
++WebContents* AddDeferredTab(
++    BrowserWindowInterface* browser,
++    const GURL& url,
++    const std::u16string& title,
++    int tab_index,
++    bool pin,
++    const std::optional<content::StoragePartitionConfig>&
++        storage_partition_config) {
+   SerializedNavigationEntry navigation;
+   navigation.set_index(0);
+   navigation.set_virtual_url(url);
+   navigation.set_title(title);
++  if (storage_partition_config) {
++    navigation.set_storage_partition_key(
++        {storage_partition_config->partition_domain(),
++         storage_partition_config->partition_name()});
++  }
+   return AddRestoredTab(
+       browser, base::span_from_ref(navigation), tab_index,
+       /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+--- a/chrome/browser/ui/browser_tabrestore.h
++++ b/chrome/browser/ui/browser_tabrestore.h
+@@ -6,12 +6,14 @@
+ #define CHROME_BROWSER_UI_BROWSER_TABRESTORE_H_
+ 
+ #include <map>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+ #include "base/containers/span.h"
+ #include "base/token.h"
+ #include "components/sessions/core/session_types.h"
++#include "content/public/browser/storage_partition_config.h"
+ 
+ class BrowserWindowInterface;
+ class GURL;
+@@ -73,12 +75,16 @@ content::WebContents* AddRestoredTab(
+ 
+ // Adds a background tab at tab_index that shows url, with title unless
+ // it's empty, and isn't loaded until it's activated. If pin is true, the tab
+-// is pinned. Returns the WebContents of the tab.
+-content::WebContents* AddDeferredTab(BrowserWindowInterface* browser,
+-                                     const GURL& url,
+-                                     const std::u16string& title,
+-                                     int tab_index,
+-                                     bool pin);
++// is pinned. The tab uses storage_partition_config's storage partition, if
++// any. Returns the WebContents of the tab.
++content::WebContents* AddDeferredTab(
++    BrowserWindowInterface* browser,
++    const GURL& url,
++    const std::u16string& title,
++    int tab_index,
++    bool pin,
++    const std::optional<content::StoragePartitionConfig>&
++        storage_partition_config);
+ 
+ // Replaces the state of the currently selected tab with the session
+ // history restored from the SessionRestore and TabRestoreService systems.
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -441,7 +441,7 @@ BrowserWindowInterface* StartupBrowserCr
+       chrome::AddDeferredTab(
+           browser, tab.url, /*title=*/std::u16string(),
+           browser->tab_strip_model()->IndexOfFirstNonPinnedTab(),
+-          /*pin=*/true);
++          /*pin=*/true, tab.storage_partition_config);
+       continue;
+     }
+ 
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -562,6 +562,7 @@ if (!is_android) {
+       ":tabs",
+       ":utils",
+       "//brave/browser/containers",
++      "//brave/components/containers/content/browser",
+       "//brave/components/containers/core/common",
+       "//chrome/app:command_ids",
+       "//chrome/app/vector_icons",
+--- a/chrome/browser/ui/tabs/helium_pins_list.cc
++++ b/chrome/browser/ui/tabs/helium_pins_list.cc
+@@ -21,6 +21,8 @@ constexpr char kSplitKey[] = "split";
+ constexpr char kSplitLayoutKey[] = "split_layout";
+ constexpr char kSplitRatioKey[] = "split_ratio";
+ constexpr char kStackedLayout[] = "stacked";
++// Shared with PinnedTabCodec, which opens pins at startup in their container.
++constexpr char kContainerIdKey[] = "container_id";
+ 
+ }  // namespace
+ 
+@@ -53,6 +55,10 @@ PinList PinList::FromPref(const base::Li
+     const std::string* const id = dict->FindString(kIdKey);
+     if (id && !id->empty() && list.Find(*id) == list.end()) {
+       list.pins_.push_back({*id, pin_url});
++      if (const std::string* const container_id =
++              dict->FindString(kContainerIdKey)) {
++        list.pins_.back().container_id = *container_id;
++      }
+       if (const std::string* const split = dict->FindString(kSplitKey)) {
+         Pin& pin = list.pins_.back();
+         pin.split = *split;
+@@ -84,6 +90,9 @@ base::ListValue PinList::ToPref() const
+   for (const Pin& pin : pins_) {
+     base::DictValue entry =
+         base::DictValue().Set(kUrlKey, pin.url.spec()).Set(kIdKey, pin.id);
++    if (!pin.container_id.empty()) {
++      entry.Set(kContainerIdKey, pin.container_id);
++    }
+     if (!pin.split.empty()) {
+       entry.Set(kSplitKey, pin.split);
+       if (pin.split_visual_data.split_layout() ==
+--- a/chrome/browser/ui/tabs/helium_pins_list.h
++++ b/chrome/browser/ui/tabs/helium_pins_list.h
+@@ -25,6 +25,9 @@ struct Pin {
+   // The id of the first pin of the split that this pin is part of, if any.
+   std::string split;
+   split_tabs::SplitTabVisualData split_visual_data;
++
++  // The id of the container that the pin's tabs are in, if any.
++  std::string container_id;
+ };
+ 
+ // Returns a new, unique pin id.
+--- a/chrome/browser/ui/tabs/helium_pins_service.cc
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -12,9 +12,13 @@
+ #include "base/auto_reset.h"
+ #include "base/check.h"
+ #include "base/containers/map_util.h"
++#include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "brave/browser/containers/container_specifier_utils.h"
++#include "brave/components/containers/content/browser/storage_partition_utils.h"
++#include "brave/components/containers/core/common/features.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tab_list/tab_removed_reason.h"
+@@ -39,6 +43,7 @@
+ #include "content/public/browser/invalidate_type.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/storage_partition_config.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/url_constants.h"
+ 
+@@ -54,6 +59,26 @@ GURL GetNewPinUrl(content::WebContents*
+   return url.is_valid() ? url : GURL(url::kAboutBlankURL);
+ }
+ 
++// Returns the id of the container that contents is in, if any.
++std::string GetContainerId(content::WebContents* contents) {
++  return base::FeatureList::IsEnabled(containers::features::kContainers)
++             ? containers::GetContainerIdForWebContents(contents)
++             : std::string();
++}
++
++// Returns the storage partition of the pin's container, unless it has none or
++// the container can't be used, e.g. because it was deleted.
++std::optional<content::StoragePartitionConfig> GetPinStoragePartitionConfig(
++    Profile* profile,
++    const Pin& pin) {
++  if (pin.container_id.empty()) {
++    return std::nullopt;
++  }
++
++  return containers::GetStoragePartitionConfigForContainerSpecifier(
++      profile, containers::ContainerId(pin.container_id));
++}
++
+ // Returns the controllers of the pinned tabs of browser, in tab strip order.
+ std::vector<HeliumPinsTabController*> GetPinnedTabControllers(
+     BrowserWindowInterface* browser) {
+@@ -817,7 +842,8 @@ std::string HeliumPinsService::InsertNew
+     BrowserWindowInterface* browser,
+     HeliumPinsTabController* controller) {
+   tabs::TabInterface* const tab = &controller->tab();
+-  const Pin pin{CreatePinId(), GetNewPinUrl(tab->GetContents())};
++  Pin pin{CreatePinId(), GetNewPinUrl(tab->GetContents())};
++  pin.container_id = GetContainerId(tab->GetContents());
+   pins_.insert(pins_.begin() + GetNewPinPosition(browser, tab), pin);
+   controller->SetPin(pin.id, pin.url);
+ 
+@@ -933,8 +959,14 @@ void HeliumPinsService::Reconcile(Browse
+   for (HeliumPinsTabController* controller : unidentified) {
+     content::WebContents* const contents = controller->tab().GetContents();
+     const GURL url = GetPinnableUrl(contents);
++    const std::string container_id = GetContainerId(contents);
+     auto match = std::ranges::find_if(pins_, [&](const Pin& pin) {
+-      return pin.url == url && !present.contains(pin.id);
++      // Pins whose container is gone are opened outside of it.
++      const std::string pin_container_id =
++          GetPinStoragePartitionConfig(profile_, pin) ? pin.container_id
++                                                      : std::string();
++      return pin.url == url && pin_container_id == container_id &&
++             !present.contains(pin.id);
+     });
+ 
+     // Pin lists saved before pins had ids kept the page URL of source views,
+@@ -1218,7 +1250,8 @@ void HeliumPinsService::InsertHibernated
+   }
+ 
+   content::WebContents* const contents =
+-      chrome::AddDeferredTab(browser, pin.url, title, index, /*pin=*/true);
++      chrome::AddDeferredTab(browser, pin.url, title, index, /*pin=*/true,
++                             GetPinStoragePartitionConfig(profile_, pin));
+   tabs::TabInterface* const tab = tabs::TabInterface::GetFromContents(contents);
+   HeliumPinsTabController::From(tab)->SetPin(pin.id, pin.url);
+ 
