@@ -1,0 +1,342 @@
+--- a/chrome/browser/renderer_context_menu/BUILD.gn
++++ b/chrome/browser/renderer_context_menu/BUILD.gn
+@@ -113,6 +113,7 @@ source_set("impl") {
+     ]
+ 
+     deps += [
++      "//brave/components/containers/content/browser",
+       "//chrome/app:command_ids",
+       "//chrome/app:generated_resources",
+       "//chrome/browser:browser_features",
+@@ -159,6 +160,7 @@ source_set("impl") {
+       "//chrome/browser/ui:ui_features",
+       "//chrome/browser/ui/autofill",
+       "//chrome/browser/ui/browser_window",
++      "//chrome/browser/ui/containers",
+       "//chrome/browser/ui/lens",
+       "//chrome/browser/ui/profiles",
+       "//chrome/browser/ui/qrcode_generator",
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -36,6 +36,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/system/sys_info.h"
++#include "brave/components/containers/content/browser/storage_partition_utils.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -121,6 +122,7 @@
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/containers/containers_open_menu.h"
+ #include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
+ #include "chrome/browser/ui/exclusive_access/keyboard_lock_controller.h"
+ #include "chrome/browser/ui/lens/lens_overlay_entry_point_controller.h"
+@@ -2052,6 +2054,27 @@ void RenderViewContextMenu::AppendLinkIt
+         menu_model_.SetElementIdentifierAt(command_index,
+                                            kOpenLinkInSplitMenuItem);
+       }
++
++      if (IsNormalBrowser()) {
++        containers::ContainersOpenMenu::Params containers_params;
++        containers_params.urls = {params_.link_url};
++        if (std::string id = containers::GetContainerIdForWebContents(
++                source_web_contents_);
++            !id.empty()) {
++          containers_params.current_container_ids = {std::move(id)};
++        }
++        containers_params.link_initiator_origin = params_.frame_origin;
++        if (auto* view = GetRenderFrameHost()->GetView()) {
++          containers_params.scale_factor = view->GetDeviceScaleFactor();
++        }
++        containers_menu_ = containers::ContainersOpenMenu::MaybeCreate(
++            GetBrowser(), std::move(containers_params));
++        if (containers_menu_) {
++          menu_model_.AddSubMenuWithStringId(IDC_OPEN_IN_CONTAINER,
++                                             IDS_CXMENU_OPEN_LINK_IN_CONTAINER,
++                                             containers_menu_->model());
++        }
++      }
+     }
+ #endif
+ 
+@@ -3545,6 +3568,7 @@ bool RenderViewContextMenu::IsCommandIdE
+       return navigation_allowed && params_.link_url.is_valid() &&
+              IsOpenLinkAllowedByDlp(params_.link_url);
+ 
++    case IDC_OPEN_IN_CONTAINER:
+     case IDC_CONTENT_CONTEXT_OPENLINKSPLITVIEW:
+       return navigation_allowed && params_.link_url.is_valid() &&
+              params_.link_url.IsStandard() &&
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.h
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.h
+@@ -64,6 +64,10 @@ class SpellingOptionsSubMenuObserver;
+ class TemplateURL;
+ class ToastController;
+ 
++namespace containers {
++class ContainersOpenMenu;
++}  // namespace containers
++
+ namespace content {
+ class NavigationHandle;
+ class RenderFrameHost;
+@@ -653,6 +657,7 @@ class RenderViewContextMenu
+ 
+   std::unique_ptr<ui::SimpleMenuModel> send_tab_to_self_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> split_layout_submenu_;
++  std::unique_ptr<containers::ContainersOpenMenu> containers_menu_;
+ 
+   //  Used for CTR metrics of menu item for opening Glic.
+   bool glic_item_shown_ = false;
+--- /dev/null
++++ b/chrome/browser/ui/containers/BUILD.gn
+@@ -0,0 +1,30 @@
++# Copyright 2026 The Helium Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# Helium's containers UI, built on Brave's containers code in //brave.
++source_set("containers") {
++  sources = [
++    "containers_open_menu.cc",
++    "containers_open_menu.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//brave/browser/ui/containers",
++    "//url",
++  ]
++
++  deps = [
++    "//brave/browser/containers",
++    "//brave/components/containers/content/browser",
++    "//brave/components/containers/core/browser",
++    "//brave/components/containers/core/common",
++    "//brave/components/containers/core/mojom",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/navigator",
++    "//content/public/browser",
++    "//ui/base",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/containers/containers_open_menu.cc
+@@ -0,0 +1,113 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/containers/containers_open_menu.h"
++
++#include <utility>
++
++#include "base/memory/ptr_util.h"
++#include "brave/browser/containers/containers_service_factory.h"
++#include "brave/components/containers/content/browser/storage_partition_utils.h"
++#include "brave/components/containers/core/browser/containers_service.h"
++#include "brave/components/containers/core/common/features.h"
++#include "brave/components/containers/core/mojom/containers.mojom.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "content/public/browser/storage_partition_config.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++
++namespace containers {
++
++void OpenInContainer(BrowserWindowInterface* browser,
++                     const std::vector<GURL>& urls,
++                     const std::string& container_id,
++                     std::optional<url::Origin> link_initiator_origin) {
++  Profile* profile = browser->GetProfile();
++  const bool is_link = link_initiator_origin.has_value();
++  for (const GURL& url : urls) {
++    if (!url.is_valid()) {
++      continue;
++    }
++    NavigateParams params(browser, url,
++                          is_link ? ui::PAGE_TRANSITION_LINK
++                                  : ui::PAGE_TRANSITION_TYPED);
++    params.disposition = WindowOpenDisposition::kNewForegroundTab;
++    params.initiator_origin = link_initiator_origin;
++    params.started_from_context_menu = is_link;
++    if (!container_id.empty()) {
++      params.storage_partition_config = content::StoragePartitionConfig::Create(
++          profile, kContainersStoragePartitionDomain, container_id,
++          profile->IsOffTheRecord());
++    }
++    Navigate(&params);
++  }
++}
++
++ContainersOpenMenu::Params::Params() = default;
++ContainersOpenMenu::Params::Params(Params&&) = default;
++ContainersOpenMenu::Params& ContainersOpenMenu::Params::operator=(Params&&) =
++    default;
++ContainersOpenMenu::Params::~Params() = default;
++
++// static
++std::unique_ptr<ContainersOpenMenu> ContainersOpenMenu::MaybeCreate(
++    BrowserWindowInterface* browser,
++    Params params) {
++  if (!base::FeatureList::IsEnabled(features::kContainers) || !browser ||
++      params.urls.empty()) {
++    return nullptr;
++  }
++  auto* service = ContainersServiceFactory::GetForProfile(browser->GetProfile());
++  if (!service || !service->ShouldShowContainerControls()) {
++    return nullptr;
++  }
++
++  auto menu =
++      base::WrapUnique(new ContainersOpenMenu(browser, std::move(params)));
++  menu->model_ = std::make_unique<ContainersMenuModel>(*menu, *service);
++  return menu;
++}
++
++ContainersOpenMenu::ContainersOpenMenu(BrowserWindowInterface* browser,
++                                       Params params)
++    : browser_(browser), params_(std::move(params)) {}
++
++ContainersOpenMenu::~ContainersOpenMenu() = default;
++
++void ContainersOpenMenu::OnContainerSelected(
++    const mojom::ContainerPtr& container) {
++  OpenInContainer(browser_, params_.urls, container->id,
++                  params_.link_initiator_origin);
++}
++
++void ContainersOpenMenu::OnNoContainerSelected() {
++  OpenInContainer(browser_, params_.urls, std::string(),
++                  params_.link_initiator_origin);
++}
++
++void ContainersOpenMenu::OnNewTemporaryContainerSelected() {
++  auto* service = ContainersServiceFactory::GetForProfile(browser_->GetProfile());
++  CHECK(service);
++  // The URLs share one new temporary container.
++  OpenInContainer(browser_, params_.urls,
++                  service->CreateAndPersistTemporaryContainer()->id,
++                  params_.link_initiator_origin);
++}
++
++base::flat_set<std::string> ContainersOpenMenu::GetCurrentContainerIds() {
++  return params_.current_container_ids;
++}
++
++BrowserWindowInterface* ContainersOpenMenu::GetBrowserToOpenSettings() {
++  return browser_;
++}
++
++float ContainersOpenMenu::GetScaleFactor() {
++  return params_.scale_factor;
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/chrome/browser/ui/containers/containers_open_menu.h
+@@ -0,0 +1,80 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_CONTAINERS_CONTAINERS_OPEN_MENU_H_
++#define CHROME_BROWSER_UI_CONTAINERS_CONTAINERS_OPEN_MENU_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/memory/raw_ptr.h"
++#include "brave/browser/ui/containers/containers_menu_model.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++class BrowserWindowInterface;
++
++namespace containers {
++
++// Opens |urls| in new tabs in the container |container_id|, or outside of
++// containers if it's empty. |link_initiator_origin| is set when opening a link,
++// to the origin of the page it's on.
++void OpenInContainer(
++    BrowserWindowInterface* browser,
++    const std::vector<GURL>& urls,
++    const std::string& container_id,
++    std::optional<url::Origin> link_initiator_origin = std::nullopt);
++
++// A containers menu that opens URLs in new tabs in the chosen container,
++// such as a link from the page context menu, the selected tabs from the tab
++// context menu, or a new tab from the new tab button.
++class ContainersOpenMenu : public ContainersMenuModel::Delegate {
++ public:
++  struct Params {
++    Params();
++    Params(Params&&);
++    Params& operator=(Params&&);
++    ~Params();
++
++    std::vector<GURL> urls;
++    // Containers the URLs are currently shown in, checked in the menu.
++    base::flat_set<std::string> current_container_ids;
++    // Set when opening a link, to the origin of the page it's on.
++    std::optional<url::Origin> link_initiator_origin;
++    float scale_factor = 1.0f;
++  };
++
++  // Returns null when container controls are disabled for the profile.
++  static std::unique_ptr<ContainersOpenMenu> MaybeCreate(
++      BrowserWindowInterface* browser,
++      Params params);
++
++  ContainersOpenMenu(const ContainersOpenMenu&) = delete;
++  ContainersOpenMenu& operator=(const ContainersOpenMenu&) = delete;
++  ~ContainersOpenMenu() override;
++
++  ui::MenuModel* model() { return model_.get(); }
++
++  // ContainersMenuModel::Delegate:
++  void OnContainerSelected(const mojom::ContainerPtr& container) override;
++  void OnNoContainerSelected() override;
++  void OnNewTemporaryContainerSelected() override;
++  base::flat_set<std::string> GetCurrentContainerIds() override;
++  BrowserWindowInterface* GetBrowserToOpenSettings() override;
++  float GetScaleFactor() override;
++
++ private:
++  ContainersOpenMenu(BrowserWindowInterface* browser, Params params);
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const Params params_;
++  std::unique_ptr<ContainersMenuModel> model_;
++};
++
++}  // namespace containers
++
++#endif  // CHROME_BROWSER_UI_CONTAINERS_CONTAINERS_OPEN_MENU_H_
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -638,5 +638,14 @@
+ #define IDC_WRITING_DIRECTION_DEFAULT 57311
+ #define IDC_CONTENT_CONTEXT_CONTEXTUAL_TASKS_SUBMENU 57309
+ 
++// Containers, from Brave. Each container gets an id in the
++// IDC_OPEN_IN_CONTAINER_START..IDC_OPEN_IN_CONTAINER_END range.
++#define IDC_OPEN_IN_CONTAINER           56353
++#define IDC_OPEN_IN_CONTAINER_START     56354
++#define IDC_OPEN_IN_CONTAINER_NO_CONTAINER IDC_OPEN_IN_CONTAINER_START
++#define IDC_OPEN_IN_CONTAINER_END       56453
++#define IDC_OPEN_CONTAINERS_SETTING     56454
++#define IDC_NEW_TEMPORARY_CONTAINER     56458
++
+ 
+ #endif  // CHROME_APP_CHROME_COMMAND_IDS_H_
