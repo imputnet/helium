@@ -1,0 +1,138 @@
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2026, The Brave Authors
+Copyright (c) 2026, The Helium Authors
+--- a/chrome/browser/ui/startup/BUILD.gn
++++ b/chrome/browser/ui/startup/BUILD.gn
+@@ -27,7 +27,10 @@ source_set("startup_tab") {
+     "startup_tab.h",
+   ]
+ 
+-  public_deps = [ "//url" ]
++  public_deps = [
++    "//content/public/browser",
++    "//url",
++  ]
+ }
+ 
+ source_set("startup") {
+@@ -211,6 +214,8 @@ source_set("impl") {
+     deps += [
+       ":startup_tab",
+       "//apps",
++      "//brave/browser/containers",
++      "//brave/components/containers/core/browser",
+       "//base:i18n",
+       "//build:branding_buildflags",
+       "//build:buildflag_header_h",
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -422,7 +422,8 @@ BrowserWindowInterface* StartupBrowserCr
+     // Active tab overwrites apply only to one tab per launch, and can only
+     // happen if there is already a tab open to replace
+     if (first_tab && browser->GetTabStripModel()->count() &&
+-        (is_active_tab_overwrite == TabOverWrite::kYes)) {
++        (is_active_tab_overwrite == TabOverWrite::kYes) &&
++        !tab.storage_partition_config) {
+       NavigateParams params(browser, tab.url,
+                             ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
+       params.disposition = WindowOpenDisposition::kCurrentTab;
+@@ -453,6 +454,7 @@ BrowserWindowInterface* StartupBrowserCr
+                              ? WindowOpenDisposition::kNewForegroundTab
+                              : WindowOpenDisposition::kNewBackgroundTab;
+     params.tabstrip_add_types = add_types;
++    params.storage_partition_config = tab.storage_partition_config;
+ 
+ #if BUILDFLAG(ENABLE_RLZ)
+     if (process_startup == chrome::startup::IsProcessStartup::kYes &&
+--- a/chrome/browser/ui/startup/startup_tab.cc
++++ b/chrome/browser/ui/startup/startup_tab.cc
+@@ -9,4 +9,9 @@ StartupTab::StartupTab(const GURL& url,
+ StartupTab::StartupTab(const GURL& url, bool is_untrusted_launch)
+     : url(url), is_untrusted_launch(is_untrusted_launch) {}
+ 
++StartupTab::StartupTab(const StartupTab&) = default;
++StartupTab& StartupTab::operator=(const StartupTab&) = default;
++StartupTab::StartupTab(StartupTab&&) noexcept = default;
++StartupTab& StartupTab::operator=(StartupTab&&) noexcept = default;
++
+ StartupTab::~StartupTab() = default;
+--- a/chrome/browser/ui/startup/startup_tab.h
++++ b/chrome/browser/ui/startup/startup_tab.h
+@@ -5,8 +5,10 @@
+ #ifndef CHROME_BROWSER_UI_STARTUP_STARTUP_TAB_H_
+ #define CHROME_BROWSER_UI_STARTUP_STARTUP_TAB_H_
+ 
++#include <optional>
+ #include <vector>
+ 
++#include "content/public/browser/storage_partition_config.h"
+ #include "url/gurl.h"
+ 
+ // Represents tab data at startup.
+@@ -21,6 +23,10 @@ struct StartupTab {
+ 
+   explicit StartupTab(const GURL& url, Type type = Type::kNormal);
+   StartupTab(const GURL& url, bool is_untrusted_launch);
++  StartupTab(const StartupTab&);
++  StartupTab& operator=(const StartupTab&);
++  StartupTab(StartupTab&&) noexcept;
++  StartupTab& operator=(StartupTab&&) noexcept;
+   ~StartupTab();
+ 
+   // The url to load.
+@@ -31,6 +37,9 @@ struct StartupTab {
+   // True if this tab was launched from an untrusted external custom protocol
+   // (e.g., google-chrome://) that was stripped on startup.
+   bool is_untrusted_launch = false;
++
++  // The StoragePartition of the container to open the tab in, if any.
++  std::optional<content::StoragePartitionConfig> storage_partition_config;
+ };
+ 
+ using StartupTabs = std::vector<StartupTab>;
+--- a/chrome/browser/ui/startup/startup_tab_provider.cc
++++ b/chrome/browser/ui/startup/startup_tab_provider.cc
+@@ -15,6 +15,9 @@
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+ #include "base/threading/thread_restrictions.h"
++#include "brave/browser/containers/container_specifier_utils.h"
++#include "brave/browser/containers/containers_service_factory.h"
++#include "brave/components/containers/core/browser/command_line_container.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/first_run/first_run.h"
+ #include "chrome/browser/prefs/session_startup_pref.h"
+@@ -167,6 +170,20 @@ StartupTabs StartupTabProviderImpl::GetC
+     }
+   }
+ 
++  // Resolved only when there are tabs, as it may create a temporary
++  // container.
++  if (auto* containers_service =
++          ContainersServiceFactory::GetForProfile(profile);
++      containers_service && !result.empty()) {
++    auto storage_partition_config =
++        containers::GetStoragePartitionConfigForContainerSpecifier(
++            profile, containers::GetContainerSpecifierForCommandLineTabs(
++                         command_line, containers_service));
++    for (auto& tab : result) {
++      tab.storage_partition_config = storage_partition_config;
++    }
++  }
++
+   return result;
+ }
+ 
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -1445,6 +1445,7 @@ class SessionRestoreImpl : public Browse
+                                ? WindowOpenDisposition::kNewForegroundTab
+                                : WindowOpenDisposition::kNewBackgroundTab;
+       params.tabstrip_add_types = add_types;
++      params.storage_partition_config = startup_tab.storage_partition_config;
+       is_first_tab = false;
+       Navigate(&params);
+     }

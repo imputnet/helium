@@ -51,6 +51,17 @@ def find_parent_grd(tree, grdp_path):
     raise FileNotFoundError(f'no parent GRD found for {grdp_path}')
 
 
+def find_including_grd(tree, grdp_path, grd_files):
+    """Find which of grd_files includes a GRDP from another directory."""
+    grdp = (tree / grdp_path).resolve()
+    for grd_file in grd_files:
+        root = xml.parse(grd_file).getroot()
+        for part in root.iter('part'):
+            if (grd_file.parent / part.get('file')).resolve() == grdp:
+                return grd_file
+    raise FileNotFoundError(f'no parent GRD found for {grdp_path}')
+
+
 def get_parent_grd(tree, source_path):
     """Get the parent GRD file for a source path (GRD or GRDP)."""
     if source_path.endswith('.grd'):
@@ -120,15 +131,27 @@ def build_xtb_index(source, tree):
     """Prebuild a mapping from source path -> {lang -> XTB path}."""
     grd_cache = {}
     index = {}
+    unresolved = []
     for src in source:
         src_path = src['source']
-        if src_path in index:
+        if src_path in index or src_path in unresolved:
             continue
-        grd_path = get_parent_grd(tree, src_path)
+        try:
+            grd_path = get_parent_grd(tree, src_path)
+        except FileNotFoundError:
+            unresolved.append(src_path)
+            continue
         grd_key = str(grd_path)
         if grd_key not in grd_cache:
             grd_cache[grd_key] = parse_xtb_paths(grd_path)
         index[src_path] = grd_cache[grd_key]
+
+    # Parts that a GRD includes from another directory, e.g. ../brave/..., are
+    # looked up in the GRDs that the other strings come from.
+    grd_files = [Path(grd_key) for grd_key in grd_cache]
+    for src_path in unresolved:
+        grd_path = find_including_grd(tree, src_path, grd_files)
+        index[src_path] = grd_cache[str(grd_path)]
     return index
 
 
